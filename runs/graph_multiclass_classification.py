@@ -24,7 +24,6 @@ lr                             = hps.lr
 dropout_p                      = hps.dropout
 model_checkpoint               = hps.model_name
 data_file                      = hps.data_file
-data_path                      = hps.data_path
 vocab_file                     = hps.vocab_file
 parallel                       = hps.parallel
 deepspeed_kernel               = hps.deepspeed_kernel
@@ -34,7 +33,6 @@ load_checkpoint                = hps.load_ckpt
 collate                        = hps.collate
 world_size                     = hps.world_size
 free_gpu_id                    = hps.free_gpu_id
-vocab_filepath                 = os.path.join(data_path, vocab_file)
 train_type                     = 'multiclass' 
 
 if deepspeed:
@@ -44,14 +42,14 @@ if __name__ == '__main__':
   if deepspeed_kernel == False:
     deepspeed_config = None
   print(f"Load Tokenizer...")
-  tokenizer = GraphTokenizer(pd.read_csv(vocab_filepath, sep=',', index_col=0)) if tokenizer == 'custom' else AutoTokenizer.from_pretrained(models[model_checkpoint]) 
-  print(os.path.join(data_path, data_file))
+  tokenizer = GraphTokenizer(pd.read_csv(vocab_file, sep=',', index_col=0)) if tokenizer == 'custom' else AutoTokenizer.from_pretrained(models[model_checkpoint]) 
+  print(data_file)
   if data_file[-3:] != 'csv':
-    tokenized_datasets = load_from_disk(os.path.join(data_path, data_file), keep_in_memory=True)
+    tokenized_datasets = load_from_disk(data_file, keep_in_memory=True)
     max_freq           = 5 # is hardcoded.........................
   elif data_file[-3:] == 'csv':
     print(f"Load Dataset...")
-    raw_dataset                            = load_dataset(data_path, data_files=data_file, keep_in_memory=True).remove_columns('Unnamed: 0')
+    raw_dataset                            = load_dataset(data_files=data_file, keep_in_memory=True).remove_columns('Unnamed: 0')
     max_num_of_patterns_per_circuit        = max(set([len(patterns.split('\n')) for patterns in raw_dataset['train']['patterns']]))
 
     print(f"Data Initial Preprocessing...")

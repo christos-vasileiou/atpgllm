@@ -438,16 +438,15 @@ def parse_arguments(parser):
   parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training')
   parser.add_argument('--epochs', type=int, default=50, help='Number of epochs for training')
   parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
-  parser.add_argument('--dropout_p', type=float, default=0.2, help='Dropout probability')
+  parser.add_argument('--dropout_p', type=float, default=0.1, help='Dropout probability')
   parser.add_argument('--model_checkpoint', type=str, default='bert', help='Based Model checkpoint for training. Values can take: "t5-small", "t5-base", "t5-v1_1-base", "t5-large", "t5-xl", "t5-xxl", "mt5-base", "m2m100", "t5-finetuned", "led-base", "distilbert", "bert"')
   parser.add_argument('--is_causal', action='store_true', help='Specify if the you want to have a causal model specified')  
   parser.add_argument('--use_4bit', action='store_true', help='Apply 4-bit quantization on the model. Be advised that the model will be loaded on float32 but the training will take place on a device i.e. gpu, will be then quantized to the specified bit precision')
   parser.add_argument('--use_8bit', action='store_true', help='Apply 8-bit quantization on the model. Be advised that the model will be loaded on float32 but the training will take place on a device i.e. gpu, will be then quantized to the specified bit precision')
   
   parser.add_argument('--peft', action='store_true', help='Apply Parametric-Efficient Fine-Tuning (PEFT) with the use of LoRA technique. Specify the appropriate lora hyperparameters.')  
-  parser.add_argument('--data_file', type=str, default=None, help='Data file for training')
-  parser.add_argument('--data_path', type=str, default='../../data/', help='Data path that data file located')
-  parser.add_argument('--vocab_file', type=str, default='vocab.csv', help='Use vocabulary for the custom tokenizer')
+  parser.add_argument('--data_file', type=str, default=None, required=True, help='Data file for training')
+  parser.add_argument('--vocab_file', type=str, default=None, help='Use vocabulary for the custom tokenizer')
   parser.add_argument('--parallel', action='store_true', help='Parallel training using Distributed Data Parallelization')  
   parser.add_argument('--deepspeed_kernel', action='store_true', help='Use DeepSpeed transformer kernel to accelerate')
   parser.add_argument('--fp16', action='store_true', help='Store the model as dtype torch.bfloat16')
@@ -677,8 +676,7 @@ def hyperparameters(args):
   # model
   hps.dropout    = args.dropout_p
   hps.data_file  = args.data_file
-  hps.data_path  = args.data_path
-  hps.vocab_file = args.vocab_size
+  hps.vocab_file = args.vocab_file
   hps.model_name = args.model_checkpoint
   hps.fp16       = args.fp16
   hps.is_causal  = args.is_causal

@@ -36,7 +36,6 @@ lr                             = args.lr
 dropout_p                      = args.dropout_p
 model_checkpoint               = args.model_checkpoint
 data_file                      = args.data_file
-data_path                      = args.data_path
 vocab_file                     = args.vocab_file
 parallel                       = args.parallel
 deepspeed_kernel               = args.deepspeed_kernel
@@ -47,7 +46,6 @@ load_checkpoint                = args.load_checkpoint
 collate                        = args.atpg_collate
 train_type                     = sys.argv[0].split('_')[1]
 world_size                     = int(len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))) if deepspeed_kernel == True else None
-vocab_filepath                 = os.path.join(data_path, vocab_file)
 free_gpu_id                    = get_free_gpu()
 
 if __name__ == '__main__':
@@ -94,14 +92,14 @@ if __name__ == '__main__':
   else:
     deepspeed_config = None
   print(f"Load Tokenizer...")
-  tokenizer = ATPGTokenizer(pd.read_csv(vocab_filepath, sep=',', index_col=0)) if tokenizer == 'custom' else AutoTokenizer.from_pretrained(models[model_checkpoint]) 
-  print(os.path.join(data_path, data_file))
+  tokenizer = ATPGTokenizer(pd.read_csv(vocab_file, sep=',', index_col=0)) if tokenizer == 'custom' else AutoTokenizer.from_pretrained(models[model_checkpoint]) 
+  print(data_file)
   if data_file[-3:] != 'csv':
-    tokenized_datasets = load_from_disk(os.path.join(data_path, data_file), keep_in_memory=True)
+    tokenized_datasets = load_from_disk(data_file, keep_in_memory=True)
     max_freq           = 10 # is hardcoded......................... 
   else:
     print(f"Load Dataset...")
-    raw_dataset                            = load_dataset(data_path, data_files=data_file, keep_in_memory=True).remove_columns('Unnamed: 0')
+    raw_dataset                            = load_dataset(data_files=data_file, keep_in_memory=True).remove_columns('Unnamed: 0')
     max_num_of_patterns_per_circuit        = max(set([len(patterns.split('\n')) for patterns in raw_dataset['train']['patterns']]))
 
     print(f"Data Initial Preprocessing...")
