@@ -11,20 +11,7 @@ LONG_DESCRIPTION = open("../README.md").read()
 LONG_DESCRIPTION_CONTENT_TYPE = "text/markdown"
 REQUIRED_PACKAGES = [line for line in open("../rl_requirements.txt").readlines() if 'https://' not in line]
 REQUIRED_LINKS = [line.strip().split()[-1] for line in open("../requirements.txt").readlines() if 'https://' in line]
-VERSION_FILE = "../.rl_version.txt"
-
-# Read the current version
-with open(VERSION_FILE, "r") as f:
-  version = f.read().strip()
-
-# Split the version string and increment the last segment
-major, minor, patch = map(int, version.split("."))
-patch += 1
-VERSION = f"{major}.{minor}.{patch}"
-
-# Save the incremented version back to the file
-with open(VERSION_FILE, "w") as f:
-  f.write(VERSION)
+VERSION = "0.0.5"
 
 setup(
   name=PROJECT_NAME,
