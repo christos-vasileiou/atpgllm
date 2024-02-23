@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from atpg.utils import length_less_than_model_max_len, patterns_contains_special_tokens
+from atpgllm.utils import length_less_than_model_max_len, patterns_contains_special_tokens
 
 
 class MyCollate:

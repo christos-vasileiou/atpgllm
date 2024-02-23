@@ -2,7 +2,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
-from atpg.utils import collate_fn_dict, create_data_loader, convert_bytes, seconds_to_dhms, setup_logging, save_checkpoint, model_size_in_bytes, load_checkpoint, penalize, compute_metrics, move_optimizer_to_device
+from atpgllm.utils import collate_fn_dict, create_data_loader, convert_bytes, seconds_to_dhms, setup_logging, save_checkpoint, model_size_in_bytes, load_checkpoint, penalize, compute_metrics, move_optimizer_to_device
 import torch.distributed as dist
 import torch.optim as optim
 import torch.nn as nn
@@ -12,6 +12,7 @@ import os
 import time
 import io
 import re  
+import sys
 
 timing_template = ("[{epoch}/{total_epochs}]: "
             "GPU ID: {local_rank} | "
@@ -27,19 +28,24 @@ timing_template = ("[{epoch}/{total_epochs}]: "
 testing_template = ("GPU ID: {local_rank}, "
                     "Test Time Elapsed: {elapsed_time}, "
 		    "Test Acc [%, N]: [({accuracy:.4f}, {accuracy_topk:.4f}), {non_norm_accuracy}/{test_labels_size}], "
-		    "Test Prec %: {precision:.4f}, "
+		    "Test Prec % (>.5, topk): ({precision:.4f}, {precision_topk:.4f}), "
 		    "Test Loss: {avg_test_loss:.4f}")
 
 epoch_data = {"epoch": None,
               "total_epochs": None,
-              "time_elapsed": None,
               "local_rank": None,
+              "time_elapsed": None,
               "train_accuracy": None,
+              "train_accuracy_topk": None,
               "train_precision": None,
+              "train_precision_topk": None,
               "accuracy": None,
+              "accuracy_topk": None,
               "non_norm_accuracy": None,
+              "non_norm_accuracy_topk": None,
               "total_samples": None,
               "precision": None,
+              "precision_topk": None,
               #"f1_score_micro": None,
               "f1_score_macro": None,
               "train_loss": None,
@@ -52,10 +58,11 @@ test_data = {"local_rank": None,
 	     "non_norm_accuracy": None,
 	     "test_labels_size": None,
 	     "precision": None,
+	     "precision_topk": None,
 	     "avg_test_loss": None}
 
 
-def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, reduction='sum', parallel=False, deepspeed_config=None, fp16=False, stored_checkpoint=None, graph_collate=None, pos_weight=None, train_type=None, free_gpu_id=0, args=None):
+def train_cls_task(epochs, model, dataset, lr, batch_size, labels_filtering=True, reduction='mean', parallel=False, deepspeed_config=None, fp16=False, stored_checkpoint=None, atpg_collate=None, pos_weight=None, train_type=None, free_gpu_id=0, args=None):
   #if train_type is None:
   #  raise ValueError(f"train_type: has to set to 'multilabel' or 'multiclass'")
   if reduction not in ['sum', 'mean', 'none']:
@@ -80,7 +87,9 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
     filename   = '_'.join('_'.join(split_path[1:]).split('_')[1:])
     print(f"{date_time}, {local_rank}, {filename}")
     # load model
-    model, optimizer, start_epoch, hyperparameter = load_checkpoint(date_time=date_time, local_rank=local_rank, filename=filename, model=None, optimizer=optimizer)
+    #import atpg.llm.models
+    #sys.modules['atpg.models'] = atpg.llm.models
+    model, optimizer, start_epoch, hyperparameter = load_checkpoint(date_time=date_time, local_rank=local_rank, filename=filename, model=model, optimizer=optimizer)
   start_epoch += 1
   local_rank = free_gpu_id
   #os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -92,8 +101,8 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
        
       device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
       logger = setup_logging(local_rank)
-      logger.info(f"{device}\n{model_engine}\n{optimizer}\nModel parameters: {sum(p.numel() for p in model_engine.parameters())}, \nModel size: {convert_bytes(model_size_in_bytes(model_engine))}\n{args}")
-      print(f"{device}\n{model_engine}\n{optimizer}\nModel parameters: {sum(p.numel() for p in model_engine.parameters())}, \nModel size: {convert_bytes(model_size_in_bytes(model_engine))}\n{args}")
+      logger.info(f"{device}\n{model}\n{optimizer}\nModel parameters: {sum(p.numel() for p in model.parameters())}, \nModel size: {convert_bytes(model_size_in_bytes(model))}\n{args}")
+      print(f"{device}\n{model}\n{optimizer}\nModel parameters: {sum(p.numel() for p in model.parameters())}, \nModel size: {convert_bytes(model_size_in_bytes(model))}\n{args}")
       
     elif deepspeed_config is None:
       #local_rank = int(os.environ['LOCAL_RANK']) 
@@ -117,8 +126,7 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
     device = torch.device(f'cuda:{free_gpu_id}' if torch.cuda.is_available() else 'cpu')
     logger = setup_logging(local_rank)
     model  = model.to(device)
-    #print(f"device:{device}\n{model}\n{optimizer}\n{args}")
-    print(f"device: {device}\n{model}\n{optimizer}\nModel parameters: {sum(p.numel() for p in model.parameters())}, \nModel size: {convert_bytes(model_size_in_bytes(model))}\n{args}")
+    print(f"{model}\n{optimizer}\nModel parameters: {sum(p.numel() for p in model.parameters())}, \nModel size: {convert_bytes(model_size_in_bytes(model))}\n{args}")
   if train_type == 'multilabel' or train_type == 'multiclass':
     criterion   = criterion.to(device)
   else:
@@ -136,8 +144,10 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
     testing_sampler    = DistributedSampler(train_test['test'], rank=local_rank)
   else:
     training_sampler, validation_sampler, testing_sampler = None, None, None
-  collate_fn        = collate_fn_dict if graph_collate is None else graph_collate
-  training_loader   = create_data_loader(train_val['train'], batch_size, shuffle, collate_fn, training_sampler,   num_workers=0)
+  collate_fn        = collate_fn_dict if atpg_collate is None else atpg_collate
+  training_loader   = create_data_loader(train_val['train'], batch_size, shuffle, collate_fn, training_sampler,   num_workers=4)
+  validation_loader = create_data_loader(train_val['test'],  batch_size, shuffle, collate_fn, validation_sampler, num_workers=4)
+  testing_loader    = create_data_loader(train_test['test'], batch_size, shuffle, collate_fn, testing_sampler,    num_workers=4)
 
   train_loss_to_print = []
   val_loss_to_print   = []
@@ -146,6 +156,8 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
   llambda    = 3
   vllambda   = 3
   loss_ratio = None
+  #epoch = start_epoch
+  #while epoch < start_epoch + epochs:
   for epoch in range(start_epoch, start_epoch + epochs):
     # Training
     train_loss = []
@@ -153,32 +165,25 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
     train_labels  = torch.tensor([])
     model.train()
     for data in training_loader:
-      nodes      = data['nodes'].to(device, dtype=torch.bfloat16)
-      edge_index = data['edge_index'] #.to(device, dtype=torch.long)
-      labels     = data['labels'].to(device, dtype=torch.bfloat16)
+      ids            = data['input_ids'].to(device, dtype=torch.long)
+      mask           = data['attention_mask'].to(device, dtype=torch.long)
+      token_type_ids = data['token_type_ids'].to(device, dtype=torch.long)
+      labels         = data['labels'].to(device, dtype=torch.float)
+      #print(ids[0], mask[0], token_type_ids[0])
+      #exit(0)
+      assert ids.shape == mask.shape and ids.shape == token_type_ids.shape
       
-      #print(f"nodes; {type(nodes)}, edge_index: {type(edge_index)}, labels: {type(labels)}")
-      #print(f"nodes: {type(nodes[0])}, edge_index: {type(edge_index[0])}, labels: {type(labels[0])}")
-      #print(f"nodes:\n{nodes[0]}\nedge_index:\n{edge_index[0]}\nlabels:\n{labels[0]}")
       # Forward pass
-      outputs       = torch.tensor([]).to(device)
-      for node, e_idx in zip(nodes, edge_index):
-        #print(node.shape, type(node), e_idx.shape, type(e_idx))
-        o = model((node, e_idx), device=device) if deepspeed_config is None else model_engine((node, e_idx), device=device)
-        outputs = torch.concat([outputs, o.unsqueeze(0)], dim=0)
-      #print(f"nodes: {nodes.shape}, outputs: {outputs.shape}, labels: {labels.shape}")
-      
-      #print(nodes[0].dtype)
-      #print(outputs[0].dtype)
-      #print(labels[0].dtype)
+      outputs = model(ids, mask, token_type_ids) if deepspeed_config is None else model_engine(ids, mask, token_type_ids)
+      #print(outputs.shape, labels.shape)
+
       # Zero Gradients
       optimizer.zero_grad()
 
       train_outputs = torch.concat([train_outputs, torch.sigmoid(outputs).cpu().detach().view(-1) ], dim=0)
       train_labels  = torch.concat([train_labels,  labels.cpu().detach().view(-1)], dim=0)
-      #print(outputs.shape, train_outputs.shape, labels.shape, train_labels.shape)
+
       # Loss Calculation
-      #print(f"outputs: {outputs.shape}, labels: {labels.shape}")
       loss, loss_ratio = penalize(outputs, labels, criterion, labels_filtering, llambda, vllambda, train_type, epoch, loss_ratio)
       train_loss.append(loss.item())
 
@@ -196,24 +201,19 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
     train_loss_to_print.append(avg_train_loss)
 
     # Validation
-    validation_loader = create_data_loader(train_val['test'],  batch_size, shuffle, collate_fn, validation_sampler, num_workers=0)
     model.eval()
     with torch.no_grad():
       val_outputs = torch.tensor([])
       val_labels  = torch.tensor([])
       val_loss    = torch.tensor([])
       for data in training_loader:
-        nodes      = data['nodes'].to(device, dtype=torch.bfloat16)
-        edge_index = data['edge_index'] #.to(device, dtype=torch.long)
-        labels     = data['labels'].to(device, dtype=torch.bfloat16)
-        
-        #print(f"nodes; type(nodes), edge_index: type(edge_index), labels: type(labels)")
+        ids            = data['input_ids'].to(device, dtype=torch.long)
+        mask           = data['attention_mask'].to(device, dtype=torch.long)
+        token_type_ids = data['token_type_ids'].to(device, dtype=torch.long)
+        labels         = data['labels'].to(device, dtype=torch.float)
+
         # Forward pass
-        outputs       = torch.tensor([]).to(device)
-        for node, e_idx in zip(nodes, edge_index):
-          #print(node.shape, type(node), e_idx.shape, type(e_idx))
-          o = model((node, e_idx), device=device) if deepspeed_config is None else model_engine((node, e_idx), device=device)
-          outputs = torch.concat([outputs, o.unsqueeze(0)], dim=0)
+        outputs = model(ids, mask, token_type_ids) if deepspeed_config is None else model_engine(ids, mask, token_type_ids)
 
         # Loss Calculation
         loss, loss_ratio = penalize(outputs, labels, criterion, labels_filtering, llambda, vllambda, train_type, epoch, loss_ratio)
@@ -250,37 +250,34 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
     #[{strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}]:  
     printing_info = timing_template.format(**epoch_data)
     logger.info(printing_info)
-    #if (epoch==start_epoch or epoch%5==0):
-    print(printing_info)
+    if epoch==start_epoch or epoch%5==0: # print at the screen, at the first epoch and every 5 epochs
+      print(printing_info)
     #print(f'Epoch: [{epoch}/{epochs}], Accuracy: {accuracy}, f1-m: {f1_score_micro}, f1-M: {f1_score_macro}, Training Loss: {avg_train_loss.item()}, Validation Loss: {avg_val_loss.item()}')
-    
-    if epoch!=start_epoch and epoch%5!=0:
+    else:
       continue
+    #if epoch!=start_epoch and epoch%5!=0:
+    #  continue
     
     # Testing
     test_start_time = time.time()
     printing_info = f"GPU ID {local_rank}, Testing started at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}"
-    #if epoch == start_epoch + epochs - 1: 
-    logger.info(printing_info)
+    if epoch == start_epoch + epochs - 1 or epoch%5==0: # log info at the last epoch and every 10 epochs
+      logger.info(printing_info)
     print(printing_info)
-    testing_loader    = create_data_loader(train_test['test'], batch_size, shuffle, collate_fn, testing_sampler,    num_workers=0)
     model.eval()
     with torch.no_grad():
       test_outputs = torch.tensor([])
       test_labels  = torch.tensor([])
       test_loss    = torch.tensor([])
       for data in testing_loader:
-        nodes      = data['nodes'].to(device, dtype=torch.bfloat16)
-        edge_index = data['edge_index'] #.to(device, dtype=torch.long)
-        labels     = data['labels'].to(device, dtype=torch.bfloat16)
+        ids            = data['input_ids'].to(device, dtype=torch.long)
+        mask           = data['attention_mask'].to(device, dtype=torch.long)
+        token_type_ids = data['token_type_ids'].to(device, dtype=torch.long)
+        labels         = data['labels'].to(device, dtype=torch.float)
 
         # Forward pass
-        outputs       = torch.tensor([]).to(device)
-        for node, e_idx in zip(nodes, edge_index):
-          #print(node.shape, type(node), e_idx.shape, type(e_idx))
-          o = model((node, e_idx), device=device) if deepspeed_config is None else model_engine((node, e_idx), device=device)
-          outputs = torch.concat([outputs, o.unsqueeze(0)], dim=0)
- 
+        outputs = model(ids, mask, token_type_ids) if deepspeed_config is None else model_engine(ids, mask, token_type_ids)
+
         # Loss Calculation
         loss, loss_ratio = penalize(outputs, labels, criterion, labels_filtering, llambda, vllambda, train_type, epoch, loss_ratio)
 
@@ -303,11 +300,12 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
                       "non_norm_accuracy": non_norm_accuracy if non_norm_accuracy is not None else 0.0,
                       "test_labels_size": test_labels.size(0),
                       "precision": precision if precision is not None else 0.0,
+                      "precision_topk": precision_topk if precision_topk is not None else 0.0,
                       "avg_test_loss": avg_test_loss.item()})
     
     printing_info = testing_template.format(**test_data)
     print(printing_info)
-    if epoch == start_epoch + epochs - 1: 
+    if epoch == start_epoch + epochs - 1 or epoch%5==0: # log at the last epoch and every 5 epochs
       logger.info(printing_info)
   # Let other process to know which among them is the best in order to save info of the best training.
   #avg_test_loss = torch.tensor([avg_test_loss.item()], device=device).float()
@@ -338,7 +336,7 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
 
 
 
-def train_gen_task(epochs, model, dataset, lr, batch_size, labels_filtering=True, reduction='sum', parallel=False, deepspeed_config=None, fp16=False, stored_checkpoint=None, graph_collate=None, pos_weight=None, train_type=None, free_gpu_id=0):
+def train_gen_task(epochs, model, dataset, lr, batch_size, labels_filtering=True, reduction='sum', parallel=False, deepspeed_config=None, fp16=False, stored_checkpoint=None, atpg_collate=None, pos_weight=None, train_type=None, free_gpu_id=0):
   if reduction not in ['sum', 'mean', 'none']:
     raise ValueError(f"reduction: has set to wrong value.")
   
@@ -397,7 +395,7 @@ def train_gen_task(epochs, model, dataset, lr, batch_size, labels_filtering=True
     testing_sampler    = DistributedSampler(train_test['test'], rank=local_rank)
   else:
     training_sampler, validation_sampler, testing_sampler = None, None, None
-  collate_fn        = collate_fn_dict if graph_collate is None else graph_collate
+  collate_fn        = collate_fn_dict if atpg_collate is None else atpg_collate
   training_loader   = create_data_loader(train_val['train'], batch_size, shuffle, collate_fn, training_sampler,   num_workers=4)
   validation_loader = create_data_loader(train_val['test'],  batch_size, shuffle, collate_fn, validation_sampler, num_workers=4)
   testing_loader    = create_data_loader(train_test['test'], batch_size, shuffle, collate_fn, testing_sampler,    num_workers=4)

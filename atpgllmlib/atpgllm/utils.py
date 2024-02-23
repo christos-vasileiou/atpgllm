@@ -19,7 +19,7 @@ from sklearn.metrics import accuracy_score, precision_score, f1_score
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from datasets import DatasetDict, Dataset, load_dataset
-from atpg import deepspeed_config
+from atpgllm import deepspeed_config
 from plotly.subplots import make_subplots
 import plotly.graph_objs as go
 from transformers import (

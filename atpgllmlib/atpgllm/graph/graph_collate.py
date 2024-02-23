@@ -1,5 +1,5 @@
 import torch
-from atpg.utils import length_less_than_model_max_len, patterns_contains_special_tokens
+from atpgllm.utils import length_less_than_model_max_len, patterns_contains_special_tokens
 
 class GraphCollate:
   def __init__(self, tokenizer, max_freq, possible_labels2id, max_num_of_patterns_per_circuit):

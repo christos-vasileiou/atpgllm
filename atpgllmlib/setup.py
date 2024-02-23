@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 import sys
 
 # Metadata
-PROJECT_NAME = "atpg"
+PROJECT_NAME = "atpgllm"
 AUTHOR = "christos-vasileiou"
 AUTHOR_EMAIL = "chrivasileiou2@gmail.com"
 GITHUB_URL = f"https://github.com/{AUTHOR}/{PROJECT_NAME}"

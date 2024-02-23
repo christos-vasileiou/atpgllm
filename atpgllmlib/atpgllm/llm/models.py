@@ -1,5 +1,5 @@
 from transformers import BertModel, AutoModel, AutoConfig
-from atpg.utils import *
+from atpgllm.utils import *
 import torch.nn as nn
 import torch.nn.functional as F
 

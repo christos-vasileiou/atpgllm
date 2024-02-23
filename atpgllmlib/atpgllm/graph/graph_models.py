@@ -1,5 +1,5 @@
 from torch_geometric.nn import GATConv
-from atpg.utils import *
+from atpgllm.utils import *
 import torch_geometric.nn as nngm
 import torch.nn as nn
 import torch.nn.functional as F
