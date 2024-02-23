@@ -9,8 +9,8 @@ GITHUB_URL = f"https://github.com/{AUTHOR}/{PROJECT_NAME}"
 DESCRIPTION = "LLM model that can run Automated Test Pattern Generation (ATPG) and Design Verification (DV) algorithm on synthesized verilog-based netlists."
 LONG_DESCRIPTION = open("README.md").read()
 LONG_DESCRIPTION_CONTENT_TYPE = "text/markdown"
-REQUIRED_PACKAGES = [line for line in open("../requirements.txt").readlines() if 'https://' not in line]
-REQUIRED_LINKS = [line.strip().split()[-1] for line in open("../requirements.txt").readlines() if 'https://' in line]
+REQUIRED_PACKAGES = [line for line in open("requirements.txt").readlines() if 'https://' not in line]
+REQUIRED_LINKS = [line.strip().split()[-1] for line in open("requirements.txt").readlines() if 'https://' in line]
 VERSION = "1.0.1"
 
 
