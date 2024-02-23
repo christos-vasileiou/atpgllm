@@ -1,11 +1,11 @@
 from transformers import AutoTokenizer
 from datasets import load_dataset, load_from_disk
-from atpg.graph.graph_tokenizer import *
-from atpg.graph.graph_models import *
-from atpg.utils import *
-from atpg.graph.graph_collate import *
-from atpg.graph.graph_train import train_graph
-from atpg import deepspeed_config
+from atpgllm.graph.graph_tokenizer import *
+from atpgllm.graph.graph_models import *
+from atpgllm.utils import *
+from atpgllm.graph.graph_collate import *
+from atpgllm.graph.graph_train import train_graph
+from atpgllm import deepspeed_config
 import argparse
 import pandas as pd
 import torch.nn.functional as F

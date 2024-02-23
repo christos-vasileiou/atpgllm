@@ -11,7 +11,7 @@ LONG_DESCRIPTION = open("../README.md").read()
 LONG_DESCRIPTION_CONTENT_TYPE = "text/markdown"
 REQUIRED_PACKAGES = [line for line in open("../requirements.txt").readlines() if 'https://' not in line]
 REQUIRED_LINKS = [line.strip().split()[-1] for line in open("../requirements.txt").readlines() if 'https://' in line]
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 
 setup(

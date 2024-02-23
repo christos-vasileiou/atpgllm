@@ -3,11 +3,11 @@ from glob import glob
 from pprint import pprint
 from tqdm.auto import tqdm
 from datasets import load_dataset, Dataset, DatasetDict, load_from_disk
-from atpg.llm.tokenizer import *
-from atpg.llm.models import *
-from atpg.llm.train import *
-from atpg.utils import *
-from atpg.llm.collate import *
+from atpgllm.llm.tokenizer import *
+from atpgllm.llm.models import *
+from atpgllm.llm.train import *
+from atpgllm.utils import *
+from atpgllm.llm.collate import *
 import re
 import zipfile
 import json

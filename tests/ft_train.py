@@ -6,7 +6,7 @@ from pprint import pprint
 from peft import get_peft_model, LoraConfig, TaskType
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
-from atpg.utils import (
+from atpgllm.utils import (
   set_training_environment, 
   parse_arguments, 
   load_raw_dataset, 
@@ -19,9 +19,9 @@ from atpg.utils import (
   plot_training_plots,
   load_model,
 )
-from atpg.llm.collate import MyCollate
-from atpg.llm.fine_tuning import get_dec_ids_and_mask, get_targets
-from atpg.llm.tokenizer import tokenize_fn
+from atpgllm.llm.collate import MyCollate
+from atpgllm.llm.fine_tuning import get_dec_ids_and_mask, get_targets
+from atpgllm.llm.tokenizer import tokenize_fn
 
 def train(hps):
   # Use the hyperparemeters for the training

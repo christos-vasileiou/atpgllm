@@ -1,12 +1,8 @@
-# Large Language Model for design testing
+# atpgllm
 
-___
-___
+GOALS:
 
-## GOALS
-___
-
-Design for testing and Fault-Modeling:
+Large Language Model for Design Testing and Fault-Modeling:
 1. Stuck-at: A specific net is "stuck" at a constant logic value (either 0 or 1).
 2. Transition:  Related to signal transitions between different logic levels (e.g., 0 to 1 or 1 to 0).
 3. Coupling: ...
@@ -20,7 +16,6 @@ What may go wrong?
 - Main goal is Safety and Reliability.
 
 ## USE
-___
 
 For multi-gpu training use:
 - `torchrun --proc_per_node=<NODES> script_name.py`: i.e. `torchrun --proc_per_node=4 sequence_multilabel_classification.py`
@@ -30,7 +25,6 @@ For gpu/cpu training use:
 
 
 ## Attention is All you Need
-___
 
 "Attention is All You Need" is a research paper published in 2017 by Google researchers, which introduced the Transformer model, a novel architecture that revolutionized the field of natural language processing (NLP) and became the basis for the LLMs we  now know - such as GPT, PaLM and others. The paper proposes a neural network architecture that replaces traditional recurrent neural networks (RNNs) and convolutional neural networks (CNNs) with an entirely attention-based mechanism. 
 
@@ -45,12 +39,10 @@ You can read the Transformers paper
 .
 
 ## Scaling Instruct Models
-___
 
 This [paper](https://arxiv.org/abs/2210.11416) introduces FLAN (Fine-tuned LAnguage Net), an instruction finetuning method, and presents the results of its application. The study demonstrates that by fine-tuning the 540B PaLM model on 1836 tasks while incorporating Chain-of-Thought Reasoning data, FLAN achieves improvements in generalization, human usability, and zero-shot reasoning over the base model. The paper also provides detailed information on how each these aspects was evaluated.
 
-## Reinforcement Learning from Human Feedback (RLHF)
-___
+## Reinforcement Learning (RLHF)
 
 Maybe you've heard about this technique but you haven't completely understood it, especially the PPO part. This explanation might help.
 
