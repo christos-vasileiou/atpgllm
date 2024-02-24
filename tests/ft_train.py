@@ -1,5 +1,5 @@
 import torch
-import deepspeed
+# import deepspeed
 import argparse
 import numpy as np
 from pprint import pprint
