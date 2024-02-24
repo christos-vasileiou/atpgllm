@@ -4,7 +4,7 @@ import argparse
 import os
 import logging
 import numpy as np
-import deepspeed
+# import deepspeed
 import matplotlib.pyplot as plt
 import subprocess
 import torch.distributed as dist
@@ -461,7 +461,7 @@ def parse_arguments(parser):
 
   args = parser.parse_args()
   if args.deepspeed_kernel == True:
-    parser = deepspeed.add_config_arguments(parser)
+    # parser = deepspeed.add_config_arguments(parser)
     args   = parser.parse_args()
   return args
 
@@ -502,7 +502,7 @@ def set_training_environment(model, tokenized_dataset, hps):
   if hps.parallel==True:
     if hps.deepspeed_config is not None:
       
-      model, hps.optimizer, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=hps.deepspeed_config)
+      # model, hps.optimizer, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=hps.deepspeed_config)
       local_rank = model.local_rank
       
       hps.device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
