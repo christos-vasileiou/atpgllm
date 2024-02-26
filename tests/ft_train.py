@@ -23,7 +23,7 @@ from atpgllm.llm.collate import MyCollate
 from atpgllm.llm.fine_tuning import get_dec_ids_and_mask, get_targets
 from atpgllm.llm.tokenizer import tokenize_fn
 
-def train(hps):
+def train(model, logger, training_loader, validation_loader, hps):
   # Use the hyperparemeters for the training
   optimizer          = hps.optimizer
   criterion          = hps.criterion
@@ -109,7 +109,7 @@ def train(hps):
   val_losses.append(val_loss)
   return train_losses, val_losses
 
-def evaluate(hps):
+def evaluate(model, logger, testing_loader, hps):
   # Use the hyperparemeters for the training
   criterion          = hps.criterion
   patterns_criterion = hps.patterns_criterion
@@ -146,10 +146,10 @@ def evaluate(hps):
 
 def train_and_evaluate(model, logger, training_loader, validation_loader, testing_loader, hps):
   # Train the model
-  train_losses, val_losses = train(hps)
+  train_losses, val_losses = train(model, logger, training_loader, validation_loader, hps)
 
   # Evaluate the model performance
-  evaluate(hps)
+  evaluate(model, logger, testing_loader, hps)
 
   # Plot training and validation plots
   plot_training_plots(train_losses, val_losses)
