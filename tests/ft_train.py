@@ -1,27 +1,26 @@
 import torch
-# import deepspeed
 import argparse
 import numpy as np
 from pprint import pprint
 from peft import get_peft_model, LoraConfig, TaskType
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 from atpgllm.utils import (
   set_training_environment, 
   parse_arguments, 
   load_raw_dataset, 
   dataset_formation, 
-  generate_all_possible_binary_combination, 
   convert_bytes, 
   model_size_in_bytes, 
   calculate_memory,
   hyperparameters,
   plot_training_plots,
   load_model,
+  load_tokenizer,
 )
 from atpgllm.llm.collate import MyCollate
 from atpgllm.llm.fine_tuning import get_dec_ids_and_mask, get_targets
 from atpgllm.llm.tokenizer import tokenize_fn
+
 
 def train(model, logger, training_loader, validation_loader, hps):
   # Use the hyperparemeters for the training
@@ -35,6 +34,8 @@ def train(model, logger, training_loader, validation_loader, hps):
 
   train_losses = []
   val_losses   = []
+  print(device)
+  print(model.device)
   for epoch in range(1, epochs+1):
     train_loss = []
     model.train()
@@ -44,7 +45,8 @@ def train(model, logger, training_loader, validation_loader, hps):
       for data in t:
         ids  = data['input_ids'].to(device)
         mask = data['attention_mask'].to(device)
-        
+        # print(ids.dtype, mask.dtype, model.dtype)
+
         # Get targets
         targets = get_targets(data, tokenizer, is_causal, device)
         # get decoder input_ids and decoder attention mask in the case where you have a causal model
@@ -146,15 +148,14 @@ def evaluate(model, logger, testing_loader, hps):
 
 def train_and_evaluate(model, logger, training_loader, validation_loader, testing_loader, hps):
   # Train the model
+  print(model.__dir__())
   train_losses, val_losses = train(model, logger, training_loader, validation_loader, hps)
 
   # Evaluate the model performance
   evaluate(model, logger, testing_loader, hps)
-
+  
   # Plot training and validation plots
   plot_training_plots(train_losses, val_losses)
-
-
 
 
 if __name__ == '__main__':
@@ -173,24 +174,12 @@ if __name__ == '__main__':
   print(str(type(model)))
 
   # Load tokenizer
-  tokenizer = AutoTokenizer.from_pretrained(hps.model_name, model_max_length=4096)
-  tokenizer.pad_token = tokenizer.eos_token
-  tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
-  if not hps.is_causal:
-    tokenizer.add_special_tokens({"cls_token": "<s>"})
+  model, tokenizer = load_tokenizer(model, hps.model_name, hps.is_causal, hps.max_new_binary_tokens_length)
 
   # Load and Form the Dataset appropriately
   raw_dataset = load_raw_dataset(hps.data_file)
   dataset = dataset_formation(raw_dataset, is_causal=hps.is_causal)
- 
-  # Create new tokens. Binary combinations to interpret the generated patterns.
-  new_tokens = list(generate_all_possible_binary_combination(starting_point=1, max_binary_length=hps.max_new_binary_tokens_length)) if hps.max_new_binary_tokens_length > 0 else []
-  print(f"Tokenizer vocabulary: {len(tokenizer)}. New added tokens: {len(new_tokens)}")
-
-  # Resize the Embeddings
-  tokenizer.add_tokens(new_tokens)
-  model.resize_token_embeddings(len(tokenizer))
-  
+   
   if hps.peft:
     peft_config = LoraConfig(
       task_type=TaskType.CAUSAL_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout

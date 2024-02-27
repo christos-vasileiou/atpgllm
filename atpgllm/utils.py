@@ -26,6 +26,7 @@ from transformers import (
   AutoModelForCausalLM,
   AutoModelForSeq2SeqLM,
   BitsAndBytesConfig,
+  AutoTokenizer,
 )
 
 def patterns_lengths(batch, max_freq):
@@ -749,7 +750,7 @@ def load_model(hps):
       print(f"No quantization is applied. Parallelization is activated")
   elif not hps.parallel:
     try:
-      # Can't activate both 4-bit and 8-bit quantization
+      # Can't activate both 4-bit and 8-bit quantization types
       assert (not (hps.use_4bit and hps.use_8bit)) == True
     except AssertionError: 
       # There is a conflict when both types of quantization have been activated
@@ -798,3 +799,19 @@ def load_model(hps):
   model.config.use_cache = False
   model.config.pretraining_tp = 1
   return model
+
+def load_tokenizer(model, model_name:str, is_causal:bool, max_new_binary_tokens_length:int):
+  tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=4096)
+  tokenizer.pad_token = tokenizer.eos_token
+  tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
+  if not is_causal:
+    tokenizer.add_special_tokens({"cls_token": "<s>"})
+
+  # Create new tokens. Binary combinations to interpret the generated patterns.
+  new_tokens = list(generate_all_possible_binary_combination(starting_point=1, max_binary_length=max_new_binary_tokens_length)) if max_new_binary_tokens_length > 0 else []
+  print(f"Tokenizer vocabulary: {len(tokenizer)}. New added tokens: {len(new_tokens)}")
+
+  # Resize the Embeddings
+  tokenizer.add_tokens(new_tokens)
+  model.resize_token_embeddings(len(tokenizer))
+  return model, tokenizer
