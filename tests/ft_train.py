@@ -107,8 +107,8 @@ def train(model, logger, training_loader, validation_loader, hps):
     val_loss = np.mean(val_loss)
     print(f"Validation loss: {val_loss}")
 
-  # Save losses
-  val_losses.append(val_loss)
+    # Save losses
+    val_losses.append(val_loss)
   return train_losses, val_losses
 
 def evaluate(model, logger, testing_loader, hps):
