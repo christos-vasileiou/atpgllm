@@ -148,7 +148,6 @@ def evaluate(model, logger, testing_loader, hps):
 
 def train_and_evaluate(model, logger, training_loader, validation_loader, testing_loader, hps):
   # Train the model
-  print(model.__dir__())
   train_losses, val_losses = train(model, logger, training_loader, validation_loader, hps)
 
   # Evaluate the model performance
