@@ -2,15 +2,12 @@ import torch
 import argparse
 import numpy as np
 from pprint import pprint
-from peft import get_peft_model, LoraConfig, TaskType
 from tqdm.auto import tqdm
 from atpgllm.utils import (
   set_training_environment, 
   parse_arguments, 
   load_raw_dataset, 
   dataset_formation, 
-  convert_bytes, 
-  model_size_in_bytes, 
   calculate_memory,
   hyperparameters,
   plot_training_plots,
@@ -34,6 +31,8 @@ def train(model, logger, training_loader, validation_loader, hps):
 
   train_losses = []
   val_losses   = []
+  # for param in model.parameters():
+  #   param.register_hook(lambda x: print(x))
   print(device)
   print(model.device)
   for epoch in range(1, epochs+1):
@@ -56,7 +55,7 @@ def train(model, logger, training_loader, validation_loader, hps):
         optimizer.zero_grad()
         
         # Forward Pass
-        outputs = model(ids, mask) if hps.is_causal else model(ids, mask, dec_input, dec_mask)
+        outputs = model(input_ids=ids, attention_mask=mask) if hps.is_causal else model(input_ids=ids, attention_mask=mask, decoder_input_ids=dec_input, decoder_attention_mask=dec_mask)
 
         # loss
         loss          = criterion(outputs.logits.transpose(2, 1).to(torch.bfloat16), targets)
@@ -70,7 +69,9 @@ def train(model, logger, training_loader, validation_loader, hps):
 
         #print out info
         t.set_postfix(loss=loss.item(), patterns_loss=patterns_loss.item(), memory_consumption=calculate_memory(model, optimizer, ids, mask, targets))
-
+        if torch.isnan(total_loss).any():
+          raise ValueError(f"The gradients are vanished/exploded. The loss is {total_loss.item()}")
+        
     # Get train loss
     train_loss = np.mean(train_loss)
     print(f"Training loss: {train_loss}")
@@ -94,7 +95,7 @@ def train(model, logger, training_loader, validation_loader, hps):
           dec_input, dec_mask = get_dec_ids_and_mask(targets, tokenizer, is_causal, device)
           
           # Forward Pass
-          outputs = model(ids, mask) if hps.is_causal else model(ids, mask, dec_input, dec_mask)
+          outputs = model(input_ids=ids, attention_mask=mask) if hps.is_causal else model(input_ids=ids, attention_mask=mask, decoder_input_ids=dec_input, decoder_attention_mask=dec_mask)
 
           # loss calculation
           loss          = criterion(outputs.logits.transpose(2, 1), targets)
@@ -133,7 +134,7 @@ def evaluate(model, logger, testing_loader, hps):
         # shift targets forwards if seq2seq model. Get decoder input_ids and decoder attention mask in the case where you have a causal model
         dec_input, dec_mask = get_dec_ids_and_mask(targets, tokenizer, is_causal, device)
         # Forward Pass
-        outputs = model(ids, mask) if hps.is_causal else model(ids, mask, dec_input, dec_mask)
+        outputs = model(input_ids=ids, attention_mask=mask) if hps.is_causal else model(input_ids=ids, attention_mask=mask, decoder_input_ids=dec_input, decoder_attention_mask=dec_mask)
         # loss calculation
         loss          = criterion(outputs.logits.transpose(2, 1), targets)
         patterns_loss = patterns_criterion(outputs.logits.transpose(2,1), targets)
@@ -178,17 +179,7 @@ if __name__ == '__main__':
   # Load and Form the Dataset appropriately
   raw_dataset = load_raw_dataset(hps.data_file)
   dataset = dataset_formation(raw_dataset, is_causal=hps.is_causal)
-   
-  if hps.peft:
-    peft_config = LoraConfig(
-      task_type=TaskType.CAUSAL_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout
-    )
-    model = get_peft_model(model, peft_config)
-    print(f"{model.print_trainable_parameters()}\n")
-    del peft_config
-  else:
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
-  print(f"Model size: {convert_bytes(model_size_in_bytes(model))}")
+  
   # Tokenize the dataset
   tokenized_dataset = dataset.map(tokenize_fn, batched=True, num_proc=16, remove_columns=['text'], fn_kwargs={'tokenizer': tokenizer, 'is_causal': hps.is_causal})
   hps.collate_fn = MyCollate(tokenizer=tokenizer, is_causal=hps.is_causal)

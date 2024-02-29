@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import subprocess
 import torch.distributed as dist
 import torch.nn as nn
+from peft import get_peft_model, LoraConfig, TaskType
 from torch.optim import AdamW
 from tqdm.auto import tqdm
 from collections import Counter
@@ -445,7 +446,7 @@ def parse_arguments(parser):
   parser.add_argument('--use_4bit', action='store_true', help='Apply 4-bit quantization on the model. Be advised that the model will be loaded on float32 but the training will take place on a device i.e. gpu, will be then quantized to the specified bit precision')
   parser.add_argument('--use_8bit', action='store_true', help='Apply 8-bit quantization on the model. Be advised that the model will be loaded on float32 but the training will take place on a device i.e. gpu, will be then quantized to the specified bit precision')
   
-  parser.add_argument('--peft', action='store_true', help='Apply Parametric-Efficient Fine-Tuning (PEFT) with the use of LoRA technique. Specify the appropriate lora hyperparameters.')  
+  parser.add_argument('--lora', action='store_true', help='Apply Parametric-Efficient Fine-Tuning (PEFT) with the use of LoRA technique. Specify the appropriate lora hyperparameters.')  
   parser.add_argument('--data_file', type=str, default=None, required=True, help='Data file for training')
   parser.add_argument('--vocab_file', type=str, default=None, help='Use vocabulary for the custom tokenizer')
   parser.add_argument('--parallel', action='store_true', help='Parallel training using Distributed Data Parallelization')  
@@ -681,7 +682,7 @@ def hyperparameters(args):
   hps.model_name = args.model_checkpoint
   hps.fp16       = args.fp16
   hps.is_causal  = args.is_causal
-  hps.peft       = args.peft 
+  hps.lora       = args.lora 
   hps.load_ckpt  = args.load_checkpoint
   # tokenizer
   hps.tokenizer = args.tokenizer
@@ -737,9 +738,8 @@ def cleanup(hps):
   gc.collect()
   gc.collect()
 
-
-def load_model(hps):
-  print('*' * 12 + ' Model Loading ' + '*' * 12)
+def verify_training_type(hps):
+  print('=' * 36 + ' Model Loading ' + '=' * 36)
   if hps.parallel:
     try: 
       # When any quantization type is activated you can't work on distributed systems
@@ -747,7 +747,7 @@ def load_model(hps):
     except AssertionError:
       raise ValueError(f"When hyperparameter 'parallel' is acticated (parallel={hps.parallel}). Both quantization types should be de-activated. You set use_4bit={hps.use_4bit} and use_8bit={hps.use_8bit}")
     finally:
-      print(f"No quantization is applied. Parallelization is activated")
+      print(f"No quantization is applied.\nParallelization is activated")
   elif not hps.parallel:
     try:
       # Can't activate both 4-bit and 8-bit quantization types
@@ -757,17 +757,26 @@ def load_model(hps):
       raise ValueError(f"You can't have activated both 4-bit and 8-bit quantization")
     finally:
       if hps.use_4bit:
-        print(f"4-Bit quantization is applied")
+        print(f"4-Bit quantization is applied\nNo Parallelization")
       elif hps.use_8bit:
-        print(f"8-Bit quantization is applied")
+        print(f"8-Bit quantization is applied\nNo Parallelization")
       else:
-        print(f"No quantization is applied")
-  print('*' * 39)
+        print(f"No quantization is applied\nNo Parallelization")
+  if hps.lora:
+    print('LOw-Rank Adaptation (LORA) is used as Parametric-Efficient Fine-Tuning (PEFT) technique')
+  else:
+    print('No Parametric-Efficient Fine-Tuning (PEFT) technique is used')
+  print('=' * 87)
+
+
+def load_model(hps):
+  # Verify the training type has been set
+  verify_training_type(hps)
 
   # Load base model
   if hps.use_4bit:
     # Compute dtype for 4-bit base model
-    hps.bnb_4bit_compute_dtype = "float16"
+    hps.bnb_4bit_compute_dtype = "bfloat16"
     # Quantization type (fp4 or nf4)
     hps.bnb_4bit_quant_type = "nf4"
     # Activate nested quantization for 4-bit base models (double quantization)
@@ -796,9 +805,21 @@ def load_model(hps):
     model = AutoModelForCausalLM.from_pretrained(hps.model_name) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(hps.model_name)
     model = model.to(torch.bfloat16)
 
+  if hps.lora:
+    lora_config = LoraConfig(
+      task_type=TaskType.CAUSAL_LM if hps.is_causal else TaskType.SEQ_2_SEQ_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout
+    )
+    model = get_peft_model(model, lora_config)
+    print(f"{model.print_trainable_parameters()}")
+    del lora_config
+  else:
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}")
+  print(f"Model size: {convert_bytes(model_size_in_bytes(model))}")
+
   model.config.use_cache = False
   model.config.pretraining_tp = 1
   return model
+
 
 def load_tokenizer(model, model_name:str, is_causal:bool, max_new_binary_tokens_length:int):
   tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=4096)
