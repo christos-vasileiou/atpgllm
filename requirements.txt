@@ -1,5 +1,14 @@
+deepspeed
 datasets
 transformers
 peft
 accelerate
 bitsandbytes
+tqdm
+plotly
+scikit-learn
+argparse
+wandb
+opencv-python
+matplotlib
+trl

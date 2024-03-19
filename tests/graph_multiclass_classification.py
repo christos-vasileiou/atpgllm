@@ -1,16 +1,29 @@
 from transformers import AutoTokenizer
 from datasets import load_dataset, load_from_disk
-from atpgllm.graph.graph_tokenizer import *
-from atpgllm.graph.graph_models import *
-from atpgllm.utils import *
-from atpgllm.graph.graph_collate import *
-from atpgllm.graph.graph_train import train_graph
-from atpgllm import deepspeed_config
+from atpgllm import (
+  models,
+  deepspeed_config,
+  parse_arguments,
+  hyperparameters,
+  GraphTokenizer,
+  GraphCollate,
+  initial_data_preprocessing,
+  get_patterns_info_mapping,
+  tokenize_less_modelmaxlen_fn,
+  train_graph,
+  align_labels_into_matrix,
+  GAT,
+  GPT,
+  T5,
+  MyModel,
+  save_checkpoint,
+)
 import argparse
 import pandas as pd
 import torch.nn.functional as F
 import torch.distributed as dist
 import time
+import os
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -34,9 +47,6 @@ collate                        = hps.collate
 world_size                     = hps.world_size
 free_gpu_id                    = hps.free_gpu_id
 train_type                     = 'multiclass' 
-
-if deepspeed:
-  print(f"free gpu id: {free_gpu_id}")
 
 if __name__ == '__main__':
   if deepspeed_kernel == False:
@@ -94,9 +104,9 @@ if __name__ == '__main__':
       print(f"{tokenized_datasets}\n\n")
 
   model = GAT(model_checkpoint=model_checkpoint, dropout_p=dropout_p, patterns_len=max_freq)
-  #model = GPT(model_checkpoint=model_checkpoint, dropout_p=dropout_p, patterns_len=max_freq)
-  #model = T5(model_checkpoint=model_checkpoint, dropout_p=dropout_p, patterns_len=max_freq)
-  #model = MyModel(patterns_len=max_freq)
+  model = GPT(model_checkpoint=model_checkpoint, dropout_p=dropout_p, patterns_len=max_freq)
+  model = T5(model_checkpoint=model_checkpoint, dropout_p=dropout_p, patterns_len=max_freq)
+  model = MyModel(patterns_len=max_freq)
 
   world_size = len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))
   

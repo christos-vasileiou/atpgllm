@@ -2,22 +2,7 @@ from transformers import BertModel, AutoModel, AutoConfig
 from atpgllm.utils import *
 import torch.nn as nn
 import torch.nn.functional as F
-
-models = {
-    "t5-small": "google/flan-t5-small",
-    "t5-base": "google/flan-t5-base",
-    "t5-v1_1-base": "google/t5-v1_1-base",
-    "t5-large": "google/flan-t5-large",
-    "t5-xl": "google/flan-t5-xl",
-    "t5-xxl": "google/flan-t5-xxl",
-    "mt5-base": "google/mt5-base",
-    "m2m100": "facebook/m2m100_418M",
-    "t5-finetuned": "mrm8488/t5-base-finetuned-common_gen",
-    "led-base": "allenai/led-base-16384",
-    "distilbert": "distilbert-base-uncased",
-    "bert": "bert-base-uncased",
-    "gpt2": "gpt2" 
-}
+from . import models
 
 class GPT(torch.nn.Module):
   def __init__(self, model_checkpoint, dropout_p, patterns_len):

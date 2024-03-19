@@ -1,29 +1,15 @@
 from transformers import AutoTokenizer
-from glob import glob
-from pprint import pprint
-from tqdm.auto import tqdm
-from datasets import load_dataset, Dataset, DatasetDict, load_from_disk
+from datasets import load_dataset, load_from_disk
 from atpgllm.llm.tokenizer import *
 from atpgllm.llm.models import *
 from atpgllm.llm.train import *
 from atpgllm.utils import *
 from atpgllm.llm.collate import *
-import re
-import zipfile
-import json
-import random
-import math
-import argparse
-import matplotlib.pyplot as plt
-import numpy as np
+
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.multiprocessing as mp
+import argparse
 import torch.distributed as dist
 import time
-import sys
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -49,10 +35,6 @@ train_type                     = 'multiclass'
 world_size                     = int(len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))) if deepspeed_kernel == True else None
 free_gpu_id                    = get_free_gpu()
 print(train_type)
-
-if deepspeed:
-  print(f"free gpu id: {free_gpu_id}")
-  #os.environ['CUDA_VISIBLE_DEVICES'] = '1,2,3'
 
 if __name__ == '__main__':
   if deepspeed_kernel == True:

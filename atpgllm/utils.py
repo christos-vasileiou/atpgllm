@@ -4,23 +4,20 @@ import argparse
 import os
 import logging
 import numpy as np
-# import deepspeed
 import matplotlib.pyplot as plt
 import subprocess
 import torch.distributed as dist
 import torch.nn as nn
 from peft import get_peft_model, LoraConfig, TaskType
-from torch.optim import AdamW
 from tqdm.auto import tqdm
 from collections import Counter
 from itertools import product
 from torch.utils.data import DataLoader
 from datetime import datetime
-from sklearn.metrics import accuracy_score, precision_score, f1_score
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from datasets import DatasetDict, Dataset, load_dataset
-from atpgllm import deepspeed_config
+from sklearn.metrics import accuracy_score, precision_score, f1_score
 from plotly.subplots import make_subplots
 import plotly.graph_objs as go
 from transformers import (
@@ -30,29 +27,58 @@ from transformers import (
   AutoTokenizer,
 )
 
+
+class AttrDict(dict):
+  def __init__(self, initial_dict=None, **kwargs):
+    super(AttrDict, self).__init__()
+    if initial_dict is not None:
+      self.update(initial_dict)
+    self.update(kwargs)
+
+  def __getattr__(self, key):
+    try:
+      return self[key]
+    except KeyError:
+      raise AttributeError(f"No such attribute: {key}")
+
+  def __setattr__(self, key, value=None):
+    if isinstance(key, str):
+      self[key] = value
+    else:
+      raise ValueError(f'Invalid attribute assignment. You passed as key: {key} and value: {value}')
+
 def patterns_lengths(batch, max_freq):
   patterns_lengths = [len(example.split('\n')[0].split()) for example in batch['patterns']]
   batch['patterns_lengths'] = [l if l == max_freq else None for l in patterns_lengths]
   return batch
 
 
-def initial_data_preprocessing(raw_dataset):
-  lengths = []
-  for i in tqdm(range(0, len(raw_dataset['train']['patterns']), 1_000)):
-    batch = raw_dataset['train']['patterns'][ i : i+1_000 ]
-    lengths.extend([len(example.split('\n')[0].split()) for example in batch])
-  freq = Counter(lengths)
-  max_freq = max(freq, key=freq.get)
-  print(freq)
-  print(max_freq)
+def initial_data_preprocessing(raw_dataset: DatasetDict):
+    """
+    Perform initial data preprocessing steps such as tokenizing, cleaning, and filtering.
 
-  raw_dataset = raw_dataset.map(
-    patterns_lengths,
-    batched=True,
-    fn_kwargs={'max_freq': max_freq}
-  )
-  raw_dataset = raw_dataset.filter(lambda batch: batch['patterns_lengths'] is not None)
-  return raw_dataset, max_freq
+    Args:
+        raw_dataset (DatasetDict): The raw dataset containing the prompts and patterns.
+
+    Returns:
+        DatasetDict: The preprocessed dataset.
+    """
+    lengths = []
+    for i in tqdm(range(0, len(raw_dataset['train']['patterns']), 1_000)):
+        batch = raw_dataset['train']['patterns'][ i : i+1_000 ]
+        lengths.extend([len(example.split('\n')[0].split()) for example in batch])
+    freq = Counter(lengths)
+    max_freq = max(freq, key=freq.get)
+    print(freq)
+    print(max_freq)
+
+    raw_dataset = raw_dataset.map(
+        patterns_lengths,
+        batched=True,
+        fn_kwargs={'max_freq': max_freq}
+    )
+    raw_dataset = raw_dataset.filter(lambda batch: batch['patterns_lengths'] is not None)
+    return raw_dataset, max_freq
 
 
 def remove_trailing_tokens(term, token=0):
@@ -147,18 +173,8 @@ def align_labels_into_matrix(batch, max_freq, max_num_of_patterns_per_circuit, t
 def model_size_in_bytes(model):
   total_size = 0
   for p in model.parameters():
-    if p.dtype == torch.bfloat16:
-      total_size += p.numel() * 2
-    elif p.dtype == torch.float16:
-      total_size += p.numel() * 2
-    elif p.dtype == torch.int8:
-      total_size += p.numel() * 1
-    elif p.dtype == torch.int32:  # assuming int is 32-bit
-      total_size += p.numel() * 4
-    elif p.dtype == torch.float32:
-      total_size += p.numel() * 4
-    elif p.dtype == torch.float64:
-      total_size += p.numel() * 8
+    if p.requires_grad:
+      total_size += sizeof_tensor(p)
   return total_size
 
 
@@ -328,15 +344,11 @@ def labels_filtering_loss(outputs, labels, criterion, llambda=1, vllambda=1, epo
   invalid_loss     = criterion[0](invalid_outputs, invalid_labels)
   
   # Regularization terms
-  #valid_loss_reg   = (invalid_outputs.size(0) / (outputs.size(0) * max(valid_outputs.size(0), 1))) 
-  #invalid_loss_reg = (  valid_outputs.size(0) / (outputs.size(0) * max(invalid_outputs.size(0), 1)))
   if loss_ratio is None or epoch%5 == 0:
     vld_invld_loss_ratio = valid_loss/invalid_loss
 
   # Final loss calculation
   loss             += valid_loss + vld_invld_loss_ratio * invalid_loss
-  #loss             += valid_loss_reg * valid_loss + invalid_loss_reg * invalid_loss
-  #loss             += valid_loss + invalid_loss
   return loss
 
 
@@ -374,7 +386,7 @@ def penalize(outputs, labels, criterion, labels_filtering, llambda, vllambda, tr
     else:
       # Binary CrossEntropy Loss for multilabel - sigmoid-based
       loss_sigmoid = criterion[0](outputs, labels)
-      #print("sigmoid", loss_sigmoid)
+
     # Crossentropy Loss
     loss_softmax = criterion[1](outputs, labels)
     if loss_ratio is None or epoch%5 == 0:
@@ -450,16 +462,22 @@ def parse_arguments(parser):
   parser.add_argument('--data_file', type=str, default=None, required=True, help='Data file for training')
   parser.add_argument('--vocab_file', type=str, default=None, help='Use vocabulary for the custom tokenizer')
   parser.add_argument('--parallel', action='store_true', help='Parallel training using Distributed Data Parallelization')  
-  parser.add_argument('--deepspeed_kernel', action='store_true', help='Use DeepSpeed transformer kernel to accelerate')
+  parser.add_argument('--deepspeed_kernel', action='store_true', help='Use DeepSpeed transformer kernel to accelerate. Should be used together with --parallel')
+  parser.add_argument('--fsdp', action='store_true', help='Use Use Fully Sharded Data Parallelization (FSDP). Should be used together with --parallel')
   parser.add_argument('--fp16', action='store_true', help='Store the model as dtype torch.bfloat16')
   parser.add_argument('--tokenizer', type=str, default='custom', help='Which Tokenizer will be used. Values can take: "t5-small", "t5-base", "t5-v1_1-base", "t5-large", "t5-xl", "t5-xxl", "mt5-base", "m2m100", "t5-finetuned", "led-base", "distilbert", "bert"')
+  parser.add_argument('--new_tokens', action='store_true', help='Parse given dataset and add new tokens')
   parser.add_argument('--zero_stage', type=int, default=2, help="Enable ZeRO memory optimizations, compatible with FP16/BF16/FP32 and the Adam Optimizer. zero_stage: Chooses different of ZeRO Optimizer. Stage 0, 1, 2, and 3 refer to disabled, optimizer, state partioning, and optimizer+gradient state partitioning, and optimizer+gradient+parameter partitioning, respectively.")
   parser.add_argument('--local_rank', type=int, default=-1, help='local rank passed from distributed launcher')
   parser.add_argument('--load_checkpoint', type=str, default=None, help='Pre-Trained weights checkpoint from which a model will be loaded')
   parser.add_argument('--atpg_collate', action='store_true', help='Use Custom ATPG Collate so that have more efficient training with less tokens. Tokenization will take place during training process.')
   
-  parser.add_argument('--lora_alpha', type=int, default=16, help="Low-Rank Adaptation (LoRA) alpha parameter. It's used  for scaling the weights of lora layers")
-  parser.add_argument('--lora_r', type=int, default=64, help="Low-Rank Adaptation (LoRA) rank parameter. it's the size of A and B matrices. The intermediate size of the 2 matrices. i.e. (B_dim, r) x (r, A_dim) = (B_dim, A_dim)")
+  parser.add_argument('--lora_alpha', type=int, default=16, help="It's used  for scaling the weights of lora layers. Low-Rank Adaptation (LoRA) alpha parameter.")
+  parser.add_argument('--lora_r', type=int, default=64, help="It's the size of A and B matrices. The intermediate size of the 2 matrices. i.e. (B_dim, r) x (r, A_dim) = (B_dim, A_dim). Low-Rank Adaptation (LoRA) rank parameter.")
+  parser.add_argument('--lora_dropout', type=float, default=0.1, help='Dropout probability')
+
+  # Accelerator arguments used for ZeRO acceleration
+  parser.add_argument('--acc_seed', type=int, default=27, help="Set the seed for initialization of the accelerator used for ZeRO acceleration")
 
   args = parser.parse_args()
   if args.deepspeed_kernel == True:
@@ -487,71 +505,137 @@ def get_patterns_criterion(hps):
   """
   Goal: Ignore any index rather the ids of the tokens '0' and '1'.
   """
-  weight = torch.zeros(len(hps.tokenizer), dtype=torch.bfloat16)
+  weight = torch.zeros(len(hps.tokenizer), dtype=torch.bfloat16).to(hps.device)
   # weight only the vocabulary's digits 
   for i in range(10):
     weight[hps.tokenizer.convert_tokens_to_ids(str(i))] = 1
   criterion = nn.CrossEntropyLoss(weight=weight) 
   return criterion 
 
+def distibuted_env_init(hps):
+  hps.rank             = int(os.environ['RANK'])
+  hps.local_rank       = int(os.environ['LOCAL_RANK'])
+  hps.local_world_size = int(os.environ['LOCAL_WORLD_SIZE'])
+  hps.world_size       = int(os.environ['WORLD_SIZE'])
+  dist.init_process_group(backend='nccl', rank=hps.local_rank, world_size=hps.world_size)
+  hps.device = torch.device(f'cuda:{hps.local_rank}' if torch.cuda.is_available() else 'cpu')
+  hps.info += f"Backend Configuration: {dist.get_backend_config()}, local_rank: {hps.local_rank}, free-est gpu: {hps.free_gpu_id}, world_size: {hps.world_size}, device: {hps.device}\n"
+  torch.manual_seed(hps.acc_seed)
+  torch.cuda.set_device(hps.local_rank)
 
-def set_training_environment(model, tokenized_dataset, hps):
-  # Set optimizer
-  hps.optimizer = AdamW(model.parameters(), lr=hps.lr)
-  logger = None
+def accelerator_init(hps):
+  import datasets
+  import transformers
+  from accelerate import Accelerator
+  from accelerate.utils import set_seed
+  from accelerate.utils.dataclasses import DeepSpeedPlugin
+
+  # TODO: test mixed_precision='bf16'
+  accelerator = Accelerator(deepspeed_plugin=DeepSpeedPlugin(hf_ds_config=hps.deepspeed_config))
+  hps.disable_tqdm = not accelerator.is_local_main_process
+  if accelerator.is_local_main_process:
+    datasets.utils.logging.set_verbosity_warning()
+    transformers.utils.logging.set_verbosity_info()
+  else:
+    datasets.utils.logging.set_verbosity_error()
+    transformers.utils.logging.set_verbosity_error()
+  set_seed(hps.acc_seed)
+  return accelerator
+
+def initialize_training_environment(hps):
+  hps.info = ''
+  if hps.parallel==True:
+    if hps.deepspeed_kernel:
+      # Initialize the accelerator
+      hps.accelerator = accelerator_init(hps)
+    elif not hps.deepspeed_kernel:
+      # Initialize the distributed environment to apply Distributed Data Parallel (DDP)
+      distibuted_env_init(hps)
+  else:
+    # Initialize gpu
+    hps.device = torch.device(f'cuda:{hps.free_gpu_id}' if torch.cuda.is_available() else 'cpu')
+  # Verify the training type has been set
+  verify_training_type(hps)
+  
+def prepare_objects_for_training(model, dataset, hps):
+  from torch.optim import AdamW, Adam
+  from atpgllm.llm.collate import MyCollate
+  from atpgllm.llm.tokenizer import tokenize_fn
+  from accelerate.utils import DummyOptim, DummyScheduler
+  from accelerate import DistributedType
+  from transformers import get_scheduler
+  import math
 
   # Set the distributed systems if necessary
   if hps.parallel==True:
-    if hps.deepspeed_config is not None:
+    if hps.deepspeed_kernel:
+      # Tokenize the dataset
+      with hps.accelerator.main_process_first():
+        tokenized_dataset = dataset.map(tokenize_fn, batched=True, num_proc=16, remove_columns=['text'], fn_kwargs={'tokenizer': hps.tokenizer, 'is_causal': hps.is_causal})
+      hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal)
       
-      # model, hps.optimizer, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=hps.deepspeed_config)
-      local_rank = model.local_rank
+      if hps.accelerator.is_local_main_process:
+        print(f"{hps.info}"
+              f"{tokenized_dataset}\n")
+        
+      # Creates Dummy Optimizer if `optimizer` was spcified in the config file else creates Adam Optimizer
+      optimizer_cls = (
+          torch.optim.AdamW
+          if hps.accelerator.state.deepspeed_plugin is None or "optimizer" not in hps.accelerator.state.deepspeed_plugin.deepspeed_config
+          else DummyOptim
+      )
+      hps.optimizer = optimizer_cls(model.parameters(), lr=hps.lr)
+
+      # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
+      if hps.accelerator.distributed_type == DistributedType.TPU:
+          model.tie_weights()
+    
+      # Scheduler and math around the number of training steps.
+      # Get gradient accumulation steps from deepspeed config if available
+      if hps.accelerator.state.deepspeed_plugin is not None:
+          hps.gradient_accumulation_steps = hps.accelerator.state.deepspeed_plugin.deepspeed_config["gradient_accumulation_steps"]
+    elif not hps.deepspeed_kernel:
+      # Tokenize the dataset
+      tokenized_dataset = dataset.map(tokenize_fn, batched=True, num_proc=16, remove_columns=['text'], fn_kwargs={'tokenizer': hps.tokenizer, 'is_causal': hps.is_causal})
+      hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal)
       
-      hps.device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+      model = model.to(hps.local_rank)
+      if hps.fsdp:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, BackwardPrefetch, ShardingStrategy, CPUOffload, MixedPrecision
+        model = FSDP(model, 
+                     backward_prefetch=BackwardPrefetch.BACKWARD_POST, 
+                     sharding_strategy=ShardingStrategy.FULL_SHARD, 
+                     cpu_offload=CPUOffload(True), 
+                     mixed_precision=MixedPrecision(param_dtype=model.dtype, reduce_dtype=model.dtype), # NOTE: important knobs tuning for mixed precision training
+                     device_id=hps.local_rank)
+      else:
+        model = DDP(model, device_ids=[hps.local_rank], output_device=hps.local_rank)
       # logger = setup_logging(local_rank)
-      # logger.info(f"{hps.device}\n{model}\n{hps.optimizer}\nModel parameters: {sum(p.numel() for p in model.parameters())}, \nModel size: {convert_bytes(model_size_in_bytes(model))}\n")
-      print(f"{hps.device}\n{model}\n{hps.optimizer}\nModel parameters: {sum(p.numel() for p in model.parameters())}, \nModel size: {convert_bytes(model_size_in_bytes(model))}\n")
-
-    elif hps.deepspeed_config is None:
-      local_rank       = int(os.environ['LOCAL_RANK'])
-      rank             = int(os.environ['RANK'])
-      group_rank       = int(os.environ['GROUP_RANK'])
-      role_rank        = int(os.environ['ROLE_RANK'])
-      local_world_size = int(os.environ['LOCAL_WORLD_SIZE'])
-      world_size       = int(os.environ['WORLD_SIZE'])
-      dist.init_process_group(backend='nccl', rank=local_rank, world_size=world_size)
-
-      hps.device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
-      print(f"local_rank: {local_rank}, rank: {rank}, group_rank: {group_rank}, role_rank: {role_rank}, local_world_size: {local_world_size} world_size: {world_size}")
-      print(f"free gpu: {hps.free_gpu_id}")
-      print(f"Backend Configuration: {dist.get_backend_config()}")
-      torch.manual_seed(27)
-      torch.cuda.set_device(local_rank)
-      model = model.to(hps.device)
-      model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-      # move_optimizer_to_device(hps.optimizer, hps.device)
-      # logger = setup_logging(local_rank)
-      # logger.info(f"{hps.device}\n{model}\n{hps.optimizer}\nModel parameters: {sum(p.numel() for p in model.parameters())}, \nModel size: {convert_bytes(model_size_in_bytes(model))}\n")
-
-      # print(f"{hps.device}\n{model}\n{hps.optimizer}\nModel parameters: {sum(p.numel() for p in model.parameters())}, \nModel size: {convert_bytes(model_size_in_bytes(model))}\n")
+      if is_main_process():
+        print(f"{hps.info}"
+              f"{tokenized_dataset}\n"
+              f"{model}\n")
   else:
-    hps.device = torch.device(f'cuda:{hps.free_gpu_id}' if torch.cuda.is_available() else 'cpu')
-    # logger = setup_logging(hps.free_gpu_id)
+    # Move the model to the GPU only if necessary
     if hps.use_4bit == False and hps.use_8bit == False:
       model  = model.to(hps.device)
 
-  # Set the loss functions
-  hps.criterion = nn.CrossEntropyLoss(ignore_index=hps.tokenizer.pad_token_id if hps.is_causal else -100).to(hps.device)
-  hps.patterns_criterion = get_patterns_criterion(hps).to(hps.device)
+    # Tokenize the dataset
+    tokenized_dataset = dataset.map(tokenize_fn, batched=True, num_proc=32, remove_columns=['text'], fn_kwargs={'tokenizer': hps.tokenizer, 'is_causal': hps.is_causal})
+    hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal)
+    # logger = setup_logging(hps.free_gpu_id)
+    print(f"{hps.info}"
+          f"{tokenized_dataset}\n"
+          f"{model}\n")
 
   # Set the flags for distributed systems. Data samplers and Data Loaders
-  use_sampler = hps.parallel and hps.deepspeed_config is None
+  use_sampler = hps.parallel==True and hps.deepspeed_kernel==False
   hps.shuffle = not use_sampler
   
   if use_sampler:
-    training_sampler   = DistributedSampler(tokenized_dataset['train'], rank=local_rank, num_replicas=local_world_size, drop_last=True)
-    validation_sampler = DistributedSampler(tokenized_dataset['validation'], rank=local_rank, num_replicas=local_world_size, drop_last=True)
-    testing_sampler    = DistributedSampler(tokenized_dataset['test'], rank=local_rank, num_replicas=local_world_size, drop_last=True)
+    training_sampler   = DistributedSampler(tokenized_dataset['train'], rank=hps.local_rank, num_replicas=hps.local_world_size, drop_last=True)
+    validation_sampler = DistributedSampler(tokenized_dataset['validation'], rank=hps.local_rank, num_replicas=hps.local_world_size, drop_last=True)
+    testing_sampler    = DistributedSampler(tokenized_dataset['test'], rank=hps.local_rank, num_replicas=hps.local_world_size, drop_last=True)
   else:
     training_sampler, validation_sampler, testing_sampler = None, None, None
   
@@ -559,30 +643,37 @@ def set_training_environment(model, tokenized_dataset, hps):
   training_loader   = DataLoader(dataset=tokenized_dataset['train'], batch_size=hps.batch_size, shuffle=hps.shuffle, collate_fn=hps.collate_fn, sampler=training_sampler, num_workers=hps.num_workers)
   validation_loader = DataLoader(dataset=tokenized_dataset['validation'], batch_size=hps.batch_size, shuffle=hps.shuffle, collate_fn=hps.collate_fn, sampler=validation_sampler, num_workers=hps.num_workers)
   testing_loader    = DataLoader(dataset=tokenized_dataset['test'], batch_size=hps.batch_size, shuffle=hps.shuffle, collate_fn=hps.collate_fn, sampler=testing_sampler, num_workers=hps.num_workers)
+  
+  if not hps.deepspeed_kernel:
+    hps.optimizer = AdamW(model.parameters(), lr=hps.lr) # , fused=torch.cuda.is_available()
+    hps.scheduler = get_scheduler("cosine", hps.optimizer, num_warmup_steps=10, num_training_steps=hps.epochs * len(training_loader)) # when cosine scheduler is used, we need to set num_training_steps to 10
 
-  return model, logger, training_loader, validation_loader, testing_loader
-
-
-class AttrDict(dict):
-  def __init__(self, initial_dict=None, **kwargs):
-    super(AttrDict, self).__init__()
-    if initial_dict is not None:
-      self.update(initial_dict)
-    self.update(kwargs)
-
-  def __getattr__(self, key):
-    try:
-      return self[key]
-    except KeyError:
-      raise AttributeError(f"No such attribute: {key}")
-
-  def __setattr__(self, key, value=None):
-    if isinstance(key, str):
-      self[key] = value
+  # Prepare whatever requires for ZeRO acceleration training (deepspeed_kernel is activated)
+  if hps.parallel and hps.deepspeed_kernel:
+    num_update_steps_per_epoch = math.ceil(len(training_loader) / hps.gradient_accumulation_steps)
+    hps.max_train_steps = hps.epochs * num_update_steps_per_epoch
+    if (hps.accelerator.state.deepspeed_plugin is None
+        or "scheduler" not in hps.accelerator.state.deepspeed_plugin.deepspeed_config):
+      # "reduce_lr_on_plateau" scheduler does not work.
+      # Select: ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
+      hps.scheduler = get_scheduler("linear", hps.optimizer, num_warmup_steps=10, num_training_steps=hps.max_train_steps)
     else:
-      raise ValueError(f'Invalid attribute assignment. You passed as key: {key} and value: {value}')
+      hps.scheduler = DummyScheduler(
+        hps.optimizer, total_num_steps=hps.max_train_steps, warmup_num_steps=10 # hps.num_warmup_steps
+      )
+    model, hps.optimizer, training_loader, validation_loader, testing_loader, hps.scheduler = hps.accelerator.prepare(model, hps.optimizer, training_loader, validation_loader, testing_loader, hps.scheduler)
+    hps.device = model.device
+    num_update_steps_per_epoch = math.ceil(len(training_loader) / hps.gradient_accumulation_steps)
+    hps.max_train_steps = hps.epochs * num_update_steps_per_epoch
+    if hps.accelerator.is_local_main_process:
+      print(f"{model}")
+  
+  # Set the loss functions
+  hps.criterion = nn.CrossEntropyLoss(ignore_index=hps.tokenizer.pad_token_id if hps.is_causal else -100).to(hps.device)
+  hps.patterns_criterion = get_patterns_criterion(hps)
 
-deepspeed_config = AttrDict(deepspeed_config)
+  return model, training_loader, validation_loader, testing_loader
+
 
 def dataset_formation(raw_dataset, is_causal):
   """
@@ -646,24 +737,38 @@ def sizeof_tensor(tensor):
   return tensor.element_size() * tensor.nelement()
 
 
-def calculate_memory(model, optimizer, ids, mask, targets):
+def calculate_memory(model=None, optimizer=None, ids=None, mask=None, targets=None):
   total_memory = 0
+  
   # Model parameters
-  for param in model.parameters():
+  if model is not None:
+    for param in model.parameters():
       total_memory += sizeof_tensor(param)
-      if param.grad is not None:
-          total_memory += sizeof_tensor(param.grad)
+      if param.grad is not None and param.requires_grad == True:
+        total_memory += sizeof_tensor(param.grad)
+  
   # Optimizer states
-  for state in optimizer.state.values():
+  if optimizer is not None:
+    for v in optimizer.param_groups[0]['params']:
+      total_memory += sizeof_tensor(v)
+    for state_k, state in optimizer.state.items():
+      total_memory += sizeof_tensor(state_k)
       for k, v in state.items():
           if isinstance(v, torch.Tensor):
-              total_memory += sizeof_tensor(v)
+            total_memory += sizeof_tensor(v)
+  
   # ids + mask + targets
-  total_memory += sizeof_tensor(ids) + sizeof_tensor(mask) + sizeof_tensor(targets)
+  total_memory += sizeof_tensor(ids) if ids is not None else 0
+  total_memory += sizeof_tensor(mask) if mask is not None else 0
+  total_memory += sizeof_tensor(targets) if targets is not None else 0
+  
   return convert_bytes(total_memory)
 
 
 def hyperparameters(args):
+  from atpgllm import deepspeed_config
+  deepspeed_config = AttrDict(deepspeed_config)
+
   # args
   hps = AttrDict({})
   # training
@@ -685,13 +790,15 @@ def hyperparameters(args):
   hps.lora       = args.lora 
   hps.load_ckpt  = args.load_checkpoint
   # tokenizer
-  hps.tokenizer = args.tokenizer
+  hps.tokenizer  = args.tokenizer
+  hps.new_tokens = args.new_tokens
   # collate
   hps.collate = args.atpg_collate
   # gpu usage
   hps.free_gpu_id      = get_free_gpu()
   hps.parallel         = args.parallel
   hps.deepspeed_kernel = args.deepspeed_kernel
+  hps.fsdp             = args.fsdp
   hps.world_size       = int(len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))) if hps.deepspeed_kernel == True else 1
   hps.device_map       = None
   hps.use_4bit         = args.use_4bit
@@ -701,11 +808,14 @@ def hyperparameters(args):
   deepspeed_config.zero_optimization['stage']     = args.zero_stage if hps.deepspeed_kernel == True else 0
   deepspeed_config.optimizer['params']['lr']      = hps.lr
   hps.deepspeed_config = deepspeed_config if hps.deepspeed_kernel == True else None
-  
+  # ZeRO
+  hps.acc_seed     = args.acc_seed
+  hps.disable_tqdm = False
+
   return hps
 
 
-def plot_training_plots(train_losses, val_losses):
+def plot_training_plots(train_losses, val_losses, filename: str = "losses_plot.html"):
   # Assuming all lists are of the same length
   epochs = list(range(1, len(train_losses) + 1))
 
@@ -727,7 +837,7 @@ def plot_training_plots(train_losses, val_losses):
                     legend_title='Loss Type')
   
   # Save the figure as an interactive HTML
-  fig.write_html("losses_plot.html")
+  fig.write_html(filename)
 
 
 def cleanup(hps):
@@ -739,15 +849,31 @@ def cleanup(hps):
   gc.collect()
 
 def verify_training_type(hps):
-  print('=' * 36 + ' Model Loading ' + '=' * 36)
+  hps.info += '=' * 36 + ' Model Loading ' + '=' * 36 + '\n'
+  if hps.fsdp:
+    try:
+      assert hps.parallel == True
+    except AssertionError:
+      raise ValueError(f"When hyperparameter 'fsdp' is acticated (fsdp={hps.fsdp}). 'parallel' should be activated. You set parallel={hps.parallel}")
+  elif hps.deepspeed_kernel:
+    try:
+      assert hps.parallel == True
+    except AssertionError:
+      raise ValueError(f"When hyperparameter 'deepspeed_kernel' is acticated (deepspeed_kernel={hps.deepspeed_kernel}). 'parallel' should be activated. You set parallel={hps.parallel}")
   if hps.parallel:
     try: 
       # When any quantization type is activated you can't work on distributed systems
-      assert hps.use_4bit == False and hps.use_8bit == False
+      # assert hps.use_4bit == False and hps.use_8bit == False
+      pass
     except AssertionError:
       raise ValueError(f"When hyperparameter 'parallel' is acticated (parallel={hps.parallel}). Both quantization types should be de-activated. You set use_4bit={hps.use_4bit} and use_8bit={hps.use_8bit}")
     finally:
-      print(f"No quantization is applied.\nParallelization is activated")
+      if hps.use_4bit:
+        hps.info += f"4-Bit quantization is applied\nParallelization is activated\n"
+      elif hps.use_8bit:
+        hps.info += f"8-Bit quantization is applied\nParallelization is activated\n"
+      else:
+        hps.info += f"No quantization is applied.\nParallelization is activated\n"
   elif not hps.parallel:
     try:
       # Can't activate both 4-bit and 8-bit quantization types
@@ -757,22 +883,27 @@ def verify_training_type(hps):
       raise ValueError(f"You can't have activated both 4-bit and 8-bit quantization")
     finally:
       if hps.use_4bit:
-        print(f"4-Bit quantization is applied\nNo Parallelization")
+        hps.info += f"4-Bit quantization is applied\nNo Parallelization\n"
       elif hps.use_8bit:
-        print(f"8-Bit quantization is applied\nNo Parallelization")
+        hps.info += f"8-Bit quantization is applied\nNo Parallelization\n"
       else:
-        print(f"No quantization is applied\nNo Parallelization")
+        hps.info += f"No quantization is applied\nNo Parallelization\n"
   if hps.lora:
-    print('LOw-Rank Adaptation (LORA) is used as Parametric-Efficient Fine-Tuning (PEFT) technique')
+    hps.info += 'Low-Rank Adaptation (LoRA) is used as Parametric-Efficient Fine-Tuning (PEFT) technique\n'
   else:
-    print('No Parametric-Efficient Fine-Tuning (PEFT) technique is used')
-  print('=' * 87)
+    hps.info += 'No Parametric-Efficient Fine-Tuning (PEFT) technique is used\n'
+  hps.info += '=' * 87 + '\n'
+  
+def load_model(hps: AttrDict) -> torch.nn.Module:
+  """
+  Load the base model.
 
+  Args:
+      hps (AttrDict): Hyperparameter object.
 
-def load_model(hps):
-  # Verify the training type has been set
-  verify_training_type(hps)
-
+  Returns:
+      torch.nn.Module: The base model.
+  """
   # Load base model
   if hps.use_4bit:
     # Compute dtype for 4-bit base model
@@ -783,7 +914,10 @@ def load_model(hps):
     hps.use_nested_quant = False
     hps.compute_dtype = getattr(torch, hps.bnb_4bit_compute_dtype)
     # Load the entire model on an available GPU
-    hps.device_map = {"": hps.free_gpu_id if torch.cuda.is_available() else 'cpu'}
+    if hps.parallel:
+      hps.device_map = {"": hps.free_gpu_id if torch.cuda.is_available() else 'cpu'}
+    else:
+      hps.device_map = {"": hps.free_gpu_id if torch.cuda.is_available() else 'cpu'}
 
     # Quantization
     hps.bnb_config = BitsAndBytesConfig(
@@ -792,7 +926,11 @@ def load_model(hps):
       bnb_4bit_compute_dtype=hps.compute_dtype,
       bnb_4bit_use_double_quant=hps.use_nested_quant,
     )
-    model = AutoModelForCausalLM.from_pretrained(hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map)
+    model = AutoModelForCausalLM.from_pretrained(
+      hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map,
+    ) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(
+      hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map,
+    )
   elif hps.use_8bit:
     # Load the entire model on an available GPU
     hps.device_map = {"": hps.free_gpu_id if torch.cuda.is_available() else 'cpu'}
@@ -800,7 +938,11 @@ def load_model(hps):
     hps.bnb_config = BitsAndBytesConfig(
       load_in_8bit=hps.use_8bit
     )
-    model = AutoModelForCausalLM.from_pretrained(hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map)
+    model = AutoModelForCausalLM.from_pretrained(
+      hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map,
+    ) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(
+      hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map,
+    )
   else:
     model = AutoModelForCausalLM.from_pretrained(hps.model_name) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(hps.model_name)
     model = model.to(torch.bfloat16)
@@ -810,29 +952,101 @@ def load_model(hps):
       task_type=TaskType.CAUSAL_LM if hps.is_causal else TaskType.SEQ_2_SEQ_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout
     )
     model = get_peft_model(model, lora_config)
-    print(f"{model.print_trainable_parameters()}")
+    hps.info += f"{model.print_trainable_parameters()}\n"
     del lora_config
+
+  if hps.new_tokens:
+    trainable_layers = ["embed_tokens", "lm_head"]
+    for name, params in model.named_parameters():
+      if any(layer in name for layer in trainable_layers):
+        params.requires_grad = True
+      else:
+        params.requires_grad = False
   else:
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}")
-  print(f"Model size: {convert_bytes(model_size_in_bytes(model))}")
+    for name, params in model.named_parameters():
+      params.requires_grad = True
+
+  hps.info += f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\n"
+  hps.info += f"Trainable Model size: {convert_bytes(model_size_in_bytes(model))}\n"
 
   model.config.use_cache = False
   model.config.pretraining_tp = 1
   return model
 
 
-def load_tokenizer(model, model_name:str, is_causal:bool, max_new_binary_tokens_length:int):
-  tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=4096)
+def load_tokenizer(model, hps:AttrDict):
+  """
+  Load tokenizer from pre-trained model.
+  Args:
+      model (`obj:pytorch_model`):
+          The model to be used for inference.
+      hps (`obj:AttrDict`):
+          Hyperparameter object.
+  Returns:
+      `obj:AutoTokenizer`:
+          Tokenizer object.
+  """
+  from atpgllm.tokenization import get_new_tokens
+  tokenizer = AutoTokenizer.from_pretrained(hps.model_name, model_max_length=2048)
   tokenizer.pad_token = tokenizer.eos_token
-  tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
-  if not is_causal:
+  tokenizer.padding_side = "right"  # Fix weird overflow issue with fp16 training
+  if not hps.is_causal:
     tokenizer.add_special_tokens({"cls_token": "<s>"})
 
   # Create new tokens. Binary combinations to interpret the generated patterns.
-  new_tokens = list(generate_all_possible_binary_combination(starting_point=1, max_binary_length=max_new_binary_tokens_length)) if max_new_binary_tokens_length > 0 else []
-  print(f"Tokenizer vocabulary: {len(tokenizer)}. New added tokens: {len(new_tokens)}")
-
-  # Resize the Embeddings
-  tokenizer.add_tokens(new_tokens)
-  model.resize_token_embeddings(len(tokenizer))
+  # new_tokens = list(generate_all_possible_binary_combination(starting_point=1, max_binary_length=hps.max_new_binary_tokens_length)) if hps.max_new_binary_tokens_length > 0 else []
+  if hps.new_tokens:
+    new_tokens = get_new_tokens(hps)
+    hps.info += f"Tokenizer vocabulary: {len(tokenizer)}. New added tokens: {len(new_tokens)}. "
+    # Resize the Embeddings
+    tokenizer.add_tokens(new_tokens)
+    model.resize_token_embeddings(len(tokenizer))
+    hps.info += f"New Tokenizer vocabulary: {len(tokenizer)}.\n"
   return model, tokenizer
+
+def save_model(model, save_directory: str, push_to_hub: bool = True, **kwargs):
+  """
+  Save the model to a directory.
+
+  Args:
+      model (`obj:pytorch_model`):
+          The model to be saved.
+      save_directory (`str`):
+          The directory where the model should be saved.
+      push_to_hub (`bool`, optional, default=False):
+          Whether to push the model to the model hub.
+      kwargs (`Dict[str, Any]`, optional):
+          Additional keyword arguments used during saving.
+
+  Returns:
+      `None`
+  """
+  save_embedding_layers = kwargs.get('save_embedding_layers', False)
+  hps = kwargs.get('hps', AttrDict({}))
+  
+  # Save model to directory
+  if hps.parallel:
+    if hps.deepspeed_kernel:
+      if hps.accelerator.is_main_process:
+        # push to the hub!
+        if push_to_hub:
+          model.push_to_hub(save_directory)
+          hps.tokenizer.push_to_hub(save_directory)
+      hps.accelerator.wait_for_everyone()
+    else:
+      # model.module.save_pretrained(save_directory, save_embedding_layers, **kwargs)
+      if torch.distributed.get_rank() == 0:
+        # push to the hub!
+        if push_to_hub:
+          model.module.push_to_hub(save_directory)
+          hps.tokenizer.push_to_hub(save_directory)
+      torch.distributed.barrier()
+  else:
+    # model.save_pretrained(save_directory, save_embedding_layers, **kwargs)
+    # push to the hub!
+    if push_to_hub:
+      model.push_to_hub(save_directory)
+      hps.tokenizer.push_to_hub(save_directory)
+
+def is_main_process():
+    return dist.get_rank() == 0

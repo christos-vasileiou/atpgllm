@@ -7,7 +7,7 @@ import torch.distributed as dist
 import torch.optim as optim
 import torch.nn as nn
 import torch
-import deepspeed
+# import deepspeed
 import os
 import time
 import io
@@ -87,7 +87,8 @@ def train_graph(epochs, model, dataset, lr, batch_size, labels_filtering=True, r
   model = model.to(torch.bfloat16) if fp16==True else model
   if parallel==True:
     if deepspeed_config is not None:
-      model_engine, optimizer, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=deepspeed_config)
+      model_engine = None
+      # model_engine, optimizer, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=deepspeed_config)
       local_rank = model_engine.local_rank
        
       device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
@@ -359,7 +360,8 @@ def train_gen_task(epochs, model, dataset, lr, batch_size, labels_filtering=True
   model = model.to(torch.bfloat16) if fp16==True else model
   if parallel==True:
     if deepspeed_config is not None:
-      model_engine, optimizer, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=deepspeed_config)
+      model_engine = None
+      # model_engine, optimizer, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=deepspeed_config)
       logger = setup_logging(local_rank)
       logger.info(f"\n{model_engine}")
       logger.info(f"\n{optimizer}")
