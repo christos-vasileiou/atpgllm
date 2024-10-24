@@ -1,7 +1,6 @@
 from .collate import *
 from .fine_tuning import *
 from .models import *
-from .sft import *
 from .tokenizer import *
 
 models = {

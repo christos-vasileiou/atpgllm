@@ -1,10 +1,11 @@
 from typing import List
-from tokenizers import AddedToken
 import regex as re
 from atpgllm.utils import load_raw_dataset, AttrDict
+from os.path import join, dirname, abspath
 
 # Pattern for netlist split. Find gate types, nets, instance names
 NETLIST_PATTERN = r""" ?\p{L}+| ?_\p{N}+_"""
+NET_PATTERN = r""" ?_\p{N}+_"""
 
 def get_new_tokens(hps: AttrDict) -> List[str]:
   """
@@ -14,10 +15,15 @@ def get_new_tokens(hps: AttrDict) -> List[str]:
   Returns:
       List[str]: List of new tokens.
   """
+  from tokenizers import AddedToken
   # load raw dataset
-  raw_dataset = load_raw_dataset(hps.data_file)
+  # raw_dataset = load_raw_dataset(hps.data_file)
+
+  # this csv contains ALL generated netlists 
+  raw_dataset = load_raw_dataset(join(dirname(abspath(__file__)), "../../data/atpg_data_random_pis_v3.csv")) 
   # compile patterns
   compiled_pattern = re.compile(NETLIST_PATTERN)
+  compiled_net_pattern = re.compile(NET_PATTERN)
   # parse dataset -> Netlist
   tokens = set()
   for netlist in raw_dataset['train']['netlist_only_gates']:
@@ -28,13 +34,26 @@ def get_new_tokens(hps: AttrDict) -> List[str]:
   # text = [patterns for patterns in raw_dataset['train']['patterns']]
   # # split netlist in chunks of text by categories defined in regex pattern
   # tokens = tokens.union(set(compiled_pattern.findall(netlist)))
-  tokens = set([t.strip() for t in tokens])
+  tokens = sorted(set([t.strip() for t in tokens]))
   tokens_list = []
-  for t in tokens:
-    if any(t==gate for gate in ["nor", "xor", "xnor", "nand", "buf"]):
-      tokens_list.append(AddedToken(t, lstrip=False, rstrip=True, normalized=False, single_word=True))
-    elif any(t==gate for gate in ["or", "and", "not"]):
-      tokens_list.append(AddedToken(t, lstrip=True, rstrip=False, normalized=True, single_word=False))
+  for token in tokens:
+    # gate names
+    if any(token==gate for gate in ["nor", "xor", "xnor", "nand", "buf"]): 
+      tokens_list.append(AddedToken(token, lstrip=False, rstrip=True, normalized=False, single_word=True))
+    # gate names
+    # NOTE: Be careful with these 3 tokens, since they can be actual english words
+    elif any(token==gate for gate in ["or", "and", "not"]): 
+      tokens_list.append(AddedToken(token, lstrip=False, rstrip=False, normalized=True, single_word=False))
+    # gate names
+    elif any(token==gate for gate in ['AN', 'IBUF', 'ND', 'NR', 'OR', 'XNR', 'XOR']):
+      tokens_list.append(AddedToken(token, lstrip=False, rstrip=True, normalized=False, single_word=False))
+    # gate names
+    elif token=='IV': 
+      tokens_list.append(AddedToken(token, lstrip=False, rstrip=False, normalized=False, single_word=True))
+    # net names
+    elif compiled_net_pattern.match(token):
+      tokens_list.append(AddedToken(token, lstrip=False, rstrip=False, normalized=False, single_word=False))
     else:
-      tokens_list.append(AddedToken(t, lstrip=True, rstrip=False, normalized=True, single_word=False))
+      pass
+      # tokens_list.append(AddedToken(token, lstrip=True, rstrip=False, normalized=True, single_word=False))
   return tokens_list

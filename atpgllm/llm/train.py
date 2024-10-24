@@ -40,8 +40,6 @@ def train_cls_task(epochs, model, dataset, lr, batch_size, labels_filtering=True
     filename   = '_'.join('_'.join(split_path[1:]).split('_')[1:])
     print(f"{date_time}, {local_rank}, {filename}")
     # load model
-    #import atpg.llm.models
-    #sys.modules['atpg.models'] = atpg.llm.models
     model, optimizer, start_epoch, hyperparameter = load_checkpoint(date_time=date_time, local_rank=local_rank, filename=filename, model=model, optimizer=optimizer)
   start_epoch += 1
   local_rank = free_gpu_id

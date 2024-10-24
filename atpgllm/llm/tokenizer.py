@@ -283,10 +283,10 @@ class ATPGTokenizer(object):
 
 
 
-
 def tokenize_fn(batched, tokenizer, is_causal=True):
   if is_causal:
     tokenized_inputs = tokenizer(batched['text'], truncation=True)
+    tokenized_inputs = {key: [input[1:] for input in inputs] for key, inputs in tokenized_inputs.items()}
     tokenized_inputs['netlist'] = batched['netlist']
   else:
     tokenized_inputs = tokenizer([b['prompts'] for b in batched['text']], truncation=True)
