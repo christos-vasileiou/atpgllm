@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import subprocess
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -582,7 +583,7 @@ def accelerator_init(hps):
   set_seed(hps.seed)
   return accelerator
 
-def initialize_training_environment(hps):
+def initialize_training_environment(hps, debug=False):
   hps.info = ''
   # Verify the training type has been set
   verify_training_type(hps)
@@ -601,10 +602,11 @@ def initialize_training_environment(hps):
     hps.info += f'Free detected GPU: {hps.device}\n' if torch.cuda.is_available() else 'No GPU is detected'
     print(f"Accumulated gradient steps: {hps.gradient_accumulation_steps}")
 
-  if is_main_process():
-    if os.path.exists("logs"):
-      shutil.rmtree('logs')
-    os.makedirs('logs')
+  if debug==False:
+    if is_main_process():
+      if os.path.exists("logs"):
+        shutil.rmtree('logs')
+      os.makedirs('logs')
 
 def prepare_objects_for_training(model, dataset, hps):
   from torch.optim import AdamW
@@ -645,8 +647,9 @@ def prepare_objects_for_training(model, dataset, hps):
                     f"{model}\n"
                     # f"{print_summary(model)}\n" + \
         print(f"{hps.info}")
-        with open("logs/train_env.log", 'w') as file:
-          file.write(hps.info)
+        if hps.debug == False:
+          with open("logs/train_env.log", 'w') as file:
+            file.write(hps.info)
         
       # Creates Dummy Optimizer if `optimizer` was spcified in the config file else creates Adam Optimizer
       optimizer_cls = (
@@ -704,8 +707,9 @@ def prepare_objects_for_training(model, dataset, hps):
                     f"{model}\n"
                     # f"{print_summary(model)}\n" + \
         print(f"{hps.info}")
-        with open("logs/train_env.log", 'w') as file:
-          file.write(hps.info)
+        if hps.debug == False:
+          with open("logs/train_env.log", 'w') as file:
+            file.write(hps.info)
   else:
     # Move the model to the GPU only if necessary
     if hps.use_4bit == False and hps.use_8bit == False:
@@ -719,8 +723,9 @@ def prepare_objects_for_training(model, dataset, hps):
                 f"{model}\n"
                 # f"{print_summary(model)}\n" + \
     print(f"{hps.info}")
-    with open("logs/train_env.log", 'w') as file:
-      file.write(hps.info)
+    if hps.debug == False:
+      with open("logs/train_env.log", 'w') as file:
+        file.write(hps.info)
 
   # Set the flags for distributed systems. Data samplers and Data Loaders
   use_sampler = hps.parallel==True and hps.deepspeed_kernel==False
@@ -1162,25 +1167,21 @@ def load_model(hps: AttrDict) -> torch.nn.Module:
       hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map, # attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16
     )
   else:
-    if 'lora' in hps.model_name.lower():
-      model_name = re.sub(re.escape('-lora'), '', hps.model_name, flags=re.IGNORECASE)
-      model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
-    else:
-      model = AutoModelForCausalLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
-      model = model.to(torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
+    model = model.to(torch.bfloat16)
   
   if hps.lora:
     hps.lora_config = LoraConfig(
       task_type=TaskType.CAUSAL_LM if hps.is_causal else TaskType.SEQ_2_SEQ_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout
     )
-    if 'lora' in hps.model_name.lower():
-      model = PeftModel.from_pretrained(model, hps.model_name)
-      freeze_base_model_and_train_lora(model, train_embeddings=True, train_head=True)
-      
-      model.to(torch.bfloat16)
+    if hasattr(model, "peft_config"): 
+      model = PeftModel(model, model.peft_config["default"]) 
+      model.to(torch.bfloat16) 
     else:
-      model = get_peft_model(model, hps.lora_config)
-    hps.info += f"{model.print_trainable_parameters()}\n"
+      model = get_peft_model(model, hps.lora_config) 
+
+    freeze_base_model_and_train_lora(model, train_embeddings=False, train_head=True) 
+    hps.info += f"{model.print_trainable_parameters()}\n" 
 
   if hps.new_tokens:
     train_tokens_embeddings_and_head(model)
@@ -1419,3 +1420,34 @@ def infer(ddp_model, data_iterator, tokenizer, stop_token='[/INST]', model_max_l
 def postprocess_generated_text(generated_text):
   generated_text = re.sub(r"(_\d+_)\s([,\"\);])|(IBUF|XNR|XOR)\s(\d)", lambda m: f"{m.group(1) or m.group(3)}{m.group(2) or m.group(4)}", generated_text)
   return re.sub(r" (\[\/INST\]) ", r"\n\1\n", generated_text)
+
+
+def align_tokens_length(tokenizer, x):
+  """
+  Aligns all inputs in a batch to the maximum length in the batch.
+
+  Args:
+    tokenizer: The tokenizer for the model.
+    x: A list of tensors, each of shape (B, T, Embeddings) or (B, T).
+  Returns:
+    A tensor of shape (B, max_length, Dims) or (B, max_length).
+  """
+  max_size = max(x[i].size(1) for i in range(len(x)))
+  # Find out the padding is needed for each tensor of the list
+  padding = [max_size - x[i].size(1) for i in range(len(x))]
+  # case where size is (B, T, Embeddings)
+  if len(x[0].size()) == 3:
+    # Randomize the paddings uniformly random in range of [0, 1]
+    padding = [torch.rand(x[0].size(0), pad, x[0].size(2)) for pad in padding]
+    # Assign 100 to the index of the end of string (eos_token_id)
+    # It's set to 100 due to low ranomized values. It has to be the maximum number among embeddings. It will return eos_token_id later
+    for pad in padding:
+      pad[:, :, tokenizer.eos_token_id] = 100
+    x = [torch.cat([x[i], pad], dim=1) for i, pad in enumerate(padding)]
+    x = torch.cat(x)
+    return x
+  else:
+    # Pad the targets with the eos_token_id
+    x = torch.cat([F.pad(xx, (0, padding[i]), "constant", tokenizer.eos_token_id) for i, xx in enumerate(x)])
+    return x
+

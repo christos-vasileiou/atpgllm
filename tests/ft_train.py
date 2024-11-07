@@ -1,10 +1,13 @@
 import torch
 import argparse
 import os
-import sys
+import json
 import itertools
 import torch.nn as nn
 import numpy as np
+import pandas as pd
+from collections import OrderedDict
+from torch.nn.utils.rnn import pad_sequence
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, set_seed
 from huggingface_hub import HfApi, login
@@ -12,9 +15,6 @@ from huggingface_hub import HfApi, login
 from atpgllm import (
   parse_arguments, 
   load_raw_dataset, 
-  dataset_formation, 
-  dataset_formation_using_chat_template, 
-  calculate_memory,
   hyperparameters,
   plot_training_plots,
   load_model,
@@ -31,14 +31,20 @@ from atpgllm import (
   dist,
   models_causal, 
   models_seq2seq,
-  infer
+  infer,
+  compute_bleu,
+  compute_rouge, 
+  compute_repetition_rate, 
+  compute_distinct_n, 
+  compute_fault_coverage,
 )
+
 import warnings
 warnings.filterwarnings('ignore')
 
 DEBUG = False
 
-def epoch_loop(dataloader, desc, model, hps, training_loop:bool = True, epoch=1) -> list:
+def epoch_loop(dataloader, desc, model, hps, training_loop:bool = True, epoch=0) -> list:
   """
   A function that loops over the dataloader for one epoch.
 
@@ -79,10 +85,21 @@ def epoch_loop(dataloader, desc, model, hps, training_loop:bool = True, epoch=1)
   else:
     data_iterator = iter(itertools.cycle(dataloader))
 
+  if not training_loop and is_main_process():
+    stop_token = tokenizer.encode("[/INST]", return_tensors='pt')[:, 1:] # return BxT: where B is 1, and T is <s>+token_ids. Get rid of <s> with '1:'
+    windows_size = stop_token.size(1)
+
+  metrics_df = pd.DataFrame([{}])
   learning_rates = []
   epoch_batch_losses = []
   pat_losses = []
+  predictions = []
+  references = []
   info = dict()
+  metrics = dict()
+  generated_texts_for_metrics = []
+  target_texts_for_metrics = []
+  netlists = []
   # Main loop
   for i in range(0, len(dataloader)):
     # Initialize gradient accumulation state
@@ -126,6 +143,21 @@ def epoch_loop(dataloader, desc, model, hps, training_loop:bool = True, epoch=1)
       # Calculate the gradients
       hps.accelerator.backward(total_micro_batch_loss) if hps.deepspeed_kernel else total_micro_batch_loss.backward()
 
+      # Gather outputs and targets 
+      if is_main_process():
+        # Make sure both will be loaded on CPU RAM
+        # Generate the token ids
+        _, generated_ids = torch.topk(outputs.logits.detach().cpu(), k=1)
+        # Convert generated ids to text
+        generated_texts = tokenizer.batch_decode(generated_ids.squeeze(-1), skip_special_tokens=True)
+        # Convert target ids to text
+        target_texts = tokenizer.batch_decode(targets.cpu(), skip_special_tokens=True)
+        # Collect texts
+        generated_texts_for_metrics.extend(generated_texts)
+        target_texts_for_metrics.extend(target_texts)
+        netlists.extend(data["netlist"])
+      
+      # gradient accumulation completes the batch size 
       if (i+1) % hps.gradient_accumulation_steps == 0:
         if hps.new_tokens:
           zero_grad_old_embeddings(model, tunable_ids = list(tokenizer.added_tokens_decoder.keys()))
@@ -137,27 +169,103 @@ def epoch_loop(dataloader, desc, model, hps, training_loop:bool = True, epoch=1)
         if scheduler:
           scheduler.step() if hps.deepspeed_kernel else scheduler.step(batch_loss)
           learning_rates.append(scheduler.get_lr()[0])
+        
+        if is_main_process():
+          # Collect metrics
+          metrics.update(compute_bleu(references=target_texts_for_metrics, completions=generated_texts_for_metrics))
+          metrics.update(compute_rouge(references=target_texts_for_metrics, completions=generated_texts_for_metrics))
+          metrics.update(compute_distinct_n(completions=generated_texts_for_metrics, n=3))
+          metrics.update(compute_repetition_rate(completions=generated_texts_for_metrics))
+          metrics.update(compute_fault_coverage(completions=generated_texts_for_metrics, netlists=netlists))
+          info.update(dict(micro_batch_loss=micro_batch_loss.item()))
+          info.update(metrics)
+          generated_texts_for_metrics = []
+          target_texts_for_metrics = []
+          netlists = []
+        dist.barrier()
 
       if memory_consumption:
         # Calculate the Memory Consumption per GPU
         memory_consumption_per_gpu = convert_bytes(torch.cuda.max_memory_allocated(device))
         memory_consumption = False
-    
-    info.update(dict(micro_batch_loss=micro_batch_loss.item()))
+
+    else:
+      if is_main_process():
+        # Take token ids up to the "[/INST]"
+        ids = ids.cpu()
+        windows = ids.unfold(1, windows_size, 1)
+        matches = (windows == stop_token).all(dim=2)
+        # Find the first occurrence in each sequence
+        # Initialize indices with sequence length for sequence without a match
+        indices = torch.full((ids.size(0),), ids.size(1), dtype=torch.long)
+
+        # For sequence where a match is found, update the index
+        for j in range(ids.size(0)):
+          match_indices = torch.nonzero(matches[j], as_tuple=True)[0]
+          if match_indices.numel() > 0:
+            indices[j] = match_indices[0].item()
+        user_prompt_ids = [ids[j, :idx+stop_token.size(1)] for j, idx in enumerate(indices)]
+
+        # Create the attention mask
+        attention_mask_list = [torch.ones_like(ids) for ids in user_prompt_ids]
+
+        # Pad sequences to the maximum length
+        input_ids = pad_sequence(user_prompt_ids, batch_first=True, padding_value=tokenizer.eos_token_id).to(model.module.device)
+        attention_mask = pad_sequence(attention_mask_list, batch_first=True, padding_value=0).to(model.module.device)
+
+        # Generate completion
+        generated_ids = model.module.generate(input_ids=input_ids, attention_mask=attention_mask, num_return_sequences=1, top_k=1, max_length=1024)
+        # Convert generated ids to text
+        generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        # Convert target ids to text
+        references = tokenizer.batch_decode(targets, skip_special_tokens=True)
+        # Update the metrics dictionary 
+        metrics.update(compute_bleu(references=references, completions=generated_texts))
+        metrics.update(compute_rouge(references=references, completions=generated_texts))
+        metrics.update(compute_distinct_n(completions=generated_texts, n=3))
+        metrics.update(compute_repetition_rate(completions=generated_texts))
+        metrics.update(compute_fault_coverage(completions=generated_texts, netlists=data["netlist"]))
+        
+        metrics_df = pd.concat([metrics_df, pd.DataFrame([metrics])]).dropna().reset_index(drop=True)
+        # Update the info dictionary 
+        info.update(metrics)
+        # Update the progress bar 
+        pbar.set_postfix(info)
+      dist.barrier()
+
     if (i+1) % hps.gradient_accumulation_steps == 0:
       epoch_batch_losses.append(batch_loss)
-      info.update(dict(epoch_estimate=np.mean(epoch_batch_losses), batch_loss=batch_loss))
+      info.update(dict(epoch_est=np.mean(epoch_batch_losses), b_loss=batch_loss))
 
     if is_main_process():
       pbar.update(1)
       pbar.set_postfix(info)
     
-    if DEBUG and i>50:
+    if DEBUG == True and i>50 and training_loop == True:
       break
 
+    if training_loop == False and (i+1) % hps.gradient_accumulation_steps == 0:
+      break
+    
+  gathered_dfs = [None for _ in range(hps.world_size)]
+  dist.all_gather_object(gathered_dfs, metrics_df)
+
   if is_main_process():
+    gathered_dfs = pd.concat(gathered_dfs, ignore_index=True)
+    avg_metrics_gpus = gathered_dfs.mean(0)
+    pbar.set_postfix(info)
+    if not training_loop and DEBUG == False:
+      # Flush the metrics into a logfile 
+      with open("logs/metrics.json", mode='w' if epoch == 1 else 'a', encoding='utf-8') as logfile:
+        json.dump(avg_metrics_gpus.to_dict(into=OrderedDict), logfile)
+        logfile.write("\n") # Ensure each JSON object is on a separate line
+        logfile.flush()      # Flush the buffer to ensure data is written to disk
+        os.fsync(logfile.fileno())  # Force write to disk
+      
+    # Close progress bar 
     pbar.close()
-  
+  dist.barrier()
+
   torch.cuda.empty_cache()
 
   return epoch_batch_losses, learning_rates
@@ -193,8 +301,9 @@ def train(model, training_loader, validation_loader, hps) -> list:
   for epoch in range(1, epochs+1):
     if is_main_process():
       print(f"\nEpoch: [{epoch}/{epochs}]")
-      with open("logs/losses.log", 'w' if epoch == 1 else 'a') as file:
-        file.write(f"Epoch: [{epoch}/{epochs}]\n")
+      if DEBUG == False:
+        with open("logs/losses.log", 'w' if epoch == 1 else 'a') as file:
+          file.write(f"Epoch: [{epoch}/{epochs}]\n")
 
     model.train()
     train_loss, _learning_rates = epoch_loop(dataloader=training_loader, desc=f"Training...", model=model, hps=hps, training_loop=True, epoch=epoch)
@@ -204,8 +313,9 @@ def train(model, training_loader, validation_loader, hps) -> list:
     _train_loss = np.mean(train_loss)
     if is_main_process():
       print(f"Training loss: {_train_loss}")
-      with open("logs/losses.log", 'a') as file:
-        file.write(f"Training loss: {_train_loss}\n")
+      if DEBUG == False:
+        with open("logs/losses.log", 'a') as file:
+          file.write(f"Training loss: {_train_loss}\n")
     
     # Save losses
     train_losses.append(_train_loss)
@@ -215,14 +325,15 @@ def train(model, training_loader, validation_loader, hps) -> list:
     model.eval()
     # Validation
     with torch.no_grad():
-      val_loss, _ = epoch_loop(dataloader=validation_loader, desc=f"Validation...", model=model, hps=hps, training_loop=False)
+      val_loss, _ = epoch_loop(dataloader=validation_loader, desc=f"Validation...", model=model, hps=hps, training_loop=False, epoch=epoch)
 
     # Get eval loss
     _val_loss = np.mean(val_loss)
     if is_main_process():
       print(f"Validation loss: {_val_loss}")
-      with open("logs/losses.log", 'a') as file:
-        file.write(f"Validation loss: {_val_loss}\n\n")
+      if DEBUG == False:
+        with open("logs/losses.log", 'a') as file:
+          file.write(f"Validation loss: {_val_loss}\n\n")
     
     # schedule the learning rate based on the model validation loss
     scheduler.step() if hps.deepspeed_kernel else scheduler.step(_val_loss)
@@ -279,8 +390,9 @@ def evaluate(model, testing_loader, hps) -> None:
   test_loss = np.mean(test_loss)
   if is_main_process():
     print(f"Testing loss: {test_loss}")
-    with open("logs/losses.log", 'a') as file:
-      file.write(f"Testing loss: {test_loss}\n")
+    if DEBUG == False:
+      with open("logs/losses.log", 'a') as file:
+        file.write(f"Testing loss: {test_loss}\n")
   
 
 def train_and_evaluate(model, training_loader, validation_loader, testing_loader, hps) -> None:
@@ -336,6 +448,7 @@ def main():
 
   # Initialize hyperparameters using custom AttrDict()
   hps = hyperparameters(args)
+  hps.debug = DEBUG
 
   # Create an api to communicate with huggingface hub
   hps.api = HfApi()
@@ -347,7 +460,7 @@ def main():
   hps.model_name = models_causal[hps.model_name] if hps.is_causal == True else models_seq2seq[hps.model_name]
 
   # Initialize the training environment based on the GPU availability and parallelization
-  initialize_training_environment(hps)
+  initialize_training_environment(hps, debug=DEBUG)
 
   # Model Loading
   model = load_model(hps)
