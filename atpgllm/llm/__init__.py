@@ -2,6 +2,9 @@ from .collate import *
 from .fine_tuning import *
 from .models import *
 from .tokenizer import *
+from .metrics import *
+from .fault_coverage_calc import *
+from .reward_funcs import *
 
 models = {
     "t5-small": "google/flan-t5-small",

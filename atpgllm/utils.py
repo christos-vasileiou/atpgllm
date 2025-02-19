@@ -1,4 +1,5 @@
 # Helper Functions
+import logging.handlers
 import torch
 import argparse
 import os
@@ -281,41 +282,53 @@ def seconds_to_dhms(seconds):
     return f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
 
 
-def setup_logging(rank):
+def setup_logging():
+  if not is_main_process():
+    return None
+
+  from logging.handlers import RotatingFileHandler
+  import uuid
   # Ensure the logs directory exists
   log_dir = 'logs'
-  if not os.path.exists(log_dir):
-    print(log_dir)
-    os.makedirs(log_dir, exist_ok=True)
+  os.makedirs(log_dir, exist_ok=True)
 
   # Create a logger
   logger = logging.getLogger(__name__)
-  logger.setLevel(logging.INFO)
-  
-  # Create a console handler and set level to info
-  #ch = logging.StreamHandler()
-  #ch.setLevel(logging.INFO)
-  #logger.addHandler(ch)
- 
-  # Check if the file exists and try different filenames if it does
-  base_filename = f"process_{rank}"
-  extension     = '.log'
-  counter       = 0
-  filename      = os.path.join(log_dir, f"{base_filename}_{counter}{extension}")
-  while os.path.exists(filename) and os.path.isfile(filename):
-    counter  += 1
-    filename  = os.path.join(log_dir, f"{base_filename}_{counter}{extension}")
-  # Create a file handler and set level to info
-  fh = logging.FileHandler(filename)
-  fh.setLevel(logging.INFO)
-  logger.addHandler(fh)
+  logger.setLevel(logging.DEBUG)
+  # Create a unique identifier for log files
+  unique_id = uuid.uuid4().hex[:8]
+
+  # create log filename
+  log_info_filename = os.path.join("logs", f"info.log")
+  log_debug_filename = os.path.join("logs", f"debug.log")
 
   # Create a formatter
   formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-  
-  # Add formatter to ch and fh
-  #ch.setFormatter(formatter)
-  fh.setFormatter(formatter)
+
+  # Create a file handlers
+  # Set INFO handler
+  info_fh = RotatingFileHandler(log_info_filename, maxBytes=10**6, backupCount=20, encoding="utf-8")
+  # Set Level
+  info_fh.setLevel(logging.INFO)
+  # Add formatter to file handlers
+  info_fh.setFormatter(formatter)
+  # Add handler into the logger
+  logger.addHandler(info_fh)
+
+  # Set DEBUG handler
+  debug_fh = RotatingFileHandler(log_debug_filename, maxBytes=10**6, backupCount=20, encoding="utf-8")
+  # Set Level
+  debug_fh.setLevel(logging.DEBUG)
+  # Add formatter to file handlers
+  debug_fh.setFormatter(formatter)
+  # Add handler into the logger
+  logger.addHandler(debug_fh)
+
+  console_handler = logging.StreamHandler()
+  console_handler.setLevel(logging.INFO)
+  console_handler.setFormatter(formatter)
+  logger.addHandler(console_handler)
+
   return logger
 
 
@@ -481,6 +494,7 @@ def parse_arguments(parser):
   parser.add_argument('--test_size', '--test-size', type=float, default=0.3, help='Test size. The test size is the ratio from the original dataset size')
   parser.add_argument('--dropout_p', '--dropout-p', type=float, default=0.1, help='Dropout probability')
   parser.add_argument('--model_name', '--model-name', '--model_checkpoint', '--model-checkpoint', '--load_checkpoint', '--load-checkpoint', type=str, default='llama-2', help='Based Model checkpoint for training.')
+  parser.add_argument('--revision', type=str, default='main', help='Set the commit hash of huggingface\'s repository to download and train. Huggingface repo is set by `--model-name`.')
   parser.add_argument('--save_model', '--save-model', type=str, default='llama-2-combin-atpg', help='Save the trained model')
   parser.add_argument('--is_causal', '--is-causal', action='store_true', help='Specify if the you want to have a causal model specified')  
   
@@ -508,12 +522,19 @@ def parse_arguments(parser):
   # GPU parallelization
   parser.add_argument('--parallel', action='store_true', help='Parallel training using Distributed Data Parallelization')  
   parser.add_argument('--deepspeed_kernel', '--deepspeed-kernel', action='store_true', help='Use DeepSpeed transformer kernel to accelerate. Should be used together with --parallel')
-  parser.add_argument('--fsdp', action='store_true', help='Use Use Fully Sharded Data Parallelization (FSDP). Should be used together with --parallel')
-  parser.add_argument('--local_rank', '--local-rank', type=int, default=-1, help='local rank passed from distributed launcher')
+  parser.add_argument('--fsdp', action='store_true', help='Fully Sharded Data Parallelization (FSDP). Should be enabled together with --parallel')
+  parser.add_argument('--local_rank', '--local-rank', type=int, default=-1, help='Local rank passed from distributed launcher')
 
   # Accelerator arguments used for ZeRO acceleration
   parser.add_argument('--zero_stage', '--zero-stage', type=int, default=2, help="Enable ZeRO memory optimizations, compatible with FP16/BF16/FP32 and the Adam Optimizer. zero_stage: Chooses different of ZeRO Optimizer. Stage 0, 1, 2, and 3 refer to disabled, optimizer, state partioning, and optimizer+gradient state partitioning, and optimizer+gradient+parameter partitioning, respectively.")
-  parser.add_argument('--seed', type=int, default=27, help="Set the seed for initialization of the accelerator used for ZeRO acceleration")
+  parser.add_argument('--seed', type=int, default=27, help="Seed for initialization of the accelerator used for ZeRO acceleration")
+
+  # GRPO-RL hyperparameters
+  parser.add_argument('--grpo_beta', '--beta', type=float, default=0.04, help="KL coefficient for Group Relative Policy Optimization (GRPO)")
+  parser.add_argument('--num_generations', '--num-generations', type=int, default=2, help="Number of generations per prompt to sample.")
+
+  # Weights and Biases
+  parser.add_argument('--wandb', action='store_true', help='Use Weights and Biases for logging')
 
   args = parser.parse_args()
   if args.deepspeed_kernel == True:
@@ -549,7 +570,7 @@ def get_patterns_criterion(hps):
   criterion = nn.CrossEntropyLoss(weight=weight, ignore_index=hps.tokenizer.pad_token_id if hps.is_causal else -100) 
   return criterion 
 
-def distibuted_env_init(hps):
+def distributed_env_init(hps):
   import datetime
   hps.rank             = int(os.environ['RANK'])
   hps.local_rank       = int(os.environ['LOCAL_RANK'])
@@ -583,7 +604,7 @@ def accelerator_init(hps):
   set_seed(hps.seed)
   return accelerator
 
-def initialize_training_environment(hps, debug=False):
+def initialize_training_environment(hps):
   hps.info = ''
   # Verify the training type has been set
   verify_training_type(hps)
@@ -595,18 +616,57 @@ def initialize_training_environment(hps, debug=False):
       # Initialize the distributed environment to apply:
       # 1. Distributed Data Parallel (DDP)
       # 2. Fully Sharded Data Parallelization (FSDP)
-      distibuted_env_init(hps)
+      distributed_env_init(hps)
   else:
     # Initialize single GPU/CPU
     hps.device = torch.device(f'cuda:{hps.free_gpu_id}' if torch.cuda.is_available() else 'cpu')
+    hps.local_rank = hps.free_gpu_id
+    hps.world_size = 1
     hps.info += f'Free detected GPU: {hps.device}\n' if torch.cuda.is_available() else 'No GPU is detected'
-    print(f"Accumulated gradient steps: {hps.gradient_accumulation_steps}")
+    hps.logger.info(f"Accumulated gradient steps: {hps.gradient_accumulation_steps}")
 
-  if debug==False:
-    if is_main_process():
-      if os.path.exists("logs"):
-        shutil.rmtree('logs')
-      os.makedirs('logs')
+
+def get_trainable_parameters(model):
+  """
+  Get trainable parameters based on what we want to train.
+  
+  Args:
+      model: The model containing the parameters
+  
+  Returns:
+      List of parameter dictionaries with name and params
+  """
+  trainable_params = []
+  base_model = model.module if hasattr(model, "module") else model
+  
+  # Group parameters by type
+  for name, param in base_model.named_parameters():
+    # Skip frozen parameters
+    if not param.requires_grad:
+      continue
+        
+    # Handle embeddings
+    if "embed" in name:
+      trainable_params.append({
+          "name": f"embeddings: {name}",
+          "params": param,
+          "lr": 1e-5  # Lower learning rate for embeddings
+      })
+    # Handle LoRA parameters
+    elif any(adapter in name for adapter in ["lora", "adapter"]):
+      trainable_params.append({
+          "name": f"lora: {name}",
+          "params": param,
+          "lr": 1e-4  # Higher learning rate for LoRA
+      })
+    # Handle output head
+    elif "head" in name or "output" in name:
+      trainable_params.append({
+          "name": f"head: {name}",
+          "params": param,
+          "lr": 5e-5  # Medium learning rate for head
+      })
+  return trainable_params
 
 def prepare_objects_for_training(model, dataset, hps):
   from torch.optim import AdamW
@@ -618,18 +678,10 @@ def prepare_objects_for_training(model, dataset, hps):
   from accelerate import DistributedType
   from transformers import get_constant_schedule_with_warmup, get_inverse_sqrt_schedule, get_cosine_schedule_with_warmup, get_cosine_with_hard_restarts_schedule_with_warmup
   from torchinfo import summary
+  from functools import partial
+  import multiprocessing as mp
   import math
   import sys
-
-  # Functions prints the model summary
-  if hps.use_4bit or hps.use_8bit or hps.fsdp:
-    print_summary = lambda x: ''
-  else:
-    if hps.parallel:
-      pass
-      # print_summary = lambda x: str(summary(x, input_size=(1, 1024), dtypes=['torch.cuda.IntTensor'], device=f'cuda:{hps.local_rank}', depth=4, col_names=['output_size', 'num_params', 'params_percent', 'mult_adds']))
-    else:
-      print_summary = lambda x: str(summary(x, input_size=(1, 1024), dtypes=['torch.cuda.IntTensor'], device=f'cuda:{hps.free_gpu_id}', depth=3, col_names=['output_size', 'num_params', 'params_percent', 'mult_adds']))
 
   # Set the distributed systems if necessary
   if hps.parallel==True:
@@ -645,12 +697,8 @@ def prepare_objects_for_training(model, dataset, hps):
       if hps.accelerator.is_local_main_process:
         hps.info += f"{tokenized_dataset}\n" + \
                     f"{model}\n"
-                    # f"{print_summary(model)}\n" + \
-        print(f"{hps.info}")
-        if hps.debug == False:
-          with open("logs/train_env.log", 'w') as file:
-            file.write(hps.info)
-        
+        hps.logger.info(f"\n{hps.info}")
+
       # Creates Dummy Optimizer if `optimizer` was spcified in the config file else creates Adam Optimizer
       optimizer_cls = (
           torch.optim.AdamW
@@ -668,26 +716,25 @@ def prepare_objects_for_training(model, dataset, hps):
       if hps.accelerator.state.deepspeed_plugin is not None:
           hps.gradient_accumulation_steps = hps.accelerator.state.deepspeed_plugin.deepspeed_config["gradient_accumulation_steps"]
     elif not hps.deepspeed_kernel: 
-      # 1. Distributed Data Parallel (DDP)
-      # 2. Fully Sharded Data Parallelization (FSDP)
-      os.environ["NCCL_TIMEOUT"] = "1200"
+      # Initialize the distributed environment to apply in NCCL:
+      os.environ["NCCL_TIMEOUT"] = "3000"
       # os.environ["NCCL_DEBUG"] = "INFO"
       # os.environ["NCCL_DEBUG_SUBSYS"] = "ALL"
 
+      # 1. Distributed Data Parallel (DDP)
+      # 2. Fully Sharded Data Parallelization (FSDP)
+
       # Tokenize the dataset
       # tokenized_dataset = dataset.map(tokenize_fn, batched=True, num_proc=16, load_from_cache_file=True, remove_columns=['text'], fn_kwargs={'tokenizer': hps.tokenizer, 'is_causal': hps.is_causal})
-      # import code; code.interact(local=locals())
       tokenized_dataset = dataset
       hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora)
       
       model = model.to(hps.local_rank) if sys.argv[0] != 'sft.py' else model
       if hps.fsdp:
-        # import code; code.interact(local=locals())
-        import functools
         total_model_parameters = sum(p.numel() for p in model.parameters())
         num_params_per_gpu = (total_model_parameters // torch.cuda.device_count())
         # num_params_per_gpu *= 1.00_01 # add a minute number of extra parameters (+00.01%)
-        my_auto_wrap_policy = functools.partial(
+        my_auto_wrap_policy = partial(
           size_based_auto_wrap_policy, min_num_params=int(num_params_per_gpu)
         )
         model = FSDP(model,
@@ -699,17 +746,15 @@ def prepare_objects_for_training(model, dataset, hps):
                     #  mixed_precision=MixedPrecision(param_dtype=model.dtype, reduce_dtype=model.dtype), # NOTE: important knobs tuning for mixed precision training
                 ) if sys.argv[0] != 'sft.py' else model
       else:
-        model = DDP(model, device_ids=[hps.local_rank], output_device=hps.local_rank) if sys.argv[0] != 'sft.py' else model
+        model = DDP(model, device_ids=[hps.local_rank], output_device=hps.local_rank, find_unused_parameters=False) if sys.argv[0] != 'sft.py' else model
+        # model.module = torch.compile(model.module, backend='inductor', fullgraph=True)
 
       # logger = setup_logging(local_rank)
       if is_main_process():
         hps.info += f"{tokenized_dataset}\n" + \
                     f"{model}\n"
-                    # f"{print_summary(model)}\n" + \
-        print(f"{hps.info}")
-        if hps.debug == False:
-          with open("logs/train_env.log", 'w') as file:
-            file.write(hps.info)
+        hps.logger.info(f"\n{hps.info}")
+        
   else:
     # Move the model to the GPU only if necessary
     if hps.use_4bit == False and hps.use_8bit == False:
@@ -721,31 +766,28 @@ def prepare_objects_for_training(model, dataset, hps):
     hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora)
     hps.info += f"{tokenized_dataset}\n" + \
                 f"{model}\n"
-                # f"{print_summary(model)}\n" + \
-    print(f"{hps.info}")
-    if hps.debug == False:
-      with open("logs/train_env.log", 'w') as file:
-        file.write(hps.info)
-
+    hps.logger.info(f"\n{hps.info}")
+    
   # Set the flags for distributed systems. Data samplers and Data Loaders
   use_sampler = hps.parallel==True and hps.deepspeed_kernel==False
   # Shuffle is handled by the sampler
   hps.shuffle = not use_sampler
-  
+
   if use_sampler:
     training_sampler   = DistributedSampler(tokenized_dataset['train'], rank=hps.local_rank, num_replicas=hps.local_world_size)
     validation_sampler = DistributedSampler(tokenized_dataset['validation'], rank=hps.local_rank, num_replicas=hps.local_world_size)
     testing_sampler    = DistributedSampler(tokenized_dataset['test'], rank=hps.local_rank, num_replicas=hps.local_world_size)
   else:
     training_sampler, validation_sampler, testing_sampler = None, None, None
-  
+
   # Create the Data Loaders
   training_loader   = DataLoader(dataset=tokenized_dataset['train'], batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=hps.collate_fn, sampler=training_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
   validation_loader = DataLoader(dataset=tokenized_dataset['validation'], batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=hps.collate_fn, sampler=validation_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
   testing_loader    = DataLoader(dataset=tokenized_dataset['test'], batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=hps.collate_fn, sampler=testing_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
-  
+
   if not hps.deepspeed_kernel:
     total_training_steps = (hps.epochs * len(training_loader)) // hps.gradient_accumulation_steps
+    # import code; code.interact(local=locals())
     hps.optimizer = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=AdamW, lr=hps.lr) if hps.parallel else AdamW(model.parameters(), lr=hps.lr) if sys.argv[0] != 'sft.py' else None
     if hps.new_tokens:
       # NOTE: schedulers are being tested
@@ -785,15 +827,12 @@ def prepare_objects_for_training(model, dataset, hps):
     num_update_steps_per_epoch = math.ceil(len(training_loader) / hps.gradient_accumulation_steps)
     hps.max_train_steps = hps.epochs * num_update_steps_per_epoch
     if hps.accelerator.is_local_main_process:
-      print(f"{model}")
+      hps.logger.info(f"{model}")
   
   # Set the loss functions
   hps.criterion = nn.CrossEntropyLoss(ignore_index=hps.tokenizer.pad_token_id if hps.is_causal else -100).to(hps.device)
   hps.patterns_criterion = get_patterns_criterion(hps)
   hps.accuracy = ATPGAccuracy(model, hps.tokenizer)
-
-  # model = torch.compile(model, mode='reduce-overhead')
-  # import code;code.interact(local=locals())
 
   return model, training_loader, validation_loader, testing_loader
 
@@ -952,21 +991,17 @@ def load_raw_dataset(data_file, test_size=.3):
   dataset = DatasetDict({'train': train_val_split['train'], 'validation': train_val_split['test'], 'test': train_test_split['test']})
   return dataset
 
-
 def sizeof_tensor(tensor):
   return tensor.element_size() * tensor.nelement()
 
-
 def calculate_memory(model=None, optimizer=None, ids=None, mask=None, targets=None):
-  total_memory = 0
-  
+  total_memory = 0  
   # Model parameters
   if model is not None:
     for param in model.parameters():
       total_memory += sizeof_tensor(param)
       if param.grad is not None and param.requires_grad == True:
         total_memory += sizeof_tensor(param.grad)
-  
   # Optimizer states
   if optimizer is not None:
     for v in optimizer.param_groups[0]['params']:
@@ -975,8 +1010,7 @@ def calculate_memory(model=None, optimizer=None, ids=None, mask=None, targets=No
       total_memory += sizeof_tensor(state_k)
       for k, v in state.items():
           if isinstance(v, torch.Tensor):
-            total_memory += sizeof_tensor(v)
-  
+            total_memory += sizeof_tensor(v)  
   # ids + mask + targets
   total_memory += sizeof_tensor(ids) if ids is not None else 0
   total_memory += sizeof_tensor(mask) if mask is not None else 0
@@ -986,6 +1020,7 @@ def calculate_memory(model=None, optimizer=None, ids=None, mask=None, targets=No
 
 
 def hyperparameters(args):
+  from huggingface_hub import HfApi
   from atpgllm import deepspeed_config
   deepspeed_config = AttrDict(deepspeed_config)
 
@@ -1012,6 +1047,7 @@ def hyperparameters(args):
   hps.bf16       = args.bf16
   hps.is_causal  = args.is_causal
   hps.lora       = args.lora 
+  hps.revision   = args.revision
   # tokenizer
   hps.tokenizer        = args.tokenizer
   hps.new_tokens       = args.new_tokens
@@ -1036,7 +1072,26 @@ def hyperparameters(args):
   hps.deepspeed_config = deepspeed_config if hps.deepspeed_kernel == True else None
   hps.seed     = args.seed
 
+  # GRPO
+  hps.grpo_beta = args.grpo_beta
+  hps.num_generations = args.num_generations
+
   hps.disable_tqdm = False
+
+  # Create an api to communicate with huggingface hub
+  hps.api = HfApi()
+
+  # Create a logger
+  hps.logger = setup_logging()
+
+  # Weights and Biases
+  hps.wandb = args.wandb
+
+  hps.log_dir = "logs"
+  os.makedirs(hps.log_dir, exist_ok=True)
+  hps.filename = "generated_text_embs_grpo.md"
+  hps.file_path = os.path.join(hps.log_dir, hps.filename)
+
   return hps
 
 
@@ -1140,7 +1195,7 @@ def load_model(hps: AttrDict) -> torch.nn.Module:
     hps.compute_dtype = getattr(torch, hps.bnb_4bit_compute_dtype)
     # Load the entire model on an available GPU
     hps.device_map = {"": 0 if torch.cuda.is_available() else 'cpu'}
-    print(hps.device_map)
+    hps.logger.info(hps.device_map)
     # Quantization
     hps.bnb_config = BitsAndBytesConfig(
       load_in_4bit=hps.use_4bit,
@@ -1167,7 +1222,7 @@ def load_model(hps: AttrDict) -> torch.nn.Module:
       hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map, # attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16
     )
   else:
-    model = AutoModelForCausalLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16, revision=hps.revision) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
     model = model.to(torch.bfloat16)
   
   if hps.lora:
@@ -1175,27 +1230,31 @@ def load_model(hps: AttrDict) -> torch.nn.Module:
       task_type=TaskType.CAUSAL_LM if hps.is_causal else TaskType.SEQ_2_SEQ_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout
     )
     if hasattr(model, "peft_config"): 
-      model = PeftModel(model, model.peft_config["default"]) 
-      model.to(torch.bfloat16) 
+      model = PeftModel.from_pretrained(model, hps.model_name, revision=hps.revision)  
     else:
       model = get_peft_model(model, hps.lora_config) 
+    model.to(torch.bfloat16) 
 
-    freeze_base_model_and_train_lora(model, train_embeddings=False, train_head=True) 
+    train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False) 
     hps.info += f"{model.print_trainable_parameters()}\n" 
 
   if hps.new_tokens:
-    train_tokens_embeddings_and_head(model)
+    train_layers(model, train_embeddings=True, train_head=True, train_lora=False, train_base_model=False)
+    # train_tokens_embeddings_and_head(model)
   else:
     if not hps.lora:
       for name, params in model.named_parameters():
-        params.requires_grad = True
+        if 'lm_head' in name:
+          params.requires_grad = True
+        else:
+          params.requires_grad = False
 
   hps.info += f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\n"
   hps.info += f"Trainable Model size: {convert_bytes(model_size_in_bytes(model))}\n"
 
   model.config.use_cache = False
   model.config.pretraining_tp = 1
-  torch.set_float32_matmul_precision('high')
+  torch.set_float32_matmul_precision('medium')
   return model
 
 def train_tokens_embeddings_and_head(model, trainable_layers=["embed_tokens", "lm_head"]):
@@ -1205,16 +1264,16 @@ def train_tokens_embeddings_and_head(model, trainable_layers=["embed_tokens", "l
     else:
       params.requires_grad = False
 
-def freeze_base_model_and_train_lora(model, train_embeddings=True, train_head=True):
+def train_layers(model, train_embeddings=False, train_head=False, train_lora=False, train_base_model=False):
   for name, param in model.named_parameters():
-    if 'lm_head' in name and train_head:
-      param.requires_grad = True  # Train head
-    elif 'embed_tokens' in name and train_embeddings:
-      param.requires_grad = True  # Train embeddings
+    if 'lm_head' in name:
+      param.requires_grad = train_head  # Train head
+    elif 'embed_tokens' in name:
+      param.requires_grad = train_embeddings  # Train embeddings
     elif 'lora' in name:
-      param.requires_grad = True  # Train LoRA layers
+      param.requires_grad = train_lora  # Train LoRA layers
     else:
-      param.requires_grad = False  # Freeze base model
+      param.requires_grad = train_base_model  # Freeze base model
 
 
 def load_tokenizer(model, hps:AttrDict):
@@ -1230,7 +1289,7 @@ def load_tokenizer(model, hps:AttrDict):
           Tokenizer object.
   """
   from atpgllm.tokenization import get_new_tokens
-  tokenizer = AutoTokenizer.from_pretrained(hps.model_name, model_max_length=hps.model_max_length, use_fast=False if hps.parallel else True)
+  tokenizer = AutoTokenizer.from_pretrained(hps.model_name, model_max_length=hps.model_max_length, use_fast=True if hps.parallel else False)
   tokenizer.pad_token = tokenizer.eos_token
   tokenizer.padding_side = "right"  # Fix weird overflow issue with fp16 training
   if not hps.is_causal:
@@ -1247,9 +1306,13 @@ def load_tokenizer(model, hps:AttrDict):
     hps.info += f"Tokenizer vocabulary: {len(tokenizer)}. New added tokens: {len(hps.added_new_tokens)}. "
     # Resize the Embeddings
     if len(hps.added_new_tokens) > 0:
+      prev_size_tokenizer = len(tokenizer)
       tokenizer.add_tokens(hps.added_new_tokens)
       hps.tokenizer = tokenizer
-      model.resize_token_embeddings(len(tokenizer))
+      # Initialize the new embeddings from a multivariate that has old embeddings' mean and covariance. As described in the article: https://nlp.stanford.edu/~johnhew/vocab-expansion.html.
+      # To disable this, use `mean_resizing=False`
+      model.resize_token_embeddings(len(tokenizer), mean_resizing=True)
+      # initialize_new_embeddings(model, prev_size_tokenizer)
       hps.info += f"New Tokenizer vocabulary: {len(tokenizer)}.\n"
     else:
       hps.tokenizer = tokenizer
@@ -1259,6 +1322,13 @@ def load_tokenizer(model, hps:AttrDict):
     hps.info += f"Tokenizer vocabulary: {len(tokenizer)}. New added tokens: 0\n"
   return model
 
+def initialize_new_embeddings(model, prev_size_tokenizer, noise_std=0.0001):
+  mean_embedding = model.model.embed_tokens.weight[:prev_size_tokenizer].mean(0)
+  new_added_tokens = model.model.embed_tokens.weight.shape[0] - prev_size_tokenizer
+  embedding_dim = model.model.embed_tokens.weight.shape[1]
+  with torch.no_grad():
+    random_noise = torch.randn(new_added_tokens, embedding_dim) * noise_std
+    model.model.embed_tokens.weight[prev_size_tokenizer:] = mean_embedding + random_noise
 
 def save_model(model, save_directory: str, push_to_hub: bool = True, **kwargs):
   """
@@ -1286,27 +1356,28 @@ def save_model(model, save_directory: str, push_to_hub: bool = True, **kwargs):
     if hps.deepspeed_kernel:
       if hps.accelerator.is_main_process:
         # push to the hub!
-        upload_model(model.module, save_directory, push_to_hub, hps)  
+        upload_model(model.module, save_directory, push_to_hub, **kwargs)  
       hps.accelerator.wait_for_everyone()
     elif not hps.deepspeed_kernel:
       if is_main_process():
         # push to the hub!
-        upload_model(model.module, save_directory, push_to_hub, hps)
+        upload_model(model.module, save_directory, push_to_hub, **kwargs)
       dist.barrier()
   else:
     # push to the hub!
-    upload_model(model, save_directory, push_to_hub, hps)
+    upload_model(model, save_directory, push_to_hub, **kwargs)
 
-def upload_model(model, save_directory, push_to_hub, hps):
+def upload_model(model, save_directory, push_to_hub, hps, **kwargs):
+  commit_message = kwargs.get('commit_message', "")
+  hps.api.upload_file(repo_id=hps.save_directory, path_or_fileobj=hps.file_path, path_in_repo=hps.filename, commit_message=f"Upload {hps.filename} before upload {commit_message}")
   if push_to_hub:
     print(save_directory)
     if hps.lora:
-      model.push_to_hub(save_directory, private=True)
-      model.base_model.model.push_to_hub(save_directory, private=True)
       hps.tokenizer.push_to_hub(save_directory, private=True)
+      model.base_model.model.push_to_hub(save_directory, private=True, safe_serialization=True, commit_message=commit_message)
     else:
-      model.push_to_hub(save_directory, private=True)
       hps.tokenizer.push_to_hub(save_directory, private=True)
+      model.push_to_hub(save_directory, private=True, safe_serialization=True, commit_message=commit_message)
 
 def is_main_process():
   return not dist.is_initialized() or dist.get_rank() == 0
@@ -1326,7 +1397,7 @@ def zero_grad_old_embeddings(model, tunable_ids = 32000):
       module.weight.grad[mask].zero_()
       return
 
-def infer(ddp_model, data_iterator, tokenizer, stop_token='[/INST]', model_max_length=4096, epoch=1, file_path='generated_text.txt'):
+def infer(ddp_model, dataloader, tokenizer, model_max_length=4096, epoch=1, file_path='generated_text.txt', parallel=False, new_file=True):
   """
   Creates a copy of the model, merges LoRA weights, and runs inference using token_ids.
   
@@ -1340,7 +1411,10 @@ def infer(ddp_model, data_iterator, tokenizer, stop_token='[/INST]', model_max_l
   Returns:
     None
   """
-
+  import itertools
+  # To achieve efficient completion set left padding. Left padding comes with user prompt cropping so that model generates the completion
+  dataloader.collate_fn.set_left_padding()
+  data_iterator = iter(itertools.cycle(dataloader))
   # Ensure we only do this on rank 0 (main process) to avoid redundant work on other GPUs
   if is_main_process():
     print(f"Generate text. Please wait...")
@@ -1350,58 +1424,36 @@ def infer(ddp_model, data_iterator, tokenizer, stop_token='[/INST]', model_max_l
     try:
       # Merge LoRA weights into the model
       # if hasattr(model_copy, 'merge_and_unload'):
-        # print("Merging LoRA weights into the model...")
-        # model_copy.merge_and_unload()
-      
+      # print("Merging LoRA weights into the model...")
+      # model_copy.merge_and_unload()
+
       # Don't use gradients
       ddp_model.eval()
-
-      # Token IDs for the stop token (e.g., [/INST])
-      stop_token_ids = tokenizer.encode(stop_token)[1:]
-
-      # Function to check if stop_token_ids is a subsequence of token_buffer
-      def find_stop_token_subsequence(buffer, stop_token_ids):
-        buffer_len = len(buffer)
-        stop_token_len = len(stop_token_ids)
-        # Check for subsequence
-        for i in range(buffer_len - stop_token_len + 1):
-          if buffer[i:i + stop_token_len] == stop_token_ids:
-            return i + stop_token_len  # Return the index after the stop_token sequence
-        return -1
       
       # Iterate over the data iterator and accumulate token_ids until the stop_token sequence is found
-      token_ids = next(data_iterator)["input_ids"][:2] # get 2 prompts from the micro_batch
+      data = next(data_iterator)
+
       # Open the file based on the epoch
-      mode = 'w' if epoch == 1 else 'a'
+      mode = 'w' if new_file else 'a'
       # Open the file in the specified mode
       with open(file_path, mode) as file:
         file.write(f"\n---\nEpoch: {epoch}\n\n---\n")
-        for i in range(token_ids.size(0)):
-          token_buffer = token_ids[i].tolist()  # Add token IDs to the buffer
-          
-          # Check if the stop_token_ids sequence is found
-          stop_token_pos = find_stop_token_subsequence(token_buffer, stop_token_ids)
-          if stop_token_pos != -1:
-            # Extract the tokens up to and including the stop token
-            prompt_token_ids = token_buffer[:stop_token_pos]
-            token_buffer = token_buffer[stop_token_pos:]  # Clear processed tokens
-            
-            # Convert to tensor and move to device
-            input_ids = torch.tensor([prompt_token_ids], device=original_device)
-            
-            # Generate text using the copied model
-            generated_ids = ddp_model.module.generate(input_ids, num_return_sequences=3, max_length=model_max_length)
-            
-            # Move tensors back to CPU to free up GPU memory
-            input_ids = input_ids.cpu()
-            generated_ids = generated_ids.cpu()
-            torch.cuda.empty_cache()
 
-            # Decode and flush the generated text to a file
-            generated_outputs = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-            for i, generated_output in enumerate(generated_outputs):
-              # postproc_generated_text = postprocess_generated_text(generated_output)
-              file.write(f"Generated Sample {i+1}:\n\n{generated_output}\n\n")
+        # Move to GPU
+        ids = data.input_ids[:2].to(original_device) # get 2 prompts from the micro_batch
+        mask = data.attention_mask[:2].to(original_device) # get 2 prompts from the micro_batch
+
+        # Generate completion
+        generate_model = ddp_model.module if hasattr(ddp_model, "module") else ddp_model 
+        generated_ids = generate_model.generate(input_ids=ids, attention_mask=mask, num_return_sequences=2, max_length=model_max_length, do_sample=True, temperature=0.6, top_p=0.95)
+            
+        torch.cuda.empty_cache()
+
+        # Decode and flush the generated text to a file
+        generated_outputs = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        for i, generated_output in enumerate(generated_outputs):
+          # postproc_generated_text = postprocess_generated_text(generated_output)
+          file.write(f"Generated Sample {i+1}:\n{generated_output}\n\n")
         file.write("-" * 80)
         file.write('\n\n')
     finally:
@@ -1413,8 +1465,9 @@ def infer(ddp_model, data_iterator, tokenizer, stop_token='[/INST]', model_max_l
 
       # After inference, move the original DDP-wrapped model back to its original device (e.g., GPU)
       print(f"Check {file_path} to estimate progress. Epoch {epoch} is completed.")
-  # Ensure all processes stay in sync
-  dist.barrier()
+  if parallel:
+    # Ensure all processes stay in sync
+    dist.barrier()
 
 # Function to postprocess the generated text
 def postprocess_generated_text(generated_text):
@@ -1451,3 +1504,23 @@ def align_tokens_length(tokenizer, x):
     x = torch.cat([F.pad(xx, (0, padding[i]), "constant", tokenizer.eos_token_id) for i, xx in enumerate(x)])
     return x
 
+
+def get_user_prompt(text_inputs, system_tag="<</SYS>>", instr_tag="[/INST]"):
+  prompts = []
+  for text_input in text_inputs:
+    if system_tag:
+      sys_split = text_input.split(system_tag)
+      if len(sys_split) > 2:
+        raise ValueError(f"There are multiple {system_tag}") 
+      sys_split = sys_split[1]
+    else:
+      sys_split = text_input
+    if instr_tag:
+      instr_split = sys_split.split(instr_tag)
+      if len(instr_split) > 2:
+        prompts.append(instr_tag.join(instr_split[:2]).strip())
+      else:
+        prompts.append(instr_split[0].strip())
+    else:
+      prompts.append(sys_split)
+  return prompts

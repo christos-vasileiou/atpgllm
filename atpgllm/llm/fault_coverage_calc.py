@@ -1,4 +1,5 @@
 from io import StringIO
+from typing import Union
 import pandas as pd
 import os
 import regex as re
@@ -47,16 +48,21 @@ def detect_and_get_input_output_vectors(quotes):
   vectors = quotes[vectors_idx]
   return vectors[:2]
 
-
-def fault_sim(input_vector, output_vector, fault, verilog_code, gate_func):
+def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], fault: str, verilog_code: str, gate_func: dict = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}, return_rewards: bool =False):
   """
   Simulates a fault in a digital circuit described by a Verilog code.
 
   Parameters:
-  input_vector (str): A string representing the input vector for the circuit. The values are separated by spaces.
-  output_vector (str): A string representing the expected output vector for the circuit. The values are separated by spaces.
+  input_vector (str, dict): Represents the input vector for the circuit. 
+                            - When it's a string the values are separated by spaces.
+                            - When it's a dictionary the values are either 0 or 1 and the keys are the input ports.
+  output_vector (str, dict): Represents the expected output vector for the circuit. 
+                             - When it's a string the values are separated by spaces.
+                             - When it's a dictionary the values are either 0 or 1 and the keys are the output ports.
   fault (str): A string representing the fault to be simulated. The fault is in the format "saX _Y_", where X is the fault value (0 or 1) and Y is the faulty net name.
   verilog_code (str): A string containing the Verilog code of the digital circuit.
+  gate_func (dict): A dictionary containing the logic functions for each gate type.
+  return_rewards (bool): A boolean indicating whether to return the rewards.
 
   Returns:
   DataFrame: A tuple containing two dictionaries:
@@ -77,6 +83,13 @@ def fault_sim(input_vector, output_vector, fault, verilog_code, gate_func):
   # Collect Primary Inputs and Primary Outputs of the model
   inputs = [net.strip() for match in inputs_nets.findall(verilog_code) for net in match.split(',')]
   outputs = [net.strip() for match in outputs_nets.findall(verilog_code) for net in match.split(',')]
+  
+  # Calculate rewards if input and output vectors have the correct length
+  if return_rewards:
+    rewards = {}
+    rewards["inputs_len_rew"] = 2*int(len(inputs) == len(input_vector))-1
+    rewards["outputs_len_rew"] = 2*int(len(outputs) == len(output_vector))-1
+
   # Get faulty value and faulty net
   faulty_value, faulty_net = next(iter(fault_value.findall(fault)))
   # keep track of fault path
@@ -84,8 +97,8 @@ def fault_sim(input_vector, output_vector, fault, verilog_code, gate_func):
 
   circuit = []
   # Map input and output nets to their values
-  test_ivector = {i:int(v) for i, v in zip(inputs, input_vector.split())}
-  test_ovector = {o:int(v) for o, v in zip(outputs, output_vector.split())}
+  test_ivector = input_vector.copy() if isinstance(input_vector, dict) else {i:int(v) for i, v in zip(inputs, input_vector.split())}
+  test_ovector = output_vector.copy() if isinstance(output_vector, dict) else {o:int(v) for o, v in zip(outputs, output_vector.split())}
   
   # Keep track of the circuit's inputs and outputs
   _inputs = inputs.copy()
@@ -119,7 +132,7 @@ def fault_sim(input_vector, output_vector, fault, verilog_code, gate_func):
     # gather ingredients
     circuit.append(ingredients)
     # get ingredients from circuit
-    gate_type, instance, output, *inputs = ingredients    
+    gate_type, instance, output, *inputs = ingredients
     inputs = inputs[0].split(', ')
     if fault_path[-1] in inputs:
       fault_path.append(output)
@@ -135,14 +148,19 @@ def fault_sim(input_vector, output_vector, fault, verilog_code, gate_func):
   simulation.columns = ["Good Machine", "Bad Machine", "PIs", "POs", "Fault Path"]
   simulation.sort_index(inplace=True)
 
+  # Check if the faulty net has been correctly identified
+  if return_rewards:
+    rewards["det_fault_rew"] = 2*int(simulation.loc[faulty_net, "Good Machine"] != simulation.loc[faulty_net, "Bad Machine"])-1
+    return simulation[["Good Machine", "Bad Machine"]], rewards
+
   return simulation
 
 
-def validate_generated_text(completion, eval_netlist, vector_re = re.compile(r'"([^"]*[\w\s_][^"]*)"'), postproc_re = re.compile(r'(_\d+_)'), fault_sim_re = re.compile(r'```(.*?)```', re.DOTALL), gate_func = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}):
+def validate_generated_text(completion, eval_netlist, quotes_re = re.compile(r'"([^"]*[\w\s_][^"]*)"'), postproc_re = re.compile(r'(_\d+_)'), fault_sim_re = re.compile(r'```(.*?)```', re.DOTALL), gate_func = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}):
   try:
     start_token = completion.find("[/INST]") + len("[/INST]")
     generated_text = completion[start_token:].strip()
-    quotes = vector_re.findall(completion)
+    quotes = quotes_re.findall(completion)
     # print(quotes)
     user_test_net, model_test_net = quotes[1:3]
     # print(f"Is the tested net the one that the user asked for? {user_test_net == model_test_net}")

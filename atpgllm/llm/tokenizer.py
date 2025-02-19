@@ -282,15 +282,19 @@ class ATPGTokenizer(object):
     return [1 if w in self.stoi.keys() else 0 for w in s]
 
 
-
-def tokenize_fn(batched, tokenizer, is_causal=True):
+def tokenize_fn(batched, tokenizer, is_causal=True, sft=False, rlft=False):
+  # assert sft ^ rlft == True, "You have to pick one of the two options: sft or rlft."
   if is_causal:
-    tokenized_inputs = tokenizer(batched['text'], truncation=True)
-    tokenized_inputs = {key: [input[1:] for input in inputs] for key, inputs in tokenized_inputs.items()}
-    tokenized_inputs['netlist'] = batched['netlist']
+    tokenized_inputs = tokenizer(batched['text'], 
+                                truncation=True, # truncates to the specified tokenizer's maximum length.
+                                padding=True, # add eos-special-tokens-id, i.e. the number 2. ID of '</s>'
+                                add_special_tokens=False, # do not add bos-special-token-id, i.e. the number 1. ID of '<s>'
+                                return_tensors='pt', # return PyTorch tensors.
+                                )
+    tokenized_inputs['netlist'] = batched['netlist']    
   else:
-    tokenized_inputs = tokenizer([b['prompts'] for b in batched['text']], truncation=True)
-    tokenized_labels = tokenizer([b['answers'] for b in batched['text']], truncation=True)
+    tokenized_inputs = tokenizer([b['prompts'] for b in batched['text']], truncation=True, padding=True, add_special_tokens=False, return_tensors='pt')
+    tokenized_labels = tokenizer([b['answers'] for b in batched['text']], truncation=True, padding=True, add_special_tokens=False, return_tensors='pt')
     tokenized_inputs['labels']  = tokenized_labels['input_ids']
     tokenized_inputs['netlist'] = batched['netlist']
   return tokenized_inputs

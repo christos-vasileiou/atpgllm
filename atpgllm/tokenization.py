@@ -20,13 +20,15 @@ def get_new_tokens(hps: AttrDict) -> List[str]:
   # raw_dataset = load_raw_dataset(hps.data_file)
 
   # this csv contains ALL generated netlists 
-  raw_dataset = load_raw_dataset(join(dirname(abspath(__file__)), "../../data/atpg_data_random_pis_v3.csv")) 
+  # raw_dataset = load_raw_dataset(join(dirname(abspath(__file__)), "../../data/atpg_data_random_pis_v3.csv")) 
+  raw_dataset = load_raw_dataset(hps.data_file)
+
   # compile patterns
   compiled_pattern = re.compile(NETLIST_PATTERN)
   compiled_net_pattern = re.compile(NET_PATTERN)
   # parse dataset -> Netlist
   tokens = set()
-  for netlist in raw_dataset['train']['netlist_only_gates']:
+  for netlist in raw_dataset['train']['netlist']:
     # split netlist in chunks of text by categories defined in regex pattern
     tokens = tokens.union(set(compiled_pattern.findall(netlist)))
   # parse dataset -> Patterns

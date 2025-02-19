@@ -1,9 +1,11 @@
 from typing import Dict, List, Any
 import torch
 import torch.nn.functional as F
+import multiprocessing as mp
 from atpgllm.utils import (
   length_less_than_model_max_len, 
-  patterns_contains_special_tokens, 
+  patterns_contains_special_tokens,
+  get_user_prompt, 
 )
 from .tokenizer import tokenize_fn
 from ..utils import AttrDict
@@ -16,13 +18,25 @@ class PinMemoryData(AttrDict):
     return self
 
 class MyCollate:
-  def __init__(self, tokenizer, is_causal=True, lora=False, sft=False):
+  def __init__(self, tokenizer, is_causal=True, lora=False):
     self.tokenizer = tokenizer
     self.is_causal = is_causal
     self.lora = lora
-    self.tokenize_fn = lambda x: tokenize_fn(x, tokenizer=tokenizer, is_causal=is_causal)
-    self.sft = sft
+    self.tokenize_fn = lambda x, t: tokenize_fn(x, tokenizer=t, is_causal=is_causal)
+    self.set_right_padding()
 
+  def set_right_padding(self):
+    self.right_padding = True # sft
+    self.left_padding = False # rlft
+    self.tokenizer.pad_token = self.tokenizer.eos_token
+    self.tokenizer.padding_side = 'right'
+
+  def set_left_padding(self):
+    self.right_padding = False # sft
+    self.left_padding = True   # rlft
+    self.tokenizer.pad_token = self.tokenizer.eos_token
+    self.tokenizer.padding_side = 'left'
+    
   def __call__(self, batch: List[Dict[str, Any]]):
     """
     Args:
@@ -31,85 +45,16 @@ class MyCollate:
     Returns:
         dict: a dictionary of collated samples
     """
-    if not self.sft:
-      keys = list(batch[0].keys())
-      # print(batch)
-      # for key in keys:
-      #   print(f"{key}:\n{batch[0][key]}")
-      if isinstance(batch[0], dict) and all([isinstance(batch[0][key], str) for key in keys]):
-        batch = {key: [item[key] for item in batch] for key in keys}
-        if self.is_causal:
-          batch = self.tokenize_fn(batch)
-          batch = [
-            {'netlist': netlist, 
-            'input_ids': ids, 
-            'attention_mask': mask}
-            for netlist, ids, mask in zip(batch['netlist'], batch['input_ids'], batch['attention_mask']) ]
-          # print(batch)
-        else:
-          batch = self.tokenize_fn(batch)
-          batch = [
-            {'netlist': netlist, 
-            'input_ids': ids, 
-            'attention_mask': mask,
-            'labels': labels}
-            for netlist, ids, mask, labels in zip(batch['netlist'], batch['input_ids'], batch['attention_mask'], batch['labels']) ]
-    return self.forward_if_causal(batch) if self.is_causal else self.forward_if_seq2seq(batch)
-
-  def forward_if_seq2seq(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-    """
-    Collate a batch of samples for sequence-to-sequence tasks.
-
-    Args:
-        batch (list): a list of samples to collate. list of dicts.
-
-    Returns:
-        dict: a dictionary of collated samples
-    """
-    collated_batch = {}
-    collect_netlists = True
-    for key in ['input_ids', 'attention_mask', 'labels']:
-      temp = []
-      max_size = 0
-      for item in batch:
-        temp.append(torch.tensor(item[key], dtype=torch.long))
-        max_size = max(max_size, temp[-1].size(-1))
-        if collect_netlists and 'netlist' in item.keys():
-          collated_batch.setdefault('netlist', list())
-          collated_batch['netlist'].append(item['netlist'])
-      collect_netlists = False
-      padded_batch = [F.pad(t, (0, max_size - t.size(-1)), "constant", self.tokenizer.pad_token_id if key == 'input_ids' else 0) for t in temp]
-      collated_batch[key] = torch.stack(padded_batch)
-    return PinMemoryData(collated_batch)
-
-  def forward_if_causal(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-    """
-    Collate a batch of samples for causal language modeling tasks.
-
-    Args:
-        batch (list): a list of samples to collate. list of dicts.
-
-    Returns:
-        dict: a dictionary of collated samples
-    """
-    collated_batch = {}
-    collect_netlists = True
-    for key in ['input_ids', 'attention_mask']:
-      temp = []
-      max_size = 0
-      for item in batch:
-        temp.append(torch.tensor(item[key], dtype=torch.long))
-        max_size = max(max_size, temp[-1].size(-1))
-        if collect_netlists and 'netlist' in item.keys():
-          collated_batch.setdefault('netlist', list())
-          collated_batch['netlist'].append(item['netlist'])
-      collect_netlists = False
-      padded_batch = [F.pad(t, (0, max_size - t.size(-1)), "constant", self.tokenizer.pad_token_id if key == 'input_ids' else 0) for t in temp]
-      collated_batch[key] = torch.stack(padded_batch)
-    if self.lora:
-      collated_batch['labels'] = collated_batch['input_ids']
-    
-    return PinMemoryData(collated_batch)
+    keys = list(batch[0].keys())
+    if self.right_padding:
+      # convert list of dicts to dict of lists
+      batch = {key: [item[key] for item in batch] for key in keys}
+    elif self.left_padding:
+      # convert list of dicts to dict of lists
+      batch = {key: [get_user_prompt([item[key]], system_tag=None, instr_tag="[/INST]")[0]+"[/INST]" if key == 'text' else item[key] for item in batch] for key in keys}
+    tokenized_batch = self.tokenize_fn(batch, self.tokenizer)
+    tokenized_batch = PinMemoryData(tokenized_batch)
+    return tokenized_batch
 
 
 class ATPGCollate:
