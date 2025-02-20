@@ -100,7 +100,6 @@ pure-eval==0.2.2
 py-cpuinfo==9.0.0
 pyarrow-hotfix==0.6
 pyasn1==0.5.1
-pygame==2.1.0
 pylev==1.4.0
 pynvml==11.5.0
 pyparsing==3.1.1

@@ -48,7 +48,7 @@ def main():
     
     # Then write the rest in dependency order
     for pkg in sorted_pkgs:
-      if pkg not in PRIORITY_PACKAGES and pkg != 'atpgllm':  # Skip if already written
+      if pkg not in PRIORITY_PACKAGES and pkg != 'atpgllm' and pkg != 'pygame':  # Skip if already written
         outfile.write(f"{pkg}=={versions[pkg]}\n")
 
 if __name__ == "__main__":
