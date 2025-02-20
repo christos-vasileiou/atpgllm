@@ -382,7 +382,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
   torch.cuda.empty_cache()
   gc.collect()
 
-  return loss, metrics
+  return loss, metrics, error_flag.item()
 
 def update_ref_adapter_ema(model, tau=0.05, ref_adapter_name="ref_adapter", grpo_adapter_name="grpo_adapter"):
   """
@@ -527,14 +527,16 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
       data = next(data_iterator)
 
       # Compute loss and get metrics
-      micro_batch_loss, micro_batch_metrics = compute_loss(
+      micro_batch_loss, micro_batch_metrics, error_flag = compute_loss(
           model=model,
           data=data,
           reward_funcs=reward_funcs,
           reward_kwargss=reward_kwargss,
           hps=hps
       )
-
+      if error_flag:
+        if is_main_process():
+          pbar.update(1)
       # Scale loss for gradient accumulation
       micro_batch_loss = micro_batch_loss / hps.gradient_accumulation_steps
       batch_loss += micro_batch_loss.item()
@@ -603,7 +605,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
     if hps.wandb:
       wandb.log({"rlft_complete_history": wandb.Table(dataframe=x)})
     print(tabulate(x, headers='keys', tablefmt='psql', showindex=False))
-  
+    pbar.close()
 
 def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # Fine-tune with Supevised Fine-Tuning (SFT)
