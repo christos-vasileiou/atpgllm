@@ -7,13 +7,13 @@
 - pip package manager
 
 ### Setup
-1. Clone the repository:
+1. **Clone the repository**
 ```bash
 git clone https://github.com/christos-vasileiou/atpgllm.git
 cd atpgllm
 ```
 
-2. Create and activate a virtual environment (recommended):
+2. **Create and Activate a Virtual Environment (Recommended)**
 ```bash
 python -m venv myenv
 source myenv/bin/activate  # On Linux/Mac
@@ -21,10 +21,34 @@ source myenv/bin/activate  # On Linux/Mac
 myenv\Scripts\activate  # On Windows
 ```
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt --use-pep517
-```
+3. **Install Dependencies**
+
+   The dependency management is split into two files:
+   
+   - **`requirements-core.txt`**:  
+     This file contains the core dependencies in a topologically sorted order. The order was computed by the helper script `pipdep_analysis.py`, which uses `pipdeptree` to generate a dependency graph and then applies a topological sort (using the `toposort` module) so that packages with no dependencies are listed first and packages that depend on others come later.
+     
+     If you ever want to regenerate this file (for example, after updating dependencies), run:
+     ```bash
+     python atpgllm/pipdep_analysis.py
+     ```
+     This script will overwrite `requirements-core.txt` with the newly computed, sorted dependency list.
+     
+   - **`requirements.txt`**:  
+     This file references `requirements-core.txt` using the `-r requirements-core.txt` directive and then installs the local package in editable mode with `-e .`. In other words, it installs all core dependencies (in the sorted order) and then installs your local copy so that changes made during development are immediately available.
+
+   To install the package and its dependencies, run:
+   ```bash
+   pip install -r requirements.txt --use-pep517
+   ```
+   This command first installs all packages listed in `requirements-core.txt` (in dependency order) and then installs your project locally (editable).
+
+### Summary
+- **`pipdep_analysis.py`**: Used to analyze and sort dependencies based on their relationships.
+- **`requirements-core.txt`**: Generated (or updated) by `pipdep_analysis.py`, contains the sorted core dependencies.
+- **`requirements.txt`**: Installs the sorted dependencies (via `-r requirements-core.txt`) and installs the local repository with `-e .`.
+
+By following these steps, your environment will first install your dependencies in the proper order and then install your local package, ensuring the correct dependency resolution.
 
 GOALS:
 
