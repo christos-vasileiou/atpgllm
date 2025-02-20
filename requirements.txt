@@ -1,14 +1,5 @@
-deepspeed
-datasets
-transformers
-peft
-accelerate
-bitsandbytes
-tqdm
-plotly
-scikit-learn
-argparse
-wandb
-opencv-python
-matplotlib
-trl
+# Install core dependencies
+-r requirements-core.txt
+
+# Install local package in editable mode
+-e .
