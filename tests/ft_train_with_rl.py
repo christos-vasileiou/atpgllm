@@ -575,12 +575,10 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
           metrics["step"].append(str(i+1))
           metrics["batch_loss"].append(smart_round(batch_loss))
           metrics["ref_update_step"].append(f"{ref_update_step}/{next_ref_update}")
-
           # Add averaged metrics
           for key in accumulated_metrics.keys():
             avg_value = sum(accumulated_metrics[key]) / len(accumulated_metrics[key])
             metrics[f"avg_{key}"].append(smart_round(avg_value))
-
           x = pd.DataFrame(metrics)
         
           if hps.wandb: 
@@ -591,10 +589,13 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
 
           # Show averaged metrics in progress bar
           pbar.set_postfix(x.loc[x.index[-1], ['batch', 'batch_loss', 'avg_per_token_loss', 'avg_per_token_kl', 'avg_reward', 'avg_reward_std', 'avg_cot_reward', 'avg_test_generation_reward']].to_dict())
-          pbar.update(1)
           if logging_step % logging_steps == 0:
             print(tabulate(x.loc[x.index[-logging_steps:], ['batch', 'batch_loss', 'avg_per_token_loss', 'avg_per_token_kl', 'avg_reward', 'avg_reward_std', 'avg_cot_reward', 'avg_test_generation_reward']], headers='keys', tablefmt='psql', showindex=False))
             logging_step = 0
+          logging_step += 1
+
+      if is_main_process():
+        pbar.update(1)
 
       if DEBUG and i>500:
         break
