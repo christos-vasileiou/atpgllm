@@ -2,6 +2,15 @@ import subprocess
 import json
 from toposort import toposort_flatten
 
+# Define packages that must be installed first
+PRIORITY_PACKAGES = {
+    'torch': '2.2.1',
+    'numpy': '1.26.4',
+    'setuptools': '50.3.2',
+    'wheel': '0.45.1',
+    'pip': '25.0.1'
+}
+
 def get_dependency_graph():
   output = subprocess.check_output(['pipdeptree', '--json-tree'])
   deps_list = json.loads(output)
@@ -12,7 +21,7 @@ def get_dependency_graph():
     name = node['package_name']
     versions[name] = node['installed_version']
     graph.setdefault(name, set())
-    for dep in node['dependencies']:
+    for dep in node.get('dependencies', []):
       graph[name].add(dep['package_name'])
       # Recursively process dependencies
       process_node(dep)
@@ -28,11 +37,19 @@ def get_toposort_order(graph):
 def main():
   graph, versions = get_dependency_graph()
   sorted_pkgs = get_toposort_order(graph)
+  
   # Write the sorted package list to 'requirements-core.txt'
   with open("requirements-core.txt", "w") as outfile:
+    # First write priority packages
+    for pkg, version in PRIORITY_PACKAGES.items():
+      if pkg in versions:
+        outfile.write(f"{pkg}=={versions[pkg]}\n")
+        sorted_pkgs.remove(pkg)  # Remove from main list to avoid duplicates
+    
+    # Then write the rest in dependency order
     for pkg in sorted_pkgs:
-      outfile.write(f"{pkg}=={versions[pkg]}\n")
-
+      if pkg not in PRIORITY_PACKAGES and pkg != 'atpgllm':  # Skip if already written
+        outfile.write(f"{pkg}=={versions[pkg]}\n")
 
 if __name__ == "__main__":
   main()
