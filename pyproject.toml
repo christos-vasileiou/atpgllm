@@ -11,7 +11,7 @@ authors = [
     { name = "christos-vasileiou", email = "chrivasileiou2@gmail.com" }
 ]
 requires-python = ">=3.9"
-# Add dependencies from requirements-core.txt
+# Dependencies will be read from setup.py
 dynamic = ["dependencies"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
@@ -26,5 +26,6 @@ Homepage = "https://github.com/christos-vasileiou/atpgllm"
 
 [tool.setuptools]
 packages = ["atpgllm"]
-# Tell setuptools to read dependencies from setup.py
-dynamic = {dependencies = true} 
+
+[tool.setuptools.dynamic]
+dependencies = {file = "requirements-core.txt"} 
