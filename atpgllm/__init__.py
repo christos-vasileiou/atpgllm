@@ -15,6 +15,7 @@ models_causal = {
   'llama-2-combin-atpg-lora': "chrivasileiou/LlamaModelForCausalLM-Combin-ATPG-LoRA",
   "llama-2-cot": "chrivasileiou/COTSimAwareATPG",
   'test-model': "chrivasileiou/TestModel",
+  'test-model-v2': "chrivasileiou/TestModel-2",
   'codegemma-2b': "google/codegemma-2b",
   'codegemma-7b': "google/codegemma-7b-it",
 }
@@ -25,8 +26,10 @@ models_seq2seq = {
   't5-xl': "google-t5/t5-3b",
 }
 
+current_dir = os.path.dirname(os.path.dirname(__file__))
+config_path = os.path.join(current_dir, "atpgllm", "deepspeed_config.json")
 
-with open("/proj/trela/christos/transformers_atpg/libatpgllm/tests/deepspeed_config.json", 'r') as f:
+with open(config_path, 'r') as f:
   deepspeed_config = json.load(f)
 
 _system_prompts = [
