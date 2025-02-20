@@ -1,5 +1,31 @@
 # atpgllm
 
+## Installation
+
+### Requirements
+- Python 3.9 or higher
+- pip package manager
+
+### Setup
+1. Clone the repository:
+```bash
+git clone https://github.com/christos-vasileiou/atpgllm.git
+cd atpgllm
+```
+
+2. Create and activate a virtual environment (recommended):
+```bash
+python -m venv myenv
+source myenv/bin/activate  # On Linux/Mac
+# or
+myenv\Scripts\activate  # On Windows
+```
+
+3. Install dependencies:
+```bash
+pip install -r requirements.txt --use-pep517
+```
+
 GOALS:
 
 Large Language Model for Design Testing and Fault-Modeling:
