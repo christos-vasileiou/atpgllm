@@ -977,7 +977,9 @@ def load_raw_dataset(data_file, test_size=.3):
   """
   Load the dataset given at the data_file argument
   """
-  raw_dataset = load_dataset('csv', data_files=data_file)
+  from datasets import Features, Value
+  features = Features({'text': Value('string'), 'netlist': Value('string')})
+  raw_dataset = load_dataset('csv', data_files=data_file, features=features)
   if 'Unnamed: 0' in raw_dataset.column_names:
     raw_dataset = raw_dataset.remove_columns('Unnamed: 0')
   
