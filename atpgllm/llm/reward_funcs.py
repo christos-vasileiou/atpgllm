@@ -183,7 +183,7 @@ def cot_reward(prompts: list, completions: list, model: torch.nn.Sequential, cot
 
         # Compute the cosine similarity between the embeddings
         similarity = util.pytorch_cos_sim(embedding1, embedding2)
-        similarity_rewards.append(similarity.item()*5)
+        similarity_rewards.append(similarity.item())
     except (ValueError, UnboundLocalError):
       similarity_rewards.append(-1)
   return similarity_rewards
