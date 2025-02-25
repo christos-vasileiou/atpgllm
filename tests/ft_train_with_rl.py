@@ -10,6 +10,7 @@ import gc
 import pandas as pd
 import regex as re
 import multiprocessing as mp
+from peft import PeftModel
 from tqdm.auto import tqdm
 from tabulate import tabulate
 from collections import defaultdict
@@ -131,7 +132,7 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
           if hps.wandb: 
             # Log to wandb as both metrics and table
             wandb.log({
-                **{f"sft/{k}": metrics[k][-1] for k in metrics.keys()}
+                **{f"sft/{k}": float(metrics[k][-1]) for k in metrics.keys()}
             })
 
           pbar.set_postfix(x.iloc[-1].to_dict())
@@ -139,8 +140,8 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
             print(tabulate(x.iloc[-logging_steps:], headers='keys', tablefmt='psql', showindex=False))
             logging_step=0
           logging_step+=1
-        if DEBUG and i>100:
-          break
+      if DEBUG and i>10:
+        break
       
       if is_main_process():
         pbar.update(1)
@@ -149,6 +150,7 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
     x = pd.DataFrame(metrics)
     # Log final complete table
     if hps.wandb: 
+      x = x.astype(float)
       wandb.log({"sft_complete_history": wandb.Table(dataframe=x)})
     print(tabulate(x, headers='keys', tablefmt='psql', showindex=False))
 
@@ -300,7 +302,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     
     # Activate the reference adapter
     base_model.set_adapter("ref_adapter")
-    
+
     # Compute reference model log probabilities
     with torch.inference_mode():
       with unwrap_ddp(model) as unwrapped_model:
@@ -375,16 +377,17 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
   except torch.cuda.OutOfMemoryError as e:
     print(f"[{hps.local_rank}]: Out of memory error. Exiting training loop. Error is being handled by the training loop.\n{e}")
     error_flag.fill_(1)
-    dist.broadcast(error_flag, src=hps.local_rank)
+    if hps.parallel:
+      dist.broadcast(error_flag, src=hps.local_rank)
     # Return a zero loss to avoid breaking the training loop
-    loss = torch.tensor(0, device=hps.device)
+    loss = torch.tensor(0, device=hps.device, requires_grad=False)
 
   torch.cuda.empty_cache()
   gc.collect()
 
   return loss, metrics, error_flag.item()
 
-def update_ref_adapter_ema(model, tau=0.05, ref_adapter_name="ref_adapter", grpo_adapter_name="grpo_adapter"):
+def update_ref_adapter_ema(model, tau=0.1, ref_adapter_name="ref_adapter", grpo_adapter_name="grpo_adapter"):
   """
   Performs an exponential moving average (EMA) update of the reference adapter weights.
   The reference adapter is updated using the weights from the GRPO adapter.
@@ -393,7 +396,7 @@ def update_ref_adapter_ema(model, tau=0.05, ref_adapter_name="ref_adapter", grpo
   
   Args:
       model: The model containing both adapters
-      tau: The EMA decay rate (default: 0.05)
+      tau: The EMA decay rate (default: 0.1)
       ref_adapter_name: Name of the reference adapter to update
       grpo_adapter_name: Name of the source GRPO adapter
   """
@@ -502,8 +505,8 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
   # Parameters for dynamic reference adapter updates
   updates_per_epoch = len(dataloader) // hps.gradient_accumulation_steps
   total_updates = hps.epochs * updates_per_epoch  # Total updates across all epochs
-  initial_ref_update_freq = 10  # Update every 10 gradient steps at start
-  final_ref_update_freq = 1     # Update every gradient step at end
+  initial_ref_update_freq = hps.initial_ref_update_freq  # Update every 10 gradient steps at start
+  final_ref_update_freq = hps.final_ref_update_freq      # Update every gradient step at end
   
   ref_update_step = 0  # Counter for actual parameter updates across all epochs
   next_ref_update = get_ref_update_freq(0, total_updates, initial_ref_update_freq, final_ref_update_freq)  # Steps until next ref update
@@ -522,6 +525,8 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         accumulated_metrics.clear()
         # zero the parameter gradients
         optimizer.zero_grad()
+        # Count skipped micro batches due to OOM error
+        count_skip_micro_batch = 0
 
       # Get next data
       data = next(data_iterator)
@@ -537,8 +542,10 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
       if error_flag:
         if is_main_process():
           pbar.update(1)
+        count_skip_micro_batch += 1
+        continue
       # Scale loss for gradient accumulation
-      micro_batch_loss = micro_batch_loss / hps.gradient_accumulation_steps
+      micro_batch_loss = micro_batch_loss / (hps.gradient_accumulation_steps-count_skip_micro_batch)
       batch_loss += micro_batch_loss.item()
       # Accumulate metrics for each micro-batch
       for key, value in micro_batch_metrics.items():
@@ -584,7 +591,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
           if hps.wandb: 
             # Log to wandb as both metrics and table
             wandb.log({
-                **{f"rlft/{k}": metrics[k][-1] for k in metrics.keys()},
+                **{f"rlft/{k}": float(metrics[k][-1]) for k in metrics.keys()},
             })
 
           # Show averaged metrics in progress bar
@@ -604,6 +611,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
     x = pd.DataFrame(metrics)
     # Log final complete table
     if hps.wandb:
+      x = x.astype(float)
       wandb.log({"rlft_complete_history": wandb.Table(dataframe=x)})
     print(tabulate(x, headers='keys', tablefmt='psql', showindex=False))
     pbar.close()
@@ -619,28 +627,37 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
     infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
     save_model(model, hps.save_directory, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="New model trained with new embeddings")
 
-  # Add adapter (LoRA matrices) 
-  base_model = model.module if hasattr(model, "module") and hps.parallel else model
-  # Check if the base model has the 'peft_config' attribute to determine if LoRA configuration needs to be set
-  if not hasattr(base_model, 'peft_config'):
-    # Set LoRA configuration: LoRA (Low-Rank Adaptation) is used to efficiently fine-tune large models by adding low-rank matrices to the model's weights.
-    hps.lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM if hps.is_causal else TaskType.SEQ_2_SEQ_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout)
-    peft_model = get_peft_model(base_model, hps.lora_config, adapter_name="ref_adapter")
-  else:
-    peft_model = model.module if hasattr(model, "module") and hps.parallel else model # TODO: Check if this is correct
+  hps.lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM if hps.is_causal else TaskType.SEQ_2_SEQ_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout)
+  if not hps.adapter_name or not hps.adapter_repo:
+    # Add adapter (LoRA matrices) 
+    base_model = model.module if hasattr(model, "module") and hps.parallel else model
+    # Check if the base model has the 'peft_config' attribute to determine if LoRA configuration needs to be set
+    if not hasattr(base_model, 'peft_config'):
+      # Set LoRA configuration: LoRA (Low-Rank Adaptation) is used to efficiently fine-tune large models by adding low-rank matrices to the model's weights.
+      peft_model = get_peft_model(base_model, hps.lora_config, adapter_name="ref_adapter")
+    else:
+      # TODO: Check if this is correct
+      peft_model = model.module if hasattr(model, "module") and hps.parallel else model 
 
-  if is_main_process():
-    print(f"Applying LoRA to the model...")
-  # Activate the newly added LoRA adapter to use the LoRA weights during training
-  if hps.parallel:
-    model = apply_lora_distributed(model, peft_model, hps.lora_config, adapter_name="ref_adapter")
-  else:
-    model = apply_lora_non_distributed(model, peft_model, hps.lora_config, adapter_name="ref_adapter")
+    if is_main_process():
+      print(f"Applying LoRA to the model...")
+    # Activate the newly added LoRA adapter to use the LoRA weights during training
+    if hps.parallel:
+      model = apply_lora_distributed(model, peft_model, hps.lora_config, adapter_name="ref_adapter")
+    else:
+      model = apply_lora_non_distributed(model, peft_model, hps.lora_config, adapter_name="ref_adapter")
+    # Load the adapter
+  elif hps.adapter_name and hps.adapter_repo:
+    if hps.parallel:
+      model.module = PeftModel.from_pretrained(model.module, hps.adapter_repo, subfolder=hps.adapter_name, adapter_name=hps.adapter_name).to(torch.bfloat16)
+    else:
+      model = PeftModel.from_pretrained(model, hps.adapter_repo, subfolder=hps.adapter_name, adapter_name=hps.adapter_name).to(torch.bfloat16)
+
   # Set find_unused_parameters to True to avoid OOM error
   model.find_unused_parameters = True
 
-  # Configure which parts of the model to train
-  train_layers(model, train_embeddings=False, train_head=False, train_lora=True, train_base_model=False)
+  # Configure which parts of the model to train in step 2
+  train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False)
 
   # Get trainable parameters with their specific learning rates
   # trainable_params = get_trainable_parameters(model)
@@ -661,16 +678,20 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # Calculate the total number of training steps
   total_training_steps = (hps.epochs * len(dataloader)) // hps.gradient_accumulation_steps
   # Set up the learning rate scheduler. Uses a cosine schedule with warmup
-  hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=100, num_training_steps=total_training_steps, num_cycles=3/20)
+  hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20)
   if is_main_process():
     print(f"{model}\nSFT embedding, lora and head:\nModel training parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}\n")
 
-  # 2. Train adapter (LoRA weights) as well
-  sft(dataloader, model, hps, desc="SFT Lora Training...", training_loop=training_loop) 
-  # Apply inference on some random samples of validation set
-  if not DEBUG:
-    infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=False)
-    save_model(model, hps.save_directory, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="New model trained with new embeddings and LoRA")
+  if hps.train_lora:
+    # 2. Train adapter (LoRA weights) as well
+    sft(dataloader, model, hps, desc="SFT Lora Training...", training_loop=training_loop) 
+    # Apply inference on some random samples of validation set
+    if not DEBUG:
+      infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=False)
+      save_model(model, hps.save_directory, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="New model trained with new embeddings and LoRA")
+
+  # Configure which parts of the model to train in step 3
+  train_layers(model, train_embeddings=False, train_head=False, train_lora=True, train_base_model=False)
 
   # Add GRPO adapter
   if hps.parallel:
@@ -688,11 +709,11 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # Replicate the sampler across all processes
   sampler = DistributedSampler(dataloader.sampler.dataset, rank=dataloader.sampler.rank, num_replicas=dataloader.sampler.num_replicas) if use_sampler else None  
 
-  # Adjust gradient accumulation steps. Ensure don't have OOM cuda error.
-  hps.gradient_accumulation_steps /= hps.num_generations*2
+  # Adjust gradient accumulation steps. GRPO is slower than SFT. lower the number of gradient accumulation steps.
+  hps.gradient_accumulation_steps = max(1, hps.gradient_accumulation_steps//hps.num_generations)
   hps.epochs = 1
   # Change batch size. Due to number of generations there might be OOM cuda error.
-  dataloader = DataLoader(dataset=dataloader.dataset, batch_size=dataloader.batch_size//hps.num_generations, shuffle=hps.shuffle, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)#, multiprocessing_context='fork', worker_init_fn=worker_init_fn)
+  dataloader = DataLoader(dataset=dataloader.dataset, batch_size=max(1, dataloader.batch_size//hps.num_generations), shuffle=hps.shuffle, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)#, multiprocessing_context='fork', worker_init_fn=worker_init_fn)
   torch.cuda.empty_cache()
   gc.collect()
 
@@ -716,10 +737,10 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False)
   # Calculate the total number of training steps
   total_training_steps = (hps.epochs * len(dataloader)) // hps.gradient_accumulation_steps
-  hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=100, num_training_steps=total_training_steps, num_cycles=3/20)
+  hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20)
 
   if is_main_process():
-    print(f"GRPO-RLFT train embedding, lora and head:\nTrainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}")
+    print(f"{model}\nGRPO-RLFT train embedding, lora and head:\nTrainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}")
   
   # 3, Fine-tune with Reinforcement Learning (RL)
   rlft(dataloader, model, hps, reward_funcs=[cot_reward, test_generation_reward], training_loop=training_loop)
@@ -744,6 +765,7 @@ def main():
 
   # Set the model name
   hps.model_name = models_causal[hps.model_name]
+  hps.adapter_repo = models_causal[hps.adapter_repo] if hps.adapter_repo else None
   hps.save_directory = models_causal[hps.save_model]
 
   # Initialize the W&B logger

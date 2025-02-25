@@ -230,33 +230,37 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
       try:
         # Format: Parse the simulation and convert it to a DataFrame
         pred_simulation = pd.read_csv(StringIO(pred_simulation), sep="\s{2,}")
-        reward += 2
+        reward += 1
         # print("1. Correct simulation format: 1")
 
         # Fault Detection: Check if the fault simulation trigger the requested fault
-        reward += 4*int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"]) - 2
+        r2 = int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
+        reward += r2
         # print(f"2. LLM Fault Simulation reward: {int(pred_simulation.loc[net, 'Good Machine'] != pred_simulation.loc[net, 'Bad Machine'])} ")
       except:
         # print(f"1-2. Wrong simulation format, reward:0\n{pred_simulation}")
         pred_simulation = None
-        reward = 0
+        reward = -1
 
     gate_func = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}
     if pred_input_vector and pred_expected_output and fault and net and netlist:
       try:
         fault_simulation, fault_sim_rewards = fault_sim(pred_input_vector, pred_expected_output, f"{fault} {net}", netlist, gate_func, return_rewards=True)
         # print(f"3. Fault Simulation Reward based on test input: {pred_input_vector}, expected output: {pred_expected_output}:\n{fault_sim_rewards}")
+        if isinstance(pred_simulation, pd.DataFrame) and isinstance(fault_simulation, pd.DataFrame):
+          reward += 5*int(pred_simulation.equals(fault_simulation))
 
         # if LLM simulation and actual simulation have same:
-        # r1=+1 input length
-        # r2=+1 output length 
-        # r3=+1/-1 triggered fault.
-        # r4=4*sum(r1,r2,r3)-2 if LLM simulation and actual simulation match 
+        # input length +1
+        # output length +1 
+        # triggered fault +1/-1 
+        # r4=sum(r) if LLM simulation and actual simulation match 
         r4 = sum(fault_sim_rewards.values())
-        reward += 4*r4-2*r4
+        reward += r4
         
-        # r5=+2/-2 if LLM simulation and actual simulation match 
-        reward += 4*int(fault_simulation.equals(pred_simulation))-2
+        # r5=+1 if LLM simulation and actual simulation match 
+        r5 = int(fault_simulation.equals(pred_simulation))
+        reward += r5
       except:
         # print(f"3. Wrong Fault Simulation, Reward:0")
         fault_simulation = None

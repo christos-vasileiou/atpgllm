@@ -87,8 +87,10 @@ def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], f
   # Calculate rewards if input and output vectors have the correct length
   if return_rewards:
     rewards = {}
-    rewards["inputs_len_rew"] = 2*int(len(inputs) == len(input_vector))-1
-    rewards["outputs_len_rew"] = 2*int(len(outputs) == len(output_vector))-1
+    rewards["inputs_len_rew"] = int(len(inputs) == len(input_vector.split(','))) if isinstance(input_vector, str) else int(len(inputs) == len(input_vector))
+    rewards["inputs_nets"]    = int(all(net.strip() in inputs for net_value in input_vector.split(',') for net, value, in [net_value.split(':')]))
+    rewards["outputs_len_rew"] = int(len(outputs) == len(output_vector.split(','))) if isinstance(output_vector, str) else int(len(outputs) == len(output_vector))
+    rewards["outputs_nets"]    = int(all(net.strip() in outputs for net_value in output_vector.split(',') for net, value, in [net_value.split(':')]))
 
   # Get faulty value and faulty net
   faulty_value, faulty_net = next(iter(fault_value.findall(fault)))
@@ -97,8 +99,8 @@ def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], f
 
   circuit = []
   # Map input and output nets to their values
-  test_ivector = input_vector.copy() if isinstance(input_vector, dict) else {i:int(v) for i, v in zip(inputs, input_vector.split())}
-  test_ovector = output_vector.copy() if isinstance(output_vector, dict) else {o:int(v) for o, v in zip(outputs, output_vector.split())}
+  test_ivector = input_vector.copy() if isinstance(input_vector, dict) else {net.strip():int(value.strip()) for net_value in input_vector.split(',') for net, value in [net_value.split(':')]}
+  test_ovector = output_vector.copy() if isinstance(output_vector, dict) else {net.strip():int(value.strip()) for net_value in output_vector.split(',') for net, value in [net_value.split(':')]}
   
   # Keep track of the circuit's inputs and outputs
   _inputs = inputs.copy()
@@ -126,7 +128,6 @@ def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], f
       continue
     if len(gate_ingredients.findall(line))==0:
       continue
-
     # get ingredients using the regex pattern
     ingredients = gate_ingredients.findall(line)[0]
     # gather ingredients

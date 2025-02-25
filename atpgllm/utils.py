@@ -536,6 +536,38 @@ def parse_arguments(parser):
   # Weights and Biases
   parser.add_argument('--wandb', action='store_true', help='Use Weights and Biases for logging')
 
+  # Add missing arguments for GRPO-RL training
+  parser.add_argument('--initial_ref_update_freq', '--initial-ref-update-freq', 
+                     type=int, default=1,
+                     help='Initial frequency for reference model updates')
+  
+  parser.add_argument('--final_ref_update_freq', '--final-ref-update-freq',
+                     type=int, default=1,
+                     help='Final frequency for reference model updates')
+  
+  parser.add_argument('--grpo_tau', '--grpo-tau',
+                     type=float, default=0.05,
+                     help='EMA coefficient for reference model updates')
+
+  # Add adapter loading arguments
+  parser.add_argument('--adapter_name', '--adapter-name',
+                     type=str, default=None,
+                     help='Name of the adapter to load')
+  
+  parser.add_argument('--adapter_repo', '--adapter-repo',
+                     type=str, default=None,
+                     help='Repository containing the adapter to load')
+
+  # Add train_lora flag
+  parser.add_argument('--train_lora', '--train-lora',
+                     action='store_true',
+                     help='Whether to train LoRA layers during training')
+
+  # Add filename parameter
+  parser.add_argument('--filename', type=str, default=None,
+                     help='Custom filename for output files (logs, generated text, etc.)')
+
+  # Parse arguments
   args = parser.parse_args()
   if args.deepspeed_kernel == True:
     # parser = deepspeed.add_config_arguments(parser)
@@ -793,13 +825,13 @@ def prepare_objects_for_training(model, dataset, hps):
       # NOTE: schedulers are being tested
 
       # hps.scheduler = get_constant_schedule_with_warmup(hps.optimizer, num_warmup_steps=10)
-      hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=100, num_training_steps=total_training_steps, num_cycles=3/20)
+      hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20)
       # hps.scheduler = CosineAnnealingWarmRestarts(hps.optimizer, T_0=len(training_loader)//hps.batch_size, T_mult=1, eta_min=hps.lr*0.1, last_epoch=-1) if sys.argv[0] != 'sft.py' else None
       # hps.scheduler = get_inverse_sqrt_schedule(hps.optimizer, num_warmup_steps=total_training_steps*0.05, timescale=total_training_steps//2)
     else:
       # NOTE: schedulers are being tested
 
-      hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=100, num_training_steps=total_training_steps, num_cycles=3/20) if sys.argv[0] != 'sft.py' else None # when cosine scheduler is used, we need to set num_training_steps to 10 
+      hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20) if sys.argv[0] != 'sft.py' else None # when cosine scheduler is used, we need to set num_training_steps to 10 
       # hps.scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=5)
       # hps.scheduler = CosineAnnealingWarmRestarts(hps.optimizer, T_0=len(training_loader), T_mult=1, eta_min=hps.lr*0.1, last_epoch=-1)
       
@@ -1091,8 +1123,22 @@ def hyperparameters(args):
 
   hps.log_dir = "logs"
   os.makedirs(hps.log_dir, exist_ok=True)
-  hps.filename = "generated_text_embs_grpo.md"
+  
+  # Use custom filename if provided, otherwise use default
+  hps.filename = args.filename if args.filename is not None else "generated_text_embs_grpo.md"
   hps.file_path = os.path.join(hps.log_dir, hps.filename)
+
+  # Add missing GRPO-RL hyperparameters
+  hps.initial_ref_update_freq = args.initial_ref_update_freq
+  hps.final_ref_update_freq = args.final_ref_update_freq
+  hps.grpo_tau = args.grpo_tau
+
+  # Add adapter loading parameters
+  hps.adapter_name = args.adapter_name
+  hps.adapter_repo = args.adapter_repo
+
+  # Add train_lora flag
+  hps.train_lora = args.train_lora
 
   return hps
 
@@ -1231,10 +1277,7 @@ def load_model(hps: AttrDict) -> torch.nn.Module:
     hps.lora_config = LoraConfig(
       task_type=TaskType.CAUSAL_LM if hps.is_causal else TaskType.SEQ_2_SEQ_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout
     )
-    if hasattr(model, "peft_config"): 
-      model = PeftModel.from_pretrained(model, hps.model_name, revision=hps.revision)  
-    else:
-      model = get_peft_model(model, hps.lora_config) 
+    model = get_peft_model(model, hps.lora_config) 
     model.to(torch.bfloat16) 
 
     train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False) 
