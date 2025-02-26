@@ -282,15 +282,15 @@ def seconds_to_dhms(seconds):
     return f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
 
 
-def setup_logging():
+def setup_logging(hps: AttrDict):
   if not is_main_process():
     return None
 
   from logging.handlers import RotatingFileHandler
   import uuid
   # Ensure the logs directory exists
-  log_dir = 'logs'
-  os.makedirs(log_dir, exist_ok=True)
+  hps.log_dir = "logs"
+  os.makedirs(hps.log_dir, exist_ok=True)
 
   # Create a logger
   logger = logging.getLogger(__name__)
@@ -299,8 +299,8 @@ def setup_logging():
   unique_id = uuid.uuid4().hex[:8]
 
   # create log filename
-  log_info_filename = os.path.join("logs", f"info.log")
-  log_debug_filename = os.path.join("logs", f"debug.log")
+  log_info_filename = os.path.join(hps.log_dir, f"info.log")
+  log_debug_filename = os.path.join(hps.log_dir, f"debug.log")
 
   # Create a formatter
   formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -781,7 +781,6 @@ def prepare_objects_for_training(model, dataset, hps):
         model = DDP(model, device_ids=[hps.local_rank], output_device=hps.local_rank, find_unused_parameters=False) if sys.argv[0] != 'sft.py' else model
         # model.module = torch.compile(model.module, backend='inductor', fullgraph=True)
 
-      # logger = setup_logging(local_rank)
       if is_main_process():
         hps.info += f"{tokenized_dataset}\n" + \
                     f"{model}\n"
@@ -1115,14 +1114,11 @@ def hyperparameters(args):
   # Create an api to communicate with huggingface hub
   hps.api = HfApi()
 
-  # Create a logger
-  hps.logger = setup_logging()
-
   # Weights and Biases
   hps.wandb = args.wandb
 
-  hps.log_dir = "logs"
-  os.makedirs(hps.log_dir, exist_ok=True)
+  # Create a logger
+  hps.logger = setup_logging(hps)
   
   # Use custom filename if provided, otherwise use default
   hps.filename = args.filename if args.filename is not None else "generated_text_embs_grpo.md"
@@ -1407,22 +1403,88 @@ def save_model(model, save_directory: str, push_to_hub: bool = True, **kwargs):
       if is_main_process():
         # push to the hub!
         upload_model(model.module, save_directory, push_to_hub, **kwargs)
-      dist.barrier()
   else:
     # push to the hub!
     upload_model(model, save_directory, push_to_hub, **kwargs)
 
 def upload_model(model, save_directory, push_to_hub, hps, **kwargs):
+  """
+  Upload or save a model to the Hugging Face Hub or local directory.
+  
+  Args:
+      model: The model to be uploaded or saved
+      save_directory: Directory path where the model will be saved
+      push_to_hub: Boolean flag to determine if model should be pushed to HF Hub
+      hps: Hyperparameters object containing configuration settings
+      **kwargs: Additional keyword arguments
+          - commit_message: Custom commit message for Hub uploads
+          - delete_previous: Whether to delete previous local checkpoints
+  
+  Returns:
+      None
+  """
+  # Extract commit message from kwargs or use empty string as default
   commit_message = kwargs.get('commit_message', "")
-  hps.api.upload_file(repo_id=hps.save_directory, path_or_fileobj=hps.file_path, path_in_repo=hps.filename, commit_message=f"Upload {hps.filename} before upload {commit_message}")
+  
+  # Push model to Hugging Face Hub if specified
   if push_to_hub:
-    print(save_directory)
+    # First upload the source file to the repository for reference
+    hps.api.upload_file(
+        repo_id=save_directory, 
+        path_or_fileobj=hps.file_path, 
+        path_in_repo=hps.filename, 
+        commit_message=f"Upload {hps.filename} before upload {commit_message}"
+    )
+
+    print(f"Pushing model to Hugging Face Hub: {save_directory}")
+    
+    # Handle differently based on whether we're using LoRA or not
     if hps.lora:
+      # For LoRA models, we need to push tokenizer and base model separately
       hps.tokenizer.push_to_hub(save_directory, private=True)
-      model.base_model.model.push_to_hub(save_directory, private=True, safe_serialization=True, commit_message=commit_message)
+      model.base_model.model.push_to_hub(
+          save_directory, 
+          private=True, 
+          safe_serialization=True,  # Use safetensors format
+          commit_message=commit_message
+      )
     else:
+      # For full models, push tokenizer and model
       hps.tokenizer.push_to_hub(save_directory, private=True)
-      model.push_to_hub(save_directory, private=True, safe_serialization=True, commit_message=commit_message)
+      model.push_to_hub(
+          save_directory, 
+          private=True, 
+          safe_serialization=True,  # Use safetensors format
+          commit_message=commit_message
+      )
+  else:
+    # Save model locally instead of pushing to Hub
+    print(f"Saving model locally to {save_directory}")
+    
+    # Check if we should delete previous checkpoints before saving
+    delete_previous = kwargs.get('delete_previous', False)
+    if delete_previous and os.path.exists(save_directory):
+      print(f"Deleting previous checkpoint at {save_directory}")
+      try:
+        # Remove the entire directory and recreate it
+        shutil.rmtree(save_directory)
+        os.makedirs(save_directory, exist_ok=True)
+        print(f"✅ Previous checkpoint deleted successfully")
+      except Exception as e:
+        print(f"⚠️ Error deleting previous checkpoint: {e}")
+    
+    # Save the model based on architecture type
+    if hps.lora:
+      # For LoRA models, save tokenizer and base model with adapters
+      hps.tokenizer.save_pretrained(save_directory)
+      model.base_model.model.save_pretrained(save_directory, safe_serialization=True)
+    else:
+      # For full models, save tokenizer and complete model
+      hps.tokenizer.save_pretrained(save_directory)
+      model.save_pretrained(save_directory, safe_serialization=True)
+    
+    print(f"✅ Model saved locally to {save_directory}")
+
 
 def is_main_process():
   return not dist.is_initialized() or dist.get_rank() == 0
@@ -1450,8 +1512,11 @@ def infer(ddp_model, dataloader, tokenizer, model_max_length=4096, epoch=1, file
     ddp_model: The DDP-wrapped model during training.
     data_iterator: An iterator that returns token_ids from the validation dataset.
     tokenizer: The tokenizer for the model.
-    device: The device (e.g., 'cuda' or 'cpu').
-    stop_token (str): The token marking the end of each instance, used for segmentation.
+    model_max_length: The maximum length of the generated text.
+    epoch: The current epoch number.
+    file_path: The path to the file where the generated text will be saved.
+    parallel: Whether to run inference in parallel.
+    new_file: Whether to create a new file for the generated text.
 
   Returns:
     None
@@ -1491,7 +1556,7 @@ def infer(ddp_model, dataloader, tokenizer, model_max_length=4096, epoch=1, file
         # Generate completion
         generate_model = ddp_model.module if hasattr(ddp_model, "module") else ddp_model 
         generated_ids = generate_model.generate(input_ids=ids, attention_mask=mask, num_return_sequences=2, max_length=model_max_length, do_sample=True, temperature=0.6, top_p=0.95)
-            
+        
         torch.cuda.empty_cache()
 
         # Decode and flush the generated text to a file
@@ -1501,6 +1566,8 @@ def infer(ddp_model, dataloader, tokenizer, model_max_length=4096, epoch=1, file
           file.write(f"Generated Sample {i+1}:\n{generated_output}\n\n")
         file.write("-" * 80)
         file.write('\n\n')
+    except Exception as e:
+      print(f"Error generating text: {e}")
     finally:
       # Empty cache
       torch.cuda.empty_cache()

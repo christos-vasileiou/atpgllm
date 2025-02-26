@@ -320,17 +320,17 @@ def train(model, training_loader, validation_loader, hps) -> list:
       continue
     
     hps.log_dir = "logs"
-    hps.save_directory = models_causal[hps.save_model]
+    hps.save_in_repo = models_causal[hps.save_model]
     hps.filename = "generated_text_lora.md" if hps.lora else "generated_text.md"
     hps.file_path = os.path.join(hps.log_dir, hps.filename)
     # print examples of trained model and in-memory model.
     infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=epoch, file_path=hps.file_path, parallel=hps.parallel)
 
     if is_main_process():
-      hps.api.upload_file(repo_id=hps.save_directory, path_or_fileobj=hps.file_path, path_in_repo=hps.filename)
+      hps.api.upload_file(repo_id=hps.save_in_repo, path_or_fileobj=hps.file_path, path_in_repo=hps.filename)
 
     # store model
-    save_model(model, hps.save_directory, push_to_hub=True, save_embedding_layers=True, hps=hps)
+    save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps)
 
       
   return train_losses, val_losses, batch_train_losses, learning_rates
@@ -383,13 +383,13 @@ def train_and_evaluate(model, training_loader, validation_loader, testing_loader
   if DEBUG:
     return 
 
-  save_directory = models_causal[hps.save_model]
+  save_in_repo = models_causal[hps.save_model]
 
   # Since the model is uploaded after validation
   # it doesn't make sense to update it again
 
   # # store model
-  # save_model(model, save_directory, push_to_hub=True, save_embedding_layers=True, hps=hps)
+  # save_model(model, save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps)
   
   if is_main_process():
     # Plot training and validation plots
@@ -397,7 +397,7 @@ def train_and_evaluate(model, training_loader, validation_loader, testing_loader
     filepath = f"logs/{filename}"
     plot_training_plots(train_losses, val_losses, batch_train_losses, learning_rates, filename=filepath, parallel=hps.parallel)
     # upload logs
-    hps.api.upload_file(repo_id=save_directory, path_or_fileobj=filepath, path_in_repo=filename)
+    hps.api.upload_file(repo_id=save_in_repo, path_or_fileobj=filepath, path_in_repo=filename)
   dist.barrier()
 
 def main():
@@ -440,20 +440,20 @@ def main():
   finally:
     if is_main_process():
       from logging.handlers import RotatingFileHandler
-      save_directory = models_causal[hps.save_model]
+      save_in_repo = models_causal[hps.save_model]
       # store model
       # if hps.debug == False:
-      #   save_model(model, save_directory, push_to_hub=True, save_embedding_layers=True, hps=hps)
+      #   save_model(model, save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps)
 
       # Save logs
       for handler in hps.logger.handlers:
         if isinstance(handler, RotatingFileHandler):
           handler.doRollover()
       # upload logs
-      hps.api.upload_file(repo_id=save_directory, path_or_fileobj=r"logs/info.log.1", path_in_repo="info.log")
-      hps.api.upload_file(repo_id=save_directory, path_or_fileobj=r"logs/losses.log", path_in_repo="losses.log")
-      hps.api.upload_file(repo_id=save_directory, path_or_fileobj=r"logs/metrics.json", path_in_repo="metrics.json")
-      # hps.api.upload_file(repo_id=save_directory, path_or_fileobj=r"logs/debug.log.1", path_in_repo="logs")
+      hps.api.upload_file(repo_id=save_in_repo, path_or_fileobj=r"logs/info.log.1", path_in_repo="info.log")
+      hps.api.upload_file(repo_id=save_in_repo, path_or_fileobj=r"logs/losses.log", path_in_repo="losses.log")
+      hps.api.upload_file(repo_id=save_in_repo, path_or_fileobj=r"logs/metrics.json", path_in_repo="metrics.json")
+      # hps.api.upload_file(repo_id=save_in_repo, path_or_fileobj=r"logs/debug.log.1", path_in_repo="logs")
 
   # Ends weights & bias recording
   # wandb.finish()

@@ -122,19 +122,19 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
             scheduler.step() if hps.deepspeed_kernel else scheduler.step(batch_loss)
 
       if (i+1) % hps.gradient_accumulation_steps == 0:
+        metrics["epoch"].append(str(epoch+1))
+        metrics["batch"].append(str(int(i//hps.gradient_accumulation_steps)+1))
+        metrics['step'].append(str(i+1))
+        metrics['batch_loss'].append(smart_round(batch_loss))
+        x = pd.DataFrame(metrics)
+
+        if hps.wandb: 
+          # Log to wandb as both metrics and table
+          wandb.log({
+              **{f"sft/{k}": float(eval(metrics[k][-1])) for k in metrics.keys()}
+          })
+
         if is_main_process():
-          metrics["epoch"].append(str(epoch+1))
-          metrics["batch"].append(str(int(i//hps.gradient_accumulation_steps)+1))
-          metrics['step'].append(str(i+1))
-          metrics['batch_loss'].append(smart_round(batch_loss))
-          x = pd.DataFrame(metrics)
-
-          if hps.wandb: 
-            # Log to wandb as both metrics and table
-            wandb.log({
-                **{f"sft/{k}": float(metrics[k][-1]) for k in metrics.keys()}
-            })
-
           pbar.set_postfix(x.iloc[-1].to_dict())
           if logging_step % logging_steps == 0:
             print(tabulate(x.iloc[-logging_steps:], headers='keys', tablefmt='psql', showindex=False))
@@ -146,14 +146,14 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
       if is_main_process():
         pbar.update(1)
     
+  x = pd.DataFrame(metrics)
+  # Log final complete table
+  if hps.wandb: 
+    x = x.astype(float)
+    wandb.log({"sft_complete_history": wandb.Table(dataframe=x)})
   if is_main_process():
-    x = pd.DataFrame(metrics)
-    # Log final complete table
-    if hps.wandb: 
-      x = x.astype(float)
-      wandb.log({"sft_complete_history": wandb.Table(dataframe=x)})
     print(tabulate(x, headers='keys', tablefmt='psql', showindex=False))
-
+    pbar.close()
 
 def parse_output_to_dict(output_str):
   sections = ["CHAIN_OF_THOUGHT", "SNAPSHOT", "INPUT_VECTOR", "EXPECTED_OUTPUT", "DETECTED_FAULTS"]
@@ -249,7 +249,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
       - metrics: Dictionary of metrics to log
   """
   device = hps.device
-  beta = hps.grpo_beta
+  grpo_beta = hps.grpo_beta
   num_generations = hps.num_generations
   tokenizer = hps.tokenizer
   
@@ -360,7 +360,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
 
     # Compute final loss
     per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
-    per_token_loss = -(per_token_loss - beta * per_token_kl)
+    per_token_loss = -(per_token_loss - grpo_beta * per_token_kl)
     loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
     # Add metrics
@@ -375,7 +375,8 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     for i, reward_func in enumerate(reward_funcs):
       metrics[f"{reward_func.__name__}"] = reward_per_func[i].item()
   except torch.cuda.OutOfMemoryError as e:
-    print(f"[{hps.local_rank}]: Out of memory error. Exiting training loop. Error is being handled by the training loop.\n{e}")
+    import traceback
+    print(f"[{hps.local_rank}]: Out of memory error. Exiting training loop. Error is being handled by the training loop.\n{traceback.print_exc()}\n{e}")
     error_flag.fill_(1)
     if hps.parallel:
       dist.broadcast(error_flag, src=hps.local_rank)
@@ -387,7 +388,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
 
   return loss, metrics, error_flag.item()
 
-def update_ref_adapter_ema(model, tau=0.1, ref_adapter_name="ref_adapter", grpo_adapter_name="grpo_adapter"):
+def update_ref_adapter_ema(model, tau=0.9, ref_adapter_name="ref_adapter", grpo_adapter_name="grpo_adapter"):
   """
   Performs an exponential moving average (EMA) update of the reference adapter weights.
   The reference adapter is updated using the weights from the GRPO adapter.
@@ -396,31 +397,43 @@ def update_ref_adapter_ema(model, tau=0.1, ref_adapter_name="ref_adapter", grpo_
   
   Args:
       model: The model containing both adapters
-      tau: The EMA decay rate (default: 0.1)
+      tau: The EMA decay rate (default: 0.9)
       ref_adapter_name: Name of the reference adapter to update
       grpo_adapter_name: Name of the source GRPO adapter
   """
   base_model = model.module if hasattr(model, "module") else model
   
-  # Keep track of GRPO parameters to match with reference
-  grpo_params = {}
+  # Process parameters layer by layer to minimize memory usage
+  # Map source parameter names to their corresponding target parameter names
+  param_mapping = {}
   
-  # First pass: collect all GRPO adapter parameters
-  for name, param in base_model.named_parameters():
+  # Build the mapping between GRPO and reference parameters
+  for name, _ in base_model.named_parameters():
     if grpo_adapter_name in name:
-      layer_key = '.'.join(name.split('.')[:-2])
-      grpo_params[layer_key] = param.data
+      ref_name = name.replace(grpo_adapter_name, ref_adapter_name)
+      param_mapping[name] = ref_name
   
-  # Second pass: update reference adapter parameters
-  for name, param in base_model.named_parameters():
-    if ref_adapter_name in name:
-      layer_key = '.'.join(name.split('.')[:-2])
-      if layer_key in grpo_params:
-        param.data.mul_(1 - tau).add_(grpo_params[layer_key], alpha=tau)
+  # Update parameters one by one without storing all in memory
+  for grpo_name, ref_name in param_mapping.items():
+    # Get parameters by name to avoid storing all parameters in memory
+    grpo_param = dict(base_model.named_parameters())[grpo_name]
+    ref_param = dict(base_model.named_parameters())[ref_name]
+    
+    # Apply EMA update directly: ref = (1-tau)*ref + tau*grpo
+    ref_param.data.mul_(1 - tau).add_(grpo_param.data, alpha=tau)
+    
+    # Free memory after each update
+    if len(param_mapping) > 10:  # Only clear cache periodically for large models
+      torch.cuda.empty_cache()
+  # Final cleanup
+  del param_mapping
+  torch.cuda.empty_cache()
+  gc.collect()
 
 def copy_adapter_weights(model, source_adapter_name="ref_adapter", target_adapter_name="grpo_adapter"):
   """
   Creates a hard copy of adapter weights from source adapter to target adapter.
+  Memory-optimized implementation that processes one layer at a time.
   
   Args:
       model: The model containing the adapters
@@ -429,22 +442,24 @@ def copy_adapter_weights(model, source_adapter_name="ref_adapter", target_adapte
   """
   base_model = model.module if hasattr(model, "module") else model
   
-  # Keep track of source parameters to match with target
-  source_params = {}
+  # Map source parameter names to their corresponding target parameter names
+  source_to_target_map = {}
   
-  # First pass: collect all source adapter parameters
-  for name, param in base_model.named_parameters():
+  # Build the mapping between source and target parameters
+  for name, _ in base_model.named_parameters():
     if source_adapter_name in name:
-      # Get the layer name without the adapter name
-      layer_key = '.'.join(name.split('.')[:-2])
-      source_params[layer_key] = param.data.clone()
-
-  # Second pass: copy parameters to target adapter
-  for name, param in base_model.named_parameters():
-    if target_adapter_name in name:
-      layer_key = '.'.join(name.split('.')[:-2])
-      if layer_key in source_params:
-        param.data.copy_(source_params[layer_key])
+      target_name = name.replace(source_adapter_name, target_adapter_name)
+      source_to_target_map[name] = target_name
+  
+  # Copy parameters directly without storing intermediate copies
+  for source_name, target_name in source_to_target_map.items():
+    # Get parameters by name to avoid storing all parameters in memory
+    source_param = dict(base_model.named_parameters())[source_name]
+    target_param = dict(base_model.named_parameters())[target_name]
+    # Copy data directly without creating additional clones
+    target_param.data.copy_(source_param.data)
+    # Free memory after each copy
+    torch.cuda.empty_cache()
   torch.cuda.empty_cache()
   gc.collect()
 
@@ -501,7 +516,9 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
   # Start training
   if is_main_process():
     print(f"Optimizer's step every: {hps.gradient_accumulation_steps}")
-
+  # Initialize best_avg_reward to a negative value
+  hps.best_avg_reward = -10.0
+  
   # Parameters for dynamic reference adapter updates
   updates_per_epoch = len(dataloader) // hps.gradient_accumulation_steps
   total_updates = hps.epochs * updates_per_epoch  # Total updates across all epochs
@@ -571,33 +588,52 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         
         if ref_update_step % next_ref_update == 0:
           # Update the reference adapter
-          update_ref_adapter_ema(model, tau=0.05)
+          update_ref_adapter_ema(model, tau=hps.grpo_tau)
           # Update the next reference update step
           next_ref_update = get_ref_update_freq(ref_update_step, total_updates)
 
-        if is_main_process():
-          # Log the metrics
-          metrics["epoch"].append(str(epoch+1))
-          metrics["batch"].append(str(int(i//hps.gradient_accumulation_steps)+1))
-          metrics["step"].append(str(i+1))
-          metrics["batch_loss"].append(smart_round(batch_loss))
-          metrics["ref_update_step"].append(f"{ref_update_step}/{next_ref_update}")
-          # Add averaged metrics
-          for key in accumulated_metrics.keys():
-            avg_value = sum(accumulated_metrics[key]) / len(accumulated_metrics[key])
-            metrics[f"avg_{key}"].append(smart_round(avg_value))
-          x = pd.DataFrame(metrics)
-        
-          if hps.wandb: 
-            # Log to wandb as both metrics and table
-            wandb.log({
-                **{f"rlft/{k}": float(metrics[k][-1]) for k in metrics.keys()},
-            })
+        # Log the metrics
+        metrics["epoch"].append(str(epoch+1))
+        metrics["batch"].append(str(int(i//hps.gradient_accumulation_steps)+1))
+        metrics["step"].append(str(i+1))
+        metrics["batch_loss"].append(smart_round(batch_loss))
+        metrics["ref_update_step"].append(f"{ref_update_step}/{next_ref_update}")
+        # Add averaged metrics
+        for key in accumulated_metrics.keys():
+          avg_value = sum(accumulated_metrics[key]) / len(accumulated_metrics[key])
+          metrics[f"avg_{key}"].append(smart_round(avg_value))
+        # Track and save the best model based on average reward
+        current_avg_reward = float(eval(metrics["avg_reward"][-1]))
 
+        # Save model when we get a new best average reward
+        if current_avg_reward > hps.best_avg_reward:
+          hps.best_avg_reward = current_avg_reward
+          metrics["best_avg_reward"].append(smart_round(hps.best_avg_reward))
+          if is_main_process():
+            print(f"\n🔥 New best average reward: {current_avg_reward:.4f}")
+          if not DEBUG:
+            best_model_path = os.path.join(hps.log_dir, "models", "best_reward_model", hps.save_in_repo.split("/")[-1])
+            best_model_file_path = os.path.join(best_model_path, hps.file_path.split("/")[-1])
+            os.makedirs(best_model_path, exist_ok=True)
+            infer(ddp_model=model, dataloader=dataloader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=best_model_file_path, parallel=hps.parallel, new_file=not os.path.exists(best_model_file_path))
+            save_model(model, best_model_path, push_to_hub=False, save_embedding_layers=True, hps=hps, delete_previous=True, commit_message=f"Best reward model with avg_reward={current_avg_reward:.4f}")
+            if is_main_process():
+              print(f"✅ Saved best model to {best_model_path}")        
+        else:
+          metrics["best_avg_reward"].append(smart_round(hps.best_avg_reward))
+
+        if hps.wandb: 
+          # Log to wandb as both metrics and table
+          wandb.log({
+              **{f"rlft/{k}": float(eval(metrics[k][-1])) for k in metrics.keys()},
+          })
+
+        if is_main_process():
+          x = pd.DataFrame(metrics)
           # Show averaged metrics in progress bar
-          pbar.set_postfix(x.loc[x.index[-1], ['batch', 'batch_loss', 'avg_per_token_loss', 'avg_per_token_kl', 'avg_reward', 'avg_reward_std', 'avg_cot_reward', 'avg_test_generation_reward']].to_dict())
+          pbar.set_postfix(x.loc[x.index[-1], ['batch', 'batch_loss', 'avg_per_token_loss', 'avg_per_token_kl', 'avg_reward', 'best_avg_reward']].to_dict())
           if logging_step % logging_steps == 0:
-            print(tabulate(x.loc[x.index[-logging_steps:], ['batch', 'batch_loss', 'avg_per_token_loss', 'avg_per_token_kl', 'avg_reward', 'avg_reward_std', 'avg_cot_reward', 'avg_test_generation_reward']], headers='keys', tablefmt='psql', showindex=False))
+            print(tabulate(x.loc[x.index[-logging_steps:], ['batch', 'batch_loss', 'avg_per_token_loss', 'avg_per_token_kl', 'avg_reward', 'avg_cot_reward', 'avg_test_generation_reward', 'best_avg_reward']], headers='keys', tablefmt='psql', showindex=False))
             logging_step = 0
           logging_step += 1
 
@@ -607,12 +643,12 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
       if DEBUG and i>500:
         break
 
+  x = pd.DataFrame(metrics)
+  # Log final complete table
+  if hps.wandb:
+    x = x.astype(float)
+    wandb.log({"rlft_complete_history": wandb.Table(dataframe=x)})
   if is_main_process():
-    x = pd.DataFrame(metrics)
-    # Log final complete table
-    if hps.wandb:
-      x = x.astype(float)
-      wandb.log({"rlft_complete_history": wandb.Table(dataframe=x)})
     print(tabulate(x, headers='keys', tablefmt='psql', showindex=False))
     pbar.close()
 
@@ -621,11 +657,10 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # 1. Train new embeddings tokens and head
   if hps.new_tokens:
     sft(dataloader, model, hps, desc="SFT Embeddings Training...", training_loop=training_loop)
-
-  # Apply inference on some random samples of validation set
-  if not DEBUG and hps.new_tokens:
-    infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
-    save_model(model, hps.save_directory, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="New model trained with new embeddings")
+    # Apply inference on some random samples of validation set
+    if not DEBUG:
+      infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
+      save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="Model trained with new embeddings")
 
   hps.lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM if hps.is_causal else TaskType.SEQ_2_SEQ_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout)
   if not hps.adapter_name or not hps.adapter_repo:
@@ -687,8 +722,8 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
     sft(dataloader, model, hps, desc="SFT Lora Training...", training_loop=training_loop) 
     # Apply inference on some random samples of validation set
     if not DEBUG:
-      infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=False)
-      save_model(model, hps.save_directory, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="New model trained with new embeddings and LoRA")
+      infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
+      save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="Model trained with LoRA")
 
   # Configure which parts of the model to train in step 3
   train_layers(model, train_embeddings=False, train_head=False, train_lora=True, train_base_model=False)
@@ -712,8 +747,12 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # Adjust gradient accumulation steps. GRPO is slower than SFT. lower the number of gradient accumulation steps.
   hps.gradient_accumulation_steps = max(1, hps.gradient_accumulation_steps//hps.num_generations)
   hps.epochs = 1
+
+  # Subset the dataset to 200,000 samples to shorten the training time
+  dataset_subset = dataloader.dataset.select(range(min(200_000, len(dataloader.dataset))))
   # Change batch size. Due to number of generations there might be OOM cuda error.
-  dataloader = DataLoader(dataset=dataloader.dataset, batch_size=max(1, dataloader.batch_size//hps.num_generations), shuffle=hps.shuffle, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)#, multiprocessing_context='fork', worker_init_fn=worker_init_fn)
+  batch_size = max(1, dataloader.batch_size//hps.num_generations)
+  dataloader = DataLoader(dataset=dataset_subset, batch_size=batch_size, shuffle=hps.shuffle, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)#, multiprocessing_context='fork', worker_init_fn=worker_init_fn)
   torch.cuda.empty_cache()
   gc.collect()
 
@@ -746,8 +785,12 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   rlft(dataloader, model, hps, reward_funcs=[cot_reward, test_generation_reward], training_loop=training_loop)
   # Apply inference on some random samples of validation set
   if not DEBUG: 
-    infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=False)
-    save_model(model, hps.save_directory, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="New model trained with new embeddings, LoRA and GRPO-RL")
+    model.set_adapter("grpo_adapter")
+    infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
+    save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="Final Model trained with GRPO-RL")
+    final_model_path = os.path.join(hps.log_dir, "models", "final_model", hps.save_in_repo.split("/")[-1])
+    os.makedirs(final_model_path, exist_ok=True)
+    save_model(model, final_model_path, push_to_hub=False, save_embedding_layers=True, hps=hps, delete_previous=False)
 
 
 def main():
@@ -766,7 +809,7 @@ def main():
   # Set the model name
   hps.model_name = models_causal[hps.model_name]
   hps.adapter_repo = models_causal[hps.adapter_repo] if hps.adapter_repo else None
-  hps.save_directory = models_causal[hps.save_model]
+  hps.save_in_repo = models_causal[hps.save_model]
 
   # Initialize the W&B logger
   if is_main_process() and hps.wandb:
