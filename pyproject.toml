@@ -26,4 +26,4 @@ Homepage = "https://github.com/christos-vasileiou/atpgllm"
 packages = ["atpgllm"]
 
 [tool.setuptools.dynamic]
-dependencies = {file = "requirements-core.txt"}
+dependencies = {file = "requirements.txt"}
