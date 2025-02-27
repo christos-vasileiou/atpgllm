@@ -544,7 +544,7 @@ def parse_arguments(parser):
   parser.add_argument('--grpo_tau', '--grpo-tau', type=float, default=0.9, help='EMA coefficient for reference model updates')
 
   # Add adapter loading arguments
-  parser.add_argument('--adapter_name', '--adapter-name', type=str, default=None, help='Name of the adapter to load')
+  parser.add_argument('--adapter_name', '--adapter-name', type=str, default='ref_adapter', help='Name of the adapter to load')
   
   parser.add_argument('--adapter_repo', '--adapter-repo', type=str, default=None, help='Repository containing the adapter to load')
 
