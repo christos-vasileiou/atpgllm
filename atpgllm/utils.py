@@ -1092,9 +1092,19 @@ def hyperparameters(args):
   hps.deepspeed_config = deepspeed_config if hps.deepspeed_kernel == True else None
   hps.seed     = args.seed
 
+  # Add adapter loading parameters
+  hps.adapter_name = args.adapter_name
+  hps.adapter_repo = args.adapter_repo
+
+  # Add train_lora flag
+  hps.train_lora = args.train_lora
+
   # GRPO
   hps.grpo_beta = args.grpo_beta
   hps.num_generations = args.num_generations
+  hps.initial_ref_update_freq = args.initial_ref_update_freq
+  hps.final_ref_update_freq = args.final_ref_update_freq
+  hps.grpo_tau = args.grpo_tau
 
   hps.disable_tqdm = False
 
@@ -1110,18 +1120,6 @@ def hyperparameters(args):
   # Use custom filename if provided, otherwise use default
   hps.filename = args.filename if args.filename is not None else "generated_text_embs_grpo.md"
   hps.file_path = os.path.join(hps.log_dir, hps.filename)
-
-  # Add missing GRPO-RL hyperparameters
-  hps.initial_ref_update_freq = args.initial_ref_update_freq
-  hps.final_ref_update_freq = args.final_ref_update_freq
-  hps.grpo_tau = args.grpo_tau
-
-  # Add adapter loading parameters
-  hps.adapter_name = args.adapter_name
-  hps.adapter_repo = args.adapter_repo
-
-  # Add train_lora flag
-  hps.train_lora = args.train_lora
 
   return hps
 

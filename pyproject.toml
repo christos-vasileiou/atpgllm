@@ -4,15 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atpgllm"
-version = "0.6.14"
+version = "0.7.15"
 description = "LLM model that can run Automated Test Pattern Generation (ATPG) and Design Verification (DV) algorithm on synthesized verilog-based netlists."
 readme = "README.md"
 authors = [
     { name = "christos-vasileiou", email = "chrivasileiou2@gmail.com" }
 ]
 requires-python = ">=3.9"
-# Dependencies will be read from setup.py
-dynamic = ["dependencies"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -28,4 +26,4 @@ Homepage = "https://github.com/christos-vasileiou/atpgllm"
 packages = ["atpgllm"]
 
 [tool.setuptools.dynamic]
-dependencies = {file = "requirements-core.txt"} 
+dependencies = {file = "requirements-core.txt"}

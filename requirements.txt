@@ -1,5 +1,0 @@
-# Install core dependencies
--r requirements-core.txt
-
-# Install local package in editable mode
--e .
