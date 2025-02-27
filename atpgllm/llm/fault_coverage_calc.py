@@ -87,10 +87,10 @@ def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], f
   # Calculate rewards if input and output vectors have the correct length
   if return_rewards:
     rewards = {}
-    rewards["inputs_len_rew"] = int(len(inputs) == len(input_vector.split(','))) if isinstance(input_vector, str) else int(len(inputs) == len(input_vector))
-    rewards["inputs_nets"]    = int(all(net.strip() in inputs for net_value in input_vector.split(',') for net, value, in [net_value.split(':')]))
-    rewards["outputs_len_rew"] = int(len(outputs) == len(output_vector.split(','))) if isinstance(output_vector, str) else int(len(outputs) == len(output_vector))
-    rewards["outputs_nets"]    = int(all(net.strip() in outputs for net_value in output_vector.split(',') for net, value, in [net_value.split(':')]))
+    # rewards["input_len_reward"] = int(len(inputs) == len(input_vector.split(','))) if isinstance(input_vector, str) else int(len(inputs) == len(input_vector))
+    # rewards["input_nets_reward"]    = int(all(net.strip() in inputs for net_value in input_vector.split(',') for net, value, in [net_value.split(':')]))
+    # rewards["output_len_reward"] = int(len(outputs) == len(output_vector.split(','))) if isinstance(output_vector, str) else int(len(outputs) == len(output_vector))
+    # rewards["output_nets_reward"]    = int(all(net.strip() in outputs for net_value in output_vector.split(',') for net, value, in [net_value.split(':')]))
 
   # Get faulty value and faulty net
   faulty_value, faulty_net = next(iter(fault_value.findall(fault)))
@@ -147,12 +147,12 @@ def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], f
   simulation[4] = simulation.index.isin(fault_path)
 
   simulation.columns = ["Good Machine", "Bad Machine", "PIs", "POs", "Fault Path"]
-  simulation.sort_index(inplace=True)
 
-  # Check if the faulty net has been correctly identified
   if return_rewards:
-    rewards["det_fault_rew"] = 2*int(simulation.loc[faulty_net, "Good Machine"] != simulation.loc[faulty_net, "Bad Machine"])-1
-    return simulation[["Good Machine", "Bad Machine"]], rewards
+    # Check if the faulty net has been correctly identified using the predicted input vector
+    # rewards["trigger_fault_reward"] = 2*int(simulation.loc[faulty_net, "Good Machine"] != simulation.loc[faulty_net, "Bad Machine"])-1
+
+    return simulation, rewards
 
   return simulation
 

@@ -188,11 +188,11 @@ def get_per_token_logps(model, input_ids, attention_mask, logits_to_keep):
 def prepare_reward_kwargs(hps):
   cot_block_re = re.compile(r'CHAIN_OF_THOUGHT:\n(.*?)SNAPSHOT', re.DOTALL)
   thought_pattern_re = re.compile(r'(\d+)\.(.*?)(?=\d+\.|$)', re.DOTALL)
-  fault_re = re.compile("(sa\d)\s+(_\d+_)", re.DOTALL)
-  simulation_re = re.compile("SNAPSHOT:\n```\n(.*?)```\s+INPUT_VECTOR", re.DOTALL)
-  input_vector_re = re.compile("INPUT_VECTOR:\s\"(.*?)\"", re.DOTALL)
-  expected_output_re = re.compile("EXPECTED_OUTPUT:\s\"(.*?)\"", re.DOTALL)
-  detected_faults_re = re.compile("DETECTED_FAULTS:\s\"(.*?)\"", re.DOTALL)
+  fault_re = re.compile(r"(sa\d)\s+(_\d+_)", re.DOTALL)
+  simulation_re = re.compile(r"SNAPSHOT:\n```\n(.*?)```\s+INPUT_VECTOR", re.DOTALL)
+  input_vector_re = re.compile(r"INPUT_VECTOR:\s\"(.*?)\"", re.DOTALL)
+  expected_output_re = re.compile(r"EXPECTED_OUTPUT:\s\"(.*?)\"", re.DOTALL)
+  detected_faults_re = re.compile(r"DETECTED_FAULTS:\s\"(.*?)\"", re.DOTALL)
 
   # Prepare the reward function's arguments
   sentence_transformer = SentenceTransformer('paraphrase-MiniLM-L6-v2').to(hps.device)

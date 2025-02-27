@@ -198,47 +198,39 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
     fault = fault_re.findall(prompt)
     if fault:
       fault, net = fault[0]
-      # print("Fault: ", fault, "Net: ", net)
 
     # Extract the simulation
     pred_simulation = simulation_re.findall(completion)
     if pred_simulation:
       pred_simulation = pred_simulation[0]
-      # print("simulation:\n", pred_simulation)
 
     # Extract the input vector
     pred_input_vector = input_vector_re.findall(completion)
     if pred_input_vector:
       pred_input_vector = pred_input_vector[0]
-      # print("Input Vector: ", pred_input_vector)
 
     # Extract the expected output
     pred_expected_output = expected_output_re.findall(completion)
     if pred_expected_output:
       pred_expected_output = pred_expected_output[0]
-      # print("Expected Output: ", pred_expected_output)
 
     # Extract the detected faults
     pred_detected_faults = detected_faults_re.findall(completion)
     if pred_detected_faults:
       pred_detected_faults = pred_detected_faults[0]
-      # print("Detected Faults: ", pred_detected_faults)
 
-    # Calculate the reward
+    # Calculate Reward for Fault Simulation
     reward = 0
     if fault and pred_simulation:
       try:
-        # Format: Parse the simulation and convert it to a DataFrame
+        # +1 Parse the simulation and convert it to a DataFrame
         pred_simulation = pd.read_csv(StringIO(pred_simulation), sep="\s{2,}")
-        reward += 1
-        # print("1. Correct simulation format: 1")
-
-        # Fault Detection: Check if the fault simulation trigger the requested fault
-        r2 = int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
-        reward += r2
-        # print(f"2. LLM Fault Simulation reward: {int(pred_simulation.loc[net, 'Good Machine'] != pred_simulation.loc[net, 'Bad Machine'])} ")
+        reward += .25
+        # +1 Fault Detection: Check if the Good Machine value is different that Bad Machine for the requested net
+        reward += 0.75*int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
+        # +1 Fault Detection: Check if the fault simulation trigger the requested fault
+        reward += int(pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
       except:
-        # print(f"1-2. Wrong simulation format, reward:0\n{pred_simulation}")
         pred_simulation = None
         reward = -1
 
@@ -246,21 +238,59 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
     if pred_input_vector and pred_expected_output and fault and net and netlist:
       try:
         fault_simulation, fault_sim_rewards = fault_sim(pred_input_vector, pred_expected_output, f"{fault} {net}", netlist, gate_func, return_rewards=True)
-        # print(f"3. Fault Simulation Reward based on test input: {pred_input_vector}, expected output: {pred_expected_output}:\n{fault_sim_rewards}")
+        # Reward the simulation
+        # +2 if LLM simulation and actual simulation are the same!
         if isinstance(pred_simulation, pd.DataFrame) and isinstance(fault_simulation, pd.DataFrame):
-          reward += 5*int(pred_simulation.equals(fault_simulation))
+          # Reward the generated simulation
+          # Calculate row-wise accuracy
+          row_matches = pred_simulation.eq(fault_simulation[["Good Machine", "Bad Machine"]]).all(axis=1)
+          
+          # Weight each row based on its importance
+          # Rows in fault path are most important (weight 2.0)
+          # Primary outputs are next most important (weight 1.5) 
+          # All other rows have base weight 1.0
+          weights = pd.Series(1.0, index=row_matches.index)
+          weights[fault_simulation["Fault Path"]] = 2.0
+          weights[fault_simulation["POs"]] = 1.5
+          
+          # Calculate weighted accuracy
+          weighted_accuracy = (row_matches * weights).sum() / weights.sum()
+          
+          # Scale reward exponentially to incentivize high accuracy
+          # reward = base_reward * (1 + accuracy)^2 
+          # This gives:
+          # 50% accuracy -> 2.25x base reward
+          # 75% accuracy -> 3.06x base reward  
+          # 95% accuracy -> 3.80x base reward
+          # 100% accuracy -> 4.00x base reward
+          base_reward = 1.0
+          reward += base_reward * (1 + weighted_accuracy) ** 2
+        # Reward based on validity of generated Good-Machine input values and generated input vector
+        input_nets = fault_simulation[fault_simulation['PIs']==True].index
+        input_vector_based_on_pred_simulation = pred_simulation.loc[input_nets].reset_index()[['index', 'Good Machine']].astype(str).apply(': '.join, axis=1).str.cat(sep=', ')
+        reward += int(input_vector_based_on_pred_simulation == pred_input_vector)
 
-        # if LLM simulation and actual simulation have same:
-        # input length +1
-        # output length +1 
-        # triggered fault +1/-1 
-        # r4=sum(r) if LLM simulation and actual simulation match 
-        r4 = sum(fault_sim_rewards.values())
-        reward += r4
+        # Reward based on validity of generated Good-Machine output values and generated expected output vector
+        output_nets = fault_simulation[fault_simulation['POs']==True].index
+        output_vector_based_on_pred_simulation = pred_simulation.loc[output_nets].reset_index()[['index', 'Good Machine']].astype(str).apply(': '.join, axis=1).str.cat(sep=', ')
+        reward += int(output_vector_based_on_pred_simulation == pred_expected_output)
+
+        # Reward the detected Fault Path 
+        fault_path_str = fault_simulation[fault_simulation["Fault Path"] == True].reset_index()[["Bad Machine", "index"]].astype(str).apply(' '.join, axis=1)
+        # Combine into final string with 'sa' prefix
+        detected_faults_str = 'sa' + fault_path_str.str.cat(sep=', sa')
+        # Compare with predicted faults and add to reward
+        reward += int(detected_faults_str == pred_detected_faults)
+
         
-        # r5=+1 if LLM simulation and actual simulation match 
-        r5 = int(fault_simulation.equals(pred_simulation))
-        reward += r5
+        # Reward the input vector & expected output
+        # if LLM simulation and actual simulation have same:
+        # +1 input length, +1 nets are input nets
+        # +1 output length, +1 nets are output nets
+        # +1/-1 triggered fault
+        # r4=sum(r) if LLM simulation and actual simulation match 
+        reward += sum(fault_sim_rewards.values())
+        
       except:
         # print(f"3. Wrong Fault Simulation, Reward:0")
         fault_simulation = None
@@ -280,11 +310,11 @@ if __name__ == "__main__":
 
   cot_block_re = re.compile(r'CHAIN_OF_THOUGHT:\n(.*?)SNAPSHOT', re.DOTALL)
   thought_pattern_re = re.compile(r'(\d+)\.(.*?)(?=\d+\.|$)', re.DOTALL)
-  fault_re = re.compile("sa\d\s+_\d+_", re.DOTALL)
-  simulation_re = re.compile("SNAPSHOT:\n```\n(.*?)```\s+INPUT_VECTOR", re.DOTALL)
-  input_vector_re = re.compile("INPUT_VECTOR:\s\"(.*?)\"", re.DOTALL)
-  expected_output_re = re.compile("EXPECTED_OUTPUT:\s\"(.*?)\"", re.DOTALL)
-  detected_faults_re = re.compile("DETECTED_FAULTS:\s\"(.*?)\"", re.DOTALL)
+  fault_re = re.compile(r"(sa\d)\s+(_\d+_)", re.DOTALL)
+  simulation_re = re.compile(r"SNAPSHOT:\n```\n(.*?)```\s+INPUT_VECTOR", re.DOTALL)
+  input_vector_re = re.compile(r"INPUT_VECTOR:\s\"(.*?)\"", re.DOTALL)
+  expected_output_re = re.compile(r"EXPECTED_OUTPUT:\s\"(.*?)\"", re.DOTALL)
+  detected_faults_re = re.compile(r"DETECTED_FAULTS:\s\"(.*?)\"", re.DOTALL)
 
   prompts = [df_cot.loc[0, 'text'].split("<</SYS>>")[1].strip().split("[/INST]")[0]]
   completions = [df_cot.loc[0, 'text'].split("[/INST]")[1].strip()]

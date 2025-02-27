@@ -537,35 +537,22 @@ def parse_arguments(parser):
   parser.add_argument('--wandb', action='store_true', help='Use Weights and Biases for logging')
 
   # Add missing arguments for GRPO-RL training
-  parser.add_argument('--initial_ref_update_freq', '--initial-ref-update-freq', 
-                     type=int, default=1,
-                     help='Initial frequency for reference model updates')
+  parser.add_argument('--initial_ref_update_freq', '--initial-ref-update-freq', type=int, default=1, help='Initial frequency for reference model updates')
   
-  parser.add_argument('--final_ref_update_freq', '--final-ref-update-freq',
-                     type=int, default=1,
-                     help='Final frequency for reference model updates')
+  parser.add_argument('--final_ref_update_freq', '--final-ref-update-freq', type=int, default=1, help='Final frequency for reference model updates')
   
-  parser.add_argument('--grpo_tau', '--grpo-tau',
-                     type=float, default=0.05,
-                     help='EMA coefficient for reference model updates')
+  parser.add_argument('--grpo_tau', '--grpo-tau', type=float, default=0.9, help='EMA coefficient for reference model updates')
 
   # Add adapter loading arguments
-  parser.add_argument('--adapter_name', '--adapter-name',
-                     type=str, default=None,
-                     help='Name of the adapter to load')
+  parser.add_argument('--adapter_name', '--adapter-name', type=str, default=None, help='Name of the adapter to load')
   
-  parser.add_argument('--adapter_repo', '--adapter-repo',
-                     type=str, default=None,
-                     help='Repository containing the adapter to load')
+  parser.add_argument('--adapter_repo', '--adapter-repo', type=str, default=None, help='Repository containing the adapter to load')
 
   # Add train_lora flag
-  parser.add_argument('--train_lora', '--train-lora',
-                     action='store_true',
-                     help='Whether to train LoRA layers during training')
+  parser.add_argument('--train_lora', '--train-lora', action='store_true', help='Whether to train LoRA layers during training')
 
   # Add filename parameter
-  parser.add_argument('--filename', type=str, default=None,
-                     help='Custom filename for output files (logs, generated text, etc.)')
+  parser.add_argument('--filename', type=str, default=None, help='Custom filename for output files (logs, generated text, etc.)')
 
   # Parse arguments
   args = parser.parse_args()
