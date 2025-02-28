@@ -8,6 +8,7 @@ import argparse
 import wandb
 import gc
 import pandas as pd
+import numpy as np
 import regex as re
 import multiprocessing as mp
 from peft import PeftModel
@@ -67,6 +68,10 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
   logging_step = 0
   # Set collate function's flags to supervised fine-tuning
   dataloader.collate_fn.set_right_padding()
+
+  # Log hyperparameters to wandb
+  if hps.wandb:
+    wandb.log(hps)
 
   if is_main_process():
     pbar = tqdm(total=len(dataloader), desc=f"[{hps.local_rank}]: {desc}", disable=hps.disable_tqdm)
@@ -482,7 +487,6 @@ def get_ref_update_freq(ref_update_step, total_updates, initial_ref_update_freq=
   )
   return current_freq
 
-
 # Below rlft() function for RL Fine-Tuning
 def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Callable]], desc:str = "GRPO-RL Training...", training_loop: bool = True):
   # Retrieve optimizer from hyperparameters dict
@@ -498,6 +502,10 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
   # Ensure model is in training mode for gradient computation
   model.train()
 
+  if hps.wandb:
+    wandb.log({'rlft/hps/lr': hps.lr, 'rlft/hps/micro_batch_size': hps.micro_batch_size, 'rlft/hps/gradient_accumulation_steps': hps.gradient_accumulation_steps})
+    wandb.watch(model, log="gradients", log_freq=1)
+  
   if is_main_process():
     pbar = tqdm(total=len(dataloader), desc=f"[{hps.local_rank}]: {desc}", disable=hps.disable_tqdm)
   # Get dataloader iterator
@@ -540,11 +548,12 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         batch_loss = 0
         # Reset metric accumulators at the start of each accumulation step
         accumulated_metrics.clear()
-        # zero the parameter gradients
+        # Zero the parameter gradients
         optimizer.zero_grad()
         # Count skipped micro batches due to OOM error
         count_skip_micro_batch = 0
-
+        # Initialize last_grad_norm to None
+        last_grad_norm = None
       # Get next data
       data = next(data_iterator)
 
@@ -562,7 +571,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         count_skip_micro_batch += 1
         continue
       # Scale loss for gradient accumulation
-      micro_batch_loss = micro_batch_loss / (hps.gradient_accumulation_steps-count_skip_micro_batch)
+      micro_batch_loss = micro_batch_loss / (hps.gradient_accumulation_steps - count_skip_micro_batch)
       batch_loss += micro_batch_loss.item()
       # Accumulate metrics for each micro-batch
       for key, value in micro_batch_metrics.items():
@@ -572,10 +581,10 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
       if training_loop:
         micro_batch_loss.backward()
 
-        # Apply the gradients
-        if (i+1) % hps.gradient_accumulation_steps == 0 or i==len(dataloader)-1:
+        # Apply the gradients when the accumulation step is reached
+        if (i+1) % hps.gradient_accumulation_steps == 0 or i == len(dataloader)-1:
           # Clip the gradients
-          torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+          last_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
           # Update the model parameters
           optimizer.step()
           # Update the learning rate scheduler
@@ -585,20 +594,21 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
       if (i+1) % hps.gradient_accumulation_steps == 0:
         # Dynamic reference model update
         ref_update_step += 1
-        
         if ref_update_step % next_ref_update == 0:
           # Update the reference adapter
           update_ref_adapter_ema(model, tau=hps.grpo_tau)
           # Update the next reference update step
           next_ref_update = get_ref_update_freq(ref_update_step, total_updates)
-
+        
         # Log the metrics
         metrics["epoch"].append(str(epoch+1))
         metrics["batch"].append(str(int(i//hps.gradient_accumulation_steps)+1))
         metrics["step"].append(str(i+1))
         metrics["batch_loss"].append(smart_round(batch_loss))
         metrics["ref_update_step"].append(f"{ref_update_step}/{next_ref_update}")
-        # Add averaged metrics
+        # Log the gradient norm metric (defaulting to 0.0 if not available)
+        metrics["grad_norm"].append(smart_round(last_grad_norm) if last_grad_norm is not None else smart_round(0.0))
+        # Add averaged metrics for each micro-batch
         for key in accumulated_metrics.keys():
           avg_value = sum(accumulated_metrics[key]) / len(accumulated_metrics[key])
           metrics[f"avg_{key}"].append(smart_round(avg_value))
@@ -623,7 +633,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
           metrics["best_avg_reward"].append(smart_round(hps.best_avg_reward))
 
         if hps.wandb: 
-          # Log to wandb as both metrics and table
+          # Log to wandb both metrics and table, including the gradient norm along with other metrics
           wandb.log({
               **{f"rlft/{k}": float(eval(metrics[k][-1])) for k in metrics.keys()},
           })
@@ -636,11 +646,11 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
             print(tabulate(x.loc[x.index[-logging_steps:], ['batch', 'batch_loss', 'avg_per_token_loss', 'avg_per_token_kl', 'avg_reward', 'avg_cot_reward', 'avg_test_generation_reward', 'best_avg_reward']], headers='keys', tablefmt='psql', showindex=False))
             logging_step = 0
           logging_step += 1
-
+        
       if is_main_process():
         pbar.update(1)
 
-      if DEBUG and i>500:
+      if DEBUG and i > 500:
         break
 
   x = pd.DataFrame(metrics)
@@ -714,10 +724,10 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   total_training_steps = (hps.epochs * len(dataloader)) // hps.gradient_accumulation_steps
   # Set up the learning rate scheduler. Uses a cosine schedule with warmup
   hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20)
-  if is_main_process():
-    print(f"{model}\nSFT embedding, lora and head:\nModel training parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}\n")
 
   if hps.train_lora:
+    if is_main_process():
+      print(f"{model}\nSFT embedding, lora and head:\nModel training parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}\n")
     # 2. Train adapter (LoRA weights) as well
     sft(dataloader, model, hps, desc="SFT Lora Training...", training_loop=training_loop) 
     # Apply inference on some random samples of validation set
@@ -751,32 +761,35 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # Subset the dataset to 200,000 samples to shorten the training time
   dataset_subset = dataloader.dataset.select(range(min(200_000, len(dataloader.dataset))))
   # Change batch size. Due to number of generations there might be OOM cuda error.
-  batch_size = max(1, dataloader.batch_size//hps.num_generations)
-  dataloader = DataLoader(dataset=dataset_subset, batch_size=batch_size, shuffle=hps.shuffle, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)#, multiprocessing_context='fork', worker_init_fn=worker_init_fn)
+  hps.micro_batch_size = max(1, hps.micro_batch_size//hps.num_generations)
+  dataloader = DataLoader(dataset=dataset_subset, batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)#, multiprocessing_context='fork', worker_init_fn=worker_init_fn)
   torch.cuda.empty_cache()
   gc.collect()
 
   # When adding GRPO adapter, update optimizer similarly:
   # after_grpo_params = get_trainable_parameters(model)
-  
+
+  hps.lr = max(1e-6, hps.lr)
   if hps.parallel:
     hps.optimizer = ZeroRedundancyOptimizer(
       model.parameters(),
       optimizer_class=AdamW,
+      lr=hps.lr
     )
   else:
     hps.optimizer = AdamW(
       model.parameters(),
       weight_decay=0.01,
       eps=1e-8,
-      betas=(0.9, 0.999)
+      betas=(0.9, 0.999),
+      lr=hps.lr
     )
 
   # Configure which parts of the model to train
   # train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False)
   # Calculate the total number of training steps
   total_training_steps = (hps.epochs * len(dataloader)) // hps.gradient_accumulation_steps
-  hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20)
+  hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=1, num_training_steps=total_training_steps, num_cycles=3/20)
 
   if is_main_process():
     print(f"{model}\nGRPO-RLFT train embedding, lora and head:\nTrainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}")
@@ -800,9 +813,6 @@ def main():
   # Initialize hyperparameters using custom AttrDict()
   hps = hyperparameters(parse_arguments(parser))
   
-  # set a seed for proper synchronization
-  set_seed(hps.seed)
-  
   # Set debug mode
   hps.debug = DEBUG
 
@@ -817,7 +827,10 @@ def main():
 
   # Initialize the training environment based on the GPU availability and parallelization
   initialize_training_environment(hps)
-
+  
+  # set a seed for proper synchronization
+  set_seed(hps.seed + hps.local_rank + np.random.randint(1, 2**32 - 1))
+  
   # Model Loading
   model = load_model(hps)
 
