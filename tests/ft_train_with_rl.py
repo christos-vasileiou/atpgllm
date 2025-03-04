@@ -71,7 +71,7 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
 
   # Log hyperparameters to wandb
   if hps.wandb:
-    wandb.log(hps)
+    wandb.log({'sft/hps/lr': hps.lr, 'sft/hps/micro_batch_size': hps.micro_batch_size, 'sft/hps/gradient_accumulation_steps': hps.gradient_accumulation_steps})
 
   if is_main_process():
     pbar = tqdm(total=len(dataloader), desc=f"[{hps.local_rank}]: {desc}", disable=hps.disable_tqdm)
@@ -769,7 +769,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # When adding GRPO adapter, update optimizer similarly:
   # after_grpo_params = get_trainable_parameters(model)
 
-  hps.lr = max(1e-6, hps.lr)
+  hps.lr = min(5e-6, hps.lr)
   if hps.parallel:
     hps.optimizer = ZeroRedundancyOptimizer(
       model.parameters(),

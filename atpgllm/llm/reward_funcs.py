@@ -258,12 +258,16 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # Scale reward exponentially to incentivize high accuracy
           # reward = base_reward * (1 + accuracy)^2 
           # This gives:
-          # 50% accuracy -> 2.25x base reward
-          # 75% accuracy -> 3.06x base reward  
-          # 95% accuracy -> 3.80x base reward
-          # 100% accuracy -> 4.00x base reward
+          #  ^2 -----------------------------    ^3 -------------------------------   ^4 -------------------------------
+          # 50% accuracy -> 2.25x base reward  | 50% accuracy -> 3.378x base reward  | 50% accuracy -> 5.06x base reward   |
+          # 75% accuracy -> 3.06x base reward  | 75% accuracy -> 5.36x base reward   | 75% accuracy -> 9.38x base reward   |
+          # 95% accuracy -> 3.80x base reward  | 95% accuracy -> 7.41x base reward   | 95% accuracy -> 14.46x base reward  |
+          # 100% accuracy -> 4.00x base reward | 100% accuracy -> 9.00x base reward  | 100% accuracy -> 16.00x base reward |
           base_reward = 1.0
-          reward += base_reward * (1 + weighted_accuracy) ** 2
+          reward += base_reward * (1 + weighted_accuracy) ** 4
+        else:
+          reward -= 1
+          
         # Reward based on validity of generated Good-Machine input values and generated input vector
         input_nets = fault_simulation[fault_simulation['PIs']==True].index
         input_vector_based_on_pred_simulation = pred_simulation.loc[input_nets].reset_index()[['index', 'Good Machine']].astype(str).apply(': '.join, axis=1).str.cat(sep=', ')
