@@ -755,7 +755,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   sampler = DistributedSampler(dataloader.sampler.dataset, rank=dataloader.sampler.rank, num_replicas=dataloader.sampler.num_replicas) if use_sampler else None  
 
   # Adjust gradient accumulation steps. GRPO is slower than SFT. lower the number of gradient accumulation steps.
-  hps.gradient_accumulation_steps = max(1, hps.gradient_accumulation_steps//hps.num_generations)
+  hps.gradient_accumulation_steps = max(1, hps.gradient_accumulation_steps//min(2, hps.num_generations))
   hps.epochs = 1
 
   # Subset the dataset to 200,000 samples to shorten the training time

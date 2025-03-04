@@ -149,6 +149,7 @@ def thoughts_check(thoughts, fault_net):
 
 # Usage
 def cot_reward(prompts: list, completions: list, model: torch.nn.Sequential, cot_block_re: re.Pattern, thought_pattern_re: re.Pattern, fault_re: re.Pattern, reward_per_thought: bool = False):
+  base_reward = 1.0
   similarity_rewards = []
   for prompt, completion in zip(prompts, completions):
     # Randomly select a target chain of thought
@@ -183,7 +184,14 @@ def cot_reward(prompts: list, completions: list, model: torch.nn.Sequential, cot
 
         # Compute the cosine similarity between the embeddings
         similarity = util.pytorch_cos_sim(embedding1, embedding2)
-        similarity_rewards.append(similarity.item())
+
+        # Penalize if the LLM generates multiple faults
+        if len(set(fault_re.findall(completion))) > 1:
+          similarity_reward /= 10
+
+        # Reward the similarity between the LLM's chain of thought and the target chain of thought
+        similarity_reward = base_reward * (1 + similarity.item()) ** 3
+        similarity_rewards.append(similarity_reward)
     except (ValueError, UnboundLocalError):
       similarity_rewards.append(-1)
   return similarity_rewards
@@ -228,7 +236,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         reward += .25
       except:
         pred_simulation = None
-        reward = -1
+        reward -= 1
 
     gate_func = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}
     if pred_input_vector and pred_expected_output and fault and net and netlist:
@@ -267,7 +275,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           reward += base_reward * (1 + weighted_accuracy) ** 4
         else:
           reward -= 1
-          
+
         # Reward based on validity of generated Good-Machine input values and generated input vector
         input_nets = fault_simulation[fault_simulation['PIs']==True].index
         input_vector_based_on_pred_simulation = pred_simulation.loc[input_nets].reset_index()[['index', 'Good Machine']].astype(str).apply(': '.join, axis=1).str.cat(sep=', ')
@@ -285,7 +293,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         # Compare with predicted faults and add to reward
         detected_faults_reward = detected_faults_str == pred_detected_faults
 
-        reward += 3*int(detected_faults_reward and input_vector_reward and output_vector_reward)
+        reward += 5*int(detected_faults_reward and input_vector_reward and output_vector_reward)
         
         # Reward the input vector & expected output
         # if LLM simulation and actual simulation have same:
@@ -293,7 +301,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         # +1 output length, +1 nets are output nets
         # +1/-1 triggered fault
         # r4=sum(r) if LLM simulation and actual simulation match 
-        reward += sum(fault_sim_rewards.values())
+        reward += sum(fault_sim_rewards.values()) # The dictionary is empty. Adds 0. Keep for consistency.
         
       except:
         # print(f"3. Wrong Fault Simulation, Reward:0")
