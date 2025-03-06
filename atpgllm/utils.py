@@ -533,16 +533,12 @@ def parse_arguments(parser):
   # GRPO-RL hyperparameters
   parser.add_argument('--grpo_beta', '--beta', type=float, default=0.04, help="KL coefficient for Group Relative Policy Optimization (GRPO)")
   parser.add_argument('--num_generations', '--num-generations', type=int, default=2, help="Number of generations per prompt to sample.")
+  parser.add_argument('--initial_ref_update_freq', '--initial-ref-update-freq', type=int, default=1, help='Initial frequency for reference model updates')
+  parser.add_argument('--final_ref_update_freq', '--final-ref-update-freq', type=int, default=1, help='Final frequency for reference model updates')
+  parser.add_argument('--grpo_tau', '--grpo-tau', type=float, default=0.9, help='EMA coefficient for reference model updates')
 
   # Weights and Biases
   parser.add_argument('--wandb', action='store_true', help='Use Weights and Biases for logging')
-
-  # Add missing arguments for GRPO-RL training
-  parser.add_argument('--initial_ref_update_freq', '--initial-ref-update-freq', type=int, default=1, help='Initial frequency for reference model updates')
-  
-  parser.add_argument('--final_ref_update_freq', '--final-ref-update-freq', type=int, default=1, help='Final frequency for reference model updates')
-  
-  parser.add_argument('--grpo_tau', '--grpo-tau', type=float, default=0.9, help='EMA coefficient for reference model updates')
 
   # Add adapter loading arguments
   parser.add_argument('--adapter_name', '--adapter-name', type=str, default='ref_adapter', help='Name of the adapter to load')
@@ -644,8 +640,9 @@ def initialize_training_environment(hps):
     hps.world_size = 1
     hps.info += f'Free detected GPU: {hps.device}\n' if torch.cuda.is_available() else 'No GPU is detected'
     hps.logger.info(f"Accumulated gradient steps: {hps.gradient_accumulation_steps}")
+
   # Initialize the W&B logger
-  if is_main_process() and hps.wandb:
+  if hps.wandb:
     wandb.init(project=f"RL Fine-Tuning", entity="chrivasileiou", config=hps)
 
 
