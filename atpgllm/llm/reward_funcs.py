@@ -149,6 +149,12 @@ def thoughts_check(thoughts, fault_net):
 
 # Usage
 def cot_reward(prompts: list, completions: list, model: torch.nn.Sequential, cot_block_re: re.Pattern, thought_pattern_re: re.Pattern, fault_re: re.Pattern, reward_per_thought: bool = False):
+  """
+  This function calculates the reward for the chain of thought task.
+  It takes in a list of prompts, completions, and model.
+  It returns a list of rewards for each prompt. Rewards are dictionaries with the key '', to simplify the metrics calculation.
+  The reward is the cosine similarity between the LLM's chain of thought and the target chain of thought.
+  """
   base_reward = 1.0
   similarity_rewards = []
   for prompt, completion in zip(prompts, completions):
@@ -168,9 +174,9 @@ def cot_reward(prompts: list, completions: list, model: torch.nn.Sequential, cot
         if thoughts_check(thoughts, f"{fault} {net}"):    
           # Compute the cosine similarity between the thought pairs
           # similarity_rewards.append(calculate_cos_sim(thoughts, model))
-          similarity_rewards.append(calculate_cos_sim(thoughts, model))
+          similarity_rewards.append({'':calculate_cos_sim(thoughts, model)})
         else:
-          similarity_rewards.append(0)  # No matching thought pairs found
+          similarity_rewards.append({'':-1})  # No matching thought pairs found
       else:
         cot_block = cot_block_re.findall(completion)
         if cot_block:
@@ -191,14 +197,20 @@ def cot_reward(prompts: list, completions: list, model: torch.nn.Sequential, cot
 
         # Reward the similarity between the LLM's chain of thought and the target chain of thought
         similarity_reward = base_reward * (1 + similarity.item()) ** 3
-        similarity_rewards.append(similarity_reward)
+        similarity_rewards.append({'': similarity_reward})
     except (ValueError, UnboundLocalError):
-      similarity_rewards.append(-1)
+      similarity_rewards.append({'': -1})
   return similarity_rewards
 
 
 # Extract the fault and net
 def test_generation_reward(prompts: list, completions: list, netlists: list, fault_re: re.Pattern, simulation_re: re.Pattern, input_vector_re: re.Pattern, expected_output_re: re.Pattern, detected_faults_re: re.Pattern):
+  """
+  This function calculates the reward for the test generation task.
+  It takes in a list of prompts, completions, and netlists.
+  It returns a list of rewards for each prompt. 
+  Rewards are dictionaries with the key 'pred_simulation', 'fault_simulation', 'input_vector', 'expected_output', 'detected_faults'.
+  """
   gate_func = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}
   
   rewards = []
@@ -228,22 +240,23 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
       pred_detected_faults = pred_detected_faults[0]
 
     # Calculate Reward for Fault Simulation
-    reward = 0
+    reward = {'pred_simulation': 0, 'fault_simulation': 0, 'input_vector': 0, 'expected_output': 0, 'detected_faults': 0}
     if fault and pred_simulation:
       try:
         # +1 Parse the simulation and convert it to a DataFrame
         pred_simulation = pd.read_csv(StringIO(pred_simulation), sep="\s{2,}")
-        reward += .25
+        reward['pred_simulation'] += .25
+        # Check if the Good Machine value is different than Bad Machine for the requested net + if the fault simulation trigger the requested fault
+        reward['pred_simulation'] += int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
+        reward['pred_simulation'] += int(pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
       except:
         pred_simulation = None
-        reward -= 1
+        reward['pred_simulation'] -= 2
 
     gate_func = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}
     if pred_input_vector and pred_expected_output and fault and net and netlist:
       try:
-        # +2 Fault Detection: Check if the Good Machine value is different than Bad Machine for the requested net + if the fault simulation trigger the requested fault
-        reward += 2*int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"] and pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
-
+        # Run Fault Simulation
         fault_simulation, fault_sim_rewards = fault_sim(pred_input_vector, pred_expected_output, f"{fault} {net}", netlist, gate_func, return_rewards=True)
         # Reward the simulation
         # +2 if LLM simulation and actual simulation are the same!
@@ -272,9 +285,9 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # 95% accuracy -> 3.80x base reward  | 95% accuracy -> 7.41x base reward   | 95% accuracy -> 14.46x base reward  |
           # 100% accuracy -> 4.00x base reward | 100% accuracy -> 9.00x base reward  | 100% accuracy -> 16.00x base reward |
           base_reward = 1.0
-          reward += base_reward * (1 + weighted_accuracy) ** 4
+          reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** 4
         else:
-          reward -= 1
+          reward['fault_simulation'] -= 5
 
         # Reward based on validity of generated Good-Machine input values and generated input vector
         input_nets = fault_simulation[fault_simulation['PIs']==True].index
@@ -293,7 +306,9 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         # Compare with predicted faults and add to reward
         detected_faults_reward = detected_faults_str == pred_detected_faults
 
-        reward += 5*int(detected_faults_reward and input_vector_reward and output_vector_reward)
+        reward['detected_faults'] += 2*int(detected_faults_reward)
+        reward['expected_output'] += 2*int(output_vector_reward)
+        reward['input_vector'] += 2*int(input_vector_reward)
         
         # Reward the input vector & expected output
         # if LLM simulation and actual simulation have same:
@@ -301,7 +316,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         # +1 output length, +1 nets are output nets
         # +1/-1 triggered fault
         # r4=sum(r) if LLM simulation and actual simulation match 
-        reward += sum(fault_sim_rewards.values()) # The dictionary is empty. Adds 0. Keep for consistency.
+        reward['fault_simulation'] += sum(fault_sim_rewards.values()) # The dictionary is empty. Adds 0. Keep for consistency.
         
       except:
         # print(f"3. Wrong Fault Simulation, Reward:0")

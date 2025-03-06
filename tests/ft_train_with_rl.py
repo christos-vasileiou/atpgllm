@@ -274,13 +274,13 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     gen_start = time.time()
     with unwrap_ddp(model) as unwrapped_model:
       prompt_completion_ids = unwrapped_model.generate(
-        input_ids=ids,
+        input_ids=ids, 
         attention_mask=mask, 
-        max_length=hps.model_max_length,
-        num_return_sequences=num_generations,
-        do_sample=True,
-        temperature=0.6,
-        top_p=0.95,
+        max_length=hps.model_max_length, 
+        num_return_sequences=num_generations, 
+        do_sample=True, 
+        temperature=0.6, 
+        top_p=0.75
       )
     gen_end = time.time()
     metrics['generation_time'] = gen_end - gen_start
@@ -338,11 +338,22 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     for reward_idx, (reward_func, reward_kwargs) in enumerate(zip(reward_funcs, reward_kwargss)):
       if reward_func.__name__ == "test_generation_reward":
         reward_kwargs.update({"netlists": netlists})
-      rewards_per_func[:, reward_idx] = torch.tensor(
-        reward_func(prompts, completions, **reward_kwargs),
-        dtype=torch.float32,
-        device=device
-      )
+      returned_rewards_list = reward_func(prompts, completions, **reward_kwargs)
+      
+      # Initialize rewards array and process metrics in one pass
+      returned_rewards_per_func = torch.zeros(len(returned_rewards_list), dtype=torch.float32, device=device)
+      # Pre-calculate divisor for averaging
+      divisor = 1.0 / len(returned_rewards_list)
+      for r_i, returned_rewards in enumerate(returned_rewards_list):
+        # Sum all reward components and update metrics
+        returned_rewards_per_func[r_i] = sum(returned_rewards.values())
+        # Update metrics dictionary efficiently
+        for k, v in returned_rewards.items():
+          # Construct metrics key efficiently - only append suffix if k is not empty
+          metrics_key = f"{reward_func.__name__}" + (f"/{k}" if k else "")
+          metrics[metrics_key] = metrics.get(metrics_key, 0) + v * divisor
+
+      rewards_per_func[:, reward_idx] = returned_rewards_per_func
 
     # Gather rewards and compute advantages
     rewards_per_func = gather(rewards_per_func)
@@ -769,7 +780,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # When adding GRPO adapter, update optimizer similarly:
   # after_grpo_params = get_trainable_parameters(model)
 
-  hps.lr = min(5e-6, hps.lr)
+  hps.lr = max(1e-7, min(1e-5, hps.lr))
   if hps.parallel:
     hps.optimizer = ZeroRedundancyOptimizer(
       model.parameters(),
