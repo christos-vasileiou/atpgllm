@@ -821,10 +821,6 @@ def main():
   hps.adapter_repo = models_causal[hps.adapter_repo] if hps.adapter_repo else None
   hps.save_in_repo = models_causal[hps.save_model]
 
-  # Initialize the W&B logger
-  if is_main_process() and hps.wandb:
-    wandb.init(project=f"RL Fine-Tuning", entity="chrivasileiou", config=hps)
-
   # Initialize the training environment based on the GPU availability and parallelization
   initialize_training_environment(hps)
   

@@ -5,6 +5,7 @@ import argparse
 import os
 import logging
 import copy
+import wandb
 import gc
 import shutil
 import ast
@@ -643,6 +644,9 @@ def initialize_training_environment(hps):
     hps.world_size = 1
     hps.info += f'Free detected GPU: {hps.device}\n' if torch.cuda.is_available() else 'No GPU is detected'
     hps.logger.info(f"Accumulated gradient steps: {hps.gradient_accumulation_steps}")
+  # Initialize the W&B logger
+  if is_main_process() and hps.wandb:
+    wandb.init(project=f"RL Fine-Tuning", entity="chrivasileiou", config=hps)
 
 
 def get_trainable_parameters(model):
