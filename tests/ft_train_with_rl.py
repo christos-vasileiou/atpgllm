@@ -670,10 +670,15 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
 
         if is_main_process():
           x = pd.DataFrame(metrics)
+          # Dynamically create a list of columns to display
+          display_columns = ['batch', 'batch_loss', 'avg_clip_ratio', 'avg_kl', 'avg_reward', 'avg_reward_std']
           # Show averaged metrics in progress bar
-          pbar.set_postfix(x.loc[x.index[-1], ['batch', 'batch_loss', 'clip_ratio', 'kl', 'reward', 'reward_std', 'avg_reward', 'best_avg_reward']].to_dict())
+          pbar.set_postfix(x.loc[x.index[-1], display_columns + ['best_avg_reward']].to_dict())
           if logging_step % logging_steps == 0:
-            print(tabulate(x.loc[x.index[-logging_steps:], ['batch', 'batch_loss', 'clip_ratio', 'kl', 'avg_reward', 'avg_cot_reward', 'avg_test_generation_reward', 'best_avg_reward']], headers='keys', tablefmt='psql', showindex=False))
+            # Add any reward function metrics that exist in the dataframe
+            reward_metrics = [col for col in x.columns if col.startswith('avg_') and col.endswith('_reward')]
+            display_columns.extend(reward_metrics)
+            print(tabulate(x.loc[x.index[-logging_steps:], display_columns + ['best_avg_reward']], headers='keys', tablefmt='psql', showindex=False))
             logging_step = 0
           logging_step += 1
         
