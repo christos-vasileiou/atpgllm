@@ -806,7 +806,6 @@ def prepare_objects_for_training(model, dataset, hps):
 
   if not hps.deepspeed_kernel:
     total_training_steps = (hps.epochs * len(training_loader)) // hps.gradient_accumulation_steps
-    # import code; code.interact(local=locals())
     hps.optimizer = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=AdamW, lr=hps.lr) if hps.parallel else AdamW(model.parameters(), lr=hps.lr) if sys.argv[0] != 'sft.py' else None
     if hps.new_tokens:
       # NOTE: schedulers are being tested

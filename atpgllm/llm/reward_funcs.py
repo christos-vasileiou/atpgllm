@@ -196,6 +196,11 @@ def cot_reward(prompts: list, completions: list, model: torch.nn.Sequential, cot
           similarity_reward /= 10
 
         # Reward the similarity between the LLM's chain of thought and the target chain of thought
+        #  ^3 -----------------------------  
+        # 50% accuracy -> 3.38x base reward  
+        # 75% accuracy -> 5.36x base reward  
+        # 95% accuracy -> 7.41x base reward  
+        # 100% accuracy -> 9.00x base reward 
         similarity_reward = base_reward * (1 + similarity.item()) ** 3
         similarity_rewards.append({'': similarity_reward})
     except (ValueError, UnboundLocalError):
@@ -240,7 +245,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
       pred_detected_faults = pred_detected_faults[0]
 
     # Calculate Reward for Fault Simulation
-    reward = {'pred_simulation': 0, 'fault_simulation': 0, 'input_vector': 0, 'expected_output': 0, 'detected_faults': 0}
+    reward = {'pred_simulation': 0, 'fault_simulation': 0, 'input_vector': 0, 'expected_output': 0, 'detected_faults': 0, 'fault_detect_inpvector': 0}
     if fault and pred_simulation:
       try:
         # +1 Parse the simulation and convert it to a DataFrame
@@ -270,7 +275,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # Primary outputs are next most important (weight 1.5) 
           # All other rows have base weight 1.0
           weights = pd.Series(1.0, index=row_matches.index)
-          weights[fault_simulation["POs"]] = 1.5
+          # weights[fault_simulation["POs"]] = 1.5
           weights[fault_simulation["Fault Path"]] = 2.0
           
           # Calculate weighted accuracy
@@ -280,12 +285,13 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # reward = base_reward * (1 + accuracy)^2 
           # This gives:
           #  ^2 -----------------------------    ^3 -------------------------------   ^4 -------------------------------
-          # 50% accuracy -> 2.25x base reward  | 50% accuracy -> 3.378x base reward  | 50% accuracy -> 5.06x base reward   |
+          # 50% accuracy -> 2.25x base reward  | 50% accuracy -> 3.38x base reward   | 50% accuracy -> 5.06x base reward   |
           # 75% accuracy -> 3.06x base reward  | 75% accuracy -> 5.36x base reward   | 75% accuracy -> 9.38x base reward   |
           # 95% accuracy -> 3.80x base reward  | 95% accuracy -> 7.41x base reward   | 95% accuracy -> 14.46x base reward  |
           # 100% accuracy -> 4.00x base reward | 100% accuracy -> 9.00x base reward  | 100% accuracy -> 16.00x base reward |
           base_reward = 1.0
           reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** 4
+          reward['fault_detect_inpvector'] += int(fault_simulation.loc[net, "Bad Machine"] == int(fault[-1]) and fault_simulation.loc[net, 'Good Machine'] != fault_simulation.loc[net, 'Bad Machine'])
         else:
           reward['fault_simulation'] -= 5
 

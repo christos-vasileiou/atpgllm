@@ -176,9 +176,10 @@ def parse_output_to_dict(output_str):
 # Get the per-token log probabilities for the completions for the model and the reference model
 def get_per_token_logps(model, input_ids, attention_mask, logits_to_keep):
   # NOTE: Be careful with num_logits_to_keep. 
-  # It should be num_logits_to_keep=logits_to_keep+1 only if transformers <= 4.48. 
-  # It should be logits_to_keep=logits_to_keep+1 only if transformers >= 4.49. 
-  logits = model(input_ids=input_ids, attention_mask=attention_mask, num_logits_to_keep=logits_to_keep+1).logits # (B, L, V)
+  # It should be num_logits_to_keep=logits_to_keep+1 only if transformers <= 4.48 
+  # It should be logits_to_keep=logits_to_keep+1 only if transformers >= 4.49 
+  # logits_to_keep keeps the last predicted tokens. Starts counting from the last token.
+  logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep+1).logits # (B, L, V)
   logits = logits[:, :-1, :] # (B, L-1, V) exclude the last logit: it corresponds to the next token pred  
   input_ids = input_ids[:, -logits_to_keep:] # Keep completion ids
   
@@ -257,7 +258,8 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
   grpo_beta = hps.grpo_beta
   num_generations = hps.num_generations
   tokenizer = hps.tokenizer
-  
+  epsilon = 0.2
+
   metrics = {}
   base_model = model.module if hasattr(model, "module") else model
   error_flag = torch.zeros(1, device=hps.device)
@@ -286,8 +288,8 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     metrics['generation_time'] = gen_end - gen_start
     
     prompt_length = ids.size(1)
-    prompt_ids = ids.repeat_interleave(num_generations, dim=0)
-    prompt_mask = mask.repeat_interleave(num_generations, dim=0)
+    prompt_ids = ids.repeat_interleave(num_generations, dim=0) # equivalent to prompt_completion_ids[:, :prompt_length]
+    prompt_mask = mask.repeat_interleave(num_generations, dim=0) 
     completion_ids = prompt_completion_ids[:, prompt_length:]
 
     # Mask everything after the first EOS token
@@ -303,17 +305,20 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     logits_to_keep = completion_ids.size(1)
 
     # Compute log probabilities
-    per_token_logps = get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+    with torch.inference_mode(): # don't track gradients
+      # Get log probabilities for the training model
+      per_token_logps = get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
     
     # Activate the reference adapter
     base_model.set_adapter("ref_adapter")
 
     # Compute reference model log probabilities
-    with torch.inference_mode():
-      with unwrap_ddp(model) as unwrapped_model:
-        with disable_ref_adapter(unwrapped_model) as disabled_ref_model:
+    with torch.inference_mode(): # don't track gradients
+      with unwrap_ddp(model) as unwrapped_model: # unwrap_ddp() is used to handle and disable the adapter
+        with disable_ref_adapter(unwrapped_model) as ref_model: # disable_ref_adapter() is used to disable the adapter
+          # Get log probabilities for the reference model
           ref_per_token_logps = get_per_token_logps(
-            disabled_ref_model, 
+            ref_model, 
             prompt_completion_ids,
             attention_mask,
             logits_to_keep
@@ -322,7 +327,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     # Activate the GRPO adapter again
     base_model.set_adapter("grpo_adapter")
 
-    # Compute KL divergence
+    # Compute KL divergence between the model and the reference model
     per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
     metrics['kl'] = per_token_kl.sum(dim=1).mean().item()
 
@@ -374,15 +379,24 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
       )
       advantages = advantages[process_slice]
 
-    # Compute final loss
-    per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
-    per_token_loss = -(per_token_loss - grpo_beta * per_token_kl)
-    loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+    old_per_token_logps = per_token_logps if num_generations > 1 else per_token_logps.detach()
+    # Get log probabilities for the training model with the gradients enabled
+    per_token_logps = get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+
+    # Compute surrogate loss with clipped ratio
+    ratio = torch.exp(per_token_logps - old_per_token_logps)
+    clipped_ratio = torch.clamp(ratio, min=1-epsilon, max=1+epsilon)
+    per_token_loss1 = ratio * advantages.unsqueeze(1)
+    per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
+    per_token_loss = -torch.minimum(per_token_loss1, per_token_loss2)
+    per_token_loss = per_token_loss + grpo_beta * per_token_kl
+    loss = ((per_token_loss * completion_mask).sum() / completion_mask.sum()).mean()
 
     # Add metrics
+    is_clipped = (ratio < clipped_ratio).float() + (ratio > clipped_ratio).float()
     metrics.update({
-      'per_token_loss': per_token_loss.sum(dim=1).mean().item(),
-      'per_token_kl': per_token_kl.sum(dim=1).mean().item(),
+      'clip_ratio': (is_clipped * completion_mask).sum() / completion_mask.sum(),
+      'kl': (per_token_kl * completion_mask).sum() / completion_mask.sum(),
       'reward': rewards.mean().item(),
       'reward_std': std_grouped_rewards.mean().item()
     })
@@ -390,6 +404,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     reward_per_func = rewards_per_func.mean(0)
     for i, reward_func in enumerate(reward_funcs):
       metrics[f"{reward_func.__name__}"] = reward_per_func[i].item()
+      
   except torch.cuda.OutOfMemoryError as e:
     import traceback
     print(f"[{hps.local_rank}]: Out of memory error. Exiting training loop. Error is being handled by the training loop.\n{traceback.print_exc()}\n{e}")
