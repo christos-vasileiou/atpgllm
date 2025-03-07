@@ -671,9 +671,9 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         if is_main_process():
           x = pd.DataFrame(metrics)
           # Show averaged metrics in progress bar
-          pbar.set_postfix(x.loc[x.index[-1], ['batch', 'batch_loss', 'avg_per_token_loss', 'avg_per_token_kl', 'avg_reward', 'best_avg_reward']].to_dict())
+          pbar.set_postfix(x.loc[x.index[-1], ['batch', 'batch_loss', 'clip_ratio', 'kl', 'reward', 'reward_std', 'avg_reward', 'best_avg_reward']].to_dict())
           if logging_step % logging_steps == 0:
-            print(tabulate(x.loc[x.index[-logging_steps:], ['batch', 'batch_loss', 'avg_per_token_loss', 'avg_per_token_kl', 'avg_reward', 'avg_cot_reward', 'avg_test_generation_reward', 'best_avg_reward']], headers='keys', tablefmt='psql', showindex=False))
+            print(tabulate(x.loc[x.index[-logging_steps:], ['batch', 'batch_loss', 'clip_ratio', 'kl', 'avg_reward', 'avg_cot_reward', 'avg_test_generation_reward', 'best_avg_reward']], headers='keys', tablefmt='psql', showindex=False))
             logging_step = 0
           logging_step += 1
         
@@ -785,7 +785,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   sampler = DistributedSampler(dataloader.sampler.dataset, rank=dataloader.sampler.rank, num_replicas=dataloader.sampler.num_replicas) if use_sampler else None  
 
   # Adjust gradient accumulation steps. GRPO is slower than SFT. lower the number of gradient accumulation steps.
-  hps.gradient_accumulation_steps = max(1, hps.gradient_accumulation_steps//min(2, hps.num_generations))
+  # hps.gradient_accumulation_steps = max(1, hps.gradient_accumulation_steps//2)
   hps.epochs = 1
 
   # Subset the dataset to 200,000 samples to shorten the training time
@@ -825,7 +825,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
     print(f"{model}\nGRPO-RLFT train embedding, lora and head:\nTrainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}")
   
   # 3, Fine-tune with Reinforcement Learning (RL)
-  rlft(dataloader, model, hps, reward_funcs=[cot_reward, test_generation_reward], training_loop=training_loop)
+  rlft(dataloader, model, hps, reward_funcs=[test_generation_reward], training_loop=training_loop)
   # Apply inference on some random samples of validation set
   if not DEBUG: 
     model.set_adapter("grpo_adapter")
