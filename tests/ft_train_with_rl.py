@@ -191,7 +191,7 @@ def get_per_token_logps(model, input_ids, attention_mask, logits_to_keep):
     per_token_logps.append(token_log_prob)
   return torch.stack(per_token_logps)
 
-def prepare_reward_kwargs(hps):
+def prepare_reward_kwargs(hps, reward_funcs):
   cot_block_re = re.compile(r'CHAIN_OF_THOUGHT:\n(.*?)SNAPSHOT', re.DOTALL)
   thought_pattern_re = re.compile(r'(\d+)\.(.*?)(?=\d+\.|$)', re.DOTALL)
   fault_re = re.compile(r"(sa\d)\s+(_\d+_)", re.DOTALL)
@@ -202,8 +202,12 @@ def prepare_reward_kwargs(hps):
 
   # Prepare the reward function's arguments
   sentence_transformer = SentenceTransformer('paraphrase-MiniLM-L6-v2').to(hps.device)
-  reward_kwargs = [{"model": sentence_transformer, "cot_block_re": cot_block_re, "thought_pattern_re": thought_pattern_re, "fault_re": fault_re},
-                   {"fault_re": fault_re, "simulation_re": simulation_re, "input_vector_re": input_vector_re, "expected_output_re": expected_output_re, "detected_faults_re": detected_faults_re}]
+  reward_kwargs = []
+  for reward_func in reward_funcs:
+    if reward_func.__name__ == "cot_reward":
+      reward_kwargs.append({"model": sentence_transformer, "cot_block_re": cot_block_re, "thought_pattern_re": thought_pattern_re, "fault_re": fault_re})
+    elif reward_func.__name__ == "test_generation_reward":
+      reward_kwargs.append({"fault_re": fault_re, "simulation_re": simulation_re, "input_vector_re": input_vector_re, "expected_output_re": expected_output_re, "detected_faults_re": detected_faults_re})
   return reward_kwargs
 
 def smart_round(value, sig_figs=3):
@@ -404,7 +408,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     reward_per_func = rewards_per_func.mean(0)
     for i, reward_func in enumerate(reward_funcs):
       metrics[f"{reward_func.__name__}"] = reward_per_func[i].item()
-      
+
   except torch.cuda.OutOfMemoryError as e:
     import traceback
     print(f"[{hps.local_rank}]: Out of memory error. Exiting training loop. Error is being handled by the training loop.\n{traceback.print_exc()}\n{e}")
@@ -543,8 +547,8 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
   if not isinstance(reward_funcs, list):
     reward_funcs = [reward_funcs]
 
-  # Regular expressions used during Chain-of-Thoughts (COTs) rewards calculation.
-  reward_kwargss = prepare_reward_kwargs(hps)
+  # Regular expressions used during Chain-of-Thoughts (COTs) rewards calculation and fault simulation.
+  reward_kwargss = prepare_reward_kwargs(hps, reward_funcs)
   # Initialize logging step
   logging_step = 0
   # Start training
