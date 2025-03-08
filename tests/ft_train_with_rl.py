@@ -47,9 +47,10 @@ from atpgllm import (
   save_model,
   MyCollate,
   get_trainable_parameters,
+  print_prompt_completions_sample,
 )
 from typing import List, Union, Callable, Dict, Any
-from transformers import Trainer
+from trl.trainer.utils import print_rich_table
 
 DEBUG = False
 
@@ -142,7 +143,8 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
         if is_main_process():
           pbar.set_postfix(x.iloc[-1].to_dict())
           if logging_step % logging_steps == 0:
-            print(tabulate(x.iloc[-logging_steps:], headers='keys', tablefmt='psql', showindex=False))
+            print_rich_table(x.iloc[-logging_steps:])
+            # print(tabulate(x.iloc[-logging_steps:], headers='keys', tablefmt='psql', showindex=False))
             logging_step=0
           logging_step+=1
       if DEBUG and i>10:
@@ -157,7 +159,8 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
     x = x.astype(float)
     wandb.log({"sft_complete_history": wandb.Table(dataframe=x)})
   if is_main_process():
-    print(tabulate(x, headers='keys', tablefmt='psql', showindex=False))
+    print_rich_table(x)
+    # print(tabulate(x, headers='keys', tablefmt='psql', showindex=False))
     pbar.close()
 
 def parse_output_to_dict(output_str):
@@ -242,7 +245,7 @@ def apply_lora_non_distributed(model, peft_model, lora_config, adapter_name="def
   return model
 
 
-def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
+def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
   """
   Compute the GRPO loss for a batch of inputs.
   
@@ -252,7 +255,8 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
       reward_funcs: List of reward functions to use
       reward_kwargss: List of kwargs for each reward function
       hps: Hyperparameters object
-      
+      step: Current step number
+
   Returns:
       tuple containing:
       - loss: The computed loss value
@@ -308,7 +312,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
     logits_to_keep = completion_ids.size(1)
 
-    # Compute log probabilities
+    # Compute log probabilities of the training model
     with torch.inference_mode(): # don't track gradients
       # Get log probabilities for the training model
       per_token_logps = get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
@@ -316,7 +320,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     # Activate the reference adapter
     base_model.set_adapter("ref_adapter")
 
-    # Compute reference model log probabilities
+    # Compute reference model log probabilities with gradients disabled. KL divergence from the reference model to the training model.
     with torch.inference_mode(): # don't track gradients
       with unwrap_ddp(model) as unwrapped_model: # unwrap_ddp() is used to handle and disable the adapter
         with disable_ref_adapter(unwrapped_model) as ref_model: # disable_ref_adapter() is used to disable the adapter
@@ -408,6 +412,10 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps):
     reward_per_func = rewards_per_func.mean(0)
     for i, reward_func in enumerate(reward_funcs):
       metrics[f"{reward_func.__name__}"] = reward_per_func[i].item()
+
+    # Print a sample of the prompt, completion, and reward
+    if step % hps.gradient_accumulation_steps == 0:
+      print_prompt_completions_sample(prompts, completions, rewards_per_func.sum(dim=1).clone().cpu(), step)
 
   except torch.cuda.OutOfMemoryError as e:
     import traceback
@@ -593,7 +601,8 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
           data=data,
           reward_funcs=reward_funcs,
           reward_kwargss=reward_kwargss,
-          hps=hps
+          hps=hps,
+          step=epoch*len(dataloader) + i
       )
       if error_flag:
         if is_main_process():
@@ -678,7 +687,8 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
             # Add any reward function metrics that exist in the dataframe
             reward_metrics = [col for col in x.columns if col.startswith('avg_') and col.endswith('_reward')]
             display_columns.extend(reward_metrics)
-            print(tabulate(x.loc[x.index[-logging_steps:], display_columns + ['best_avg_reward']], headers='keys', tablefmt='psql', showindex=False))
+            print_rich_table(x.loc[x.index[-logging_steps:], display_columns + ['best_avg_reward']])
+            # print(tabulate(x.loc[x.index[-logging_steps:], display_columns + ['best_avg_reward']], headers='keys', tablefmt='psql', showindex=False))
             logging_step = 0
           logging_step += 1
         
@@ -694,7 +704,8 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
     x = x.astype(float)
     wandb.log({"rlft_complete_history": wandb.Table(dataframe=x)})
   if is_main_process():
-    print(tabulate(x, headers='keys', tablefmt='psql', showindex=False))
+    print_rich_table(x)
+    # print(tabulate(x, headers='keys', tablefmt='psql', showindex=False))
     pbar.close()
 
 def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
