@@ -224,28 +224,41 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
     if fault:
       fault, net = fault[0]
 
+    # Calculate Reward for Fault Simulation
+    reward = {'format': 0, 'pred_simulation': 0, 'fault_simulation': 0, 'input_vector': 0, 'expected_output': 0, 'detected_faults': 0, 'fault_detect_inpvector': 0}
+
     # Extract the simulation
     pred_simulation = simulation_re.findall(completion)
     if pred_simulation:
       pred_simulation = pred_simulation[0]
+      reward['format'] += 1
+    else:
+      reward['format'] -= 1
 
     # Extract the input vector
     pred_input_vector = input_vector_re.findall(completion)
     if pred_input_vector:
       pred_input_vector = pred_input_vector[0]
+      reward['format'] += 1
+    else:
+      reward['format'] -= 1
 
     # Extract the expected output
     pred_expected_output = expected_output_re.findall(completion)
     if pred_expected_output:
       pred_expected_output = pred_expected_output[0]
+      reward['format'] += 1
+    else:
+      reward['format'] -= 1
 
     # Extract the detected faults
     pred_detected_faults = detected_faults_re.findall(completion)
     if pred_detected_faults:
       pred_detected_faults = pred_detected_faults[0]
+      reward['format'] += 1
+    else:
+      reward['format'] -= 1
 
-    # Calculate Reward for Fault Simulation
-    reward = {'pred_simulation': 0, 'fault_simulation': 0, 'input_vector': 0, 'expected_output': 0, 'detected_faults': 0, 'fault_detect_inpvector': 0}
     if fault and pred_simulation:
       try:
         # +1 Parse the simulation and convert it to a DataFrame

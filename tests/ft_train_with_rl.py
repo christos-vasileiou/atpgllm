@@ -368,6 +368,10 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
 
       rewards_per_func[:, reward_idx] = returned_rewards_per_func
 
+    # Print a sample of the prompt, completion, and reward
+    if step % hps.gradient_accumulation_steps == 0:
+      print_prompt_completions_sample(prompts, completions, rewards_per_func.sum(dim=1).clone().cpu(), step)
+
     # Gather rewards and compute advantages
     rewards_per_func = gather(rewards_per_func)
     rewards = rewards_per_func.sum(dim=1)
@@ -412,10 +416,6 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
     reward_per_func = rewards_per_func.mean(0)
     for i, reward_func in enumerate(reward_funcs):
       metrics[f"{reward_func.__name__}"] = reward_per_func[i].item()
-
-    # Print a sample of the prompt, completion, and reward
-    if step % hps.gradient_accumulation_steps == 0:
-      print_prompt_completions_sample(prompts, completions, rewards_per_func.sum(dim=1).clone().cpu(), step)
 
   except torch.cuda.OutOfMemoryError as e:
     import traceback
@@ -797,15 +797,15 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   use_sampler = hps.parallel==True and hps.deepspeed_kernel==False
   # Shuffle is handled by the sampler
   hps.shuffle = not use_sampler
+  # Subset the dataset to 200,000 samples to shorten the training time
+  dataset_subset = dataloader.dataset.select(range(min(200_000, len(dataloader.dataset))))
   # Replicate the sampler across all processes
-  sampler = DistributedSampler(dataloader.sampler.dataset, rank=dataloader.sampler.rank, num_replicas=dataloader.sampler.num_replicas) if use_sampler else None  
+  sampler = DistributedSampler(dataset_subset, rank=dataloader.sampler.rank, num_replicas=dataloader.sampler.num_replicas, shuffle=True) if use_sampler else None  
 
   # Adjust gradient accumulation steps. GRPO is slower than SFT. lower the number of gradient accumulation steps.
   # hps.gradient_accumulation_steps = max(1, hps.gradient_accumulation_steps//2)
   hps.epochs = 1
 
-  # Subset the dataset to 200,000 samples to shorten the training time
-  dataset_subset = dataloader.dataset.select(range(min(200_000, len(dataloader.dataset))))
   # Change batch size. Due to number of generations there might be OOM cuda error.
   hps.micro_batch_size = max(1, hps.micro_batch_size//hps.num_generations)
   dataloader = DataLoader(dataset=dataset_subset, batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)#, multiprocessing_context='fork', worker_init_fn=worker_init_fn)
