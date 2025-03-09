@@ -51,6 +51,7 @@ from atpgllm import (
 )
 from typing import List, Union, Callable, Dict, Any
 from trl.trainer.utils import print_rich_table
+import random
 
 DEBUG = False
 
@@ -797,8 +798,9 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   use_sampler = hps.parallel==True and hps.deepspeed_kernel==False
   # Shuffle is handled by the sampler
   hps.shuffle = not use_sampler
-  # Subset the dataset to 200,000 samples to shorten the training time
-  dataset_subset = dataloader.dataset.select(range(min(200_000, len(dataloader.dataset))))
+  # Randomly select 200,000 samples from the dataset to shorten the training time
+  random_indices = random.sample(range(len(dataloader.dataset)), min(200_000, len(dataloader.dataset)))
+  dataset_subset = dataloader.dataset.select(random_indices)
   # Replicate the sampler across all processes
   sampler = DistributedSampler(dataset_subset, rank=dataloader.sampler.rank, num_replicas=dataloader.sampler.num_replicas, shuffle=True) if use_sampler else None  
 
