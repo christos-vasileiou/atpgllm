@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, BackwardPrefetch, ShardingStrategy, CPUOffload, MixedPrecision
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, enable_wrap, wrap
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy, enable_wrap, wrap
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from peft import get_peft_model, LoraConfig, TaskType
 from tqdm.auto import tqdm
@@ -37,6 +37,7 @@ from transformers import (
   BitsAndBytesConfig,
   AutoTokenizer,
 )
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from trl.import_utils import is_rich_available
 
 if is_rich_available():
@@ -650,7 +651,7 @@ def initialize_training_environment(hps):
 
   # Initialize the W&B logger
   if hps.wandb:
-    wandb.init(project=f"RL Fine-Tuning", entity="chrivasileiou", config=hps)
+    hps.run = wandb.init(project=f"RL Fine-Tuning", entity="chrivasileiou", config=hps, save_code=True, tags=["baseline"])
 
 
 def get_trainable_parameters(model):
@@ -756,23 +757,35 @@ def prepare_objects_for_training(model, dataset, hps):
       tokenized_dataset = dataset
       hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora)
       
-      model = model.to(hps.local_rank) if sys.argv[0] != 'sft.py' else model
       if hps.fsdp:
         total_model_parameters = sum(p.numel() for p in model.parameters())
         num_params_per_gpu = (total_model_parameters // torch.cuda.device_count())
-        # num_params_per_gpu *= 1.00_01 # add a minute number of extra parameters (+00.01%)
-        my_auto_wrap_policy = partial(
-          size_based_auto_wrap_policy, min_num_params=int(num_params_per_gpu)
+        
+        # Create a custom wrap policy for FSDP
+        hps.my_auto_wrap_policy = partial(
+          transformer_auto_wrap_policy, recurse=True, transformer_layer_cls={LlamaDecoderLayer}
         )
+        hps.mixed_precision = MixedPrecision(
+          param_dtype=torch.bfloat16, 
+          reduce_dtype=torch.bfloat16, 
+          buffer_dtype=torch.bfloat16
+        )
+        # Standard FSDP wrapping for non-LoRA models
+        # Check if all parameters have requires_grad=True
+        all_params_require_grad = all(p.requires_grad for p in model.parameters())
         model = FSDP(model,
-                     auto_wrap_policy=my_auto_wrap_policy,
-                     backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-                     sharding_strategy=ShardingStrategy.FULL_SHARD,
-                     cpu_offload=CPUOffload(True),
-                     use_orig_params=True if hps.lora else False,
-                    #  mixed_precision=MixedPrecision(param_dtype=model.dtype, reduce_dtype=model.dtype), # NOTE: important knobs tuning for mixed precision training
-                ) if sys.argv[0] != 'sft.py' else model
+                      # device_id=hps.device,
+                      auto_wrap_policy=hps.my_auto_wrap_policy,
+                      use_orig_params=not all_params_require_grad,  # Set to True if some params don't require grad
+                      sharding_strategy=ShardingStrategy.FULL_SHARD,
+                      # Avoid wrapping LoRA modules to prevent issues
+                      ignored_modules=[m for name, m in model.named_modules() if 'lora' in name.lower()],
+                      mixed_precision=hps.mixed_precision
+                    ) if sys.argv[0] != 'sft.py' else model
+        torch.cuda.set_device(hps.local_rank)
       else:
+        # Move model to the correct device before wrapping with DDP
+        model = model.to(f"cuda:{hps.local_rank}")
         model = DDP(model, device_ids=[hps.local_rank], output_device=hps.local_rank, find_unused_parameters=False) if sys.argv[0] != 'sft.py' else model
         # model.module = torch.compile(model.module, backend='inductor', fullgraph=True)
 
@@ -812,8 +825,9 @@ def prepare_objects_for_training(model, dataset, hps):
   testing_loader    = DataLoader(dataset=tokenized_dataset['test'], batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=hps.collate_fn, sampler=testing_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
 
   if not hps.deepspeed_kernel:
+    
     total_training_steps = (hps.epochs * len(training_loader)) // hps.gradient_accumulation_steps
-    hps.optimizer = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=AdamW, lr=hps.lr) if hps.parallel else AdamW(model.parameters(), lr=hps.lr) if sys.argv[0] != 'sft.py' else None
+    hps.optimizer = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=AdamW, lr=hps.lr) if hps.parallel and not hps.fsdp else AdamW(model.parameters(), lr=hps.lr) if sys.argv[0] != 'sft.py' else None
     if hps.new_tokens:
       # NOTE: schedulers are being tested
 
@@ -857,7 +871,7 @@ def prepare_objects_for_training(model, dataset, hps):
   # Set the loss functions
   hps.criterion = nn.CrossEntropyLoss(ignore_index=hps.tokenizer.pad_token_id if hps.is_causal else -100).to(hps.device)
   hps.patterns_criterion = get_patterns_criterion(hps)
-  hps.accuracy = ATPGAccuracy(model, hps.tokenizer)
+  # hps.accuracy = ATPGAccuracy(model, hps.tokenizer)
 
   return model, training_loader, validation_loader, testing_loader
 
@@ -1265,7 +1279,10 @@ def load_model(hps: AttrDict) -> torch.nn.Module:
     hps.lora_config = LoraConfig(
       task_type=TaskType.CAUSAL_LM if hps.is_causal else TaskType.SEQ_2_SEQ_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout
     )
-    model = get_peft_model(model, hps.lora_config) 
+    if hps.adapter_name and hps.adapter_repo:
+      model = PeftModel.from_pretrained(model, hps.adapter_repo, subfolder=hps.adapter_name, adapter_name=hps.adapter_name)
+    else:
+      model = get_peft_model(model, hps.lora_config) 
     model.to(torch.bfloat16) 
 
     train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False) 
@@ -1276,11 +1293,7 @@ def load_model(hps: AttrDict) -> torch.nn.Module:
     # train_tokens_embeddings_and_head(model)
   else:
     if not hps.lora:
-      for name, params in model.named_parameters():
-        if 'lm_head' in name:
-          params.requires_grad = True
-        else:
-          params.requires_grad = False
+      train_layers(model, train_embeddings=False, train_head=True, train_lora=False, train_base_model=False) 
 
   hps.info += f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\n"
   hps.info += f"Trainable Model size: {convert_bytes(model_size_in_bytes(model))}\n"
@@ -1496,7 +1509,7 @@ def zero_grad_old_embeddings(model, tunable_ids = 32000):
       module.weight.grad[mask].zero_()
       return
 
-def infer(ddp_model, dataloader, tokenizer, model_max_length=4096, epoch=1, file_path='generated_text.txt', parallel=False, new_file=True):
+def infer(wrapped_model, dataloader, tokenizer, model_max_length=4096, epoch=1, file_path='generated_text.txt', parallel=False, new_file=True):
   """
   Creates a copy of the model, merges LoRA weights, and runs inference using token_ids.
   
@@ -1521,16 +1534,12 @@ def infer(ddp_model, dataloader, tokenizer, model_max_length=4096, epoch=1, file
   if is_main_process():
     print(f"Generate text. Please wait...")
     # Store the current device of the original DDP model to restore it later
-    original_device = next(ddp_model.parameters()).device
+    original_device = next(wrapped_model.parameters()).device
 
     try:
-      # Merge LoRA weights into the model
-      # if hasattr(model_copy, 'merge_and_unload'):
-      # print("Merging LoRA weights into the model...")
-      # model_copy.merge_and_unload()
-
+      
       # Don't use gradients
-      ddp_model.eval()
+      wrapped_model.eval()
       
       # Iterate over the data iterator and accumulate token_ids until the stop_token sequence is found
       data = next(data_iterator)
@@ -1542,12 +1551,13 @@ def infer(ddp_model, dataloader, tokenizer, model_max_length=4096, epoch=1, file
         file.write(f"\n---\nEpoch: {epoch}\n\n---\n")
 
         # Move to GPU
-        ids = data.input_ids[:2].to(original_device) # get 2 prompts from the micro_batch
-        mask = data.attention_mask[:2].to(original_device) # get 2 prompts from the micro_batch
+        ids = data.input_ids[:2].to(original_device).contiguous() # get 2 prompts from the micro_batch
+        mask = data.attention_mask[:2].to(original_device).contiguous() # get 2 prompts from the micro_batch
 
         # Generate completion
-        generate_model = ddp_model.module if hasattr(ddp_model, "module") else ddp_model 
-        generated_ids = generate_model.generate(input_ids=ids, attention_mask=mask, num_return_sequences=2, max_length=model_max_length, do_sample=True, temperature=0.6, top_p=0.95)
+        generate_model = wrapped_model.module if isinstance(wrapped_model, FSDP) or isinstance(wrapped_model, DDP) else wrapped_model 
+        with torch.no_grad():
+          generated_ids = generate_model.generate(input_ids=ids, attention_mask=mask, num_return_sequences=2, max_length=model_max_length, do_sample=True, temperature=0.6, top_p=0.95)
         
         torch.cuda.empty_cache()
 

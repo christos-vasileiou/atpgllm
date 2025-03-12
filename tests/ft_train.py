@@ -324,7 +324,7 @@ def train(model, training_loader, validation_loader, hps) -> list:
     hps.filename = "generated_text_lora.md" if hps.lora else "generated_text.md"
     hps.file_path = os.path.join(hps.log_dir, hps.filename)
     # print examples of trained model and in-memory model.
-    infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=epoch, file_path=hps.file_path, parallel=hps.parallel)
+    infer(wrapped_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=epoch, file_path=hps.file_path, parallel=hps.parallel)
 
     if is_main_process():
       hps.api.upload_file(repo_id=hps.save_in_repo, path_or_fileobj=hps.file_path, path_in_repo=hps.filename)

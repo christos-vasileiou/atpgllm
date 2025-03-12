@@ -15,12 +15,14 @@ from peft import PeftModel
 from tqdm.auto import tqdm
 from tabulate import tabulate
 from collections import defaultdict
+from transformers import AutoModelForCausalLM
 from transformers import set_seed, AutoTokenizer, get_cosine_schedule_with_warmup
 from sentence_transformers import SentenceTransformer
 from accelerate.utils import gather
 from peft import get_peft_model, LoraConfig, TaskType, get_peft_model_state_dict
 from torch.optim import AdamW
 from torch.distributed.optim import ZeroRedundancyOptimizer
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -157,7 +159,8 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
   x = pd.DataFrame(metrics)
   # Log final complete table
   if hps.wandb: 
-    x = x.astype(float)
+    # Convert string values to float, handling any non-numeric values and None values
+    x = x.fillna(0).applymap(lambda val: float(eval(val)) if isinstance(val, str) else val)
     wandb.log({"sft_complete_history": wandb.Table(dataframe=x)})
   if is_main_process():
     print_rich_table(x)
@@ -218,12 +221,27 @@ def smart_round(value, sig_figs=3):
   return f"{value:.{sig_figs}g}" if value != 0 else "0"
 
 @contextmanager
-def unwrap_ddp(model):
-  yield model.module if hasattr(model, "module") else model
+def unwrap_model(model):
+  if isinstance(model, DDP):
+    yield model.module
+  elif isinstance(model, FSDP): 
+    # Set up a context where we have the full weights
+    with FSDP.summon_full_params(model, recurse=True, writeback=False, with_grads=False):
+      yield model._fsdp_wrapped_module
+  else:
+    yield model
 
+def get_base_model(model):
+  if isinstance(model, DDP):
+    return model.module
+  elif isinstance(model, FSDP):
+    return model._fsdp_wrapped_module
+  else:
+    return model
+  
 @contextmanager
 def disable_ref_adapter(model):
-  for name, param in model.named_parameters():
+  for _, param in model.named_parameters():
     param.requires_grad = False
   yield model
 
@@ -270,32 +288,39 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
   epsilon = 0.2
 
   metrics = {}
-  base_model = model.module if hasattr(model, "module") else model
+  base_model = get_base_model(model)
   error_flag = torch.zeros(1, device=hps.device)
+  generate_kwargs = {
+    "max_length": hps.model_max_length,
+    "num_return_sequences": num_generations,
+    "do_sample": True,
+    "temperature": 0.6,
+    "top_p": 0.75,
+    "pad_token_id": tokenizer.eos_token_id
+  }
 
   try:
     # Activate the GRPO adapter
     base_model.set_adapter("grpo_adapter")
     
     # Get ids and mask from data
-    ids = data['input_ids'].to(device, non_blocking=True)
-    mask = data['attention_mask'].to(device, non_blocking=True)
+    ids = data['input_ids'].to(device, non_blocking=True).contiguous()
+    mask = data['attention_mask'].to(device, non_blocking=True).contiguous()
 
     # Generate completions
     gen_start = time.time()
-    with unwrap_ddp(model) as unwrapped_model:
-      prompt_completion_ids = unwrapped_model.generate(
-        input_ids=ids, 
-        attention_mask=mask, 
-        max_length=hps.model_max_length, 
-        num_return_sequences=num_generations, 
-        do_sample=True, 
-        temperature=0.6, 
-        top_p=0.75
-      )
+    with unwrap_model(model) as unwrapped_model:        
+      # Move generation parameters to the same device as the model
+      generate_kwargs.update({
+        "input_ids": ids,
+        "attention_mask": mask,
+      })
+      # Run generation with proper error handling
+      prompt_completion_ids = unwrapped_model.generate(**generate_kwargs)
     gen_end = time.time()
     metrics['generation_time'] = gen_end - gen_start
-    
+
+    # Prepare inputs for logit computation
     prompt_length = ids.size(1)
     prompt_ids = ids.repeat_interleave(num_generations, dim=0) # equivalent to prompt_completion_ids[:, :prompt_length]
     prompt_mask = mask.repeat_interleave(num_generations, dim=0) 
@@ -314,7 +339,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
     logits_to_keep = completion_ids.size(1)
 
     # Compute log probabilities of the training model
-    with torch.inference_mode(): # don't track gradients
+    with torch.no_grad(): # don't track gradients
       # Get log probabilities for the training model
       per_token_logps = get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
     
@@ -322,8 +347,8 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
     base_model.set_adapter("ref_adapter")
 
     # Compute reference model log probabilities with gradients disabled. KL divergence from the reference model to the training model.
-    with torch.inference_mode(): # don't track gradients
-      with unwrap_ddp(model) as unwrapped_model: # unwrap_ddp() is used to handle and disable the adapter
+    with torch.no_grad(): # don't track gradients
+      with unwrap_model(model) as unwrapped_model: # unwrap_model() is used to handle and disable the adapter
         with disable_ref_adapter(unwrapped_model) as ref_model: # disable_ref_adapter() is used to disable the adapter
           # Get log probabilities for the reference model
           ref_per_token_logps = get_per_token_logps(
@@ -348,14 +373,14 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
     netlists = [netlist for netlist in data['netlist'] for _ in range(num_generations)]
 
     # Compute rewards
-    rewards_per_func = torch.zeros(len(prompts), len(reward_funcs), device=device)
+    rewards_per_func = torch.zeros(len(prompts), len(reward_funcs), device=device, dtype=torch.bfloat16)
     for reward_idx, (reward_func, reward_kwargs) in enumerate(zip(reward_funcs, reward_kwargss)):
       if reward_func.__name__ == "test_generation_reward":
         reward_kwargs.update({"netlists": netlists})
       returned_rewards_list = reward_func(prompts, completions, **reward_kwargs)
       
       # Initialize rewards array and process metrics in one pass
-      returned_rewards_per_func = torch.zeros(len(returned_rewards_list), dtype=torch.float32, device=device)
+      returned_rewards_per_func = torch.zeros(len(returned_rewards_list), dtype=torch.bfloat16, device=device)
       # Pre-calculate divisor for averaging
       divisor = 1.0 / len(returned_rewards_list)
       for r_i, returned_rewards in enumerate(returned_rewards_list):
@@ -377,9 +402,11 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
     rewards_per_func = gather(rewards_per_func)
     rewards = rewards_per_func.sum(dim=1)
     
+    # Size: (B*N) -> Size: (B, N) -> Size: (B, 1)
     mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
     std_grouped_rewards = rewards.view(-1, num_generations).std(dim=1)
     
+    # Size: (B, 1) -> Size: (B*N, 1)
     mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
     std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
     advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-6)
@@ -393,6 +420,7 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
       advantages = advantages[process_slice]
 
     old_per_token_logps = per_token_logps if num_generations > 1 else per_token_logps.detach()
+    
     # Get log probabilities for the training model with the gradients enabled
     per_token_logps = get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
@@ -422,15 +450,21 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
     import traceback
     print(f"[{hps.local_rank}]: Out of memory error. Exiting training loop. Error is being handled by the training loop.\n{traceback.print_exc()}\n{e}")
     error_flag.fill_(1)
-    if hps.parallel:
-      dist.broadcast(error_flag, src=hps.local_rank)
+    # Ensure all processes know about the OOM error
+    if dist.is_available() and dist.is_initialized():
+      dist.all_reduce(error_flag, op=dist.ReduceOp.MAX)
     # Return a zero loss to avoid breaking the training loop
-    loss = torch.tensor(0, device=hps.device, requires_grad=False)
+    loss = torch.tensor(0.0, device=hps.device, dtype=torch.bfloat16, requires_grad=True)
+    return loss, metrics, error_flag
+
+  # Synchronize error flags one last time before returning
+  if dist.is_available() and dist.is_initialized():
+    dist.all_reduce(error_flag, op=dist.ReduceOp.MAX)
 
   torch.cuda.empty_cache()
   gc.collect()
 
-  return loss, metrics, error_flag.item()
+  return loss, metrics, error_flag
 
 def update_ref_adapter_ema(model, tau=0.9, ref_adapter_name="ref_adapter", grpo_adapter_name="grpo_adapter"):
   """
@@ -445,8 +479,8 @@ def update_ref_adapter_ema(model, tau=0.9, ref_adapter_name="ref_adapter", grpo_
       ref_adapter_name: Name of the reference adapter to update
       grpo_adapter_name: Name of the source GRPO adapter
   """
-  base_model = model.module if hasattr(model, "module") else model
-  
+  base_model = get_base_model(model)
+
   # Process parameters layer by layer to minimize memory usage
   # Map source parameter names to their corresponding target parameter names
   param_mapping = {}
@@ -456,7 +490,7 @@ def update_ref_adapter_ema(model, tau=0.9, ref_adapter_name="ref_adapter", grpo_
     if grpo_adapter_name in name:
       ref_name = name.replace(grpo_adapter_name, ref_adapter_name)
       param_mapping[name] = ref_name
-  
+
   # Update parameters one by one without storing all in memory
   for grpo_name, ref_name in param_mapping.items():
     # Get parameters by name to avoid storing all parameters in memory
@@ -484,7 +518,7 @@ def copy_adapter_weights(model, source_adapter_name="ref_adapter", target_adapte
       source_adapter_name: Name of the source adapter (e.g., "grpo_adapter")
       target_adapter_name: Name of the target adapter (e.g., "ref_adapter")
   """
-  base_model = model.module if hasattr(model, "module") else model
+  base_model = get_base_model(model)
   
   # Map source parameter names to their corresponding target parameter names
   source_to_target_map = {}
@@ -496,17 +530,23 @@ def copy_adapter_weights(model, source_adapter_name="ref_adapter", target_adapte
       source_to_target_map[name] = target_name
   
   # Copy parameters directly without storing intermediate copies
+  base_model_named_parameters = dict(base_model.named_parameters())
   for source_name, target_name in source_to_target_map.items():
     # Get parameters by name to avoid storing all parameters in memory
-    source_param = dict(base_model.named_parameters())[source_name]
-    target_param = dict(base_model.named_parameters())[target_name]
+    source_param = base_model_named_parameters[source_name]
+    target_param = base_model_named_parameters[target_name]
     # Copy data directly without creating additional clones
-    target_param.data.copy_(source_param.data)
+    if source_param.data.numel() == target_param.data.numel():
+      # Make sure shapes match without trying to reshape empty tensors
+      if source_param.data.shape == target_param.data.shape:
+        target_param.data.copy_(source_param.data)
+      else:
+        print(f"Warning: Shape mismatch. Source: {source_param.data.shape}, Target: {target_param.data.shape}")
+        # Only reshape if source has data
+        target_param.data.copy_(source_param.data.reshape(target_param.data.shape))
     # Free memory after each copy
     torch.cuda.empty_cache()
-  torch.cuda.empty_cache()
-  gc.collect()
-
+  
 def get_ref_update_freq(ref_update_step, total_updates, initial_ref_update_freq=10, final_ref_update_freq=1):
   """
   Calculate how often to update reference adapter based on training progress.
@@ -531,13 +571,13 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
   # Retrieve optimizer from hyperparameters dict
   optimizer = hps.get('optimizer', torch.optim.AdamW(model.parameters(), lr=hps.lr))
   scheduler = hps.get('scheduler', None)
-  
+    
   # TODO: I have to add them in hyperparameters
   logging_steps = 10 
 
   # Set collate function's flags to supervised fine-tuning
   dataloader.collate_fn.set_left_padding()
-
+  
   # Ensure model is in training mode for gradient computation
   model.train()
 
@@ -564,7 +604,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
   if is_main_process():
     print(f"Optimizer's step every: {hps.gradient_accumulation_steps}")
   # Initialize best_avg_reward to a negative value
-  hps.best_avg_reward = -10.0
+  hps.best_avg_reward = -np.inf
   
   # Parameters for dynamic reference adapter updates
   updates_per_epoch = len(dataloader) // hps.gradient_accumulation_steps
@@ -595,6 +635,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         last_grad_norm = None
       # Get next data
       data = next(data_iterator)
+      # hps.replay_buffer.append(i)
 
       # Compute loss and get metrics
       micro_batch_loss, micro_batch_metrics, error_flag = compute_loss(
@@ -605,13 +646,18 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
           hps=hps,
           step=epoch*len(dataloader) + i
       )
-      if error_flag:
+      
+      # Handle errors during compute_loss
+      if error_flag.item() > 0:
         if is_main_process():
           pbar.update(1)
         count_skip_micro_batch += 1
+        # Ensure all processes are synchronized after an error
+        if dist.is_available() and dist.is_initialized():
+          dist.barrier()
         continue
       # Scale loss for gradient accumulation
-      micro_batch_loss = micro_batch_loss / (hps.gradient_accumulation_steps - count_skip_micro_batch)
+      micro_batch_loss = micro_batch_loss #/ (hps.gradient_accumulation_steps - count_skip_micro_batch)
       batch_loss += micro_batch_loss.item()
       # Accumulate metrics for each micro-batch
       for key, value in micro_batch_metrics.items():
@@ -620,13 +666,16 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
       # Compute/Accumulate the gradients
       if training_loop:
         micro_batch_loss.backward()
-
+        
         # Apply the gradients when the accumulation step is reached
         if (i+1) % hps.gradient_accumulation_steps == 0 or i == len(dataloader)-1:
           # Clip the gradients
           last_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
           # Update the model parameters
           optimizer.step()
+          torch.cuda.empty_cache()
+          gc.collect()
+        
           # Update the learning rate scheduler
           if scheduler:
             scheduler.step() if hps.deepspeed_kernel else scheduler.step(batch_loss)
@@ -665,7 +714,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
             best_model_path = os.path.join(hps.log_dir, "models", "best_reward_model", hps.save_in_repo.split("/")[-1])
             best_model_file_path = os.path.join(best_model_path, hps.file_path.split("/")[-1])
             os.makedirs(best_model_path, exist_ok=True)
-            infer(ddp_model=model, dataloader=dataloader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=best_model_file_path, parallel=hps.parallel, new_file=not os.path.exists(best_model_file_path))
+            infer(wrapped_model=model, dataloader=dataloader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=best_model_file_path, parallel=hps.parallel, new_file=not os.path.exists(best_model_file_path))
             save_model(model, best_model_path, push_to_hub=False, save_embedding_layers=True, hps=hps, delete_previous=True, commit_message=f"Best reward model with avg_reward={current_avg_reward:.4f}")
             if is_main_process():
               print(f"✅ Saved best model to {best_model_path}")        
@@ -702,34 +751,97 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
   x = pd.DataFrame(metrics)
   # Log final complete table
   if hps.wandb:
-    x = x.astype(float)
+    # Convert string values to float, handling any non-numeric values and None values
+    x = x.fillna(0).applymap(lambda val: float(eval(val)) if isinstance(val, str) else val)
     wandb.log({"rlft_complete_history": wandb.Table(dataframe=x)})
   if is_main_process():
     print_rich_table(x)
     # print(tabulate(x, headers='keys', tablefmt='psql', showindex=False))
     pbar.close()
 
+
+def validate_model(model, validation_loader, hps, reward_funcs=[test_generation_reward], num_prompts_to_validate=4_000):
+  generate_kwargs = {"max_length": hps.model_max_length, "num_return_sequences": 1, "do_sample": True, "temperature": 0.6, "top_p": 0.7, "pad_token_id": hps.tokenizer.eos_token_id, "num_beams": 4}
+  validation_loader.collate_fn.set_left_padding()
+  validation_loader_iterator = iter(validation_loader)
+  total_steps = max(1, min(1000, round(num_prompts_to_validate // (validation_loader.batch_size * hps.world_size))))
+  if is_main_process():
+    pbar = tqdm(total=total_steps, desc=f"[{hps.local_rank}]: Validation...", disable=hps.disable_tqdm)
+  base_model = get_base_model(model)
+  base_model.set_adapter("grpo_adapter")
+  if not isinstance(reward_funcs, list):
+    reward_funcs = [reward_funcs]
+  reward_kwargss = prepare_reward_kwargs(hps, reward_funcs)
+  total_completions = []
+  total_prompts = []
+  total_netlists = []
+  for i in range(total_steps): 
+    data = next(validation_loader_iterator)
+    with torch.inference_mode():
+      with unwrap_model(model) as unwrapped_model:
+        generate_kwargs.update({"input_ids": data.input_ids.to(hps.device), "attention_mask": data.attention_mask.to(hps.device)})
+        completions = unwrapped_model.generate(**generate_kwargs)
+        prompt_length = data.input_ids.size(1)
+        completions = completions[:, prompt_length:]
+        completions = hps.tokenizer.batch_decode(completions, skip_special_tokens=True)
+        total_completions.extend(completions)
+        prompts = get_user_prompt(hps.tokenizer.batch_decode(data.input_ids))
+        total_prompts.extend(prompts)
+        total_netlists.extend(data.netlist)
+        if is_main_process():
+          pbar.update(1)
+        torch.cuda.empty_cache()
+        gc.collect()
+  metrics = {}
+
+  rewards_per_func = torch.zeros(len(total_prompts), len(reward_funcs), device=hps.device, dtype=torch.bfloat16)
+  for reward_idx, (reward_func, reward_kwargs) in enumerate(zip(reward_funcs, reward_kwargss)):
+    if reward_func.__name__ == "test_generation_reward":
+      reward_kwargs.update({"netlists": total_netlists})
+    returned_rewards_list = reward_func(total_prompts, total_completions, **reward_kwargs)
+    returned_rewards_per_func = torch.zeros(len(returned_rewards_list), dtype=torch.bfloat16, device=hps.device)
+    divisor = 1.0 / len(returned_rewards_list)
+    for r_i, returned_rewards in enumerate(returned_rewards_list):
+      returned_rewards_per_func[r_i] = sum(returned_rewards.values())
+      for k, v in returned_rewards.items():
+        metrics_key = f"{reward_func.__name__}" + (f"/{k}" if k else "")
+        metrics[metrics_key] = metrics.get(metrics_key, 0) + v * divisor      
+    rewards_per_func[:, reward_idx] = returned_rewards_per_func
+  rewards_per_func = gather(rewards_per_func).mean(dim=0)
+  if is_main_process():
+    print(rewards_per_func)
+    print(pd.DataFrame([metrics]))
+  if hps.wandb:
+    wandb.log({"validate_model": wandb.Table(dataframe=pd.DataFrame([metrics]))})
+
 def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # Fine-tune with Supevised Fine-Tuning (SFT)
   # 1. Train new embeddings tokens and head
   if hps.new_tokens:
+    hps.run.tags += ('train_new_embeddings',)
     sft(dataloader, model, hps, desc="SFT Embeddings Training...", training_loop=training_loop)
     # Apply inference on some random samples of validation set
     if not DEBUG:
-      infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
+      infer(wrapped_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
       save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="Model trained with new embeddings")
 
   hps.lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM if hps.is_causal else TaskType.SEQ_2_SEQ_LM, r=hps.lora_r, lora_alpha=hps.lora_alpha, lora_dropout=hps.lora_dropout)
   if not hps.adapter_name or not hps.adapter_repo:
-    # Add adapter (LoRA matrices) 
-    base_model = model.module if hasattr(model, "module") and hps.parallel else model
-    # Check if the base model has the 'peft_config' attribute to determine if LoRA configuration needs to be set
-    if not hasattr(base_model, 'peft_config'):
+    # This block of code is for adding lora weights when either fsdp or ddp is used
+    # Check for DDP or FSDP wrapped modules using attribute names
+    base_model = model
+    if hps.parallel:
+      base_model = get_base_model(model)
+
+    # Check if the model is already a PeftModel
+    is_peft_model = hasattr(base_model, 'peft_config') or isinstance(base_model, PeftModel)
+
+    if not is_peft_model:
       # Set LoRA configuration: LoRA (Low-Rank Adaptation) is used to efficiently fine-tune large models by adding low-rank matrices to the model's weights.
       peft_model = get_peft_model(base_model, hps.lora_config, adapter_name="ref_adapter")
     else:
-      # TODO: Check if this is correct
-      peft_model = model.module if hasattr(model, "module") and hps.parallel else model 
+      # Model is already a PeftModel, no need to convert it
+      peft_model = base_model
 
     if is_main_process():
       print(f"Applying LoRA to the model...")
@@ -737,34 +849,80 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
     if hps.parallel:
       model = apply_lora_distributed(model, peft_model, hps.lora_config, adapter_name="ref_adapter")
     else:
-      model = apply_lora_non_distributed(model, peft_model, hps.lora_config, adapter_name="ref_adapter")
-    # Load the adapter
+      model = apply_lora_non_distributed(model, peft_model, hps.lora_config, adapter_name="ref_adapter")  
   elif hps.adapter_name and hps.adapter_repo:
     if hps.parallel:
-      model.module = PeftModel.from_pretrained(model.module, hps.adapter_repo, subfolder=hps.adapter_name, adapter_name=hps.adapter_name).to(torch.bfloat16)
+      if isinstance(model, DDP):
+        model.module = PeftModel.from_pretrained(model.module, hps.adapter_repo, subfolder=hps.adapter_name, adapter_name=hps.adapter_name).to(torch.bfloat16)
+      elif isinstance(model, FSDP):
+        # We need to completely unwrap the model first
+        # Get the base model without FSDP wrapping
+        with FSDP.summon_full_params(model, recurse=True, writeback=False):
+          # Create a deep copy of the unwrapped module to avoid FSDP references
+          base_model_config = model._fsdp_wrapped_module.config
+          base_model_state = {k: v.clone().detach().cpu() for k, v in model._fsdp_wrapped_module.state_dict().items()}
+        del model
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        print("Creating clean model from config. It might take a while...")
+        # Create a model on meta device to avoid redundant memory allocation
+        clean_model = AutoModelForCausalLM.from_pretrained(hps.model_name, 
+                                                           attn_implementation="flash_attention_2", 
+                                                           config=base_model_config)
+        
+        # Move model to CPU first for efficient memory management
+        clean_model = clean_model.to('cpu')
+        
+        # Load state dict with non-blocking transfers and pin memory for faster GPU transfer
+        for key, param in base_model_state.items():
+          if key in clean_model.state_dict():
+            clean_model.state_dict()[key].copy_(param.to('cpu', non_blocking=True))
+        
+        # Clear CUDA cache to free up memory before next operations
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # Ensure all operations complete
+        # Now apply PEFT to the clean model
+        peft_model = PeftModel.from_pretrained(
+            clean_model,
+            hps.adapter_repo,
+            subfolder=hps.adapter_name,
+            adapter_name=hps.adapter_name
+        ).to(torch.bfloat16)
+        
+        # Re-wrap with FSDP
+        model = FSDP(
+            peft_model,
+            # device_id=hps.local_rank,
+            auto_wrap_policy=hps.my_auto_wrap_policy,
+            mixed_precision=hps.mixed_precision,
+            use_orig_params=True,
+            # ignored_modules=[m for name, m in peft_model.named_modules() if 'lora' in name.lower()]
+        )
     else:
       model = PeftModel.from_pretrained(model, hps.adapter_repo, subfolder=hps.adapter_name, adapter_name=hps.adapter_name).to(torch.bfloat16)
 
-  # Set find_unused_parameters to True to avoid OOM error
-  model.find_unused_parameters = True
+  # Handle unused parameters based on model type
+  if hps.parallel:
+    if isinstance(model, DDP):
+      model.find_unused_parameters = True  # Set find_unused_parameters to True to avoid OOM error
 
   # Configure which parts of the model to train in step 2
   train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False)
 
-  # Get trainable parameters with their specific learning rates
-  # trainable_params = get_trainable_parameters(model)
-  
   # Initialize the optimizer with parameter groups
-  if hps.parallel:
+  # Get only trainable parameters to optimize memory usage and training efficiency
+  trainable_params = [p for p in model.parameters() if p.requires_grad]
+  if hps.parallel and not hps.fsdp:
     hps.optimizer = ZeroRedundancyOptimizer(
-        model.parameters(),  # Contains parameter groups with their learning rates
-        optimizer_class=AdamW,
-        lr=hps.lr
+      trainable_params,  # Only parameters that require gradients
+      optimizer_class=AdamW,
+      lr=hps.lr
     )
   else:
     hps.optimizer = AdamW(
-        model.parameters(),  # Contains parameter groups with their learning rates
-        lr=hps.lr
+      trainable_params,  # Only parameters that require gradients
+      lr=hps.lr
     )
 
   # Calculate the total number of training steps
@@ -775,11 +933,13 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   if hps.train_lora:
     if is_main_process():
       print(f"{model}\nSFT embedding, lora and head:\nModel training parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}\n")
+    if hps.wandb:
+      hps.run.tags += ('train_lora',)
     # 2. Train adapter (LoRA weights) as well
     sft(dataloader, model, hps, desc="SFT Lora Training...", training_loop=training_loop) 
     # Apply inference on some random samples of validation set
     if not DEBUG:
-      infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
+      infer(wrapped_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
       save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="Model trained with LoRA")
 
   # Configure which parts of the model to train in step 3
@@ -787,13 +947,20 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
 
   # Add GRPO adapter
   if hps.parallel:
-    model.module.base_model.add_adapter(hps.lora_config, adapter_name="grpo_adapter")
-    model.module.set_adapter("grpo_adapter")
+    if isinstance(model, DDP):
+      model.module.base_model.add_adapter(hps.lora_config, adapter_name="grpo_adapter")
+      model.module.set_adapter("grpo_adapter")
+    elif isinstance(model, FSDP):
+      model._fsdp_wrapped_module.base_model.add_adapter(hps.lora_config, adapter_name="grpo_adapter")
+      model._fsdp_wrapped_module.set_adapter("grpo_adapter")
   else:
     model.base_model.add_adapter(hps.lora_config, adapter_name="grpo_adapter")
     model.set_adapter("grpo_adapter")
   # Copy the weights from the reference adapter to the GRPO adapter
   copy_adapter_weights(model, source_adapter_name="ref_adapter", target_adapter_name="grpo_adapter")
+  torch.cuda.empty_cache()
+  gc.collect()
+
   # Set the flags for distributed systems. Data samplers and Data Loaders
   use_sampler = hps.parallel==True and hps.deepspeed_kernel==False
   # Shuffle is handled by the sampler
@@ -814,27 +981,21 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   torch.cuda.empty_cache()
   gc.collect()
 
-  # When adding GRPO adapter, update optimizer similarly:
-  # after_grpo_params = get_trainable_parameters(model)
-
   hps.lr = max(1e-7, min(1e-5, hps.lr))
-  if hps.parallel:
+  trainable_params = [p for p in model.parameters() if p.requires_grad]
+  if hps.parallel and not hps.fsdp:
     hps.optimizer = ZeroRedundancyOptimizer(
-      model.parameters(),
+      trainable_params,
       optimizer_class=AdamW,
       lr=hps.lr
     )
   else:
     hps.optimizer = AdamW(
-      model.parameters(),
-      weight_decay=0.01,
-      eps=1e-8,
-      betas=(0.9, 0.999),
+      trainable_params,
       lr=hps.lr
     )
 
   # Configure which parts of the model to train
-  # train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False)
   # Calculate the total number of training steps
   total_training_steps = (hps.epochs * len(dataloader)) // hps.gradient_accumulation_steps
   hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=1, num_training_steps=total_training_steps, num_cycles=3/20)
@@ -843,16 +1004,28 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
     print(f"{model}\nGRPO-RLFT train embedding, lora and head:\nTrainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}")
   
   # 3, Fine-tune with Reinforcement Learning (RL)
+  if hps.wandb:
+    hps.run.tags += ('train_rl_grpo',)
   rlft(dataloader, model, hps, reward_funcs=[test_generation_reward], training_loop=training_loop)
   # Apply inference on some random samples of validation set
   if not DEBUG: 
-    model.set_adapter("grpo_adapter")
-    infer(ddp_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
+    base_model = get_base_model(model)
+    base_model.set_adapter("grpo_adapter")
+    # Apply inference on some random samples of validation set
+    infer(wrapped_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
+    # Save the model in the repository
     save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="Final Model trained with GRPO-RL")
+    # Save the model in the local directory
     final_model_path = os.path.join(hps.log_dir, "models", "final_model", hps.save_in_repo.split("/")[-1])
     os.makedirs(final_model_path, exist_ok=True)
     save_model(model, final_model_path, push_to_hub=False, save_embedding_layers=True, hps=hps, delete_previous=False)
+  
+  torch.cuda.empty_cache()
+  gc.collect()
+  dist.barrier()
 
+  # Validate the model
+  validate_model(model, validation_loader, hps, reward_funcs=[test_generation_reward])
 
 def main():
   # Arguments

@@ -231,7 +231,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
     pred_simulation = simulation_re.findall(completion)
     if pred_simulation:
       pred_simulation = pred_simulation[0]
-      reward['format'] += 1
+      reward['format'] += 0.125
     else:
       reward['format'] -= 1
 
@@ -239,7 +239,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
     pred_input_vector = input_vector_re.findall(completion)
     if pred_input_vector:
       pred_input_vector = pred_input_vector[0]
-      reward['format'] += 1
+      reward['format'] += 0.125
     else:
       reward['format'] -= 1
 
@@ -247,7 +247,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
     pred_expected_output = expected_output_re.findall(completion)
     if pred_expected_output:
       pred_expected_output = pred_expected_output[0]
-      reward['format'] += 1
+      reward['format'] += 0.125
     else:
       reward['format'] -= 1
 
@@ -255,7 +255,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
     pred_detected_faults = detected_faults_re.findall(completion)
     if pred_detected_faults:
       pred_detected_faults = pred_detected_faults[0]
-      reward['format'] += 1
+      reward['format'] += 0.125
     else:
       reward['format'] -= 1
 
@@ -263,7 +263,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
       try:
         # +1 Parse the simulation and convert it to a DataFrame
         pred_simulation = pd.read_csv(StringIO(pred_simulation), sep="\s{2,}")
-        reward['pred_simulation'] += .25
+        reward['pred_simulation'] += .5
         # Check if the Good Machine value is different than Bad Machine for the requested net + if the fault simulation trigger the requested fault
         reward['pred_simulation'] += int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
         reward['pred_simulation'] += int(pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
@@ -271,7 +271,6 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         pred_simulation = None
         reward['pred_simulation'] -= 2
 
-    gate_func = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}
     if pred_input_vector and pred_expected_output and fault and net and netlist:
       try:
         # Run Fault Simulation
