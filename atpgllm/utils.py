@@ -651,7 +651,28 @@ def initialize_training_environment(hps):
 
   # Initialize the W&B logger
   if hps.wandb:
-    hps.run = wandb.init(project=f"RL Fine-Tuning", entity="chrivasileiou", config=hps, save_code=True, tags=["baseline"])
+    # Create a consistent group name across all distributed processes
+    # For distributed training, we want the same group name for all ranks
+    if hps.parallel:
+      # Only add timestamp from rank 0 to ensure consistency
+      if is_main_process():
+        timestamp = datetime.now().strftime("%Y_%m_%d_%Hh_%Mm_%Ss")
+        group_name = f"{timestamp}"
+        
+      # Synchronize the group name across all processes if using distributed
+      if hps.world_size > 1:
+        group_name_tensor = torch.tensor([ord(c) for c in group_name] + [0] * (100 - len(group_name)), 
+                                        dtype=torch.long, device=hps.device)
+        dist.broadcast(group_name_tensor, src=0)
+        # Convert back to string on all ranks
+        if not is_main_process():
+          group_name = ''.join([chr(c) for c in group_name_tensor.cpu().tolist() if c > 0])
+    else:
+      # For non-distributed training, add timestamp
+      timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+      group_name = f"{timestamp}"
+    
+    hps.run = wandb.init(group=group_name, project=f"RL Fine-Tuning", entity="chrivasileiou", config=hps, save_code=True, tags=["baseline"])
 
 
 def get_trainable_parameters(model):
