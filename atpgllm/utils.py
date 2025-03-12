@@ -654,16 +654,27 @@ def initialize_training_environment(hps):
     # Create a consistent group name across all distributed processes
     # For distributed training, we want the same group name for all ranks
     if hps.parallel:
-      # Only add timestamp from rank 0 to ensure consistency
+      # Initialize group_name for all processes
+      group_name = ""
+      
+      # Only create timestamp on rank 0
       if is_main_process():
         timestamp = datetime.now().strftime("%Y_%m_%d_%Hh_%Mm_%Ss")
         group_name = f"{timestamp}"
         
       # Synchronize the group name across all processes if using distributed
       if hps.world_size > 1:
-        group_name_tensor = torch.tensor([ord(c) for c in group_name] + [0] * (100 - len(group_name)), 
-                                        dtype=torch.long, device=hps.device)
+        # Create a tensor buffer for broadcasting
+        if is_main_process():
+          group_name_tensor = torch.tensor([ord(c) for c in group_name] + [0] * (100 - len(group_name)), 
+                                          dtype=torch.long, device=hps.device)
+        else:
+          # Non-main processes need to initialize the tensor to receive the broadcast
+          group_name_tensor = torch.zeros(100, dtype=torch.long, device=hps.device)
+          
+        # Broadcast from rank 0 to all processes
         dist.broadcast(group_name_tensor, src=0)
+        
         # Convert back to string on all ranks
         if not is_main_process():
           group_name = ''.join([chr(c) for c in group_name_tensor.cpu().tolist() if c > 0])
