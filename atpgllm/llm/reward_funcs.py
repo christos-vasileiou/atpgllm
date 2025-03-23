@@ -316,7 +316,8 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # Primary outputs are next most important (weight 1.5) 
           # All other rows have base weight 1.0
           weights = pd.DataFrame(1.0, index=row_matches.index, columns=row_matches.columns)
-          weights[fault_simulation["Fault Path"]] = 2.0
+          reward['pred_vs_fault_sim_acc'] += (row_matches.sum() / row_matches.count()).mean()
+          weights[fault_simulation["Fault Path"]] = 1.5
           
           # Calculate weighted accuracy
           weighted_accuracy = ((row_matches * weights).sum() / weights.sum()).mean()
@@ -330,7 +331,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # 95% accuracy -> 3.80x base reward  | 95% accuracy -> 7.41x base reward   | 95% accuracy -> 14.46x base reward  |
           # 100% accuracy -> 4.00x base reward | 100% accuracy -> 9.00x base reward  | 100% accuracy -> 16.00x base reward |
           base_reward = 1.0
-          reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** 4 - 4**(1/3)
+          reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** 4 - 9.38 # force >75% accuracy. 1.75**4=9.38
           
           # Calculate a smoother reward using weights for each subcondition
           # Subcondition 1: Bad machine value matches the fault value
@@ -345,13 +346,11 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           
           # Apply smoother scaling between 1 and 16
           # This creates intermediate values between 1 and 16 based on partial satisfaction of conditions
-          if eval_mode:
-            reward['fault_detect_inpvector'] += bad_machine_matches_fault and good_differs_from_bad
+          reward['fault_detected_by_pred_input_vector_acc'] += bad_machine_matches_fault and good_differs_from_bad
+          if bad_machine_matches_fault == 0 and good_differs_from_bad == 0:
+            reward['fault_detect_inpvector'] -= 5
           else:
-            if bad_machine_matches_fault == 0 and good_differs_from_bad == 0:
-              reward['fault_detect_inpvector'] -= 5
-            else:
-              reward['fault_detect_inpvector'] += base_reward * (1 + fault_detection_score) ** 4 - 4**(1/3)
+            reward['fault_detect_inpvector'] += base_reward * (1 + fault_detection_score) ** 4 - 5.06 # 5.06 is the minimum reward. Mean 50% accuracy.
         else:
           reward['fault_simulation'] -= 5
 
@@ -375,6 +374,9 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         reward['detected_faults'] += 2*int(detected_faults_reward)
         reward['expected_output'] += 2*int(output_vector_reward)
         reward['input_vector'] += 2*int(input_vector_reward)
+        reward['detected_faults_acc'] += int(detected_faults_reward)
+        reward['expected_output_acc'] += int(output_vector_reward)
+        reward['input_vector_acc'] += int(input_vector_reward)
         
         # Reward the input vector & expected output
         # if LLM simulation and actual simulation have same:
