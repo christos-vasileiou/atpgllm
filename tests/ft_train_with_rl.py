@@ -400,7 +400,7 @@ def compute_loss(model, data_iterator, reward_funcs, reward_kwargss, hps, step):
     if 'pass_at_k' in locals():
       pass_at_k[pass_key] = torch.tensor(pass_at_k[pass_key], device=device, dtype=torch.bool)
       pass_at_k[pass_key] = gather(pass_at_k[pass_key])
-      metrics[pass_key] = pass_at_k[pass_key].numpy()
+      metrics[pass_key] = pass_at_k[pass_key].cpu().numpy()
     # Print a sample of the prompt, completion, and reward
     if step % hps.gradient_accumulation_steps == 0:
       print_prompt_completions_sample(prompts, completions, rewards_per_func.sum(dim=1).clone().cpu(), step)
@@ -452,8 +452,8 @@ def compute_loss(model, data_iterator, reward_funcs, reward_kwargss, hps, step):
     kl_div = (per_token_kl * completion_mask).sum() / completion_mask.sum()
 
     metrics.update({
-      'clip_ratio': clip_ratio,
-      'kl': kl_div,
+      'clip_ratio': clip_ratio.item(),
+      'kl': kl_div.item(),
       'reward': rewards.mean().item(),
       'reward_std': std_grouped_rewards.mean().item()
     })
@@ -1028,7 +1028,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         metrics["ref_update_step"].append(f"{ref_update_step}/{next_ref_update}")
         # Log the gradient norm metric (defaulting to 0.0 if not available)
         metrics["grad_norm"].append(smart_round(last_grad_norm) if last_grad_norm is not None else smart_round(0.0))
-        metrics[pass_key].append(pass_at_k[pass_key].any(1).mean())
+        metrics[pass_key].append(smart_round(pass_at_k[pass_key].any(1).mean()))
         # Add averaged metrics for each micro-batch
         for key in accumulated_metrics.keys():
           avg_value = sum(accumulated_metrics[key]) / len(accumulated_metrics[key])
@@ -1375,6 +1375,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
 
   # Validate the model
   validate_model(model, validation_loader, hps, reward_funcs=[test_generation_reward])
+  
 
 def main():
   # Arguments
