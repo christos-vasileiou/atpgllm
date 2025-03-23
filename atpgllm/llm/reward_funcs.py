@@ -253,7 +253,12 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
               'input_vector': 0, 
               'expected_output': 0, 
               'detected_faults': 0, 
-              'fault_detect_inpvector': 0
+              'fault_detect_inpvector': 0,
+              'pred_vs_fault_sim_acc': 0,
+              'fault_detected_by_pred_input_vector_acc': 0,
+              'expected_output_acc': 0,
+              'input_vector_acc': 0,
+              'detected_faults_acc': 0
               }
 
     # Extract the simulation
