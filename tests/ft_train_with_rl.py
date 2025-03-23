@@ -187,9 +187,9 @@ def get_per_token_logps(model, input_ids, attention_mask, logits_to_keep):
   # It should be logits_to_keep=logits_to_keep+1 only if transformers >= 4.49 
   # logits_to_keep keeps the last predicted tokens. Starts counting from the last token.
   logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep+1).logits # (B, L, V)
-  logits = logits[:, :-1, :] # (B, L-1, V) exclude the last logit: it corresponds to the next token pred  
+  logits = logits[:, :-1, :] # (B, L-1, V) exclude the last logit: it corresponds to the next token prediction
   input_ids = input_ids[:, -logits_to_keep:] # Keep completion ids
-  
+
   # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
   per_token_logps = []
   for logits_row, input_ids_row in zip(logits, input_ids):
@@ -264,13 +264,13 @@ def apply_lora_non_distributed(model, peft_model, lora_config, adapter_name="def
   return model
 
 
-def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
+def compute_loss(model, data_iterator, reward_funcs, reward_kwargss, hps, step):
   """
   Compute the GRPO loss for a batch of inputs.
   
   Args:
       model: The model to compute loss for
-      data: Dictionary containing input_ids, attention_mask, netlist, etc.
+      data_iterator: Iterator over the data
       reward_funcs: List of reward functions to use
       reward_kwargss: List of kwargs for each reward function
       hps: Hyperparameters object
@@ -286,6 +286,8 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
   num_generations = hps.num_generations
   tokenizer = hps.tokenizer
   epsilon = 0.2
+  # Get next data
+  data = next(data_iterator)
 
   metrics = {}
   base_model = get_base_model(model)
@@ -310,13 +312,8 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
     # Generate completions
     gen_start = time.time()
     with unwrap_model(model) as unwrapped_model:        
-      # Move generation parameters to the same device as the model
-      generate_kwargs.update({
-        "input_ids": ids,
-        "attention_mask": mask,
-      })
       # Run generation with proper error handling
-      prompt_completion_ids = unwrapped_model.generate(**generate_kwargs)
+      prompt_completion_ids = unwrapped_model.generate(input_ids=ids, attention_mask=mask, **generate_kwargs)
     gen_end = time.time()
     metrics['generation_time'] = gen_end - gen_start
 
@@ -381,9 +378,17 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
       
       # Initialize rewards array and process metrics in one pass
       returned_rewards_per_func = torch.zeros(len(returned_rewards_list), dtype=torch.bfloat16, device=device)
+      # Initialize pass@k metrics
+      if reward_func.__name__ == "test_generation_reward":
+        pass_key = f'pass@{hps.num_generations}'
+        pass_at_k = {pass_key: []}
       # Pre-calculate divisor for averaging
       divisor = 1.0 / len(returned_rewards_list)
       for r_i, returned_rewards in enumerate(returned_rewards_list):
+        if reward_func.__name__ == "test_generation_reward":
+          if r_i//hps.num_generations == len(pass_at_k[pass_key]):
+            pass_at_k[pass_key].append([])
+          pass_at_k[pass_key][r_i//hps.num_generations].append(returned_rewards['fault_detect_inpvector'])
         # Sum all reward components and update metrics
         returned_rewards_per_func[r_i] = sum(returned_rewards.values())
         # Update metrics dictionary efficiently
@@ -391,9 +396,11 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
           # Construct metrics key efficiently - only append suffix if k is not empty
           metrics_key = f"{reward_func.__name__}" + (f"/{k}" if k else "")
           metrics[metrics_key] = metrics.get(metrics_key, 0) + v * divisor
-
       rewards_per_func[:, reward_idx] = returned_rewards_per_func
-
+    if 'pass_at_k' in locals():
+      pass_at_k[pass_key] = torch.tensor(pass_at_k[pass_key], device=device, dtype=torch.bool)
+      pass_at_k[pass_key] = gather(pass_at_k[pass_key])
+      metrics[pass_key] = pass_at_k[pass_key].numpy()
     # Print a sample of the prompt, completion, and reward
     if step % hps.gradient_accumulation_steps == 0:
       print_prompt_completions_sample(prompts, completions, rewards_per_func.sum(dim=1).clone().cpu(), step)
@@ -427,17 +434,26 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
     # Compute surrogate loss with clipped ratio
     ratio = torch.exp(per_token_logps - old_per_token_logps)
     clipped_ratio = torch.clamp(ratio, min=1-epsilon, max=1+epsilon)
+    
+    # Compute the surrogate loss
     per_token_loss1 = ratio * advantages.unsqueeze(1)
     per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
     per_token_loss = -torch.minimum(per_token_loss1, per_token_loss2)
-    per_token_loss = per_token_loss + grpo_beta * per_token_kl
-    loss = ((per_token_loss * completion_mask).sum() / completion_mask.sum()).mean()
 
+    # Add the KL divergence to the loss 
+    per_token_loss = per_token_loss + grpo_beta * per_token_kl
+
+    # Compute the loss
+    loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+    
     # Add metrics
-    is_clipped = (ratio < clipped_ratio).float() + (ratio > clipped_ratio).float()
+    is_clipped = (ratio < 1-epsilon).float() + (ratio > 1+epsilon).float()
+    clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
+    kl_div = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+
     metrics.update({
-      'clip_ratio': (is_clipped * completion_mask).sum() / completion_mask.sum(),
-      'kl': (per_token_kl * completion_mask).sum() / completion_mask.sum(),
+      'clip_ratio': clip_ratio,
+      'kl': kl_div,
       'reward': rewards.mean().item(),
       'reward_std': std_grouped_rewards.mean().item()
     })
@@ -465,6 +481,317 @@ def compute_loss(model, data, reward_funcs, reward_kwargss, hps, step):
   gc.collect()
 
   return loss, metrics, error_flag
+
+
+
+
+def compute_aggregated_loss(model, data_iterator, reward_funcs, reward_kwargss, hps, step, num_micro_batches=4):
+    """
+    Compute the GRPO loss aggregated across multiple micro-batches.
+    
+    Args:
+        model: The model to compute loss for
+        data_iterator: Iterator providing batches of data
+        reward_funcs: List of reward functions to use
+        reward_kwargss: List of kwargs for each reward function
+        hps: Hyperparameters object
+        step: Current step number
+        num_micro_batches: Number of micro-batches to process before computing loss
+        
+    Returns:
+        tuple containing:
+        - loss: The computed aggregated loss value
+        - metrics: Dictionary of metrics to log
+        - error_flag: Tensor indicating if an error occurred
+    """
+    device = hps.device
+    grpo_beta = hps.grpo_beta
+    num_generations = hps.num_generations
+    tokenizer = hps.tokenizer
+    epsilon = 0.2
+    
+    # Initialize storage for aggregated data across micro-batches
+    all_input_ids = []
+    all_attention_masks = []
+    all_completion_masks = []
+    all_per_token_logps = []
+    all_ref_per_token_logps = []
+    all_per_token_kl = []
+    all_prompts = []
+    all_completions = []
+    all_netlists = []
+    all_generation_times = []
+    all_logits_to_keep = []
+    aggregated_metrics = {}
+    base_model = get_base_model(model)
+    error_flag = torch.zeros(1, device=device)
+
+    # Set up generation parameters
+    generate_kwargs = {
+        "max_length": hps.model_max_length,
+        "num_return_sequences": num_generations,
+        "do_sample": True,
+        "temperature": 0.6,
+        "top_p": 0.75,
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+
+    # Process multiple micro-batches sequentially
+    for micro_batch_idx in range(num_micro_batches):
+      # Skip processing more micro-batches if an error occurred
+      if error_flag.item() > 0:
+        break
+      
+      try:
+        # Get next batch of data
+        data = next(data_iterator)
+        
+        # Activate the GRPO adapter
+        base_model.set_adapter("grpo_adapter")
+        
+        # Get ids and mask from data
+        ids = data['input_ids'].to(device, non_blocking=True).contiguous()
+        mask = data['attention_mask'].to(device, non_blocking=True).contiguous()
+        
+        # Generate completions with timing
+        gen_start = time.time()
+        with unwrap_model(model) as unwrapped_model:
+          prompt_completion_ids = unwrapped_model.generate(input_ids=ids, attention_mask=mask, **generate_kwargs)
+        gen_end = time.time()
+        all_generation_times.append(gen_end - gen_start)
+        
+        # Prepare inputs for logit computation
+        prompt_length = ids.size(1)
+        prompt_ids = ids.repeat_interleave(num_generations, dim=0)
+        prompt_mask = mask.repeat_interleave(num_generations, dim=0)
+        completion_ids = prompt_completion_ids[:, prompt_length:]
+        
+        # Mask everything after the first EOS token
+        is_eos = completion_ids == tokenizer.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        
+        # Prepare inputs for logit computation
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        
+        # Store for later processing
+        all_input_ids.append(input_ids)
+        all_attention_masks.append(attention_mask)
+        all_completion_masks.append(completion_mask)
+        all_logits_to_keep.append(logits_to_keep)
+
+        # Compute log probabilities of the training model for this micro-batch
+        with torch.no_grad():  # don't track gradients for initial logp computation
+          per_token_logps = get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+          all_per_token_logps.append(per_token_logps)
+        
+        # Activate the reference adapter
+        base_model.set_adapter("ref_adapter")
+        
+        # Compute reference model log probabilities with gradients disabled
+        with torch.no_grad():
+          with unwrap_model(model) as unwrapped_model:
+            with disable_ref_adapter(unwrapped_model) as ref_model:
+              ref_per_token_logps = get_per_token_logps(
+                  ref_model,
+                  input_ids,
+                  attention_mask,
+                  logits_to_keep
+              )
+              all_ref_per_token_logps.append(ref_per_token_logps)
+        
+        # Activate the GRPO adapter again
+        base_model.set_adapter("grpo_adapter")
+        
+        # Compute KL divergence between the model and the reference model
+        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+        all_per_token_kl.append(per_token_kl)
+        
+        # Decode completions and get prompts
+        completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+        text_inputs = tokenizer.batch_decode(ids)
+        prompts = get_user_prompt(text_inputs)
+        prompts = [prompt for prompt in prompts for _ in range(num_generations)]
+        netlists = [netlist for netlist in data['netlist'] for _ in range(num_generations)]
+        
+        # Store for later processing
+        all_prompts.extend(prompts)
+        all_completions.extend(completions)
+        all_netlists.extend(netlists)
+        
+        # Clear CUDA cache after each micro-batch to prevent OOM
+        torch.cuda.empty_cache()
+          
+      except torch.cuda.OutOfMemoryError as e:
+        import traceback
+        print(f"[{hps.local_rank}]: Out of memory error during micro-batch {micro_batch_idx}. Error is being handled.\n{traceback.print_exc()}\n{e}")
+        error_flag.fill_(1)
+        # Ensure all processes know about the OOM error
+        if dist.is_available() and dist.is_initialized():
+          dist.all_reduce(error_flag, op=dist.ReduceOp.MAX)
+        break
+    
+    # If an error occurred, return early with zero loss
+    if error_flag.item() > 0:
+      loss = torch.tensor(0.0, device=device, dtype=torch.bfloat16, requires_grad=True)
+      return loss, aggregated_metrics, error_flag
+    
+    # Process rewards for all completions across micro-batches
+    rewards_per_func = torch.zeros(len(all_prompts), len(reward_funcs), device=device, dtype=torch.bfloat16)
+    
+    for reward_idx, (reward_func, reward_kwargs) in enumerate(zip(reward_funcs, reward_kwargss)):
+      if reward_func.__name__ == "test_generation_reward":
+        reward_kwargs.update({"netlists": all_netlists})
+
+      # Calculate rewards
+      returned_rewards_list = reward_func(all_prompts, all_completions, **reward_kwargs)
+      returned_rewards_per_func = torch.zeros(len(returned_rewards_list), dtype=torch.bfloat16, device=device)
+      divisor = 1.0 / len(returned_rewards_list) if len(returned_rewards_list) > 0 else 0
+      for r_i, returned_rewards in enumerate(returned_rewards_list):
+        returned_rewards_per_func[r_i] = sum(returned_rewards.values())
+        for k, v in returned_rewards.items():
+          metrics_key = f"{reward_func.__name__}" + (f"/{k}" if k else "")
+          aggregated_metrics[metrics_key] = aggregated_metrics.get(metrics_key, 0) + v * divisor
+      
+      rewards_per_func[:, reward_idx] = returned_rewards_per_func
+    
+    # Print sample of prompts, completions and rewards
+    if step % hps.gradient_accumulation_steps == 0:
+      print_prompt_completions_sample(
+          all_prompts[:5], 
+          all_completions[:5], 
+          rewards_per_func[:5].sum(dim=1).clone().cpu(), 
+          step
+      )
+    
+    # Gather rewards from all processes
+    rewards_per_func = gather(rewards_per_func)
+    rewards = rewards_per_func.sum(dim=1)
+    
+    # TODO: Test the following 3 lines of code
+    # Compute advantages across all micro-batches
+    # We need to reshape rewards to (num_prompts_total, num_generations) to compute mean and std per prompt group
+    batch_size_per_micro_batch = len(all_input_ids[0]) // num_generations
+    total_prompts = batch_size_per_micro_batch * num_micro_batches * hps.world_size
+    rewards_reshaped = rewards.view(total_prompts, num_generations)
+    
+    # Compute mean and std per prompt group
+    mean_grouped_rewards = rewards_reshaped.mean(dim=1)
+    std_grouped_rewards = rewards_reshaped.std(dim=1)
+    
+    # Expand back to original shape
+    mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+    std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
+    
+    # Compute advantages
+    advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-6)
+    
+    # Handle parallel processing - slice to get only this process's data
+    if hps.parallel:
+      process_start = hps.local_rank * len(all_prompts)
+      process_end = (hps.local_rank + 1) * len(all_prompts)
+      process_slice = slice(process_start, process_end)
+      advantages = advantages[process_slice]
+    
+    # Compute the final loss in memory-efficient chunks
+    total_loss = torch.tensor(0.0, device=device, dtype=torch.bfloat16, requires_grad=True)
+    total_token_count = 0
+    
+    # Detach old logps for stable gradient computation
+    detached_per_token_logps = [logps.detach() for logps in all_per_token_logps]
+    
+    # Split processing into chunks to avoid OOM
+    for mb_idx in range(len(all_input_ids)):
+      input_ids = all_input_ids[mb_idx]
+      attention_mask = all_attention_masks[mb_idx]
+      completion_mask = all_completion_masks[mb_idx]
+      logits_to_keep = all_logits_to_keep[mb_idx]
+      old_per_token_logps = detached_per_token_logps[mb_idx]
+      per_token_kl = all_per_token_kl[mb_idx]
+      mb_advantages = advantages[mb_idx * input_ids.size(0):(mb_idx + 1) * input_ids.size(0)]
+
+      # Compute current log probabilities for this chunk (with gradients enabled)
+      current_per_token_logps = get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+      
+      # Compute PPO ratio
+      ratio = torch.exp(current_per_token_logps - old_per_token_logps)
+      clipped_ratio = torch.clamp(ratio, min=1-epsilon, max=1+epsilon)
+      
+      # Compute surrogate loss
+      per_token_loss1 = ratio * mb_advantages.unsqueeze(1)
+      per_token_loss2 = clipped_ratio * mb_advantages.unsqueeze(1)
+      per_token_loss = -torch.minimum(per_token_loss1, per_token_loss2)
+          
+      # Add KL penalty
+      per_token_loss = per_token_loss + grpo_beta * per_token_kl
+      
+      # Sum loss and update metrics
+      token_count = completion_mask.sum()
+      loss = (per_token_loss * completion_mask).sum() / token_count
+      loss.backward()
+      total_loss = total_loss + loss * token_count
+      total_token_count += token_count
+      
+      # Calculate clip ratio for metrics
+      is_clipped = (ratio < 1-epsilon).float() + (ratio > 1+epsilon).float()
+      clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
+      kl_div = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+      
+      # Update metrics
+      aggregated_metrics.update({
+          'clip_ratio': aggregated_metrics.get('clip_ratio', 0) + clip_ratio.item(),
+          'kl': aggregated_metrics.get('kl', 0) + kl_div.item(),
+      })
+      del current_per_token_logps
+      del old_per_token_logps
+      del per_token_kl
+      del mb_advantages
+      del completion_mask
+      del input_ids
+      
+      # Clear cache after each chunk
+      torch.cuda.empty_cache()
+      gc.collect()
+
+    # Normalize the total loss and metrics
+    if total_token_count > 0:
+      total_loss = total_loss / total_token_count
+    
+    # Average metrics over all chunks
+    num_chunks = len(all_input_ids)
+    if num_chunks > 0:
+      for key in ['clip_ratio', 'kl']:
+        if key in aggregated_metrics:
+          aggregated_metrics[key] /= num_chunks
+    
+    # Add reward metrics
+    aggregated_metrics.update({
+        'reward': rewards.mean().item(),
+        'reward_std': std_grouped_rewards.mean().item(),
+        'generation_time': sum(all_generation_times) / len(all_generation_times) if all_generation_times else 0
+    })
+    
+    # Add per-function reward metrics
+    reward_per_func = rewards_per_func.mean(0)
+    for i, reward_func in enumerate(reward_funcs):
+        aggregated_metrics[f"{reward_func.__name__}"] = reward_per_func[i].item()
+    
+    # Synchronize error flags one last time before returning
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(error_flag, op=dist.ReduceOp.MAX)
+    
+    # Final cleanup
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    return total_loss, aggregated_metrics, error_flag
+
+
+
 
 def update_ref_adapter_ema(model, tau=0.9, ref_adapter_name="ref_adapter", grpo_adapter_name="grpo_adapter"):
   """
@@ -633,20 +960,20 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         count_skip_micro_batch = 0
         # Initialize last_grad_norm to None
         last_grad_norm = None
-      # Get next data
-      data = next(data_iterator)
-      # hps.replay_buffer.append(i)
+        # Initialize pass@k metrics
+        pass_key = f'pass@{hps.num_generations}'
+        pass_at_k = dict()
 
       # Compute loss and get metrics
       micro_batch_loss, micro_batch_metrics, error_flag = compute_loss(
           model=model,
-          data=data,
+          data_iterator=data_iterator,
           reward_funcs=reward_funcs,
           reward_kwargss=reward_kwargss,
           hps=hps,
           step=epoch*len(dataloader) + i
       )
-      
+
       # Handle errors during compute_loss
       if error_flag.item() > 0:
         if is_main_process():
@@ -656,8 +983,12 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         if dist.is_available() and dist.is_initialized():
           dist.barrier()
         continue
+
+      if pass_key not in pass_at_k.keys():
+        pass_at_k[pass_key] = micro_batch_metrics.pop(pass_key)
+      else:
+        pass_at_k[pass_key] = np.concatenate([pass_at_k[pass_key], micro_batch_metrics.pop(pass_key)], axis=0)
       # Scale loss for gradient accumulation
-      micro_batch_loss = micro_batch_loss #/ (hps.gradient_accumulation_steps - count_skip_micro_batch)
       batch_loss += micro_batch_loss.item()
       # Accumulate metrics for each micro-batch
       for key, value in micro_batch_metrics.items():
@@ -666,7 +997,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
       # Compute/Accumulate the gradients
       if training_loop:
         micro_batch_loss.backward()
-        
+
         # Apply the gradients when the accumulation step is reached
         if (i+1) % hps.gradient_accumulation_steps == 0 or i == len(dataloader)-1:
           # Clip the gradients
@@ -697,6 +1028,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         metrics["ref_update_step"].append(f"{ref_update_step}/{next_ref_update}")
         # Log the gradient norm metric (defaulting to 0.0 if not available)
         metrics["grad_norm"].append(smart_round(last_grad_norm) if last_grad_norm is not None else smart_round(0.0))
+        metrics[pass_key].append(pass_at_k[pass_key].any(1).mean())
         # Add averaged metrics for each micro-batch
         for key in accumulated_metrics.keys():
           avg_value = sum(accumulated_metrics[key]) / len(accumulated_metrics[key])
@@ -741,7 +1073,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
             # print(tabulate(x.loc[x.index[-logging_steps:], display_columns + ['best_avg_reward']], headers='keys', tablefmt='psql', showindex=False))
             logging_step = 0
           logging_step += 1
-        
+      
       if is_main_process():
         pbar.update(1)
 
@@ -761,7 +1093,8 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
 
 
 def validate_model(model, validation_loader, hps, reward_funcs=[test_generation_reward], num_prompts_to_validate=4_000):
-  generate_kwargs = {"max_length": hps.model_max_length, "num_return_sequences": 1, "do_sample": True, "temperature": 0.6, "top_p": 0.7, "pad_token_id": hps.tokenizer.eos_token_id, "num_beams": 4}
+  generate_kwargs = {"max_length": hps.model_max_length, "num_return_sequences": 1, "temperature": 0.6, "top_p": 0.6, "top_k": 5, "pad_token_id": hps.tokenizer.eos_token_id, "num_beams": 4}
+  print(generate_kwargs)
   validation_loader.collate_fn.set_left_padding()
   validation_loader_iterator = iter(validation_loader)
   total_steps = max(1, min(1000, round(num_prompts_to_validate // (validation_loader.batch_size * hps.world_size))))
@@ -786,8 +1119,10 @@ def validate_model(model, validation_loader, hps, reward_funcs=[test_generation_
         completions = hps.tokenizer.batch_decode(completions, skip_special_tokens=True)
         total_completions.extend(completions)
         prompts = get_user_prompt(hps.tokenizer.batch_decode(data.input_ids))
+        prompts = [prompt for prompt in prompts for _ in range(hps.num_generations)]
+        netlists = [data.netlist for _ in range(hps.num_generations)]
         total_prompts.extend(prompts)
-        total_netlists.extend(data.netlist)
+        total_netlists.extend(netlists)
         if is_main_process():
           pbar.update(1)
         torch.cuda.empty_cache()
@@ -812,7 +1147,8 @@ def validate_model(model, validation_loader, hps, reward_funcs=[test_generation_
     print(rewards_per_func)
     print(pd.DataFrame([metrics]))
   if hps.wandb:
-    wandb.log({"validate_model": wandb.Table(dataframe=pd.DataFrame([metrics]))})
+    wandb.log({"validation_metrics": wandb.Table(dataframe=pd.DataFrame([metrics]))})
+
 
 def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # Fine-tune with Supevised Fine-Tuning (SFT)
@@ -948,16 +1284,29 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # Add GRPO adapter
   if hps.parallel:
     if isinstance(model, DDP):
-      model.module.base_model.add_adapter(hps.lora_config, adapter_name="grpo_adapter")
-      model.module.set_adapter("grpo_adapter")
+      # Check if the model already has ref_adapter or grpo_adapter
+      available_adapters = model.module.base_model.peft_config.keys() if hasattr(model.module.base_model, 'peft_config') else []
+      
+      if "ref_adapter" in available_adapters:
+        model.module.base_model.add_adapter(hps.lora_config, adapter_name="grpo_adapter")
+        # Copy the weights from the reference adapter to the GRPO adapter
+        copy_adapter_weights(model, source_adapter_name="ref_adapter", target_adapter_name="grpo_adapter")
+        model.module.set_adapter("grpo_adapter")
+      elif "grpo_adapter" in available_adapters:
+        model.module.base_model.add_adapter(hps.lora_config, adapter_name="ref_adapter")
+        # Copy the weights from the GRPO adapter to the reference adapter
+        copy_adapter_weights(model, source_adapter_name="grpo_adapter", target_adapter_name="ref_adapter")
+        model.module.set_adapter("grpo_adapter")
     elif isinstance(model, FSDP):
       model._fsdp_wrapped_module.base_model.add_adapter(hps.lora_config, adapter_name="grpo_adapter")
+      # Copy the weights from the reference adapter to the GRPO adapter
+      copy_adapter_weights(model, source_adapter_name="ref_adapter", target_adapter_name="grpo_adapter")
       model._fsdp_wrapped_module.set_adapter("grpo_adapter")
   else:
     model.base_model.add_adapter(hps.lora_config, adapter_name="grpo_adapter")
+    # Copy the weights from the reference adapter to the GRPO adapter
+    copy_adapter_weights(model, source_adapter_name="ref_adapter", target_adapter_name="grpo_adapter")
     model.set_adapter("grpo_adapter")
-  # Copy the weights from the reference adapter to the GRPO adapter
-  copy_adapter_weights(model, source_adapter_name="ref_adapter", target_adapter_name="grpo_adapter")
   torch.cuda.empty_cache()
   gc.collect()
 
@@ -972,7 +1321,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   sampler = DistributedSampler(dataset_subset, rank=dataloader.sampler.rank, num_replicas=dataloader.sampler.num_replicas, shuffle=True) if use_sampler else None  
 
   # Adjust gradient accumulation steps. GRPO is slower than SFT. lower the number of gradient accumulation steps.
-  # hps.gradient_accumulation_steps = max(1, hps.gradient_accumulation_steps//2)
+  hps.gradient_accumulation_steps = max(1, int(hps.gradient_accumulation_steps//hps.num_generations))
   hps.epochs = 1
 
   # Change batch size. Due to number of generations there might be OOM cuda error.
@@ -1039,7 +1388,7 @@ def main():
 
   # Set the model name
   hps.model_name = models_causal[hps.model_name]
-  hps.adapter_repo = models_causal[hps.adapter_repo] if hps.adapter_repo else None
+  hps.adapter_repo = models_causal[hps.adapter_repo] if hps.adapter_repo is not None and hps.adapter_repo in models_causal.keys() else hps.adapter_repo
   hps.save_in_repo = models_causal[hps.save_model]
 
   # Initialize the training environment based on the GPU availability and parallelization

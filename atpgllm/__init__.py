@@ -16,6 +16,7 @@ models_causal = {
   "llama-2-cot": "chrivasileiou/COTSimAwareATPG",
   'test-model': "chrivasileiou/TestModel",
   'test-model-v2': "chrivasileiou/TestModel-2",
+  'test-model-v3': "chrivasileiou/TestModel-3",
   'codegemma-2b': "google/codegemma-2b",
   'codegemma-7b': "google/codegemma-7b-it",
 }

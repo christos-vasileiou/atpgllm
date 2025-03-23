@@ -209,12 +209,34 @@ def cot_reward(prompts: list, completions: list, model: torch.nn.Sequential, cot
 
 
 # Extract the fault and net
-def test_generation_reward(prompts: list, completions: list, netlists: list, fault_re: re.Pattern, simulation_re: re.Pattern, input_vector_re: re.Pattern, expected_output_re: re.Pattern, detected_faults_re: re.Pattern):
+def test_generation_reward(prompts: list, completions: list, netlists: list, fault_re: re.Pattern, simulation_re: re.Pattern, input_vector_re: re.Pattern, expected_output_re: re.Pattern, detected_faults_re: re.Pattern, eval_mode: bool = False):
   """
-  This function calculates the reward for the test generation task.
-  It takes in a list of prompts, completions, and netlists.
-  It returns a list of rewards for each prompt. 
-  Rewards are dictionaries with the key 'pred_simulation', 'fault_simulation', 'input_vector', 'expected_output', 'detected_faults'.
+  Calculate the reward for the test generation task.
+
+  This function evaluates the quality of generated test vectors for fault detection in digital circuits.
+  It analyzes the provided prompts, completions, and netlists to compute rewards based on various criteria
+  such as simulation accuracy, input vector validity, and fault detection effectiveness.
+
+  Parameters:
+  prompts (list): A list of input prompts describing the fault detection scenarios.
+  completions (list): A list of generated completions corresponding to each prompt.
+  netlists (list): A list of netlists representing the circuit structures.
+  fault_re (re.Pattern): Regular expression pattern to extract fault information.
+  simulation_re (re.Pattern): Regular expression pattern to extract simulation results.
+  input_vector_re (re.Pattern): Regular expression pattern to extract input vectors.
+  expected_output_re (re.Pattern): Regular expression pattern to extract expected outputs.
+  detected_faults_re (re.Pattern): Regular expression pattern to extract detected faults.
+
+  Returns:
+  list: A list of dictionaries, each containing reward scores for different aspects of the test generation task.
+        The keys in each dictionary are:
+        - 'format': Reward for correct formatting of the completion.
+        - 'pred_simulation': Reward for accuracy of the predicted simulation.
+        - 'fault_simulation': Reward for accuracy of the fault simulation.
+        - 'input_vector': Reward for correctness of the generated input vector.
+        - 'expected_output': Reward for correctness of the expected output.
+        - 'detected_faults': Reward for correctly identifying detected faults.
+        - 'fault_detect_inpvector': Reward for effectiveness of the input vector in detecting the fault.
   """
   gate_func = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}
   
@@ -225,7 +247,14 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
       fault, net = fault[0]
 
     # Calculate Reward for Fault Simulation
-    reward = {'format': 0, 'pred_simulation': 0, 'fault_simulation': 0, 'input_vector': 0, 'expected_output': 0, 'detected_faults': 0, 'fault_detect_inpvector': 0}
+    reward = {'format': 0, 
+              'pred_simulation': 0, 
+              'fault_simulation': 0, 
+              'input_vector': 0, 
+              'expected_output': 0, 
+              'detected_faults': 0, 
+              'fault_detect_inpvector': 0
+              }
 
     # Extract the simulation
     pred_simulation = simulation_re.findall(completion)
@@ -265,11 +294,11 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         pred_simulation = pd.read_csv(StringIO(pred_simulation), sep="\s{2,}")
         reward['pred_simulation'] += .5
         # Check if the Good Machine value is different than Bad Machine for the requested net + if the fault simulation trigger the requested fault
-        reward['pred_simulation'] += int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
-        reward['pred_simulation'] += int(pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
+        reward['pred_simulation'] += 2*int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
+        reward['pred_simulation'] += 2*int(pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
       except:
         pred_simulation = None
-        reward['pred_simulation'] -= 2
+        reward['pred_simulation'] -= 5
 
     if pred_input_vector and pred_expected_output and fault and net and netlist:
       try:
@@ -280,18 +309,17 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         if isinstance(pred_simulation, pd.DataFrame) and isinstance(fault_simulation, pd.DataFrame):
           # Reward the generated simulation
           # Calculate row-wise accuracy
-          row_matches = pred_simulation.eq(fault_simulation[["Good Machine", "Bad Machine"]]).all(axis=1)
+          row_matches = pred_simulation.eq(fault_simulation[["Good Machine", "Bad Machine"]])
           
           # Weight each row based on its importance
           # Rows in fault path are most important (weight 2.0)
           # Primary outputs are next most important (weight 1.5) 
           # All other rows have base weight 1.0
-          weights = pd.Series(1.0, index=row_matches.index)
-          # weights[fault_simulation["POs"]] = 1.5
+          weights = pd.DataFrame(1.0, index=row_matches.index, columns=row_matches.columns)
           weights[fault_simulation["Fault Path"]] = 2.0
           
           # Calculate weighted accuracy
-          weighted_accuracy = (row_matches * weights).sum() / weights.sum()
+          weighted_accuracy = ((row_matches * weights).sum() / weights.sum()).mean()
           
           # Scale reward exponentially to incentivize high accuracy
           # reward = base_reward * (1 + accuracy)^2 
@@ -302,8 +330,28 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # 95% accuracy -> 3.80x base reward  | 95% accuracy -> 7.41x base reward   | 95% accuracy -> 14.46x base reward  |
           # 100% accuracy -> 4.00x base reward | 100% accuracy -> 9.00x base reward  | 100% accuracy -> 16.00x base reward |
           base_reward = 1.0
-          reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** 4
-          reward['fault_detect_inpvector'] += int(fault_simulation.loc[net, "Bad Machine"] == int(fault[-1]) and fault_simulation.loc[net, 'Good Machine'] != fault_simulation.loc[net, 'Bad Machine'])
+          reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** 4 - 4**(1/3)
+          
+          # Calculate a smoother reward using weights for each subcondition
+          # Subcondition 1: Bad machine value matches the fault value
+          bad_machine_matches_fault = int(fault_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
+          
+          # Subcondition 2: Good machine value differs from bad machine value
+          good_differs_from_bad = int(fault_simulation.loc[net, 'Good Machine'] != fault_simulation.loc[net, 'Bad Machine'])
+          
+          # Calculate weighted score (0.0 to 1.0)
+          # Weight the conditions: 40% for bad machine matching fault, 60% for good/bad difference
+          fault_detection_score = (0.4 * bad_machine_matches_fault) + (0.6 * good_differs_from_bad)
+          
+          # Apply smoother scaling between 1 and 16
+          # This creates intermediate values between 1 and 16 based on partial satisfaction of conditions
+          if eval_mode:
+            reward['fault_detect_inpvector'] += bad_machine_matches_fault and good_differs_from_bad
+          else:
+            if bad_machine_matches_fault == 0 and good_differs_from_bad == 0:
+              reward['fault_detect_inpvector'] -= 5
+            else:
+              reward['fault_detect_inpvector'] += base_reward * (1 + fault_detection_score) ** 4 - 4**(1/3)
         else:
           reward['fault_simulation'] -= 5
 
@@ -340,7 +388,6 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         # print(f"3. Wrong Fault Simulation, Reward:0")
         fault_simulation = None
     rewards.append(reward)
-
   return rewards
 
 # Example usage

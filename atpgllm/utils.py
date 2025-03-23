@@ -547,10 +547,10 @@ def parse_arguments(parser):
 
   # Weights and Biases
   parser.add_argument('--wandb', action='store_true', help='Use Weights and Biases for logging')
+  parser.add_argument('--tags', type=str, default='baseline', help='Tags for Weights and Biases. For multiple tags, use comma to separate them.')
 
   # Add adapter loading arguments
   parser.add_argument('--adapter_name', '--adapter-name', type=str, default='ref_adapter', help='Name of the adapter to load')
-  
   parser.add_argument('--adapter_repo', '--adapter-repo', type=str, default=None, help='Repository containing the adapter to load')
 
   # Add train_lora flag
@@ -594,6 +594,64 @@ def get_patterns_criterion(hps):
   criterion = nn.CrossEntropyLoss(weight=weight, ignore_index=hps.tokenizer.pad_token_id if hps.is_causal else -100) 
   return criterion 
 
+
+def get_code_files_to_version():
+  """
+  Find important code files in the transformers_atpg directory structure for versioning.
+  
+  Returns:
+      tuple: (transformers_atpg_path, code_files_to_version) where:
+          - transformers_atpg_path is the path to the transformers_atpg directory or None if not found
+          - code_files_to_version is a list of file paths to version
+  """
+  # Version control for code files
+  code_files_to_version = []
+  
+  # Find the transformers_atpg directory
+  transformers_atpg_path = None
+  current_dir = os.path.abspath(os.getcwd())
+  
+  # Search for transformers_atpg directory
+  while current_dir != os.path.dirname(current_dir):  # Stop at root directory
+    if os.path.basename(current_dir) == "transformers_atpg":
+      transformers_atpg_path = current_dir
+      break
+    current_dir = os.path.dirname(current_dir)
+  
+  # If transformers_atpg directory found, look for specific files
+  if transformers_atpg_path:
+    if os.path.exists(os.path.join(transformers_atpg_path, "libatpgllm")):
+      atpgllm_dir = os.path.join(transformers_atpg_path, "libatpgllm")
+    else:
+      atpgllm_dir = os.path.join(transformers_atpg_path, "atpgllm")
+
+    if os.path.exists(atpgllm_dir) and os.path.isdir(atpgllm_dir):
+      inner_atpgllm_dir = os.path.join(atpgllm_dir, "atpgllm")
+      llm_dir = os.path.join(inner_atpgllm_dir, "llm")
+      tests_dir = os.path.join(atpgllm_dir, "tests")
+      
+      # Check for utils.py in inner_atpgllm_dir
+      if os.path.exists(inner_atpgllm_dir) and os.path.isdir(inner_atpgllm_dir):
+        utils_path = os.path.join(inner_atpgllm_dir, "utils.py")
+        if os.path.exists(utils_path) and os.path.isfile(utils_path):
+          code_files_to_version.append(utils_path)
+      
+      # Check for files in llm directory
+      if os.path.exists(llm_dir) and os.path.isdir(llm_dir):
+        for file_name in ["tokenizer.py", "collate.py", "fault_coverage_calc.py", "reward_funcs.py"]:
+          file_path = os.path.join(llm_dir, file_name)
+          if os.path.exists(file_path) and os.path.isfile(file_path):
+            code_files_to_version.append(file_path)
+
+      # Check for ft_train_with_rl.py in tests_dir
+      if os.path.exists(tests_dir) and os.path.isdir(tests_dir):
+        file_path = os.path.join(tests_dir, "ft_train_with_rl.py")
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+          code_files_to_version.append(file_path)
+  
+  return transformers_atpg_path, code_files_to_version
+
+
 def distributed_env_init(hps):
   import datetime
   hps.rank             = int(os.environ['RANK'])
@@ -605,7 +663,7 @@ def distributed_env_init(hps):
   hps.info += f"Backend Configuration: {dist.get_backend_config()}, local_rank: {hps.local_rank}, local_world_size: {hps.local_world_size}, free-est gpu: {hps.free_gpu_id}, world_size: {hps.world_size}, device: {hps.device}\n"
   torch.manual_seed(hps.seed)
   torch.cuda.set_device(hps.local_rank)
-  hps.gradient_accumulation_steps /= hps.world_size
+  hps.gradient_accumulation_steps = int(hps.gradient_accumulation_steps//hps.world_size)
   if hps.local_rank == 0:
     print(f"Accumulated gradient steps: {hps.gradient_accumulation_steps}")
 
@@ -682,8 +740,26 @@ def initialize_training_environment(hps):
       # For non-distributed training, add timestamp
       timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
       group_name = f"{timestamp}"
+        
+    # Get code files for versioning
+    transformers_atpg_path, code_files_to_version = get_code_files_to_version()
     
-    hps.run = wandb.init(group=group_name, project=f"RL Fine-Tuning", entity="chrivasileiou", config=hps, save_code=True, tags=["baseline"])
+    # Initialize wandb with versioned code files
+    hps.run = wandb.init(
+        group=group_name, 
+        project=f"RL Fine-Tuning", 
+        entity="chrivasileiou", 
+        config=hps, 
+        save_code=True, 
+        tags=hps.tags.split(","),
+    )
+    
+    # Log specific files if found
+    if code_files_to_version and hps.run:
+      artifact = wandb.Artifact(name=f"code-{group_name}", type="code")
+      for file_path in code_files_to_version:
+        artifact.add_file(file_path)
+      hps.run.log_artifact(artifact)
 
 
 def get_trainable_parameters(model):
@@ -774,7 +850,7 @@ def prepare_objects_for_training(model, dataset, hps):
       # Scheduler and math around the number of training steps.
       # Get gradient accumulation steps from deepspeed config if available
       if hps.accelerator.state.deepspeed_plugin is not None:
-          hps.gradient_accumulation_steps = hps.accelerator.state.deepspeed_plugin.deepspeed_config["gradient_accumulation_steps"]
+          hps.gradient_accumulation_steps = int(hps.accelerator.state.deepspeed_plugin.deepspeed_config["gradient_accumulation_steps"])
     elif not hps.deepspeed_kernel: 
       # Initialize the distributed environment to apply in NCCL:
       os.environ["NCCL_TIMEOUT"] = "3000"
@@ -1104,7 +1180,7 @@ def hyperparameters(args):
   hps.lr          = args.lr
   hps.batch_size  = args.batch_size
   hps.micro_batch_size            = args.micro_batch_size # micro batch size, it's hardcoded to make sure it fits in GPU memory
-  hps.gradient_accumulation_steps = args.batch_size // args.micro_batch_size
+  hps.gradient_accumulation_steps = int(args.batch_size // args.micro_batch_size)
   hps.test_size   = args.test_size
   hps.num_workers = args.num_workers
   # Low-Rank Adaptation (LoRA) - Parametric-Efficient Fine-Tuning (PEFT)
@@ -1166,6 +1242,7 @@ def hyperparameters(args):
 
   # Weights and Biases
   hps.wandb = args.wandb
+  hps.tags = args.tags
 
   # Create a logger
   hps.logger = setup_logging(hps)
