@@ -335,8 +335,8 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # 75% accuracy -> 3.06x base reward  | 75% accuracy -> 5.36x base reward   | 75% accuracy -> 9.38x base reward   |
           # 95% accuracy -> 3.80x base reward  | 95% accuracy -> 7.41x base reward   | 95% accuracy -> 14.46x base reward  |
           # 100% accuracy -> 4.00x base reward | 100% accuracy -> 9.00x base reward  | 100% accuracy -> 16.00x base reward |
-          base_reward = 1.0
-          reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** 4 - 9.38 # force >75% accuracy. 1.75**4=9.38
+          base_reward = 1.0 if weighted_accuracy < 0.85 else 2.0 # force >90% accuracy.
+          reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** 4
           
           # Calculate a smoother reward using weights for each subcondition
           # Subcondition 1: Bad machine value matches the fault value
@@ -353,11 +353,12 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # This creates intermediate values between 1 and 16 based on partial satisfaction of conditions
           reward['fault_detected_by_pred_input_vector_acc'] += bad_machine_matches_fault and good_differs_from_bad
           if bad_machine_matches_fault == 0 and good_differs_from_bad == 0:
-            reward['fault_detect_inpvector'] -= 5
+            reward['fault_detect_inpvector'] -= 15
           else:
-            reward['fault_detect_inpvector'] += base_reward * (1 + fault_detection_score) ** 4 - 5.06 # 5.06 is the minimum reward. Mean 50% accuracy.
+            base_reward = 1.0 if fault_detection_score < 0.6 else 2.0 # force >60% accuracy.
+            reward['fault_detect_inpvector'] += base_reward * (1 + fault_detection_score) ** 4
         else:
-          reward['fault_simulation'] -= 5
+          reward['fault_simulation'] -= 15
 
         # Reward based on validity of generated Good-Machine input values and generated input vector
         input_nets = fault_simulation[fault_simulation['PIs']==True].index
