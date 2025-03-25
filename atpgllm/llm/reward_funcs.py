@@ -353,12 +353,13 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # This creates intermediate values between 1 and 16 based on partial satisfaction of conditions
           reward['fault_detected_by_pred_input_vector_acc'] += bad_machine_matches_fault and good_differs_from_bad
           if bad_machine_matches_fault == 0 and good_differs_from_bad == 0:
-            reward['fault_detect_inpvector'] -= 15
+            reward['fault_detect_inpvector'] -= 5
           else:
             base_reward = 1.0 if fault_detection_score < 0.6 else 2.0 # force >60% accuracy.
             reward['fault_detect_inpvector'] += base_reward * (1 + fault_detection_score) ** 4
         else:
-          reward['fault_simulation'] -= 15
+          reward['fault_detect_inpvector'] -= 5
+          reward['fault_simulation'] -= 5
 
         # Reward based on validity of generated Good-Machine input values and generated input vector
         input_nets = fault_simulation[fault_simulation['PIs']==True].index
