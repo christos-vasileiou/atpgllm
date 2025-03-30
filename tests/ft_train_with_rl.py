@@ -297,7 +297,7 @@ def compute_loss(model, data_iterator, reward_funcs, reward_kwargss, hps, step):
     "num_return_sequences": num_generations,
     "do_sample": True,
     "temperature": 0.6,
-    "top_p": 0.75,
+    "top_p": 0.95,
     "pad_token_id": tokenizer.eos_token_id
   }
 
@@ -1037,7 +1037,7 @@ def rlft(dataloader, model, hps: AttrDict, reward_funcs: Union[Callable, list[Ca
         current_avg_reward = float(eval(metrics["avg_reward"][-1]))
 
         # Save model when we get a new best average reward
-        if current_avg_reward > hps.best_avg_reward:
+        if i % 10 == 0 or current_avg_reward > hps.best_avg_reward:
           hps.best_avg_reward = current_avg_reward
           metrics["best_avg_reward"].append(smart_round(hps.best_avg_reward))
           if is_main_process():
