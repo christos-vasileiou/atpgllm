@@ -103,7 +103,7 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
       # IDs and Attention Mask
       ids  = data['input_ids'].to(device, non_blocking=True)
       mask = data['attention_mask'].to(device, non_blocking=True)
-
+      
       # Get targets
       targets = get_targets(data, tokenizer, is_causal, device)
 
@@ -1154,7 +1154,8 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   # Fine-tune with Supevised Fine-Tuning (SFT)
   # 1. Train new embeddings tokens and head
   if hps.new_tokens:
-    hps.run.tags += ('train_new_embeddings',)
+    if hps.wandb:
+      hps.run.tags += ('train_new_embeddings',)
     sft(dataloader, model, hps, desc="SFT Embeddings Training...", training_loop=training_loop)
     # Apply inference on some random samples of validation set
     if not DEBUG:
@@ -1267,6 +1268,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20)
 
   if hps.train_lora:
+    dataloader.collate_fn.set_train_lora(True)
     if is_main_process():
       print(f"{model}\nSFT embedding, lora and head:\nModel training parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}\n")
     if hps.wandb:
@@ -1326,7 +1328,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
 
   # Change batch size. Due to number of generations there might be OOM cuda error.
   hps.micro_batch_size = max(1, hps.micro_batch_size//hps.num_generations)
-  dataloader = DataLoader(dataset=dataset_subset, batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)#, multiprocessing_context='fork', worker_init_fn=worker_init_fn)
+  dataloader = DataLoader(dataset=dataset_subset, batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)
   torch.cuda.empty_cache()
   gc.collect()
 

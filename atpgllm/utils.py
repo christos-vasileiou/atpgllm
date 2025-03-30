@@ -894,6 +894,7 @@ def prepare_objects_for_training(model, dataset, hps):
       else:
         # Move model to the correct device before wrapping with DDP
         model = model.to(f"cuda:{hps.local_rank}")
+        train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False)
         model = DDP(model, device_ids=[hps.local_rank], output_device=hps.local_rank, find_unused_parameters=False) if sys.argv[0] != 'sft.py' else model
         # model.module = torch.compile(model.module, backend='inductor', fullgraph=True)
 
@@ -1124,17 +1125,17 @@ def load_raw_dataset(data_file, test_size=.3):
   """
   Load the dataset given at the data_file argument
   """
-  from datasets import Features, Value
-  features = Features({'text': Value('string'), 'netlist': Value('string')})
-  raw_dataset = load_dataset('csv', data_files=data_file, features=features)
-  if 'Unnamed: 0' in raw_dataset.column_names:
-    raw_dataset = raw_dataset.remove_columns('Unnamed: 0')
+  import os
+  from glob import glob
+  if os.path.exists(data_file) or all(os.path.exists(file) for file in glob(data_file)):
+    # It's a local file
+    raw_dataset = load_dataset('csv', data_files=data_file)
+    if 'Unnamed: 0' in raw_dataset.column_names:
+      raw_dataset = raw_dataset.remove_columns('Unnamed: 0')
+  else:
+    # It's a Hugging Face dataset repository
+    raw_dataset = load_dataset(data_file)
   
-  # return raw_dataset
-
-  # Be careful of the following code. 
-  # It's not compatible with the function 
-  # dataset_formation or dataset_formation_using_chat_template
   train_test_split = raw_dataset['train'].train_test_split(test_size=test_size)
   train_val_split = train_test_split['train'].train_test_split(test_size=.15)
   dataset = DatasetDict({'train': train_val_split['train'], 'validation': train_val_split['test'], 'test': train_test_split['test']})
@@ -1402,7 +1403,7 @@ def load_model(hps: AttrDict) -> torch.nn.Module:
     # train_tokens_embeddings_and_head(model)
   else:
     if not hps.lora:
-      train_layers(model, train_embeddings=False, train_head=True, train_lora=False, train_base_model=False) 
+      train_layers(model, train_embeddings=True, train_head=True, train_lora=False, train_base_model=False) 
 
   hps.info += f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\n"
   hps.info += f"Trainable Model size: {convert_bytes(model_size_in_bytes(model))}\n"

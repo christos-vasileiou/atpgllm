@@ -1,5 +1,6 @@
 from typing import Dict, List, Any
 import torch
+import json
 import torch.nn.functional as F
 import multiprocessing as mp
 from atpgllm.utils import (
@@ -17,6 +18,10 @@ class PinMemoryData(AttrDict):
         self[key] = self[key].pin_memory()
     return self
 
+start_of_assistant_responses_mapping = {"meta-llama/Llama-2-7b-chat-hf": "[/INST]", 
+                                        "meta-llama/Llama-3.1-8B-Instruct": "<|eot_id|><|start_header_id|>assistant<|end_header_id|>",
+                                        "meta-llama/Llama-3.2-3B-Instruct": "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"}
+
 class MyCollate:
   def __init__(self, tokenizer, is_causal=True, lora=False):
     self.tokenizer = tokenizer
@@ -24,7 +29,13 @@ class MyCollate:
     self.lora = lora
     self.tokenize_fn = lambda x, t: tokenize_fn(x, tokenizer=t, is_causal=is_causal)
     self.set_right_padding()
-
+    self.start_of_assistant_response = start_of_assistant_responses_mapping[self.tokenizer.name_or_path]
+    self.end_of_instr = self.tokenizer.encode(self.start_of_assistant_response, return_tensors='pt', add_special_tokens=False)[0]
+    self.train_lora = False
+    
+  def set_train_lora(self, train_lora):
+    self.train_lora = train_lora
+    
   def set_right_padding(self):
     self.right_padding = True # sft
     self.left_padding = False # rlft
@@ -37,6 +48,16 @@ class MyCollate:
     self.tokenizer.pad_token = self.tokenizer.eos_token
     self.tokenizer.padding_side = 'left'
     
+  def process_batch(self, batch: List[Dict[str, Any]]):
+    for item in batch:
+      if 'chat' in item.keys():
+        try:
+          item['chat'] = json.loads(item['chat'])
+          item['text'] = self.tokenizer.apply_chat_template(item['chat'], tokenize=False)
+        except json.JSONDecodeError:
+          item['text'] = item['chat']
+    return batch
+  
   def __call__(self, batch: List[Dict[str, Any]]):
     """
     Args:
@@ -45,14 +66,26 @@ class MyCollate:
     Returns:
         dict: a dictionary of collated samples
     """
+    # import code; code.interact(local=dict(globals(), **locals()))
+    batch = self.process_batch(batch)
     keys = list(batch[0].keys())
     if self.right_padding:
       # convert list of dicts to dict of lists
       batch = {key: [item[key] for item in batch] for key in keys}
+      tokenized_batch = self.tokenize_fn(batch, self.tokenizer)
+      if self.train_lora:
+        batch_size = tokenized_batch.input_ids.size(0)
+        seq_length = tokenized_batch.input_ids.size(1)
+        end_of_instr_size = self.end_of_instr.size(0)
+        for i in range(batch_size):
+          for pos in range(seq_length - end_of_instr_size + 1):
+            if torch.equal(tokenized_batch.input_ids[i, pos:pos+end_of_instr_size], self.end_of_instr):
+              tokenized_batch.attention_mask[i, :pos+end_of_instr_size].fill_(0)
+              break
     elif self.left_padding:
       # convert list of dicts to dict of lists
       batch = {key: [get_user_prompt([item[key]], system_tag=None, instr_tag="[/INST]")[0]+"[/INST]" if key == 'text' else item[key] for item in batch] for key in keys}
-    tokenized_batch = self.tokenize_fn(batch, self.tokenizer)
+      tokenized_batch = self.tokenize_fn(batch, self.tokenizer)
     tokenized_batch = PinMemoryData(tokenized_batch)
     return tokenized_batch
 
