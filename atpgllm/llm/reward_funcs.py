@@ -353,12 +353,12 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # This creates intermediate values between 1 and 16 based on partial satisfaction of conditions
           reward['fault_detected_by_pred_input_vector_acc'] += bad_machine_matches_fault and good_differs_from_bad
           if bad_machine_matches_fault == 0 and good_differs_from_bad == 0:
-            reward['fault_detect_inpvector'] -= 5
+            reward['fault_detect_inpvector'] -= 3
           else:
-            base_reward = 1.0 if fault_detection_score < 0.6 else 2.0 # force >60% accuracy.
-            reward['fault_detect_inpvector'] += base_reward * (1 + fault_detection_score) ** 4
+            # base_reward = 1.0 if fault_detection_score < 0.6 else 2.0 # force >60% accuracy.
+            reward['fault_detect_inpvector'] += 5*fault_detection_score
         else:
-          reward['fault_detect_inpvector'] -= 5
+          reward['fault_detect_inpvector'] -= 1
           reward['fault_simulation'] -= 5
 
         # Reward based on validity of generated Good-Machine input values and generated input vector
@@ -378,25 +378,38 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         # Compare with predicted faults and add to reward
         detected_faults_reward = detected_faults_str == pred_detected_faults
 
-        reward['detected_faults'] += 2*int(detected_faults_reward)
-        reward['expected_output'] += 2*int(output_vector_reward)
-        reward['input_vector'] += 2*int(input_vector_reward)
+        reward['detected_faults'] += 2 if detected_faults_reward else -3
+        reward['expected_output'] += 2 if output_vector_reward else -3
+        reward['input_vector'] += 2 if input_vector_reward else -3
         reward['detected_faults_acc'] += int(detected_faults_reward)
         reward['expected_output_acc'] += int(output_vector_reward)
         reward['input_vector_acc'] += int(input_vector_reward)
         
         # Reward the input vector & expected output
-        # if LLM simulation and actual simulation have same:
-        # +1 input length, +1 nets are input nets
-        # +1 output length, +1 nets are output nets
-        # +1/-1 triggered fault
-        # r4=sum(r) if LLM simulation and actual simulation match 
         reward['fault_simulation'] += sum(fault_sim_rewards.values()) # The dictionary is empty. Adds 0. Keep for consistency.
         
       except:
         # print(f"3. Wrong Fault Simulation, Reward:0")
         fault_simulation = None
     rewards.append(reward)
+  # Normalize the rewards
+  # Create a dictionary to store normalized rewards
+  r_norm = {}
+  
+  # First pass: Calculate average reward values across all samples
+  for r in rewards:
+    for k in ['fault_detect_inpvector', 'input_vector', 'expected_output', 'detected_faults']:
+      r_norm[k] = r[k] / len(rewards)
+  
+  # Second pass: Apply non-linear scaling to emphasize differences
+  # Using (1 + value)^3 creates a steeper reward curve that amplifies positive results
+  for k in ['fault_detect_inpvector', 'input_vector', 'expected_output', 'detected_faults']:
+    r_norm[k] = (1 + r_norm[k]) ** 3
+  
+  # Third pass: Update each reward dictionary with the normalized values
+  for r in rewards:
+    r.update(r_norm)
+      
   return rewards
 
 # Example usage

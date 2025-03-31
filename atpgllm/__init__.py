@@ -14,7 +14,7 @@ models_causal = {
   'llama-2-atpg-lora': "chrivasileiou/LlamaModelForCausalLM-ATPG-LoRA",
   'llama-2-combin-atpg-lora': "chrivasileiou/LlamaModelForCausalLM-Combin-ATPG-LoRA",
   "llama-2-cot": "chrivasileiou/COTSimAwareATPG",
-  'llama-3': "meta-llama/Llama-3-8B-Instruct",
+  'llama-3': "meta-llama/Meta-Llama-3-8B-Instruct",
   'llama-3.1': "meta-llama/Llama-3.1-8B-Instruct",
   'llama-3.2': "meta-llama/Llama-3.2-3B-Instruct",
   'test-model': "chrivasileiou/TestModel",
