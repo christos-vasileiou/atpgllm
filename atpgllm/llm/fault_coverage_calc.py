@@ -87,11 +87,11 @@ def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], f
   # Calculate rewards if input and output vectors have the correct length
   if return_rewards:
     rewards = {}
-    # rewards["input_len_reward"] = int(len(inputs) == len(input_vector.split(','))) if isinstance(input_vector, str) else int(len(inputs) == len(input_vector))
-    # rewards["input_nets_reward"]    = int(all(net.strip() in inputs for net_value in input_vector.split(',') for net, value, in [net_value.split(':')]))
-    # rewards["output_len_reward"] = int(len(outputs) == len(output_vector.split(','))) if isinstance(output_vector, str) else int(len(outputs) == len(output_vector))
-    # rewards["output_nets_reward"]    = int(all(net.strip() in outputs for net_value in output_vector.split(',') for net, value, in [net_value.split(':')]))
-
+    # Check if the input vector has the correct length and if the nets names are correct
+    # rewards['input_nets_match'] = len(inputs) == len(input_vector.split(',')) and all(net.strip() in inputs for net_value in input_vector.split(',') for net, value in [net_value.split(':')])
+    # Check if the output vector has the correct length and if the nets names are correct
+    # rewards['output_nets_match'] = len(outputs) == len(output_vector.split(',')) and all(net.strip() in outputs for net_value in output_vector.split(',') for net, value in [net_value.split(':')])
+    
   # Get faulty value and faulty net
   faulty_value, faulty_net = next(iter(fault_value.findall(fault)))
   # keep track of fault path
