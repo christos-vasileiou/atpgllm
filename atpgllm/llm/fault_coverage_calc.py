@@ -88,9 +88,9 @@ def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], f
   if return_rewards:
     rewards = {}
     # Check if the input vector has the correct length and if the nets names are correct
-    # rewards['input_nets_match'] = len(inputs) == len(input_vector.split(',')) and all(net.strip() in inputs for net_value in input_vector.split(',') for net, value in [net_value.split(':')])
+    rewards['input_nets_match'] = len(inputs) == len(input_vector.split(',')) and all(net.strip() in inputs for net_value in input_vector.split(',') for net, value in [net_value.split(':')])
     # Check if the output vector has the correct length and if the nets names are correct
-    # rewards['output_nets_match'] = len(outputs) == len(output_vector.split(',')) and all(net.strip() in outputs for net_value in output_vector.split(',') for net, value in [net_value.split(':')])
+    rewards['output_nets_match'] = len(outputs) == len(output_vector.split(',')) and all(net.strip() in outputs for net_value in output_vector.split(',') for net, value in [net_value.split(':')])
     
   # Get faulty value and faulty net
   faulty_value, faulty_net = next(iter(fault_value.findall(fault)))
@@ -145,7 +145,6 @@ def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], f
   simulation[2] = simulation.index.isin(_inputs)
   simulation[3] = simulation.index.isin(_outputs)
   simulation[4] = simulation.index.isin(fault_path)
-
   simulation.columns = ["Good Machine", "Bad Machine", "PIs", "POs", "Fault Path"]
 
   if return_rewards:

@@ -299,11 +299,11 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
         pred_simulation = pd.read_csv(StringIO(pred_simulation), sep="\s{2,}")
         reward['pred_simulation'] += .5
         # Check if the Good Machine value is different than Bad Machine for the requested net + if the fault simulation trigger the requested fault
-        reward['pred_simulation'] += 2*int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
-        reward['pred_simulation'] += 2*int(pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
+        reward['pred_simulation'] += int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
+        reward['pred_simulation'] += int(pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
       except:
         pred_simulation = None
-        reward['pred_simulation'] -= 5
+        reward['pred_simulation'] -= 2.5
 
     if pred_input_vector and pred_expected_output and fault and net and netlist:
       try:
@@ -322,75 +322,99 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
           # All other rows have base weight 1.0
           weights = pd.DataFrame(1.0, index=row_matches.index, columns=row_matches.columns)
           reward['pred_vs_fault_sim_acc'] += (row_matches.sum() / row_matches.count()).mean()
-          weights[fault_simulation["Fault Path"]] = 1.5
-          
+          weights[fault_simulation["Fault Path"]] = 2
+          weights.loc[net, :] = 5
+
           # Calculate weighted accuracy
           weighted_accuracy = ((row_matches * weights).sum() / weights.sum()).mean()
           
           # Scale reward exponentially to incentivize high accuracy
-          # reward = base_reward * (1 + accuracy)^2 
           # This gives:
           #  ^2 -----------------------------    ^3 -------------------------------   ^4 -------------------------------
           # 50% accuracy -> 2.25x base reward  | 50% accuracy -> 3.38x base reward   | 50% accuracy -> 5.06x base reward   |
           # 75% accuracy -> 3.06x base reward  | 75% accuracy -> 5.36x base reward   | 75% accuracy -> 9.38x base reward   |
           # 95% accuracy -> 3.80x base reward  | 95% accuracy -> 7.41x base reward   | 95% accuracy -> 14.46x base reward  |
           # 100% accuracy -> 4.00x base reward | 100% accuracy -> 9.00x base reward  | 100% accuracy -> 16.00x base reward |
-          base_reward = 1.0 if weighted_accuracy < 0.85 else 2.0 # force >90% accuracy.
-          reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** 4
-          
+          exponent = 4
+          base_reward = 1.0 if weighted_accuracy < 0.9 else 2.0 # force >90% accuracy.
+          reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** exponent - base_reward
+
           # Calculate a smoother reward using weights for each subcondition
-          # Subcondition 1: Bad machine value matches the fault value
-          bad_machine_matches_fault = int(fault_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
+          fault_detection_condition = fault_simulation.loc[net, "Bad Machine"] == int(fault[-1]) and \
+                                      fault_simulation.loc[net, 'Good Machine'] != fault_simulation.loc[net, 'Bad Machine']
           
-          # Subcondition 2: Good machine value differs from bad machine value
-          good_differs_from_bad = int(fault_simulation.loc[net, 'Good Machine'] != fault_simulation.loc[net, 'Bad Machine'])
-          
-          # Calculate weighted score (0.0 to 1.0)
-          # Weight the conditions: 40% for bad machine matching fault, 60% for good/bad difference
-          fault_detection_score = (0.4 * bad_machine_matches_fault) + (0.6 * good_differs_from_bad)
-          
-          # Apply smoother scaling between 1 and 16
-          # This creates intermediate values between 1 and 16 based on partial satisfaction of conditions
-          reward['fault_detected_by_pred_input_vector_acc'] += bad_machine_matches_fault and good_differs_from_bad
-          if bad_machine_matches_fault == 0 and good_differs_from_bad == 0:
+          # Reward if the fault is detected by the predicted input vector
+          reward['fault_detected_by_pred_input_vector_acc'] += int(fault_detection_condition)
+          if not fault_detection_condition:
+            # Penalize heavily if the fault is not detected
             reward['fault_detect_inpvector'] -= 5
-          else:
-            base_reward = 1.0 if fault_detection_score < 0.6 else 2.0 # force >60% accuracy.
-            reward['fault_detect_inpvector'] += base_reward * (1 + fault_detection_score) ** 4
+
+          # Reward based on validity of generated Good-Machine input values and generated input vector
+          if fault_sim_rewards.pop('input_nets_match'):
+            # Convert the predicted input vector string to a dictionary
+            input_vector_dict = {net.strip(): int(value.strip()) for net_value in pred_input_vector.split(',') for net, value in [net_value.split(':')]}
+            # Get the input values from the simulation
+            pred_input_vector_from_sim_dict = pred_simulation[fault_simulation['PIs']]['Good Machine'].to_dict()
+            # Get weights for primary inputs
+            input_vector_weights = weights[fault_simulation['PIs']]['Good Machine'].to_dict()
+            # Calculate weighted matches between predicted and actual input values
+            weighted_input_matches = [(iv==pi)*wi for iv, pi, wi in zip(input_vector_dict.values(), pred_input_vector_from_sim_dict.values(), input_vector_weights.values())]
+            # Calculate weighted accuracy for input vector
+            weighted_input_accuracy = sum(weighted_input_matches) / sum(input_vector_weights.values())
+            # Apply exponential scaling to reward
+            exponent = 2
+            base_reward = 2.0
+            reward['fault_detect_inpvector'] += base_reward * (1 + weighted_input_accuracy) ** exponent - base_reward
+            # Additional reward for perfect accuracy
+            reward['input_vector_acc'] += int(weighted_input_accuracy==1)
+
+          # Reward based on validity of generated Good-Machine output values and generated expected output vector
+          if fault_sim_rewards.pop('output_nets_match'):
+            # Convert the predicted output vector string to a dictionary
+            output_vector_dict = {net.strip(): int(value.strip()) for net_value in pred_expected_output.split(',') for net, value in [net_value.split(':')]}
+            # Get the output values from the simulation
+            pred_expected_output_from_sim_dict = pred_simulation[fault_simulation['POs']]['Good Machine'].to_dict()
+            # Get weights for primary outputs
+            output_vector_weights = weights[fault_simulation['POs']]['Good Machine'].to_dict()
+            # Calculate weighted matches between predicted and actual output values
+            weighted_output_matches = [(ov==pv)*wo for ov, pv, wo in zip(output_vector_dict.values(), pred_expected_output_from_sim_dict.values(), output_vector_weights.values())]
+            # Calculate weighted accuracy for output vector
+            weighted_output_accuracy = sum(weighted_output_matches) / sum(output_vector_weights.values())
+            # Apply exponential scaling to reward
+            exponent = 2
+            base_reward = 2.0
+            reward['expected_output'] += base_reward * (1 + weighted_output_accuracy) ** exponent - base_reward
+            # Additional reward for perfect accuracy
+            reward['expected_output_acc'] += int(weighted_output_accuracy==1)
+
+          # Reward the detected Fault Path
+          # Extract fault path information from simulation
+          detected_fault_path_df = fault_simulation[fault_simulation["Fault Path"]].reset_index()[["Bad Machine", "index"]]
+          # Format the bad machine values as fault types (sa0, sa1)
+          detected_fault_path_df['Bad Machine'] = detected_fault_path_df['Bad Machine'].apply(lambda x: f"sa{x}").values
+          # Parse the predicted detected faults string into a numpy array
+          pred_detected_faults_np = np.array([(fault, loc) for fault_loc in pred_detected_faults.split(',') for fault, loc in [fault_loc.strip().split()]])
+          # Check if the predicted fault path matches the actual fault path
+          if detected_fault_path_df.shape[0] == pred_detected_faults_np.shape[0] and np.array_equal(detected_fault_path_df['index'].values, pred_detected_faults_np[:, 1]):
+            # Count how many values are equal between the two arrays
+            equal_values = sum(a == b for a, b in zip(detected_fault_path_df['index'].values, pred_detected_faults_np[:, 1]))
+            accuracy = equal_values / len(detected_fault_path_df['index'].values)
+            # Apply exponential scaling to reward
+            exponent = 2
+            base_reward = 2.0 
+            reward['detected_faults'] += base_reward * (1 + accuracy) ** exponent - base_reward
+            # Additional reward for perfect accuracy
+            reward['detected_faults_acc'] += int(accuracy==1)
         else:
-          reward['fault_detect_inpvector'] -= 5
-          reward['fault_simulation'] -= 5
-
-        # Reward based on validity of generated Good-Machine input values and generated input vector
-        input_nets = fault_simulation[fault_simulation['PIs']==True].index
-        input_vector_based_on_pred_simulation = pred_simulation.loc[input_nets].reset_index()[['index', 'Good Machine']].astype(str).apply(': '.join, axis=1).str.cat(sep=', ')
-        input_vector_reward = input_vector_based_on_pred_simulation == pred_input_vector
-
-        # Reward based on validity of generated Good-Machine output values and generated expected output vector
-        output_nets = fault_simulation[fault_simulation['POs']==True].index
-        output_vector_based_on_pred_simulation = pred_simulation.loc[output_nets].reset_index()[['index', 'Good Machine']].astype(str).apply(': '.join, axis=1).str.cat(sep=', ')
-        output_vector_reward = output_vector_based_on_pred_simulation == pred_expected_output
-
-        # Reward the detected Fault Path 
-        fault_path_str = fault_simulation[fault_simulation["Fault Path"] == True].reset_index()[["Bad Machine", "index"]].astype(str).apply(' '.join, axis=1)
-        # Combine into final string with 'sa' prefix
-        detected_faults_str = 'sa' + fault_path_str.str.cat(sep=', sa')
-        # Compare with predicted faults and add to reward
-        detected_faults_reward = detected_faults_str == pred_detected_faults
-
-        reward['detected_faults'] += 2*int(detected_faults_reward)
-        reward['expected_output'] += 2*int(output_vector_reward)
-        reward['input_vector'] += 2*int(input_vector_reward)
-        reward['detected_faults_acc'] += int(detected_faults_reward)
-        reward['expected_output_acc'] += int(output_vector_reward)
-        reward['input_vector_acc'] += int(input_vector_reward)
-        
-        # Reward the input vector & expected output
-        reward['fault_simulation'] += sum(fault_sim_rewards.values()) # The dictionary is empty. Adds 0. Keep for consistency.
-        
+          # Penalize if either simulation is missing
+          reward['fault_detect_inpvector'] -= 2
+          reward['fault_simulation'] -= 2
       except:
-        # print(f"3. Wrong Fault Simulation, Reward:0")
-        fault_simulation = None
+        pass
+    else:
+      # Penalize heavily if required inputs are missing
+      reward['fault_detect_inpvector'] -= 5
+      reward['fault_simulation'] -= 5
     rewards.append(reward)
   return rewards
 
