@@ -22,7 +22,6 @@ from atpgllm import (
   load_tokenizer,
   save_model, 
   get_dec_ids_and_mask, 
-  get_targets, 
   convert_bytes,
   is_main_process,
   initialize_training_environment,
@@ -103,20 +102,22 @@ def epoch_loop(dataloader, desc, model, hps, training_loop:bool = True, epoch=1)
     data = next(data_iterator)
 
     # IDs and Attention Mask
-    ids  = data['input_ids'].to(device, non_blocking=True)
-    mask = data['attention_mask'].to(device, non_blocking=True)
-    
-    # Get targets
-    targets = get_targets(data, tokenizer, is_causal, device)
+    ids    = data['input_ids'].to(device, non_blocking=True)
+    mask   = data['attention_mask'].to(device, non_blocking=True)
+    labels = data['labels'].to(device, non_blocking=True)
+
+    # Shift labels one position left
+    labels        = torch.roll(labels, shifts=-1, dims=1)
+    labels[:, -1] = tokenizer.pad_token_id
 
     # Get decoder input_ids and decoder attention mask in the case where you have a seq2seq model
-    dec_input, dec_mask = get_dec_ids_and_mask(targets, tokenizer, is_causal, device)
+    dec_input, dec_mask = get_dec_ids_and_mask(labels, tokenizer, is_causal, device)
 
     # Forward Pass
     outputs = model(input_ids=ids, attention_mask=mask) if hps.is_causal else model(input_ids=ids, attention_mask=mask, decoder_input_ids=dec_input, decoder_attention_mask=dec_mask)
 
     # loss
-    micro_batch_loss = criterion(outputs.logits.transpose(2, 1).to(torch.bfloat16), targets)    
+    micro_batch_loss = criterion(outputs.logits.transpose(2, 1).to(torch.bfloat16), labels)    
     micro_batch_loss /= hps.gradient_accumulation_steps
     
     batch_loss += micro_batch_loss.item()
@@ -128,7 +129,7 @@ def epoch_loop(dataloader, desc, model, hps, training_loop:bool = True, epoch=1)
       # Calculate the gradients
       hps.accelerator.backward(total_micro_batch_loss) if hps.deepspeed_kernel else total_micro_batch_loss.backward()
 
-      # Gather outputs and targets 
+      # Gather outputs and labels 
       if is_main_process():
         # Make sure both will be loaded on CPU RAM
         # Generate the token ids
@@ -136,7 +137,7 @@ def epoch_loop(dataloader, desc, model, hps, training_loop:bool = True, epoch=1)
         # Convert generated ids to text
         generated_texts = tokenizer.batch_decode(generated_ids.squeeze(-1), skip_special_tokens=True)
         # Convert target ids to text
-        target_texts = tokenizer.batch_decode(targets.cpu(), skip_special_tokens=True)
+        target_texts = tokenizer.batch_decode(labels.cpu(), skip_special_tokens=True)
         # Collect texts
         generated_texts_for_metrics.extend(generated_texts)
         target_texts_for_metrics.extend(target_texts)
@@ -203,7 +204,7 @@ def epoch_loop(dataloader, desc, model, hps, training_loop:bool = True, epoch=1)
       #   # Convert generated ids to text
       #   generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
       #   # Convert target ids to text
-      #   references = tokenizer.batch_decode(targets, skip_special_tokens=True)
+      #   references = tokenizer.batch_decode(labels, skip_special_tokens=True)
       #   # Update the metrics dictionary 
       #   metrics.update(compute_bleu(references=references, completions=generated_texts))
       #   metrics.update(compute_rouge(references=references, completions=generated_texts))

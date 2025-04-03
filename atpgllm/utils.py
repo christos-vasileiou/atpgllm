@@ -828,7 +828,7 @@ def prepare_objects_for_training(model, dataset, hps):
       with hps.accelerator.main_process_first():
         tokenized_dataset = dataset
         # tokenized_dataset = dataset.map(tokenize_fn, batched=True, num_proc=16, load_from_cache_file=True, remove_columns=['text'], fn_kwargs={'tokenizer': hps.tokenizer, 'is_causal': hps.is_causal})
-      hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora)
+      hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora, instruction_training=hps.train_lora or hps.new_tokens)
       
       if hps.accelerator.is_local_main_process:
         hps.info += f"{tokenized_dataset}\n" + \
@@ -863,7 +863,7 @@ def prepare_objects_for_training(model, dataset, hps):
       # Tokenize the dataset
       # tokenized_dataset = dataset.map(tokenize_fn, batched=True, num_proc=16, load_from_cache_file=True, remove_columns=['text'], fn_kwargs={'tokenizer': hps.tokenizer, 'is_causal': hps.is_causal})
       tokenized_dataset = dataset
-      hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora)
+      hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora, instruction_training=hps.train_lora or hps.new_tokens)
       
       if hps.fsdp:
         total_model_parameters = sum(p.numel() for p in model.parameters())
@@ -911,7 +911,7 @@ def prepare_objects_for_training(model, dataset, hps):
     # Tokenize the dataset
     # tokenized_dataset = dataset.map(tokenize_fn, batched=True, num_proc=32, load_from_cache_file=True, remove_columns=['text'], fn_kwargs={'tokenizer': hps.tokenizer, 'is_causal': hps.is_causal})
     tokenized_dataset = dataset
-    hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora)
+    hps.collate_fn = MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora, instruction_training=hps.train_lora or hps.new_tokens)
     hps.info += f"{tokenized_dataset}\n" + \
                 f"{model}\n"
     hps.logger.info(f"\n{hps.info}")
@@ -978,7 +978,7 @@ def prepare_objects_for_training(model, dataset, hps):
       hps.logger.info(f"{model}")
   
   # Set the loss functions
-  hps.criterion = nn.CrossEntropyLoss(ignore_index=hps.tokenizer.pad_token_id if hps.is_causal else -100).to(hps.device)
+  hps.criterion = nn.CrossEntropyLoss(ignore_index=-100).to(hps.device)
   hps.patterns_criterion = get_patterns_criterion(hps)
   # hps.accuracy = ATPGAccuracy(model, hps.tokenizer)
 
@@ -1128,6 +1128,8 @@ def load_raw_dataset(data_file, test_size=.3):
   import os
   from glob import glob
   if os.path.exists(data_file) or all(os.path.exists(file) for file in glob(data_file)):
+    from datasets import Features, Value
+    features = Features({'text': Value(dtype='string'), 'netlist': Value(dtype='string')})
     # It's a local file
     raw_dataset = load_dataset('csv', data_files=data_file)
     if 'Unnamed: 0' in raw_dataset.column_names:

@@ -16,15 +16,3 @@ def get_dec_ids_and_mask(targets, tokenizer, is_causal, device):
     dec_mask = torch.ones_like(dec_input)
     dec_mask = dec_mask.masked_fill(dec_input == tokenizer.pad_token_id, 0).to(device)
   return dec_input, dec_mask
-
-
-def get_targets(data, tokenizer, is_causal, device):
-  # shift targets backwards. The opposite of seq2seq
-  if is_causal:
-    targets        = data['input_ids'].clone().detach().to(device)
-    targets        = torch.roll(targets, shifts=-1, dims=1)
-    targets[:, -1] = tokenizer.pad_token_id
-    return targets
-  else: 
-    targets   = data['labels'].to(device)
-    return targets

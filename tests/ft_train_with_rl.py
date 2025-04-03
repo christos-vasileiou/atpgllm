@@ -37,7 +37,6 @@ from atpgllm import (
   load_raw_dataset,
   prepare_objects_for_training,
   initialize_training_environment,
-  get_targets,
   cot_reward,
   test_generation_reward,
   get_user_prompt,
@@ -101,17 +100,19 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
       data = next(data_iterator)
 
       # IDs and Attention Mask
-      ids  = data['input_ids'].to(device, non_blocking=True)
-      mask = data['attention_mask'].to(device, non_blocking=True)
+      ids    = data['input_ids'].to(device, non_blocking=True)
+      mask   = data['attention_mask'].to(device, non_blocking=True)
+      labels = data['labels'].to(device, non_blocking=True)
       
-      # Get targets
-      targets = get_targets(data, tokenizer, is_causal, device)
+      # Shift labels one position left to get
+      labels        = torch.roll(labels, shifts=-1, dims=1)
+      labels[:, -1] = tokenizer.pad_token_id
 
       # Forward Pass
       outputs = model(input_ids=ids, attention_mask=mask)
 
       # Compute loss
-      micro_batch_loss = criterion(outputs.logits.transpose(2, 1).to(torch.bfloat16), targets)    
+      micro_batch_loss = criterion(outputs.logits.transpose(2, 1).to(torch.bfloat16), labels)    
       micro_batch_loss /= hps.gradient_accumulation_steps
       
       batch_loss += micro_batch_loss.item()
@@ -1268,7 +1269,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20)
 
   if hps.train_lora:
-    dataloader.collate_fn.set_train_lora(True)
+    dataloader.collate_fn.set_instruction_training(True)
     if is_main_process():
       print(f"{model}\nSFT embedding, lora and head:\nModel training parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}\n")
     if hps.wandb:
@@ -1353,7 +1354,6 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
 
   if is_main_process():
     print(f"{model}\nGRPO-RLFT train embedding, lora and head:\nTrainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}")
-  
   # 3, Fine-tune with Reinforcement Learning (RL)
   if hps.wandb:
     hps.run.tags += ('train_rl_grpo',)

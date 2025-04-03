@@ -23,7 +23,7 @@ start_of_assistant_responses_mapping = {"meta-llama/Llama-2-7b-chat-hf": "[/INST
                                         "meta-llama/Llama-3.2-3B-Instruct": "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"}
 
 class MyCollate:
-  def __init__(self, tokenizer, is_causal=True, lora=False):
+  def __init__(self, tokenizer, is_causal=True, lora=False, instruction_training=False):
     self.tokenizer = tokenizer
     self.is_causal = is_causal
     self.lora = lora
@@ -31,10 +31,10 @@ class MyCollate:
     self.set_right_padding()
     self.start_of_assistant_response = start_of_assistant_responses_mapping[self.tokenizer.name_or_path]
     self.end_of_instr = self.tokenizer.encode(self.start_of_assistant_response, return_tensors='pt', add_special_tokens=False)[0]
-    self.train_lora = False
+    self.instruction_training = instruction_training
     
-  def set_train_lora(self, train_lora):
-    self.train_lora = train_lora
+  def set_instruction_training(self, instruction_training: bool):
+    self.instruction_training = instruction_training
     
   def set_right_padding(self):
     self.right_padding = True # sft
@@ -73,14 +73,14 @@ class MyCollate:
       # convert list of dicts to dict of lists
       batch = {key: [item[key] for item in batch] for key in keys}
       tokenized_batch = self.tokenize_fn(batch, self.tokenizer)
-      if self.train_lora:
-        batch_size = tokenized_batch.input_ids.size(0)
-        seq_length = tokenized_batch.input_ids.size(1)
+      if self.instruction_training:
+        batch_size = tokenized_batch.labels.size(0)
+        seq_length = tokenized_batch.labels.size(1)
         end_of_instr_size = self.end_of_instr.size(0)
         for i in range(batch_size):
           for pos in range(seq_length - end_of_instr_size + 1):
-            if torch.equal(tokenized_batch.input_ids[i, pos:pos+end_of_instr_size], self.end_of_instr):
-              tokenized_batch.attention_mask[i, :pos+end_of_instr_size].fill_(0)
+            if torch.equal(tokenized_batch.labels[i, pos:pos+end_of_instr_size], self.end_of_instr):
+              tokenized_batch.labels[i, :pos+end_of_instr_size].fill_(-100)
               break
     elif self.left_padding:
       # convert list of dicts to dict of lists
