@@ -1315,13 +1315,11 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
 
   # Set the flags for distributed systems. Data samplers and Data Loaders
   use_sampler = hps.parallel==True and hps.deepspeed_kernel==False
-  # Shuffle is handled by the sampler
-  hps.shuffle = not use_sampler
   # Randomly select 200,000 samples from the dataset to shorten the training time
   random_indices = random.sample(range(len(dataloader.dataset)), min(200_000, len(dataloader.dataset)))
   dataset_subset = dataloader.dataset.select(random_indices)
   # Replicate the sampler across all processes
-  sampler = DistributedSampler(dataset_subset, rank=dataloader.sampler.rank, num_replicas=dataloader.sampler.num_replicas, shuffle=True) if use_sampler else None  
+  sampler = DistributedSampler(dataset_subset, rank=dataloader.sampler.rank, num_replicas=dataloader.sampler.num_replicas, shuffle=False) if use_sampler else None  
 
   # Adjust gradient accumulation steps. GRPO is slower than SFT. lower the number of gradient accumulation steps.
   hps.gradient_accumulation_steps = max(1, int(hps.gradient_accumulation_steps//hps.num_generations))
@@ -1329,7 +1327,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
 
   # Change batch size. Due to number of generations there might be OOM cuda error.
   hps.micro_batch_size = max(1, hps.micro_batch_size//hps.num_generations)
-  dataloader = DataLoader(dataset=dataset_subset, batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)
+  dataloader = DataLoader(dataset=sorted(dataset_subset, key=lambda x: x['gates_count']), batch_size=hps.micro_batch_size, collate_fn=MyCollate(tokenizer=hps.tokenizer, is_causal=hps.is_causal, lora=hps.lora), sampler=sampler, num_workers=dataloader.num_workers, pin_memory=dataloader.pin_memory, drop_last=dataloader.drop_last)
   torch.cuda.empty_cache()
   gc.collect()
 

@@ -918,23 +918,20 @@ def prepare_objects_for_training(model, dataset, hps):
     
   # Set the flags for distributed systems. Data samplers and Data Loaders
   use_sampler = hps.parallel==True and hps.deepspeed_kernel==False
-  # Shuffle is handled by the sampler
-  hps.shuffle = not use_sampler
 
   if use_sampler:
-    training_sampler   = DistributedSampler(tokenized_dataset['train'], rank=hps.local_rank, num_replicas=hps.local_world_size)
-    validation_sampler = DistributedSampler(tokenized_dataset['validation'], rank=hps.local_rank, num_replicas=hps.local_world_size)
-    testing_sampler    = DistributedSampler(tokenized_dataset['test'], rank=hps.local_rank, num_replicas=hps.local_world_size)
+    training_sampler   = DistributedSampler(tokenized_dataset['train'], rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=False)
+    validation_sampler = DistributedSampler(tokenized_dataset['validation'], rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=False)
+    testing_sampler    = DistributedSampler(tokenized_dataset['test'], rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=False)
   else:
     training_sampler, validation_sampler, testing_sampler = None, None, None
 
   # Create the Data Loaders
-  training_loader   = DataLoader(dataset=tokenized_dataset['train'], batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=hps.collate_fn, sampler=training_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
-  validation_loader = DataLoader(dataset=tokenized_dataset['validation'], batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=hps.collate_fn, sampler=validation_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
-  testing_loader    = DataLoader(dataset=tokenized_dataset['test'], batch_size=hps.micro_batch_size, shuffle=hps.shuffle, collate_fn=hps.collate_fn, sampler=testing_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
+  training_loader   = DataLoader(dataset=sorted(tokenized_dataset['train'], key=lambda x: x['gates_count']), batch_size=hps.micro_batch_size, collate_fn=hps.collate_fn, sampler=training_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
+  validation_loader = DataLoader(dataset=tokenized_dataset['validation'], batch_size=hps.micro_batch_size, collate_fn=hps.collate_fn, sampler=validation_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
+  testing_loader    = DataLoader(dataset=tokenized_dataset['test'], batch_size=hps.micro_batch_size, collate_fn=hps.collate_fn, sampler=testing_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
 
   if not hps.deepspeed_kernel:
-    
     total_training_steps = (hps.epochs * len(training_loader)) // hps.gradient_accumulation_steps
     hps.optimizer = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=AdamW, lr=hps.lr) if hps.parallel and not hps.fsdp else AdamW(model.parameters(), lr=hps.lr) if sys.argv[0] != 'sft.py' else None
     if hps.new_tokens:
