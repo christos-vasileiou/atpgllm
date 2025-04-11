@@ -47,8 +47,8 @@ def get_new_tokens(hps: AttrDict) -> List[str]:
     elif any(token==gate for gate in ["or", "and", "not"]): 
       tokens_list.append(AddedToken(token, lstrip=False, rstrip=False, normalized=True, single_word=False))
     # gate names
-    elif any(token==gate for gate in ['AN', 'IBUF', 'ND', 'NR', 'OR', 'XNR', 'XOR']):
-      tokens_list.append(AddedToken(token, lstrip=False, rstrip=True, normalized=False, single_word=False))
+    # elif any(token==gate for gate in ['AN', 'IBUF', 'ND', 'NR', 'OR', 'XNR', 'XOR']):
+    #   tokens_list.append(AddedToken(token, lstrip=False, rstrip=True, normalized=False, single_word=False))
     # gate names
     elif token=='IV': 
       tokens_list.append(AddedToken(token, lstrip=False, rstrip=False, normalized=False, single_word=True))

@@ -1137,7 +1137,8 @@ def load_raw_dataset(data_file, test_size=.3):
   
   train_test_split = raw_dataset['train'].train_test_split(test_size=test_size)
   train_val_split = train_test_split['train'].train_test_split(test_size=.15)
-  dataset = DatasetDict({'train': train_val_split['train'], 'validation': train_val_split['test'], 'test': train_test_split['test']})
+  train_dataset = balance_dataset_by_gates_count(train_val_split['train'])
+  dataset = DatasetDict({'train': train_dataset, 'validation': train_val_split['test'], 'test': train_test_split['test']})
   return dataset
 
 def sizeof_tensor(tensor):
@@ -1807,3 +1808,56 @@ def print_prompt_completions_sample(prompts: list[str], completions: list[str], 
   # Print with bold lines
   console.print(panel)
   
+def balance_dataset_by_gates_count(dataset):
+  """
+  Balances a dataset by ensuring each gate count has the same number of examples.
+  Instead of using the most frequent count as target, it allows for more flexible balancing.
+  
+  Args:
+      dataset: The dataset to balance
+      
+  Returns:
+      A balanced dataset with equal representation of each gate count
+  """
+  import pandas as pd
+  # Convert to pandas for more efficient grouping and sampling
+  df = dataset.to_pandas()
+  
+  # Group by gates_count and get counts
+  gate_count_groups = df.groupby('gates_count')
+  counts = {count: len(group) for count, group in gate_count_groups}
+  
+  # Find the target count (using the most frequent by default)
+  target_count = max(counts.values())
+  
+  # Create balanced samples for each gate count
+  balanced_dfs = []
+  for count, group in gate_count_groups:
+    # If we have fewer examples than target, sample with replacement
+    if len(group) < target_count:
+      balanced_group = group.sample(n=target_count, replace=True)
+    # If we have more, sample without replacement
+    elif len(group) > target_count:
+      balanced_group = group.sample(n=target_count, replace=False)
+    else:
+      balanced_group = group
+    
+    balanced_dfs.append(balanced_group)
+  
+  # Combine all balanced groups
+  balanced_df = pd.concat(balanced_dfs, ignore_index=True)
+  
+  # Convert back to datasets format
+  from datasets import Dataset
+  balanced_dataset = Dataset.from_pandas(balanced_df)
+  
+  # Create a visualization comparing original vs balanced distribution
+  import plotly.graph_objects as go
+  
+  # Get counts for original dataset
+  original_counts = df['gates_count'].value_counts().sort_index()
+  
+  # Get counts for balanced dataset
+  balanced_counts = balanced_df['gates_count'].value_counts().sort_index()
+  
+  return balanced_dataset

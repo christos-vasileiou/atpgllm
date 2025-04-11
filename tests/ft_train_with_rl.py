@@ -1246,7 +1246,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
       model.find_unused_parameters = True  # Set find_unused_parameters to True to avoid OOM error
 
   # Configure which parts of the model to train in step 2
-  train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False)
+  train_layers(model, train_embeddings=False, train_head=False, train_lora=True, train_base_model=False)
 
   # Initialize the optimizer with parameter groups
   # Get only trainable parameters to optimize memory usage and training efficiency
