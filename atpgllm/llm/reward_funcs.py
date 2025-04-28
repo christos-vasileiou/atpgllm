@@ -304,6 +304,8 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
       except:
         pred_simulation = None
         reward['pred_simulation'] -= 2.5
+    else:
+      reward['pred_simulation'] -= 3.5
 
     if pred_input_vector and pred_expected_output and fault and net and netlist:
       try:
@@ -416,6 +418,7 @@ def test_generation_reward(prompts: list, completions: list, netlists: list, fau
       reward['fault_detect_inpvector'] -= 5
       reward['fault_simulation'] -= 5
     rewards.append(reward)
+  
   return rewards
 
 # Example usage
@@ -445,3 +448,4 @@ if __name__ == "__main__":
 
   rewards = test_generation_reward(prompts, completions, netlists, fault_re, simulation_re, input_vector_re, expected_output_re, detected_faults_re)
   print(f"Test Generation: {rewards}")
+

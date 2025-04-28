@@ -104,7 +104,7 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
       mask   = data['attention_mask'].to(device, non_blocking=True)
       labels = data['labels'].to(device, non_blocking=True)
       
-      # Shift labels one position left to get
+      # Shift labels one position left (more efficient than creating a new tensor)
       labels        = torch.roll(labels, shifts=-1, dims=1)
       labels[:, -1] = tokenizer.pad_token_id
 
@@ -1246,7 +1246,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
       model.find_unused_parameters = True  # Set find_unused_parameters to True to avoid OOM error
 
   # Configure which parts of the model to train in step 2
-  train_layers(model, train_embeddings=False, train_head=False, train_lora=True, train_base_model=False)
+  train_layers(model, train_embeddings=True, train_head=True, train_lora=True, train_base_model=False)
 
   # Initialize the optimizer with parameter groups
   # Get only trainable parameters to optimize memory usage and training efficiency
@@ -1317,7 +1317,7 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   use_sampler = hps.parallel==True and hps.deepspeed_kernel==False
   # Randomly select 200,000 samples from the dataset to shorten the training time
   random_indices = random.sample(range(len(dataloader.dataset)), min(200_000, len(dataloader.dataset)))
-  dataset_subset = dataloader.dataset.select(random_indices)
+  dataset_subset = [dataloader.dataset[i] for i in random_indices]
   # Replicate the sampler across all processes
   sampler = DistributedSampler(dataset_subset, rank=dataloader.sampler.rank, num_replicas=dataloader.sampler.num_replicas, shuffle=False) if use_sampler else None  
 

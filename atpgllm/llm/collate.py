@@ -10,6 +10,7 @@ from atpgllm.utils import (
 )
 from .tokenizer import tokenize_fn
 from ..utils import AttrDict
+import torch.distributed as dist
 
 class PinMemoryData(AttrDict):
   def pin_memory(self):
@@ -19,6 +20,9 @@ class PinMemoryData(AttrDict):
     return self
 
 start_of_assistant_responses_mapping = {"meta-llama/Llama-2-7b-chat-hf": "[/INST]", 
+                                        "chivasileiou/TestModel": "[/INST]",
+                                        "chivasileiou/TestModel-2": "[/INST]",
+                                        "chivasileiou/TestModel-3": "[/INST]",
                                         "meta-llama/Llama-3.1-8B-Instruct": "<|eot_id|><|start_header_id|>assistant<|end_header_id|>",
                                         "meta-llama/Llama-3.2-3B-Instruct": "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"}
 
@@ -29,7 +33,8 @@ class MyCollate:
     self.lora = lora
     self.tokenize_fn = lambda x, t: tokenize_fn(x, tokenizer=t, is_causal=is_causal)
     self.set_right_padding()
-    self.start_of_assistant_response = start_of_assistant_responses_mapping[self.tokenizer.name_or_path]
+    self.start_of_assistant_response = "[/INST]" if self.tokenizer.name_or_path not in start_of_assistant_responses_mapping \
+                                                 else start_of_assistant_responses_mapping[self.tokenizer.name_or_path]
     self.end_of_instr = self.tokenizer.encode(self.start_of_assistant_response, return_tensors='pt', add_special_tokens=False)[0]
     self.instruction_training = instruction_training
     

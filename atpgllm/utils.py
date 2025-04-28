@@ -47,25 +47,46 @@ if is_rich_available():
   from rich.text import Text
 
 class AttrDict(dict):
+  """
+  A dictionary subclass that allows attribute-style access to dictionary keys.
+  
+  This class enables dot notation access to dictionary items, making it more
+  convenient to work with configuration and parameter dictionaries.
+  
+  Example:
+      config = AttrDict({"learning_rate": 0.01})
+      print(config.learning_rate)  # Access via attribute
+      print(config["learning_rate"])  # Access via key
+  """
   def __init__(self, initial_dict=None, **kwargs):
+    # Initialize as a regular dictionary
     super(AttrDict, self).__init__()
+    # If an initial dictionary is provided, update with its contents
     if initial_dict is not None:
       self.update(initial_dict)
+    # Update with any keyword arguments provided
     self.update(kwargs)
 
   def __getattr__(self, key):
+    # Allow dictionary keys to be accessed as attributes
     try:
+      # Try to get the key from the dictionary
       return self[key]
     except KeyError:
+      # If the key doesn't exist, raise an AttributeError (standard behavior for attribute access)
       raise AttributeError(f"No such attribute: {key}")
 
   def __setattr__(self, key, value=None):
+    # Allow setting dictionary items using attribute syntax
     if isinstance(key, str):
+      # Store the key-value pair in the dictionary
       self[key] = value
     else:
+      # Ensure keys are strings to maintain expected behavior
       raise ValueError(f'Invalid attribute assignment. You passed as key: {key} and value: {value}')
 
   def __dir__(self):
+    # Enhance dir() output to include dictionary keys for better IDE autocompletion
     return super().__dir__() + list(self.keys())
 
 def patterns_lengths(batch, max_freq):
@@ -591,7 +612,7 @@ def get_patterns_criterion(hps):
   # weight only the vocabulary's digits 
   for i in range(10):
     weight[hps.tokenizer.convert_tokens_to_ids(str(i))] = 1
-  criterion = nn.CrossEntropyLoss(weight=weight, ignore_index=hps.tokenizer.pad_token_id if hps.is_causal else -100) 
+  criterion = nn.CrossEntropyLoss(weight=weight, ignore_index=-100) 
   return criterion 
 
 
@@ -653,17 +674,44 @@ def get_code_files_to_version():
 
 
 def distributed_env_init(hps):
-  import datetime
-  hps.rank             = int(os.environ['RANK'])
-  hps.local_rank       = int(os.environ['LOCAL_RANK'])
-  hps.local_world_size = int(os.environ['LOCAL_WORLD_SIZE'])
-  hps.world_size       = int(os.environ['WORLD_SIZE'])
-  dist.init_process_group(backend='nccl', rank=hps.local_rank, world_size=hps.world_size) #, timeout=datetime.timedelta(1800)
+  """
+  Initialize the distributed training environment.
+  
+  Args:
+      hps: Hyperparameters object containing training configuration
+  
+  This function:
+  1. Sets up distributed process ranks and world size from environment variables
+  2. Initializes the PyTorch distributed process group
+  3. Configures the appropriate CUDA device for each process
+  4. Sets random seed for reproducibility
+  5. Adjusts gradient accumulation steps based on world size
+  """
+  # Extract distributed training information from environment variables
+  hps.rank             = int(os.environ['RANK'])             # Global rank of current process
+  hps.local_rank       = int(os.environ['LOCAL_RANK'])       # Local rank within the current node
+  hps.local_world_size = int(os.environ['LOCAL_WORLD_SIZE']) # Number of processes in the current node
+  hps.world_size       = int(os.environ['WORLD_SIZE'])       # Total number of processes across all nodes
+  
+  # Initialize the process group with NCCL backend (optimized for GPU communication)
+  dist.init_process_group(backend='nccl', rank=hps.local_rank, world_size=hps.world_size)
+  
+  # Set the device for the current process
   hps.device = torch.device(f'cuda:{hps.local_rank}' if torch.cuda.is_available() else 'cpu')
+  
+  # Log distributed training configuration
   hps.info += f"Backend Configuration: {dist.get_backend_config()}, local_rank: {hps.local_rank}, local_world_size: {hps.local_world_size}, free-est gpu: {hps.free_gpu_id}, world_size: {hps.world_size}, device: {hps.device}\n"
+  
+  # Set random seed for reproducibility
   torch.manual_seed(hps.seed)
+  
+  # Set the current CUDA device to match local rank
   torch.cuda.set_device(hps.local_rank)
+  
+  # Scale down gradient accumulation steps by world size to maintain effective batch size
   hps.gradient_accumulation_steps = int(hps.gradient_accumulation_steps//hps.world_size)
+  
+  # Only print from the main process (rank 0) to avoid duplicate messages
   if hps.local_rank == 0:
     print(f"Accumulated gradient steps: {hps.gradient_accumulation_steps}")
 
@@ -918,16 +966,19 @@ def prepare_objects_for_training(model, dataset, hps):
     
   # Set the flags for distributed systems. Data samplers and Data Loaders
   use_sampler = hps.parallel==True and hps.deepspeed_kernel==False
+  # Shuffle is handled by the Data Sampler in distributed systems
+  hps.shuffle = not use_sampler
+  training_dataset = sorted(tokenized_dataset['train'], key=lambda x: x['gates_count'])
 
   if use_sampler:
-    training_sampler   = DistributedSampler(tokenized_dataset['train'], rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=False)
-    validation_sampler = DistributedSampler(tokenized_dataset['validation'], rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=False)
-    testing_sampler    = DistributedSampler(tokenized_dataset['test'], rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=False)
+    training_sampler   = DistributedSampler(training_dataset, rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=hps.shuffle)
+    validation_sampler = DistributedSampler(tokenized_dataset['validation'], rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=hps.shuffle)
+    testing_sampler    = DistributedSampler(tokenized_dataset['test'], rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=hps.shuffle)
   else:
     training_sampler, validation_sampler, testing_sampler = None, None, None
 
   # Create the Data Loaders
-  training_loader   = DataLoader(dataset=sorted(tokenized_dataset['train'], key=lambda x: x['gates_count']), batch_size=hps.micro_batch_size, collate_fn=hps.collate_fn, sampler=training_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
+  training_loader   = DataLoader(dataset=training_dataset, batch_size=hps.micro_batch_size, shuffle=True, collate_fn=hps.collate_fn, sampler=training_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
   validation_loader = DataLoader(dataset=tokenized_dataset['validation'], batch_size=hps.micro_batch_size, collate_fn=hps.collate_fn, sampler=validation_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
   testing_loader    = DataLoader(dataset=tokenized_dataset['test'], batch_size=hps.micro_batch_size, collate_fn=hps.collate_fn, sampler=testing_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
 
@@ -935,18 +986,9 @@ def prepare_objects_for_training(model, dataset, hps):
     total_training_steps = (hps.epochs * len(training_loader)) // hps.gradient_accumulation_steps
     hps.optimizer = ZeroRedundancyOptimizer(model.parameters(), optimizer_class=AdamW, lr=hps.lr) if hps.parallel and not hps.fsdp else AdamW(model.parameters(), lr=hps.lr) if sys.argv[0] != 'sft.py' else None
     if hps.new_tokens:
-      # NOTE: schedulers are being tested
-
-      # hps.scheduler = get_constant_schedule_with_warmup(hps.optimizer, num_warmup_steps=10)
       hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20)
-      # hps.scheduler = CosineAnnealingWarmRestarts(hps.optimizer, T_0=len(training_loader)//hps.batch_size, T_mult=1, eta_min=hps.lr*0.1, last_epoch=-1) if sys.argv[0] != 'sft.py' else None
-      # hps.scheduler = get_inverse_sqrt_schedule(hps.optimizer, num_warmup_steps=total_training_steps*0.05, timescale=total_training_steps//2)
     else:
-      # NOTE: schedulers are being tested
-
       hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20) if sys.argv[0] != 'sft.py' else None # when cosine scheduler is used, we need to set num_training_steps to 10 
-      # hps.scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=5)
-      # hps.scheduler = CosineAnnealingWarmRestarts(hps.optimizer, T_0=len(training_loader), T_mult=1, eta_min=hps.lr*0.1, last_epoch=-1)
       
   # Prepare whatever requires for ZeRO acceleration training (deepspeed_kernel is activated)
   if hps.deepspeed_kernel and hps.parallel:
@@ -955,14 +997,10 @@ def prepare_objects_for_training(model, dataset, hps):
     if (hps.accelerator.state.deepspeed_plugin is None
         or "scheduler" not in hps.accelerator.state.deepspeed_plugin.deepspeed_config):
 
-      # Select: ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
       if hps.new_tokens:
-        # hps.scheduler = get_constant_schedule_with_warmup(hps.optimizer, num_warmup_steps=10)
         hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20) if sys.argv[0] != 'sft.py' else None
-        # hps.scheduler = get_inverse_sqrt_schedule(hps.optimizer, num_warmup_steps=10, timescale=total_training_steps//2)
       else:
         hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps) # when cosine scheduler is used, we need to set num_training_steps to 10
-        # hps.scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=5) if sys.argv[0] != 'sft.py' else None
     else:
       hps.scheduler = DummyScheduler(
         hps.optimizer, total_num_steps=hps.max_train_steps, warmup_num_steps=10 # hps.num_warmup_steps
@@ -1554,7 +1592,7 @@ def upload_model(model, save_directory, push_to_hub, hps, **kwargs):
     print(f"Pushing model to Hugging Face Hub: {save_directory}")
     
     # Handle differently based on whether we're using LoRA or not
-    if hps.lora:
+    if hps.lora or hps.train_lora:
       # For LoRA models, we need to push tokenizer and base model separately
       hps.tokenizer.push_to_hub(save_directory, private=True)
       model.base_model.model.push_to_hub(
@@ -1589,7 +1627,7 @@ def upload_model(model, save_directory, push_to_hub, hps, **kwargs):
         print(f"⚠️ Error deleting previous checkpoint: {e}")
     
     # Save the model based on architecture type
-    if hps.lora:
+    if hps.lora or hps.train_lora:
       # For LoRA models, save tokenizer and base model with adapters
       hps.tokenizer.save_pretrained(save_directory)
       model.base_model.model.save_pretrained(save_directory, safe_serialization=True)
@@ -1833,17 +1871,22 @@ def balance_dataset_by_gates_count(dataset):
   # Create balanced samples for each gate count
   balanced_dfs = []
   for count, group in gate_count_groups:
-    # If we have fewer examples than target, sample with replacement
+    # Set a fixed random seed based on the count to ensure all processes sample the same data
+    random_seed = hash(f"gate_count_{count}") % 10000
+    
     if len(group) < target_count:
-      balanced_group = group.sample(n=target_count, replace=True)
-    # If we have more, sample without replacement
+      # If we have fewer examples than target, sample with replacement
+      # Use a fixed random state to ensure all processes get the same samples
+      balanced_group = group.sample(n=target_count, replace=True, random_state=random_seed).reset_index(drop=True)
     elif len(group) > target_count:
-      balanced_group = group.sample(n=target_count, replace=False)
+      # If we have more, sample without replacement
+      # Use a fixed random state to ensure all processes get the same samples
+      balanced_group = group.sample(n=target_count, replace=False, random_state=random_seed).reset_index(drop=True)
     else:
       balanced_group = group
     
     balanced_dfs.append(balanced_group)
-  
+
   # Combine all balanced groups
   balanced_df = pd.concat(balanced_dfs, ignore_index=True)
   
@@ -1860,4 +1903,17 @@ def balance_dataset_by_gates_count(dataset):
   # Get counts for balanced dataset
   balanced_counts = balanced_df['gates_count'].value_counts().sort_index()
   
+  # If we're in a distributed environment, make sure all processes are synced
+  # Your balance_dataset_by_gates_count reshuffles, oversamples, and resamples the data per-process.
+  # random seed fixes based on gate_count, but:
+  # - Tiny differences in local state (like numpy random generator or pandas sampling behavior) can still cause drift.
+  # - Even if sampling identical, shuffling or order during to_pandas() or from_pandas() can slightly differ.
+  # Move the balancing to rank 0 only, and broadcast to all other ranks.
+  if dist.is_initialized():
+    if dist.get_rank() == 0:
+      train_dataset.save_to_disk('/tmp/train_dataset')
+    dist.barrier()
+    # Now all ranks have the same train_dataset
+    train_dataset = Dataset.load_from_disk('/tmp/train_dataset')
+    
   return balanced_dataset
