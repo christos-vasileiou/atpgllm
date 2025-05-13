@@ -18,6 +18,7 @@ models_causal = {
   'llama-3.1': "meta-llama/Llama-3.1-8B-Instruct",
   'llama-3.2': "meta-llama/Llama-3.2-3B-Instruct",
   'test-model': "chrivasileiou/TestModel",
+  'test-model-lora': "chrivasileiou/TestModelLora",
   'test-model-v2': "chrivasileiou/TestModel-2",
   'test-model-v3': "chrivasileiou/TestModel-3",
   'codegemma-2b': "google/codegemma-2b",

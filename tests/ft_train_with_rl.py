@@ -69,6 +69,9 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
   logging_steps = 10
   # logging iterator 
   logging_step = 0
+  durations = 0
+  trained_tokens = 0
+  
   # Set collate function's flags to supervised fine-tuning
   dataloader.collate_fn.set_right_padding()
 
@@ -108,6 +111,7 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
       labels        = torch.roll(labels, shifts=-1, dims=1)
       labels[:, -1] = tokenizer.pad_token_id
 
+      start = time.time()
       # Forward Pass
       outputs = model(input_ids=ids, attention_mask=mask)
 
@@ -130,12 +134,17 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
           # schedule the learning rate based on the model loss
           if scheduler:
             scheduler.step() if hps.deepspeed_kernel else scheduler.step(batch_loss)
+      end = time.time()
+      durations += end - start
+      trained_tokens += (labels != -100).sum()
 
       if (i+1) % hps.gradient_accumulation_steps == 0:
         metrics["epoch"].append(str(epoch+1))
         metrics["batch"].append(str(int(i//hps.gradient_accumulation_steps)+1))
         metrics['step'].append(str(i+1))
         metrics['batch_loss'].append(smart_round(batch_loss))
+        metrics['time'].append(smart_round(durations/(i+1)))
+        metrics['tps'].append(smart_round(trained_tokens / durations)) # tokens per second (tps)
         x = pd.DataFrame(metrics)
 
         if hps.wandb: 
@@ -151,7 +160,7 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
             # print(tabulate(x.iloc[-logging_steps:], headers='keys', tablefmt='psql', showindex=False))
             logging_step=0
           logging_step+=1
-      if DEBUG and i>10:
+      if DEBUG and i>1000:
         break
       
       if is_main_process():
@@ -1405,7 +1414,7 @@ def main():
   model = load_tokenizer(model, hps)
   
   # Load dataset
-  dataset = load_raw_dataset(hps.data_file)
+  dataset = load_raw_dataset(hps.data_file, test_size=.1)
   
   # Prepare objects for training and validation methods (optimizer, scheduler, dataloader, etc...)
   model, training_loader, validation_loader, testing_loader = prepare_objects_for_training(model, dataset, hps)

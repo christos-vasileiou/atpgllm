@@ -971,14 +971,14 @@ def prepare_objects_for_training(model, dataset, hps):
   training_dataset = sorted(tokenized_dataset['train'], key=lambda x: x['gates_count'])
 
   if use_sampler:
-    training_sampler   = DistributedSampler(training_dataset, rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=hps.shuffle)
+    training_sampler   = DistributedSampler(training_dataset, rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=True)
     validation_sampler = DistributedSampler(tokenized_dataset['validation'], rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=hps.shuffle)
     testing_sampler    = DistributedSampler(tokenized_dataset['test'], rank=hps.local_rank, num_replicas=hps.local_world_size, shuffle=hps.shuffle)
   else:
     training_sampler, validation_sampler, testing_sampler = None, None, None
 
   # Create the Data Loaders
-  training_loader   = DataLoader(dataset=training_dataset, batch_size=hps.micro_batch_size, shuffle=True, collate_fn=hps.collate_fn, sampler=training_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
+  training_loader   = DataLoader(dataset=training_dataset, batch_size=hps.micro_batch_size, collate_fn=hps.collate_fn, sampler=training_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
   validation_loader = DataLoader(dataset=tokenized_dataset['validation'], batch_size=hps.micro_batch_size, collate_fn=hps.collate_fn, sampler=validation_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
   testing_loader    = DataLoader(dataset=tokenized_dataset['test'], batch_size=hps.micro_batch_size, collate_fn=hps.collate_fn, sampler=testing_sampler, num_workers=hps.num_workers, pin_memory=True, drop_last=True)
 
@@ -997,6 +997,7 @@ def prepare_objects_for_training(model, dataset, hps):
     if (hps.accelerator.state.deepspeed_plugin is None
         or "scheduler" not in hps.accelerator.state.deepspeed_plugin.deepspeed_config):
 
+      # Select: ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
       if hps.new_tokens:
         hps.scheduler = get_cosine_schedule_with_warmup(hps.optimizer, num_warmup_steps=10, num_training_steps=total_training_steps, num_cycles=3/20) if sys.argv[0] != 'sft.py' else None
       else:
@@ -1420,7 +1421,7 @@ def load_model(hps: AttrDict) -> torch.nn.Module:
       hps.model_name, quantization_config=hps.bnb_config, device_map=hps.device_map, # attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16
     )
   else:
-    model = AutoModelForCausalLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16, revision=hps.revision) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16, revision=hps.revision) if hps.is_causal == True else AutoModelForSeq2SeqLM.from_pretrained(hps.model_name, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16, revision=hps.revision)
     model = model.to(torch.bfloat16)
   
   if hps.lora:
@@ -1560,6 +1561,7 @@ def save_model(model, save_directory: str, push_to_hub: bool = True, **kwargs):
     # push to the hub!
     upload_model(model, save_directory, push_to_hub, **kwargs)
 
+
 def upload_model(model, save_directory, push_to_hub, hps, **kwargs):
   """
   Upload or save a model to the Hugging Face Hub or local directory.
@@ -1599,16 +1601,28 @@ def upload_model(model, save_directory, push_to_hub, hps, **kwargs):
           save_directory, 
           private=True, 
           safe_serialization=True,  # Use safetensors format
-          commit_message=commit_message
+          commit_message=f"Base model {commit_message}"
       )
-    else:
-      # For full models, push tokenizer and model
-      hps.tokenizer.push_to_hub(save_directory, private=True)
       model.push_to_hub(
           save_directory, 
           private=True, 
           safe_serialization=True,  # Use safetensors format
-          commit_message=commit_message
+          commit_message=f"LoRA adapters {commit_message}"
+      )
+    else:
+      # For full models, push tokenizer and model
+      hps.tokenizer.push_to_hub(save_directory, private=True)
+      model.base_model.model.push_to_hub(
+          save_directory, 
+          private=True, 
+          safe_serialization=True,  # Use safetensors format
+          commit_message=f"Base model {commit_message}"
+      )
+      model.push_to_hub(
+          save_directory, 
+          private=True, 
+          safe_serialization=True,  # Use safetensors format
+          commit_message=f"LoRA adapters {commit_message}"
       )
   else:
     # Save model locally instead of pushing to Hub
@@ -1911,9 +1925,9 @@ def balance_dataset_by_gates_count(dataset):
   # Move the balancing to rank 0 only, and broadcast to all other ranks.
   if dist.is_initialized():
     if dist.get_rank() == 0:
-      train_dataset.save_to_disk('/tmp/train_dataset')
+      balanced_dataset.save_to_disk('/tmp/train_dataset')
     dist.barrier()
     # Now all ranks have the same train_dataset
-    train_dataset = Dataset.load_from_disk('/tmp/train_dataset')
+    balanced_dataset = Dataset.load_from_disk('/tmp/train_dataset')
     
   return balanced_dataset
