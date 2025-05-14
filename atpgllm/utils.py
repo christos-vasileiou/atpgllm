@@ -25,6 +25,9 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 from peft import get_peft_model, LoraConfig, TaskType
 from tqdm.auto import tqdm
 from collections import Counter
+from pathlib import Path
+from accelerate import Accelerator
+from huggingface_hub import upload_folder
 from itertools import product
 from datetime import datetime
 from datasets import DatasetDict, Dataset, load_dataset
@@ -576,6 +579,7 @@ def parse_arguments(parser):
 
   # Add train_lora flag
   parser.add_argument('--train_lora', '--train-lora', action='store_true', help='Whether to train LoRA layers during training')
+  parser.add_argument('--train_rl', '--train-rl', action='store_true', help='Whether to train RL layers during training. Group Relative Policy Optimization (GRPO) is used.')
 
   # Add filename parameter
   parser.add_argument('--filename', type=str, default=None, help='Custom filename for output files (logs, generated text, etc.)')
@@ -698,7 +702,10 @@ def distributed_env_init(hps):
   
   # Set the device for the current process
   hps.device = torch.device(f'cuda:{hps.local_rank}' if torch.cuda.is_available() else 'cpu')
-  
+
+  # Initialize the accelerator
+  hps.accelerator = Accelerator()
+
   # Log distributed training configuration
   hps.info += f"Backend Configuration: {dist.get_backend_config()}, local_rank: {hps.local_rank}, local_world_size: {hps.local_world_size}, free-est gpu: {hps.free_gpu_id}, world_size: {hps.world_size}, device: {hps.device}\n"
   
@@ -718,7 +725,6 @@ def distributed_env_init(hps):
 def accelerator_init(hps):
   import datasets
   import transformers
-  from accelerate import Accelerator
   from accelerate.utils import set_seed
   from accelerate.utils.dataclasses import DeepSpeedPlugin
 
@@ -1239,7 +1245,6 @@ def hyperparameters(args):
   hps.revision   = args.revision
   # tokenizer
   hps.tokenizer        = args.tokenizer
-  hps.new_tokens       = args.new_tokens
   hps.model_max_length = args.model_max_length
   # collate
   hps.collate = args.atpg_collate
@@ -1266,7 +1271,9 @@ def hyperparameters(args):
   hps.adapter_repo = args.adapter_repo
 
   # Add train_lora flag
+  hps.new_tokens = args.new_tokens
   hps.train_lora = args.train_lora
+  hps.train_rl   = args.train_rl
 
   # GRPO
   hps.grpo_beta = args.grpo_beta
@@ -1551,15 +1558,86 @@ def save_model(model, save_directory: str, push_to_hub: bool = True, **kwargs):
     if hps.deepspeed_kernel:
       if hps.accelerator.is_main_process:
         # push to the hub!
-        upload_model(model.module, save_directory, push_to_hub, **kwargs)  
+        push_full_model(model, save_directory=save_directory, **kwargs)  
       hps.accelerator.wait_for_everyone()
     elif not hps.deepspeed_kernel:
       if is_main_process():
         # push to the hub!
-        upload_model(model.module, save_directory, push_to_hub, **kwargs)
+        push_full_model(model, save_directory=save_directory, **kwargs)
   else:
     # push to the hub!
-    upload_model(model, save_directory, push_to_hub, **kwargs)
+    push_full_model(model, save_directory=save_directory, **kwargs)
+
+
+def push_full_model(model, save_directory, hps, **kwargs):
+  """
+  Push the full model to the Hugging Face Hub.
+  """
+  from peft import PeftModelForCausalLM
+  commit_message = kwargs.get('commit_message', "")
+  private = kwargs.get('private', True)
+  merge_lora = kwargs.get('merge_lora', False)
+  tmp_dir = kwargs.get('tmp_dir', './tmp_dir')
+  tmp_dir = os.path.join(tmp_dir, save_directory)
+  accelerator = Accelerator()
+
+  peft_model = accelerator.unwrap_model(model)
+
+  if merge_lora:
+    model_to_push = peft_model.merge_and_unload()
+  else:
+    model_to_push = peft_model
+  
+  tmp_dir = Path(tmp_dir)
+  tmp_dir.mkdir(parents=True, exist_ok=True)
+
+  if hps.train_lora or hps.train_rl:
+    clean_base = load_model(hps)
+    clean_sd = {}
+    if isinstance(peft_model, PeftModelForCausalLM):
+      for k, v in peft_model.base_model.model.state_dict().items():
+        if k.replace(".base_layer.", ".") not in clean_base.state_dict().keys():          # drop LoRA params
+          continue
+        clean_sd[k.replace(".base_layer.", ".")] = v 
+    missing, unexpected = clean_base.load_state_dict(clean_sd, strict=False)
+    assert not unexpected, unexpected
+    assert not missing, missing
+    model_to_push.save_pretrained(tmp_dir, safe_serialization=True)
+    clean_base.save_pretrained(tmp_dir, 
+                                safe_serialization=True, 
+                                save_embedding_layers=True, 
+                                save_transformers_model=True,
+                                max_shard_size="10GB",
+                                )
+  elif hps.new_tokens:
+    model_to_push.save_pretrained(tmp_dir, 
+                                  safe_serialization=True, 
+                                  save_embedding_layers=True, 
+                                  save_transformers_model=True,
+                                  max_shard_size="5GB",
+                                  )
+  else:
+    model_to_push.save_pretrained(tmp_dir, safe_serialization=True, max_shard_size="5GB")
+
+  if hps.tokenizer is not None:
+    hps.tokenizer.save_pretrained(tmp_dir)
+
+  # Copy the file
+  try:
+    shutil.copy2(hps.file_path, os.path.join(tmp_dir, hps.filename))
+    print(f"✅ Copied {hps.file_path} to {os.path.join(tmp_dir, hps.filename)}")
+  except Exception as e:
+    print(f"❌ Failed to copy file: {e}")
+
+  try:
+    hps.api.upload_folder(repo_id=save_directory, 
+                          folder_path=str(tmp_dir), 
+                          commit_message=commit_message, 
+                          repo_type="model", 
+                          )
+    print(f"✅ pushed to https://huggingface.co/{save_directory}")
+  except Exception as e:
+    print(f"❌ Failed to upload folder to https://huggingface.co/{save_directory}: \n{e}")
 
 
 def upload_model(model, save_directory, push_to_hub, hps, **kwargs):
@@ -1580,6 +1658,7 @@ def upload_model(model, save_directory, push_to_hub, hps, **kwargs):
   """
   # Extract commit message from kwargs or use empty string as default
   commit_message = kwargs.get('commit_message', "")
+  private = kwargs.get('private', True)
   
   # Push model to Hugging Face Hub if specified
   if push_to_hub:
@@ -1597,32 +1676,32 @@ def upload_model(model, save_directory, push_to_hub, hps, **kwargs):
     if hps.lora or hps.train_lora:
       # For LoRA models, we need to push tokenizer and base model separately
       hps.tokenizer.push_to_hub(save_directory, private=True)
-      model.base_model.model.push_to_hub(
-          save_directory, 
-          private=True, 
-          safe_serialization=True,  # Use safetensors format
-          commit_message=f"Base model {commit_message}"
-      )
       model.push_to_hub(
           save_directory, 
-          private=True, 
+          private=private, 
           safe_serialization=True,  # Use safetensors format
           commit_message=f"LoRA adapters {commit_message}"
+      )
+      model.base_model.model.push_to_hub(
+          save_directory, 
+          private=private, 
+          safe_serialization=True,  # Use safetensors format
+          commit_message=f"Base model {commit_message}"
       )
     else:
       # For full models, push tokenizer and model
       hps.tokenizer.push_to_hub(save_directory, private=True)
-      model.base_model.model.push_to_hub(
-          save_directory, 
-          private=True, 
-          safe_serialization=True,  # Use safetensors format
-          commit_message=f"Base model {commit_message}"
-      )
       model.push_to_hub(
           save_directory, 
-          private=True, 
+          private=private, 
           safe_serialization=True,  # Use safetensors format
           commit_message=f"LoRA adapters {commit_message}"
+      )
+      model.base_model.model.push_to_hub(
+          save_directory, 
+          private=private, 
+          safe_serialization=True,  # Use safetensors format
+          commit_message=f"Base model {commit_message}"
       )
   else:
     # Save model locally instead of pushing to Hub

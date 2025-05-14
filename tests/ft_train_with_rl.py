@@ -1362,21 +1362,22 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
   if is_main_process():
     print(f"{model}\nGRPO-RLFT train embedding, lora and head:\nTrainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,d}\nTrainable Model size: {convert_bytes(model_size_in_bytes(model))}")
   # 3, Fine-tune with Reinforcement Learning (RL)
-  if hps.wandb:
-    hps.run.tags += ('train_rl_grpo',)
-  rlft(dataloader, model, hps, reward_funcs=[test_generation_reward], training_loop=training_loop)
-  # Apply inference on some random samples of validation set
-  if not DEBUG: 
-    base_model = get_base_model(model)
-    base_model.set_adapter("grpo_adapter")
+  if hps.train_rl:
+    if hps.wandb:
+      hps.run.tags += ('train_rl_grpo',)
+    rlft(dataloader, model, hps, reward_funcs=[test_generation_reward], training_loop=training_loop)
     # Apply inference on some random samples of validation set
-    infer(wrapped_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
-    # Save the model in the repository
-    save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="Final Model trained with GRPO-RL")
-    # Save the model in the local directory
-    final_model_path = os.path.join(hps.log_dir, "models", "final_model", hps.save_in_repo.split("/")[-1])
-    os.makedirs(final_model_path, exist_ok=True)
-    save_model(model, final_model_path, push_to_hub=False, save_embedding_layers=True, hps=hps, delete_previous=False)
+    if not DEBUG: 
+      base_model = get_base_model(model)
+      base_model.set_adapter("grpo_adapter")
+      # Apply inference on some random samples of validation set
+      infer(wrapped_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
+      # Save the model in the repository
+      save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="Final Model trained with GRPO-RL")
+      # Save the model in the local directory
+      final_model_path = os.path.join(hps.log_dir, "models", "final_model", hps.save_in_repo.split("/")[-1])
+      os.makedirs(final_model_path, exist_ok=True)
+      save_model(model, final_model_path, push_to_hub=False, save_embedding_layers=True, hps=hps, delete_previous=False)
   
   torch.cuda.empty_cache()
   gc.collect()
