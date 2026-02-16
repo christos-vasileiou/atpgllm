@@ -41,7 +41,13 @@ from transformers import (
   AutoTokenizer,
 )
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from trl.import_utils import is_rich_available
+def is_rich_available():
+  """Check if the rich library is available."""
+  try:
+    import rich
+    return True
+  except ImportError:
+    return False
 
 if is_rich_available():
   from rich.table import Table
