@@ -345,16 +345,6 @@ def buffer_streaming_dataset(
     for example in tqdm(streaming_dataset, desc=desc, file=sys.stdout):
         if buffer_size > 0 and len(examples) >= buffer_size:
             break
-        
-        
-        
-        
-        if len(example['netlist']) > 2000:
-            continue
-
-
-
-
         unique_value = example[unique_by]
         if unique_value in unique_values:
             continue
