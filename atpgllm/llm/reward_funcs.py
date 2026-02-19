@@ -72,6 +72,13 @@ def markdown_table_to_dataframe(table_str: str) -> pd.DataFrame:
   return df
 
 
+def convert_to_df(pred_simulation):
+  df = pd.read_csv(StringIO(pred_simulation), sep="\s{2,}", header=None, skiprows=1)
+  df.columns = ['ID', 'Good Machine', 'Bad Machine']
+  df = df.set_index('ID')
+  df.index.name = None
+  return df
+
 # Extract the fault and net
 def test_generation_reward(prompts: list, completions: list, **kwargs):
   """
@@ -124,6 +131,9 @@ def test_generation_reward(prompts: list, completions: list, **kwargs):
     raise ValueError("detected_faults_fn must be provided")
   eval_mode = kwargs.get('eval_mode', False)
   lib_gate_funcs = kwargs.get('lib_gate_funcs', None)
+  thinking_fn = kwargs.get('thinking_fn', None)
+  tool_call_fn = kwargs.get('tool_call_fn', None)
+  tool_response_fn = kwargs.get('tool_response_fn', None)
   
   if lib_gate_funcs is None:
     gate_func = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}
@@ -135,6 +145,7 @@ def test_generation_reward(prompts: list, completions: list, **kwargs):
       raise ValueError("fault_sim function must be provided when using lib_gate_funcs")
 
   rewards = []
+  
   for prompt, completion, netlist in zip(prompts, completions, netlists):
     fault = fault_fn(prompt)
     if fault:
@@ -155,6 +166,33 @@ def test_generation_reward(prompts: list, completions: list, **kwargs):
               'detected_faults_acc': 0
               }
     
+    # Extract the thinking
+    if thinking_fn is not None:
+      pred_thinking = thinking_fn(completion)
+      if pred_thinking:
+        pred_thinking = pred_thinking[0]
+        reward['format'] += 0.125
+      else:
+        reward['format'] -= 1
+
+    # Extract the tool call
+    if tool_call_fn is not None:
+      pred_tool_call = tool_call_fn(completion)
+      if pred_tool_call:
+        pred_tool_call = pred_tool_call[0]
+        reward['format'] += 0.125
+      else:
+        reward['format'] -= 1
+
+    # Extract the tool response
+    if tool_response_fn is not None:
+      pred_tool_response = tool_response_fn(completion)
+      if pred_tool_response:
+        pred_tool_response = pred_tool_response[0]
+        reward['format'] += 0.125
+      else:
+        reward['format'] -= 1
+
     # Extract the simulation
     pred_simulation = simulation_fn(completion)
     if pred_simulation:
@@ -190,17 +228,20 @@ def test_generation_reward(prompts: list, completions: list, **kwargs):
     if fault and pred_simulation:
       try:
         # +1 Parse the simulation and convert it to a DataFrame
-        pred_simulation = pd.read_csv(StringIO(pred_simulation), sep="\s{2,}")
-        reward['pred_simulation'] += .5
-        # Check if the Good Machine value is different than Bad Machine for the requested net + if the fault simulation trigger the requested fault
-        reward['pred_simulation'] += int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
-        reward['pred_simulation'] += int(pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
+        pred_simulation = convert_to_df(pred_simulation)
+        if pred_simulation.loc[net, "Good Machine"] == 'x':
+          reward['pred_simulation'] -= 2.5
+        else:
+          reward['pred_simulation'] += .5
+          # Check if the Good Machine value is different than Bad Machine for the requested net + if the fault simulation trigger the requested fault
+          reward['pred_simulation'] += int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
+          reward['pred_simulation'] += int(pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
       except:
         pred_simulation = None
         reward['pred_simulation'] -= 2.5
     else:
       reward['pred_simulation'] -= 3.5
-
+    
     if pred_input_vector and pred_expected_output and fault and net and netlist:
       try:
         # Run Fault Simulation
@@ -218,9 +259,9 @@ def test_generation_reward(prompts: list, completions: list, **kwargs):
           # All other rows have base weight 1.0
           weights = pd.DataFrame(1.0, index=row_matches.index, columns=row_matches.columns)
           reward['pred_vs_fault_sim_acc'] += (row_matches.sum() / row_matches.count()).mean()
-          weights[fault_simulation["Fault Path"]] = 2
+          weights[fault_simulation["Fault Propagation Path"] | fault_simulation["Backtrack Sensitizing Inputs"]] = 2
           weights.loc[net, :] = 5
-
+          
           # Calculate weighted accuracy
           weighted_accuracy = ((row_matches * weights).sum() / weights.sum()).mean()
           
@@ -234,7 +275,7 @@ def test_generation_reward(prompts: list, completions: list, **kwargs):
           exponent = 4
           base_reward = 1.0 if weighted_accuracy < 0.9 else 2.0 # force >90% accuracy.
           reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** exponent - base_reward
-
+          
           # Calculate a smoother reward using weights for each subcondition
           fault_detection_condition = fault_simulation.loc[net, "Bad Machine"] == int(fault[-1]) and \
                                       fault_simulation.loc[net, 'Good Machine'] != fault_simulation.loc[net, 'Bad Machine']
@@ -244,9 +285,9 @@ def test_generation_reward(prompts: list, completions: list, **kwargs):
           if not fault_detection_condition:
             # Penalize heavily if the fault is not detected
             reward['fault_detect_inpvector'] -= 5
-
+          
           # Reward based on validity of generated Good-Machine input values and generated input vector
-          if fault_sim_rewards.pop('input_nets_match'):
+          if fault_sim_rewards.get('input_nets_match', False):
             # Convert the predicted input vector string to a dictionary
             input_vector_dict = convert_string_to_dict(pred_input_vector, sep=':' if ':' in pred_input_vector else '=')
             # Get the input values from the simulation
@@ -263,9 +304,9 @@ def test_generation_reward(prompts: list, completions: list, **kwargs):
             reward['fault_detect_inpvector'] += base_reward * (1 + weighted_input_accuracy) ** exponent - base_reward
             # Additional reward for perfect accuracy
             reward['input_vector_acc'] += int(weighted_input_accuracy==1)
-
+          
           # Reward based on validity of generated Good-Machine output values and generated expected output vector
-          if fault_sim_rewards.pop('output_nets_match'):
+          if fault_sim_rewards.get('output_nets_match', False):
             # Convert the predicted output vector string to a dictionary
             output_vector_dict = convert_string_to_dict(pred_expected_output, sep=':' if ':' in pred_expected_output else '=')
             # Get the output values from the simulation
@@ -282,10 +323,10 @@ def test_generation_reward(prompts: list, completions: list, **kwargs):
             reward['expected_output'] += base_reward * (1 + weighted_output_accuracy) ** exponent - base_reward
             # Additional reward for perfect accuracy
             reward['expected_output_acc'] += int(weighted_output_accuracy==1)
-
-          # Reward the detected Fault Path
+          
+          # Reward the detected Fault Path. From the point where the fault occurs and onwards
           # Extract fault path information from simulation
-          detected_fault_path_df = fault_simulation[fault_simulation["Fault Path"]].reset_index()[["Bad Machine", "index"]]
+          detected_fault_path_df = fault_simulation[fault_simulation["Fault Propagation Path"]].reset_index()[["Bad Machine", "index"]]
           # Format the bad machine values as fault types (sa0, sa1)
           detected_fault_path_df['Bad Machine'] = detected_fault_path_df['Bad Machine'].apply(lambda x: f"sa{x}").values
           # Parse the predicted detected faults string into a numpy array

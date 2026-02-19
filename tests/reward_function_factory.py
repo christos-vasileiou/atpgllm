@@ -42,6 +42,9 @@ class RewardFunctionFactory:
     EXPECTED_OUTPUT_RE = re.compile(r"EXPECTED_OUTPUT:\s\"(.*?)\"", re.DOTALL)
     DETECTED_FAULTS_RE = re.compile(r"DETECTED_FAULTS:\s\"(.*?)\"", re.DOTALL)
     SYMBOLS_RE = re.compile(r'\w+')
+    THINKING_RE = re.compile(r"(?<=<think>)([\s\S]*?)(?=<\/think>)", re.DOTALL)
+    TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+    TOOL_RESPONSE_RE = re.compile(r"<tool_response>(.*?)</tool_response>", re.DOTALL)
     
     # Regex to capture full Verilog declarations
     DECL_RE = re.compile(r"""
@@ -169,8 +172,7 @@ class RewardFunctionFactory:
                 return [df.to_string()]
             except Exception as e:
                 return []
-            
-    
+
     @staticmethod
     def input_vector_fn(x: str) -> List[str]:
         """Extract input vector from completion."""
@@ -185,6 +187,21 @@ class RewardFunctionFactory:
     def detected_faults_fn(x: str) -> List[str]:
         """Extract detected faults from completion."""
         return RewardFunctionFactory.DETECTED_FAULTS_RE.findall(x)
+    
+    @staticmethod
+    def thinking_fn(x: str) -> List[str]:
+        """Extract thinking from completion."""
+        return RewardFunctionFactory.THINKING_RE.findall(x)
+    
+    @staticmethod
+    def tool_call_fn(x: str) -> List[str]:
+        """Extract tool call from completion."""
+        return RewardFunctionFactory.TOOL_CALL_RE.findall(x)
+    
+    @staticmethod
+    def tool_response_fn(x: str) -> List[str]:
+        """Extract tool response from completion."""
+        return RewardFunctionFactory.TOOL_RESPONSE_RE.findall(x)
     
     def create_reward_function(self) -> callable:
         """
@@ -216,6 +233,9 @@ class RewardFunctionFactory:
                 "input_vector_fn": self.input_vector_fn,
                 "expected_output_fn": self.expected_output_fn,
                 "detected_faults_fn": self.detected_faults_fn,
+                "thinking_fn": self.thinking_fn,
+                "tool_call_fn": self.tool_call_fn,
+                "tool_response_fn": self.tool_response_fn,
                 "eval_mode": False,
                 "lib_gate_funcs": gate_funcs,
                 "fault_sim": fast_fault_sim,  # Pass the fast_fault_sim function

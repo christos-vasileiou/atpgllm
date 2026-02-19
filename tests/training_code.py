@@ -139,7 +139,7 @@ from callbacks import (
 # =====================================================================
 _UNSLOTH_AVAILABLE = False
 try:
-    from unsloth import FastLanguageModel as _FastLM
+    #from unsloth import FastLanguageModel as _FastLM
     _UNSLOTH_AVAILABLE = True
 except ImportError:
     _FastLM = None
@@ -345,6 +345,16 @@ def buffer_streaming_dataset(
     for example in tqdm(streaming_dataset, desc=desc, file=sys.stdout):
         if buffer_size > 0 and len(examples) >= buffer_size:
             break
+        
+        
+        
+        
+        if len(example['netlist']) > 2000:
+            continue
+
+
+
+
         unique_value = example[unique_by]
         if unique_value in unique_values:
             continue
@@ -415,7 +425,7 @@ def format_dataset_for_training(dataset, tokenizer: AutoTokenizer, training_mode
             # GRPOTrainer expects 'prompt' field with the formatted prompt
             prompt = tokenizer.apply_chat_template(prompt_messages, tokenize=False, tools=TOOLS if use_tools else None, add_generation_prompt=True)
             return {"prompt": prompt, **record}
-        
+
         # Use .map() for lazy on-the-fly processing
         # For GRPO we keep original columns since we need metadata for reward functions
         return dataset.map(format_fn)
@@ -895,6 +905,7 @@ def train_with_grpo(
     report_to: str = "wandb",
     use_vllm: bool = False,
     vllm_mode: Optional[Literal["colocate", "server"]] = None,
+    num_generations: int = 8,
     steps_per_generation: int = 1,
     use_dual_adapter: bool = True,
     use_unsloth: bool = False,
@@ -1056,18 +1067,18 @@ def train_with_grpo(
     #   - steps_per_generation=1: generates 2*1=2 samples at a time (memory efficient)
     training_args = GRPOConfig(
         output_dir=output_dir,
-        per_device_train_batch_size=max(per_device_train_batch_size, 2),  # Must be divisible by num_generations
+        per_device_train_batch_size=per_device_train_batch_size,  # Must be divisible by num_generations
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=5e-5,
         max_steps=max_steps,
         logging_steps=5,
-        save_steps=50,
+        save_steps=5,
         bf16=True,  
         report_to=report_to,
         # GRPO-specific options
         loss_type="dapo", # "grpo", "dr_grpo", "dapo", "bnpo", "cispo", default is "dapo"
         max_completion_length=tokenizer.model_max_length,
-        num_generations=max(per_device_train_batch_size, 2),  # Number of completions to generate per prompt
+        num_generations=max(num_generations, 2),  # Number of completions to generate per prompt
         steps_per_generation=steps_per_generation, # Avoid OOM with large models
         use_vllm=use_vllm,
         vllm_mode=vllm_mode,
@@ -1092,6 +1103,7 @@ def train_with_grpo(
             policy_lora_config=policy_lora_config,  # For the new policy adapter
             tool_functions=[fault_simulation_tool],
             callbacks=shared_callbacks,
+            tools=TOOLS,
             # Note: don't pass peft_config - DualAdapterGRPOTrainer handles adapters manually
         )
     else:
@@ -1143,11 +1155,17 @@ def _max_steps():
 def _report_to():
     return os.environ.get('REPORT_TO', "wandb")
 
+def _num_generations():
+    return int(os.environ.get('NUM_GENERATIONS', 8))
+
 def _steps_per_generation():
-    return int(os.environ.get('STEPS_PER_GENERATION', 1))
+    return int(os.environ.get('STEPS_PER_GENERATION', 2))
 
 def _use_unsloth():
     return os.environ.get('USE_UNSLOTH', '0').lower() in ('1', 'true', 'yes')
+
+def _vllm_mode():
+    return os.environ.get('VLLM_MODE', "colocate")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fine‑tune a quantised LLM with LoRA")
@@ -1162,11 +1180,11 @@ def main() -> None:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=_gradient_accumulation_steps(), help="Gradient accumulation steps")
     parser.add_argument("--report_to", type=str, default=_report_to(), help="Report to: wandb or none")
     parser.add_argument("--use_vllm", action="store_true", help="Use VLLM")
+    parser.add_argument("--vllm_mode", type=str, default=_vllm_mode(), help="VLLM mode: 'colocate' or 'server'")
+    parser.add_argument("--num_generations", type=int, default=_num_generations(), help="Number of generations per prompt to sample.")
     parser.add_argument("--steps_per_generation", type=int, default=_steps_per_generation(), help="Steps per generation")
     parser.add_argument("--use_dual_adapter", action="store_true", default=True, 
                         help="Use dual-adapter mode (keeps SFT adapter isolated, avoids merge). Default: True")
-    parser.add_argument("--no_dual_adapter", action="store_false", dest="use_dual_adapter",
-                        help="Disable dual-adapter mode (uses standard merge_and_unload)")
     parser.add_argument("--use_unsloth", action="store_true", default=_use_unsloth(),
                         help="Use unsloth's FastLanguageModel for optimised training "
                              "(2x faster, 80%% less VRAM). Requires: pip install unsloth")
@@ -1192,6 +1210,11 @@ def main() -> None:
     except ValueError as e:
         parser.error(f"Invalid max steps: {args.max_steps}")
     
+    try:
+        args.num_generations = int(args.num_generations)
+    except ValueError as e:
+        parser.error(f"Invalid num generations: {args.num_generations}")
+        
     try:
         args.steps_per_generation = int(args.steps_per_generation)
     except ValueError as e:

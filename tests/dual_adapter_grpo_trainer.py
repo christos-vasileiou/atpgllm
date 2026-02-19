@@ -48,10 +48,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import atexit
 import json
 import re
+import time
 import threading
 import warnings
 from typing import Any, Callable, List, Optional, Union
@@ -59,7 +59,7 @@ from trl.extras.profiling import profiling_context, profiling_decorator
 from trl.data_utils import is_conversational, apply_chat_template
 import torch
 from torch import nn
-from peft import LoraConfig, PeftModel, get_peft_model
+from peft import LoraConfig, PeftModel
 from peft.tuners.lora import LoraLayer
 from trl import GRPOTrainer, GRPOConfig
 from accelerate.utils import gather
@@ -94,6 +94,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         processing_class: Optional[Any] = None,
         policy_lora_config: Optional[LoraConfig] = None,
         ref_adapter_name: str = None,
+        tools: list[Callable] | None = None,
         tool_functions: list = None,
         **kwargs,
     ):
@@ -170,6 +171,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             args=args,
             train_dataset=train_dataset,
             processing_class=processing_class,
+            tools=None,        # CRITICAL: Don't pass tools! Current transformers and trl versions don't support it.
             peft_config=None,  # CRITICAL: Don't pass peft_config to prevent merge!
             **kwargs,
         )
@@ -183,9 +185,9 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             self.async_reward_loop_ready_event.wait()
             atexit.register(shutdown_event_loop_in_daemon, self.async_reward_loop_thread, self.async_reward_loop)
         
-        # 
+        # Initialize tools and tool functions
+        self.tools = tools
         self.tool_functions = {tool_function.__name__: tool_function for tool_function in tool_functions} or {}
-
         # Override ref_model - we use adapter switching instead
         self.ref_model = None
         
@@ -435,7 +437,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         reward_kwargs["trainer_state"] = self.state
 
         async_funcs_info = []  # async custom functions for asyncio.gather
-
+        
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names, strict=True)
         ):
@@ -444,7 +446,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     if is_conversational(inputs[0]):
                         messages = [{"messages": p + c} for p, c in zip(prompts, completions, strict=True)]
                         texts = [
-                            apply_chat_template(x, reward_processing_class, **self.chat_template_kwargs)["text"]
+                            apply_chat_template(x, reward_processing_class, tools=self.tools, **self.chat_template_kwargs)["text"]
                             for x in messages
                         ]
                     else:
@@ -460,6 +462,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             else:
                 # Run synchronous reward function
                 with profiling_context(self, reward_func_name):
+                    completions = self.processing_class.batch_decode(completion_ids_list, skip_special_tokens=True)
                     output_reward_func = reward_func(
                         prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
                     )
@@ -469,7 +472,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 
         # Execute async custom functions in parallel using asyncio.gather
         if async_funcs_info:
-
+            completions = self.processing_class.batch_decode(completion_ids_list, skip_special_tokens=True)
             async def _invoke_async_reward(index, func, func_name):
                 with profiling_context(self, func_name):
                     output = await func(
@@ -519,6 +522,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         """
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
+        generation_start_time = time.perf_counter()
         
         # Copy the prompts to avoid modifying the original list
         prompts = [revert_qwen2_5_template(prompt) for prompt in prompts]
@@ -539,7 +543,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             else:
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
                 completions = [revert_qwen2_5_template("<|im_start|>assistant\n" + completion + "<|im_end|>") for completion in completions]
-
+            
             # Step 3: Implement your tool calling loop here
             # Parse tool calls from completions, execute tools, regenerate if needed
             tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count = self._custom_tool_call_loop(
@@ -584,7 +588,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
             self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
             
-            if self.tools:
+            if self.tool_functions:
                 agg_tool_call_count = self.accelerator.gather(torch.tensor(tool_call_count, device=device)).sum()
                 tool_call_frequency = (agg_tool_call_count / len(agg_prompt_lengths)).item()
                 self._metrics[mode]["tools/call_frequency"].append(tool_call_frequency)
@@ -593,6 +597,13 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     (agg_tool_failure_count / agg_tool_call_count).item() if agg_tool_call_count > 0 else 0.0
                 )
                 self._metrics[mode]["tools/failure_frequency"].append(failure_frequency)
+
+            # Generation throughput: tokens produced per second during inference
+            generation_elapsed = time.perf_counter() - generation_start_time
+            if generation_elapsed > 0 and total_completion_tokens.item() > 0:
+                gen_tokens_per_sec = total_completion_tokens.item() / generation_elapsed
+                self._metrics[mode]["generation/tokens_per_sec"].append(round(gen_tokens_per_sec, 2))
+                self._metrics[mode]["generation/total_time_sec"].append(round(generation_elapsed, 3))
 
             return (
                 prompt_ids,
@@ -645,10 +656,6 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         tool_calls = [self._parse_tool_call(completion) for completion in completions]
         idxs_with_tool = [idx for idx, tc in enumerate(tool_calls) if tc is not None]
         tool_calls = [tool_calls[idx] for idx in idxs_with_tool]
-        
-        # If no tool calls found, return None (no tool calling performed)
-        if not idxs_with_tool:
-            return None
         
         # Get max model length for truncation
         if self.use_vllm and self.vllm_mode == "colocate":
@@ -726,7 +733,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 self.processing_class.apply_chat_template(
                     conv,
                     tokenize=True,
-                    tools=TOOLS,
+                    tools=self.tools,
                     add_generation_prompt=True,
                 )
                 for conv in prompt_completion_tools
@@ -831,7 +838,10 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 if post_tool_texts[i]:
                     post_tool_msg = revert_qwen2_5_template("<|im_start|>assistant\n" + post_tool_texts[i] + "<|im_end|>")
                     if isinstance(completions[idx], list):
-                        completions[idx].append(post_tool_msg)
+                        if isinstance(post_tool_msg, list) and isinstance(post_tool_msg[0], dict):
+                            completions[idx] += post_tool_msg
+                        elif isinstance(post_tool_msg, dict):
+                            completions[idx].append(post_tool_msg)
                     else:
                         # Convert to list format
                         completions[idx] = [

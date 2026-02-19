@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=training        # Job name
+#SBATCH --job-name=unsloth_vllm        # Job name
 #SBATCH --output=jobs/training_%j.out   # Standard output file (%j will be replaced with job ID)
 #SBATCH --error=jobs/training_%j.err    # Standard error file
 #SBATCH --nodes=1                       # Request 1 node
@@ -107,11 +107,32 @@ elif [ "$METHOD" == "grpo" ]; then
     GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
     MAX_STEPS=${MAX_STEPS:-50}
     REPORT_TO=${REPORT_TO:-wandb}
+    NUM_GENERATIONS=${NUM_GENERATIONS:-8}
     STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-4}
     USE_DUAL_ADAPTER=${USE_DUAL_ADAPTER:-True}
     USE_VLLM=${USE_VLLM:-$(python -c "import vllm" && echo True || echo False)}
     USE_UNSLOTH=${USE_UNSLOTH:-$(python -c "import unsloth" && echo True || echo False)}
 fi
+
+echo "=============================================="
+echo "Command Arguments"
+echo "=============================================="
+echo "METHOD: $METHOD"
+echo "MODEL: $MODEL"
+echo "TRAIN_DATASET: $TRAIN_DATASET"
+echo "OUTPUT_DIR: $OUTPUT_DIR"
+echo "RESUME_FROM: $RESUME_FROM"
+echo "BUFFER_SIZE: $BUFFER_SIZE"
+echo "PER_DEVICE_TRAIN_BATCH_SIZE: $PER_DEVICE_TRAIN_BATCH_SIZE"
+echo "GRADIENT_ACCUMULATION_STEPS: $GRADIENT_ACCUMULATION_STEPS"
+echo "MAX_STEPS: $MAX_STEPS"
+echo "REPORT_TO: $REPORT_TO"
+echo "NUM_GENERATIONS: $NUM_GENERATIONS"
+echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION"
+echo "USE_DUAL_ADAPTER: $USE_DUAL_ADAPTER"
+echo "USE_VLLM: $USE_VLLM"
+echo "USE_UNSLOTH: $USE_UNSLOTH"
+echo "=============================================="
 
 # =============================================================================
 # Build Command Arguments
@@ -138,6 +159,8 @@ build_cmd_args() {
     fi
 
     if [ -n "$USE_UNSLOTH" ] && [ "$USE_UNSLOTH" == "True" ]; then
+        CMD_ARGS+=(--use_unsloth)
+    fi
 
     # Add --resume_from only if it's set and not "None"
     if [ -n "$RESUME_FROM" ] && [ "$RESUME_FROM" != "None" ]; then
@@ -146,13 +169,14 @@ build_cmd_args() {
 
     # Add GRPO-specific arguments only for GRPO method
     if [ "$METHOD" == "grpo" ]; then
-        CMD_ARGS+=(--buffer_size "$BUFFER_SIZE")
-        CMD_ARGS+=(--steps_per_generation "$STEPS_PER_GENERATION")
+        CMD_ARGS+=(
+            --buffer_size "$BUFFER_SIZE"
+            --num_generations "$NUM_GENERATIONS"
+            --steps_per_generation "$STEPS_PER_GENERATION"
+        )
         # This condition checks whether the variable USE_DUAL_ADAPTER is set (not empty) and its value is exactly "True".
         if [ -n "$USE_DUAL_ADAPTER" ] && [ "$USE_DUAL_ADAPTER" == "True" ]; then
             CMD_ARGS+=(--use_dual_adapter)
-        elif [ -n "$USE_DUAL_ADAPTER" ] && [ "$USE_DUAL_ADAPTER" == "False" ]; then
-            CMD_ARGS+=(--no_dual_adapter)
         fi
     fi
 }
