@@ -168,12 +168,12 @@ gym-examples
 data/*
 pics
 *version*
-atpgllm/tests/sft_finetuned_model/
-atpgllm/tests/grpo_finetuned_model/
-atpgllm/tests/tmp_dir/
-atpgllm/tests/jobs/
-atpgllm/tests/logs/
-atpgllm/tests/backup/
-atpgllm/ds_zero3.json
-atpgllm/sample_dataset.jsonl
+tests/sft_finetuned_model/
+tests/grpo_finetuned_model/
+tests/tmp_dir/
+tests/jobs/
+tests/logs/
+tests/backup/
+ds_zero3.json
+sample_dataset.jsonl
 
