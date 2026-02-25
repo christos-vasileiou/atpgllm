@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=unsloth_vllm        # Job name
+#SBATCH --job-name=training        # Job name
 #SBATCH --output=jobs/training_%j.out   # Standard output file (%j will be replaced with job ID)
 #SBATCH --error=jobs/training_%j.err    # Standard error file
 #SBATCH --nodes=1                       # Request 1 node
@@ -95,8 +95,9 @@ if [ "$METHOD" == "sft" ]; then
     MAX_STEPS=${MAX_STEPS:-50}
     REPORT_TO=${REPORT_TO:-wandb}
     USE_DUAL_ADAPTER=${USE_DUAL_ADAPTER:-False}
-    USE_VLLM=${USE_VLLM:-$(python -c "import vllm" && echo True || echo False)}
-    USE_UNSLOTH=${USE_UNSLOTH:-$(python -c "import unsloth" && echo True || echo False)}
+    USE_VLLM=$(python -c "import vllm" 2>/dev/null && echo True || echo False)
+    USE_UNSLOTH=${USE_UNSLOTH:-$(python -c "import unsloth" 2>/dev/null && echo True || echo False)}
+    USE_DDP=${USE_DDP:-True}
 elif [ "$METHOD" == "grpo" ]; then
     MODEL=${MODEL:-}
     TRAIN_DATASET=${TRAIN_DATASET:-chrivasileiou/asap7-language-of-test}
@@ -110,8 +111,9 @@ elif [ "$METHOD" == "grpo" ]; then
     NUM_GENERATIONS=${NUM_GENERATIONS:-8}
     STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-4}
     USE_DUAL_ADAPTER=${USE_DUAL_ADAPTER:-True}
-    USE_VLLM=${USE_VLLM:-$(python -c "import vllm" && echo True || echo False)}
-    USE_UNSLOTH=${USE_UNSLOTH:-$(python -c "import unsloth" && echo True || echo False)}
+    USE_VLLM=$(python -c "import vllm" 2>/dev/null && echo True || echo False)
+    USE_UNSLOTH=${USE_UNSLOTH:-$(python -c "import unsloth" 2>/dev/null && echo True || echo False)}
+    USE_DDP=${USE_DDP:-False}
 fi
 
 echo "=============================================="
@@ -132,6 +134,7 @@ echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION"
 echo "USE_DUAL_ADAPTER: $USE_DUAL_ADAPTER"
 echo "USE_VLLM: $USE_VLLM"
 echo "USE_UNSLOTH: $USE_UNSLOTH"
+echo "USE_DDP: $USE_DDP"
 echo "=============================================="
 
 # =============================================================================
@@ -178,6 +181,8 @@ build_cmd_args() {
         if [ -n "$USE_DUAL_ADAPTER" ] && [ "$USE_DUAL_ADAPTER" == "True" ]; then
             CMD_ARGS+=(--use_dual_adapter)
         fi
+    elif [ "$METHOD" == "sft" ] && [ "$USE_DDP" == "True" ]; then
+        CMD_ARGS+=(--use_ddp)
     fi
 }
 
@@ -185,18 +190,35 @@ build_cmd_args
 
 export CMD_ARGS
 
-echo "=============================================="
-echo "Starting Training"
-echo "=============================================="
-echo "Command: python training_code.py ${CMD_ARGS[*]}"
-echo ""
-
 echo "Allocated GPU:"
 echo $CUDA_VISIBLE_DEVICES
 nvidia-smi
 
-# Run the training script
-python training_code.py "${CMD_ARGS[@]}"
+echo "=============================================="
+echo "Starting Training"
+echo "=============================================="
+
+# Run the training script — DDP via accelerate or single-process
+if [ "$USE_DDP" == "True" && "$METHOD" == "sft" ]; then
+    # Determine number of GPUs from CUDA_VISIBLE_DEVICES or default to 2
+    if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+        NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
+    else
+        NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+        NUM_GPUS=${NUM_GPUS:-2}
+    fi
+    echo "Command: accelerate launch --multi_gpu --num_processes $NUM_GPUS --mixed_precision bf16 training_code.py ${CMD_ARGS[*]}"
+    echo ""
+    accelerate launch \
+        --multi_gpu \
+        --num_processes "$NUM_GPUS" \
+        --mixed_precision bf16 \
+        training_code.py "${CMD_ARGS[@]}"
+else
+    echo "Command: python training_code.py ${CMD_ARGS[*]}"
+    echo ""
+    python training_code.py "${CMD_ARGS[@]}"
+fi
 
 # Capture exit code
 EXIT_CODE=$?

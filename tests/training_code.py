@@ -138,6 +138,28 @@ from model_utils import (                                                   # no
 
 
 # =====================================================================
+# DDP helpers
+# =====================================================================
+
+def _get_device_map(use_ddp: bool) -> str | dict:
+    """
+    Return the appropriate ``device_map`` for model loading.
+
+    * **DDP mode** (``use_ddp=True``): each ``accelerate`` / ``torchrun``
+      process must load the full model on its *own* GPU.  We read the
+      ``LOCAL_RANK`` environment variable (set automatically by the
+      launcher) and pin to that device.
+    * **Single-process mode** (``use_ddp=False``): fall back to
+      ``"auto"`` which lets HuggingFace ``accelerate`` spread the model
+      across all visible GPUs (useful when the model doesn't fit on one).
+    """
+    if not use_ddp:
+        return "auto"
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    return {"": f"cuda:{local_rank}"}
+
+
+# =====================================================================
 # Training orchestration
 # =====================================================================
 
@@ -153,6 +175,7 @@ def train_with_sft(
     use_vllm: bool = False,
     eval_buffer_size: int = 30,
     use_unsloth: bool = False,
+    use_ddp: bool = False,
     **kwargs,
 ) -> None:
     """
@@ -193,11 +216,24 @@ def train_with_sft(
     use_unsloth : bool
         If *True*, use unsloth's ``FastLanguageModel`` for model loading
         and LoRA injection.
+    use_ddp : bool
+        If *True*, use Distributed Data Parallel (DDP) mode.  Each
+        ``accelerate`` / ``torchrun`` process loads the full model on its
+        own GPU (via ``LOCAL_RANK``).  When *False* the model is loaded
+        with ``device_map="auto"`` which spreads it across all visible
+        GPUs (pipeline parallelism, no data parallelism).  DDP requires
+        the model to fit on a single GPU in 4-bit (e.g. 72B ≈ 36 GB
+        fits on H100 80 GB but not A100 40 GB).
     """
     # Validate unsloth availability early
     if use_unsloth:
         _require_unsloth()
         print("[Unsloth] Enabled – using FastLanguageModel for optimised training")
+
+    # Determine device_map: per-GPU for DDP, "auto" otherwise
+    device_map = _get_device_map(use_ddp)
+    if use_ddp:
+        print(f"[DDP] Enabled – loading model with device_map={device_map}")
 
     # Load model and tokenizer — either from saved adapter or fresh
     if resume_from:
@@ -205,7 +241,7 @@ def train_with_sft(
         if use_unsloth:
             model, tokenizer = load_unsloth_model_from_adapter(resume_from)
         else:
-            model, tokenizer = load_model_from_adapter(resume_from)
+            model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
     else:
         if use_unsloth:
             model, tokenizer = load_unsloth_model(model_name)
@@ -216,7 +252,7 @@ def train_with_sft(
                 tokenizer.add_special_tokens({"eos_token": "</s>"})
             if not tokenizer.pad_token:
                 tokenizer.pad_token = tokenizer.eos_token
-            base_model = load_quantised_model(model_name)
+            base_model = load_quantised_model(model_name, device_map=device_map)
             model = prepare_lora_model(base_model)
 
     # Synchronize the model's config with the tokenizer's special token IDs
@@ -239,12 +275,20 @@ def train_with_sft(
         logging_steps=5,
         save_steps=5,
         gradient_checkpointing=True,
+        # DDP + gradient checkpointing + LoRA requires non-reentrant
+        # checkpointing to avoid "parameter marked ready twice" errors.
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         bf16=True,
         report_to=report_to,
         dataset_text_field="text",
         max_length=8192,
         # Enable token counting so ThroughputMetricsCallback can compute tokens/sec
         include_num_input_tokens_seen=True,
+        # DDP with IterableDataset: each process must fetch its own batch
+        # independently.  The default dispatch_batches=True tries to
+        # concatenate batches from all workers on the main process, which
+        # fails when sequences have different lengths.
+        **({"accelerator_config": {"dispatch_batches": False}} if use_ddp else {}),
     )
 
     shared_callbacks = [
@@ -294,6 +338,7 @@ def train_with_grpo(
     steps_per_generation: int = 1,
     use_dual_adapter: bool = True,
     use_unsloth: bool = False,
+    use_ddp: bool = False,
     **kwargs,
 ) -> None:
     """
@@ -321,11 +366,19 @@ def train_with_grpo(
         the SFT adapter isolated and avoids ``merge_and_unload``.
     use_unsloth : bool
         If *True*, use unsloth's ``FastLanguageModel`` for model loading.
+    use_ddp : bool
+        If *True*, use Distributed Data Parallel (DDP) mode.  See
+        :func:`train_with_sft` for details.
     """
     # Validate unsloth availability early
     if use_unsloth:
         _require_unsloth()
         print("[Unsloth] Enabled – using FastLanguageModel for optimised GRPO training")
+
+    # Determine device_map: per-GPU for DDP, "auto" otherwise
+    device_map = _get_device_map(use_ddp)
+    if use_ddp:
+        print(f"[DDP] Enabled – loading model with device_map={device_map}")
 
     # Define LoRA config — needed for both fresh start and resume
     lora_config = get_lora_config(use_unsloth=use_unsloth)
@@ -336,7 +389,7 @@ def train_with_grpo(
         if use_unsloth:
             model, tokenizer = load_unsloth_model_from_adapter(resume_from)
         else:
-            model, tokenizer = load_model_from_adapter(resume_from)
+            model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
 
         if use_dual_adapter:
             print("Using dual-adapter mode (DualAdapterGRPOTrainer)")
@@ -362,7 +415,7 @@ def train_with_grpo(
                 tokenizer.add_special_tokens({"eos_token": "</s>"})
             if not tokenizer.pad_token:
                 tokenizer.pad_token = tokenizer.eos_token
-            model = load_quantised_model(model_name)
+            model = load_quantised_model(model_name, device_map=device_map)
             peft_config_for_trainer = lora_config
 
         if use_dual_adapter:
@@ -538,6 +591,8 @@ def main() -> None:
     parser.add_argument("--use_unsloth", action="store_true", default=_use_unsloth(),
                         help="Use unsloth's FastLanguageModel for optimised training "
                              "(2x faster, 80%% less VRAM). Requires: pip install unsloth")
+    parser.add_argument("--use_ddp", action="store_true", default=False,
+                        help="Use Distributed Data Parallelization. It's recommended for SFT + unsloth training.")
     args = parser.parse_args()
 
     # Validate integer arguments
