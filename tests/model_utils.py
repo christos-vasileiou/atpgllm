@@ -30,19 +30,35 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, Pe
 
 
 # =====================================================================
-# UNSLOTH SUPPORT (conditional – graceful fallback when not installed)
+# UNSLOTH SUPPORT (lazy import – avoids triggering CUDA initialisation
+# at module-import time when unsloth is not needed)
 # =====================================================================
-_UNSLOTH_AVAILABLE = False
-try:
-    # from unsloth import FastLanguageModel as _FastLM
-    _UNSLOTH_AVAILABLE = True
-except ImportError:
-    _FastLM = None
+_UNSLOTH_AVAILABLE = None   # None = not yet checked; True/False after first check
+_FastLM = None
+
+
+def _lazy_import_unsloth() -> bool:
+    """Import ``unsloth`` on first use and cache the result.
+
+    Deferring the import prevents unsloth's module-level CUDA calls
+    from running when the library isn't actually needed (e.g. standard
+    BitsAndBytes + PEFT training).
+    """
+    global _UNSLOTH_AVAILABLE, _FastLM
+    if _UNSLOTH_AVAILABLE is None:
+        try:
+            from unsloth import FastLanguageModel as FastLM
+            _FastLM = FastLM
+            _UNSLOTH_AVAILABLE = True
+        except ImportError:
+            _FastLM = None
+            _UNSLOTH_AVAILABLE = False
+    return _UNSLOTH_AVAILABLE
 
 
 def _require_unsloth() -> None:
     """Raise a clear error when unsloth is requested but not installed."""
-    if not _UNSLOTH_AVAILABLE:
+    if not _lazy_import_unsloth():
         raise ImportError(
             "unsloth is not installed.  Install it with:\n"
             "    pip install unsloth\n"
@@ -54,11 +70,20 @@ def _require_unsloth() -> None:
 # Standard (BitsAndBytes + PEFT) model loading
 # =====================================================================
 
-def load_quantised_model(model_name: str) -> AutoModelForCausalLM:
+def load_quantised_model(model_name: str, device_map: str | dict = "auto") -> AutoModelForCausalLM:
     """
     Load a base causal language model in 4-bit quantised form using
     ``BitsAndBytesConfig``.  Gradient checkpointing is enabled to save
     memory.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace Hub identifier of the base model.
+    device_map : str | dict
+        Device placement strategy.  ``"auto"`` (default) spreads the
+        model across all visible GPUs.  A dict like ``{"": "cuda:0"}``
+        pins to a single device (used in DDP mode).
     """
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -69,7 +94,7 @@ def load_quantised_model(model_name: str) -> AutoModelForCausalLM:
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quant_config,
-        device_map="auto",
+        device_map=device_map,
         trust_remote_code=True,
     )
     return model
@@ -304,6 +329,7 @@ def smart_sync_model_config(model, tokenizer):
 
 def load_model_from_adapter(
     adapter_path: str,
+    device_map: str | dict = "auto",
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     """
     Load a previously fine-tuned model from a saved adapter directory.
@@ -318,6 +344,11 @@ def load_model_from_adapter(
         Path to the directory containing the saved adapter files
         (``adapter_config.json``, ``adapter_model.safetensors``,
         tokenizer files, etc.)
+    device_map : str | dict
+        Device placement strategy passed through to
+        :func:`load_quantised_model`.  ``"auto"`` (default) spreads the
+        model across all visible GPUs; a dict like ``{"": "cuda:0"}``
+        pins to a single device (used in DDP mode).
 
     Returns
     -------
@@ -349,7 +380,7 @@ def load_model_from_adapter(
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_model = load_quantised_model(base_model_name)
+    base_model = load_quantised_model(base_model_name, device_map=device_map)
     base_model = prepare_model_for_kbit_training(
         base_model, use_gradient_checkpointing=True,
     )
