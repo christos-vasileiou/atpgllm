@@ -52,7 +52,6 @@ import json
 import logging
 import os
 import sys
-import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -62,6 +61,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, TrainerCallback
 from tqdm import tqdm
+from tools import ToolHelper
 
 import matplotlib
 matplotlib.use("Agg")
@@ -180,8 +180,9 @@ class ContextLengthHistogramCallback(TrainerCallback):
         effective context length.
     """
 
-    def __init__(self, pad_token_id: int = 0):
+    def __init__(self, pad_token_id: int = 0, tokenizer: AutoTokenizer = None):
         self.pad_token_id = pad_token_id
+        self.tokenizer = tokenizer
         self.context_lengths: list[int] = []
         self._hook_handle = None
         # Gating flags to avoid double-counting from gradient checkpointing
@@ -237,7 +238,24 @@ class ContextLengthHistogramCallback(TrainerCallback):
             args.output_dir, f"checkpoint-{state.global_step}"
         )
         os.makedirs(checkpoint_dir, exist_ok=True)
+        self._inject_context_length(checkpoint_dir)
         self._save_histogram(checkpoint_dir, state.global_step)
+
+    def _inject_context_length(self, checkpoint_dir: str) -> None:
+        adapter_config_path = os.path.join(checkpoint_dir, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            import json
+            with open(adapter_config_path, "r") as f:
+                adapter_config = json.load(f)
+
+            # Inject context length to prevent vLLM from defaulting to 0
+            adapter_config["max_model_length"] = 32768#self.tokenizer.model_max_length
+            adapter_config["max_position_embeddings"] = 32768#len(self.tokenizer)
+
+            with open(adapter_config_path, "w") as f:
+                json.dump(adapter_config, f, indent=2)
+            print(f"[ContextLengthHistogram] Injected context length {self.tokenizer.model_max_length} into adapter config")
+            print(f"[ContextLengthHistogram] Injected max position embeddings {len(self.tokenizer)} into adapter config")
 
     def _save_histogram(self, directory: str, step: int) -> None:
         lengths = np.array(self.context_lengths)
@@ -366,8 +384,18 @@ class SFTStoppingCallback(TrainerCallback):
         How many completions to generate for the single-prompt diversity
         check (default 10).
     use_vllm : bool
-        If ``True``, use a vLLM engine for faster batch generation.
-        Otherwise fall back to ``model.generate()`` (always available).
+        If ``True``, use a **persistent vLLM server** for eval generation.
+        The server must be started separately (e.g. on a spare GPU) before
+        training with dynamic LoRA loading enabled::
+
+            VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \\
+                CUDA_VISIBLE_DEVICES=<gpu> vllm serve <model> \\
+                --enable-lora --max-lora-rank 64 --port 8000
+
+        Falls back to ``model.generate()`` if the server is unreachable.
+    vllm_server_url : str, optional
+        Base URL of the running vLLM server (default
+        ``"http://localhost:8000"`` when ``use_vllm=True``).
     max_new_tokens : int
         Maximum new tokens per generation turn (default 4096).
     min_steps : int
@@ -406,7 +434,8 @@ class SFTStoppingCallback(TrainerCallback):
         diversity_threshold: float = 0.3,
         diversity_num_generations: int = 10,
         use_vllm: bool = False,
-        max_new_tokens: int = 4096,
+        vllm_server_url: Optional[str] = None,
+        max_new_tokens: int = 8192,
         min_steps: int = 50,
         patience: int = 1,
         temperature: float = 0.7,
@@ -424,6 +453,9 @@ class SFTStoppingCallback(TrainerCallback):
         self.diversity_threshold = diversity_threshold
         self.diversity_num_generations = diversity_num_generations
         self.use_vllm = use_vllm
+        self.vllm_server_url = vllm_server_url or (
+            "http://localhost:8000" if use_vllm else None
+        )
         self.max_new_tokens = max_new_tokens
         self.min_steps = min_steps
         self.patience = patience
@@ -443,9 +475,9 @@ class SFTStoppingCallback(TrainerCallback):
         self._stopped: bool = False
         self._save_count: int = 0
 
-        # vLLM engine (lazy)
-        self._vllm_engine = None
-        self._vllm_adapter_dir: Optional[str] = None
+        # vLLM server state
+        self._current_checkpoint_dir: Optional[str] = None
+        self._vllm_adapter_loaded: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Lazy eval dataset loading
@@ -509,85 +541,114 @@ class SFTStoppingCallback(TrainerCallback):
         if state.global_step < self.min_steps:
             return
 
-        print(f"\n{'=' * 60}")
-        print(f"[SFTStoppingCallback] Evaluating at step {state.global_step}")
-        print(f"  Backend: {'vLLM' if self.use_vllm else 'HF batched'}"
-              f"  |  gen_batch_size: {self._generation_batch_size}"
-              f"  |  eval prompts: {len(self._eval_prompts) if self._eval_prompts else self.eval_buffer_size}")
-        print(f"{'=' * 60}")
+        # ----- DDP: only rank 0 runs the expensive eval -----
+        # All ranks must still reach the broadcast below so that
+        # ``should_training_stop`` is synchronised.
+        is_distributed = torch.distributed.is_initialized()
+        is_main = not is_distributed or torch.distributed.get_rank() == 0
+        should_stop = False
 
-        # Lazy-load eval dataset
-        self._load_eval_dataset()
-
-        # Switch to eval mode
-        was_training = model.training
-        model.eval()
-        eval_start = time.perf_counter()
-
-        try:
-            # --- Criterion 1: Format Compliance ---
-            format_score, format_details = self._check_format_compliance(model)
-
-            # --- Criterion 2: Output Diversity ---
-            diversity_score, diversity_details = self._check_diversity(model)
-
-            # --- Criterion 3: Loss Plateau (soft) ---
-            loss_plateaued = self._check_loss_plateau()
-
-            eval_elapsed = time.perf_counter() - eval_start
-            print(f"\n  [Timing] Total eval wall-clock: {eval_elapsed:.1f}s")
-
-            # Log results to console & checkpoint dir
-            self._log_results(
-                state,
-                format_score,
-                diversity_score,
-                loss_plateaued,
-                format_details,
-                diversity_details,
-                args,
+        if is_main:
+            self._current_checkpoint_dir = os.path.join(
+                args.output_dir, f"checkpoint-{state.global_step}"
             )
 
-            # Decision
-            format_passed = format_score >= self.format_threshold
-            diversity_passed = diversity_score >= self.diversity_threshold
+            backend_label = (
+                "vLLM server" if (self.use_vllm and self.vllm_server_url)
+                else "HF batched"
+            )
+            print(f"\n{'=' * 60}")
+            print(f"[SFTStoppingCallback] Evaluating at step {state.global_step}")
+            print(f"  Backend: {backend_label}"
+                  f"  |  gen_batch_size: {self._generation_batch_size}"
+                  f"  |  eval prompts: {len(self._eval_prompts) if self._eval_prompts else self.eval_buffer_size}")
+            print(f"{'=' * 60}")
 
-            if format_passed and diversity_passed:
-                self._consecutive_passes += 1
-                if self._consecutive_passes >= self.patience:
-                    print(
-                        f"\n{'*' * 60}\n"
-                        f"  SFT STOPPING CRITERIA MET at step {state.global_step}\n"
-                        f"  Format:    {format_score:.1%} >= {self.format_threshold:.1%}\n"
-                        f"  Diversity: {diversity_score:.1%} >= {self.diversity_threshold:.1%}\n"
-                        f"  Patience:  {self._consecutive_passes}/{self.patience} consecutive passes\n"
-                        f"  Loss plateau: {'Yes' if loss_plateaued else 'No'}\n"
-                        f"  --> Stopping SFT.  Ready to switch to GRPO.\n"
-                        f"{'*' * 60}"
-                    )
-                    control.should_training_stop = True
-                    self._stopped = True
+            # Lazy-load eval dataset
+            self._load_eval_dataset()
+
+            # Switch to eval mode
+            was_training = model.training
+            model.eval()
+            eval_start = time.perf_counter()
+
+            try:
+                # --- Criterion 1: Format Compliance ---
+                format_score, format_details = self._check_format_compliance(model)
+
+                # --- Criterion 2: Output Diversity ---
+                diversity_score, diversity_details = self._check_diversity(model)
+
+                # --- Criterion 3: Loss Plateau (soft) ---
+                loss_plateaued = self._check_loss_plateau()
+
+                eval_elapsed = time.perf_counter() - eval_start
+                print(f"\n  [Timing] Total eval wall-clock: {eval_elapsed:.1f}s")
+
+                # Log results to console & checkpoint dir
+                self._log_results(
+                    state,
+                    format_score,
+                    diversity_score,
+                    loss_plateaued,
+                    format_details,
+                    diversity_details,
+                    args,
+                )
+
+                # Decision
+                format_passed = format_score >= self.format_threshold
+                diversity_passed = diversity_score >= self.diversity_threshold
+
+                if format_passed and diversity_passed:
+                    self._consecutive_passes += 1
+                    if self._consecutive_passes >= self.patience:
+                        print(
+                            f"\n{'*' * 60}\n"
+                            f"  SFT STOPPING CRITERIA MET at step {state.global_step}\n"
+                            f"  Format:    {format_score:.1%} >= {self.format_threshold:.1%}\n"
+                            f"  Diversity: {diversity_score:.1%} >= {self.diversity_threshold:.1%}\n"
+                            f"  Patience:  {self._consecutive_passes}/{self.patience} consecutive passes\n"
+                            f"  Loss plateau: {'Yes' if loss_plateaued else 'No'}\n"
+                            f"  --> Stopping SFT.  Ready to switch to GRPO.\n"
+                            f"{'*' * 60}"
+                        )
+                        should_stop = True
+                    else:
+                        print(
+                            f"\n  Criteria passed ({self._consecutive_passes}/{self.patience}).  "
+                            f"Waiting for {self.patience - self._consecutive_passes} more."
+                        )
                 else:
-                    print(
-                        f"\n  Criteria passed ({self._consecutive_passes}/{self.patience}).  "
-                        f"Waiting for {self.patience - self._consecutive_passes} more."
-                    )
-            else:
-                self._consecutive_passes = 0
-                reasons = []
-                if not format_passed:
-                    reasons.append(
-                        f"Format {format_score:.1%} < {self.format_threshold:.1%}"
-                    )
-                if not diversity_passed:
-                    reasons.append(
-                        f"Diversity {diversity_score:.1%} < {self.diversity_threshold:.1%}"
-                    )
-                print(f"\n  Continuing SFT: {'; '.join(reasons)}")
+                    self._consecutive_passes = 0
+                    reasons = []
+                    if not format_passed:
+                        reasons.append(
+                            f"Format {format_score:.1%} < {self.format_threshold:.1%}"
+                        )
+                    if not diversity_passed:
+                        reasons.append(
+                            f"Diversity {diversity_score:.1%} < {self.diversity_threshold:.1%}"
+                        )
+                    print(f"\n  Continuing SFT: {'; '.join(reasons)}")
 
-        finally:
-            if was_training:
-                model.train()
+            finally:
+                if was_training:
+                    model.train()
+
+        # Synchronise the stop decision across all DDP ranks so that
+        # every process breaks out of the training loop together.
+        if is_distributed:
+            device = next(model.parameters()).device
+            stop_tensor = torch.tensor(
+                int(should_stop), dtype=torch.int32, device=device,
+            )
+            torch.distributed.broadcast(stop_tensor, src=0)
+            should_stop = bool(stop_tensor.item())
+
+        if should_stop:
+            control.should_training_stop = True
+            self._stopped = True
 
     # ------------------------------------------------------------------
     # Criterion 1 – Format Compliance
@@ -762,8 +823,8 @@ class SFTStoppingCallback(TrainerCallback):
         list[str]
             Full completions (first_turn + tool_response + second_turn).
         """
-        if self.use_vllm:
-            return self._generate_vllm(model, prompts, num_return_sequences)
+        if self.use_vllm and self.vllm_server_url:
+            return self._generate_vllm_server(model, prompts, num_return_sequences)
         return self._generate_hf(model, prompts, num_return_sequences)
 
     # ------------------------------------------------------------------
@@ -825,10 +886,7 @@ class SFTStoppingCallback(TrainerCallback):
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
-                    max_length=getattr(
-                        self.tokenizer, "model_max_length", 8192
-                    )
-                    - self.max_new_tokens,
+                    max_length=self.max_new_tokens,
                 ).to(device)
 
                 outputs = model.generate(
@@ -882,6 +940,7 @@ class SFTStoppingCallback(TrainerCallback):
 
                 tool_name = tc_data.get("name", "")
                 tool_args = tc_data.get("arguments", {})
+                tool_args["netlist"] = ToolHelper.get_netlist(prompts[prompt_index_map[idx]])
                 tool_result = self._execute_tool(tool_name, tool_args)
 
                 try:
@@ -930,10 +989,7 @@ class SFTStoppingCallback(TrainerCallback):
                         return_tensors="pt",
                         padding=True,
                         truncation=True,
-                        max_length=getattr(
-                            self.tokenizer, "model_max_length", 8192
-                        )
-                        - self.max_new_tokens // 2,
+                        max_length=self.max_new_tokens // 2,
                     ).to(device)
 
                     cont_outputs = model.generate(
@@ -976,161 +1032,248 @@ class SFTStoppingCallback(TrainerCallback):
             self.tokenizer.padding_side = orig_pad_side
 
     # ------------------------------------------------------------------
-    # vLLM backend
+    # vLLM server backend (persistent server on a separate GPU)
     # ------------------------------------------------------------------
-    def _generate_vllm(
+    def _generate_vllm_server(
         self,
         model,
         prompts: List[str],
         num_return_sequences: int = 1,
     ) -> List[str]:
         """
-        Generate using a vLLM engine for faster batch inference.
+        Generate completions via a **persistent** vLLM server.
 
-        .. note::
+        Expects ``vllm serve <base_model> --enable-lora`` to be running
+        (e.g. on a spare GPU) at :pyattr:`vllm_server_url`.  At each
+        evaluation the current LoRA adapter is loaded on the server from
+        the latest checkpoint directory — no model migration, no engine
+        creation / destruction.
 
-           For the SFT stopping callback the **HF batched backend**
-           (``_generate_hf``) is recommended instead.  It avoids the
-           GPU-memory contention that occurs when vLLM tries to load
-           a second model copy alongside the training model.  The
-           ``model.cpu()`` → vLLM → ``model.to(device)`` round-trip
-           also adds ~60 s of overhead per evaluation and can cause
-           OOM on 4-bit quantised models.
-
-        The method saves the current LoRA adapter, temporarily offloads
-        the HF training model to CPU, runs vLLM on GPU, then restores the
-        HF model.
+        Falls back to :meth:`_generate_hf` when the server is unreachable
+        or the adapter cannot be loaded.
         """
-        logger.warning(
-            "[SFTEval] vLLM backend selected.  For the SFT stopping callback "
-            "the batched HF backend (use_vllm=False) is recommended — it avoids "
-            "GPU-memory contention and the CPU↔GPU model migration overhead."
-        )
+        import requests as http_requests
+
+        base_url = self.vllm_server_url.rstrip("/")
+
+        # Health check
         try:
-            from vllm import LLM, SamplingParams
-            from vllm.lora.request import LoRARequest
-        except ImportError:
+            resp = http_requests.get(f"{base_url}/health", timeout=10)
+            if resp.status_code != 200:
+                raise ConnectionError(f"status {resp.status_code}")
+        except Exception as exc:
             logger.warning(
-                "vLLM is not installed.  Falling back to HF generation."
+                "[SFTEval] vLLM server unreachable at %s (%s). "
+                "Falling back to HF generation. Start a server with:\n"
+                "  CUDA_VISIBLE_DEVICES=<spare_gpu> vllm serve <model> "
+                "--enable-lora --port 8000",
+                base_url,
+                exc,
             )
             return self._generate_hf(model, prompts, num_return_sequences)
 
-        # Unwrap distributed/peft wrappers
-        unwrapped = model
-        while hasattr(unwrapped, "module"):
-            unwrapped = unwrapped.module
-
-        base_model_name = getattr(unwrapped.config, "_name_or_path", None)
-        if not base_model_name:
+        # Load / refresh LoRA adapter on the server
+        if not self._load_vllm_adapter(self._current_checkpoint_dir):
             logger.warning(
-                "Cannot determine base model name for vLLM.  "
+                "[SFTEval] Could not load LoRA adapter on vLLM server. "
                 "Falling back to HF generation."
             )
             return self._generate_hf(model, prompts, num_return_sequences)
 
-        device = next(model.parameters()).device
+        adapter_name = "default"
 
-        tmpdir = tempfile.mkdtemp(prefix="sft_vllm_eval_")
-        try:
-            # Save adapter
-            unwrapped.save_pretrained(tmpdir)
-            self.tokenizer.save_pretrained(tmpdir)
+        # ==============================================================
+        # TURN 1: think + tool_call
+        # ==============================================================
+        t0 = time.perf_counter()
+        first_turns, prompt_index_map = self._vllm_server_complete(
+            base_url,
+            adapter_name,
+            prompts,
+            n=num_return_sequences,
+            max_tokens=self.max_new_tokens,
+        )
+        t1 = time.perf_counter()
+        logger.info(
+            "[SFTEval/vLLM] Turn 1: %d completions in %.1fs (%.1f comp/s)",
+            len(first_turns),
+            t1 - t0,
+            len(first_turns) / max(t1 - t0, 1e-6),
+        )
 
-            # Offload training model to free GPU memory
-            model.cpu()
-            torch.cuda.empty_cache()
+        # ==============================================================
+        # TOOL EXECUTION  (CPU-bound — fast)
+        # ==============================================================
+        full_completions: List[str] = list(first_turns)
+        second_turn_items: List[tuple] = []
 
-            # Create vLLM engine
-            llm = LLM(
-                model=base_model_name,
-                enable_lora=True,
-                max_lora_rank=64,
-                trust_remote_code=True,
-                gpu_memory_utilization=0.5,
-                enforce_eager=True,
-            )
-            lora_req = LoRARequest("sft_adapter", 1, tmpdir)
-
-            first_params = SamplingParams(
-                temperature=self.temperature,
-                top_p=0.9,
-                max_tokens=self.max_new_tokens,
-                n=num_return_sequences,
-            )
-
-            # --- First turn ---
-            first_outputs = llm.generate(
-                prompts, first_params, lora_request=lora_req
-            )
-            first_turns = []
-            orig_prompt_map = []
-            for i, o in enumerate(first_outputs):
-                for gen in o.outputs:
-                    first_turns.append(gen.text)
-                    orig_prompt_map.append(prompts[i])
-
-            # --- Handle tool calling (batch second turns) ---
-            second_prompts: List[str] = []
-            second_map: Dict[int, tuple] = {}  # index -> (first_turn, tool_result)
-
-            full_completions = list(first_turns)
-
-            for i, ft in enumerate(first_turns):
-                tc_match = TOOL_CALL_RE.search(ft)
-                if tc_match and self.tool_functions:
-                    try:
-                        tc_data = json.loads(tc_match.group(1))
-                        t_name = tc_data.get("name", "")
-                        t_args = tc_data.get("arguments", {})
-                        t_result = self._execute_tool(t_name, t_args)
-
-                        msgs = self._build_continued_messages(
-                            orig_prompt_map[i], ft, tc_data, t_name, t_result
-                        )
-                        cont_prompt = self.tokenizer.apply_chat_template(
-                            msgs,
-                            tokenize=False,
-                            tools=self.tools_schema,
-                            add_generation_prompt=True,
-                        )
-                        second_prompts.append(cont_prompt)
-                        second_map[i] = (ft, t_result)
-                    except Exception as e:
-                        logger.warning(f"Tool call failed (vllm): {e}")
-
-            if second_prompts:
-                second_params = SamplingParams(
-                    temperature=self.temperature,
-                    top_p=0.9,
-                    max_tokens=self.max_new_tokens // 2,
-                    n=1,
+        for idx, ft in enumerate(first_turns):
+            tc_match = TOOL_CALL_RE.search(ft)
+            if not tc_match or not self.tool_functions:
+                continue
+            try:
+                tc_data = json.loads(tc_match.group(1))
+            except (json.JSONDecodeError, ValueError):
+                continue
+                
+            tool_name = tc_data.get("name", "")
+            tool_args = tc_data.get("arguments", {})
+            tool_args["netlist"] = ToolHelper.get_netlist(prompts[prompt_index_map[idx]])
+            tool_result = self._execute_tool(tool_name, tool_args)
+            
+            try:
+                messages = self._build_continued_messages(
+                    prompts[prompt_index_map[idx]],
+                    ft,
+                    tc_data,
+                    tool_name,
+                    tool_result,
                 )
-                second_outputs = llm.generate(
-                    second_prompts, second_params, lora_request=lora_req
+                cont_prompt = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    tools=self.tools_schema,
+                    add_generation_prompt=True,
                 )
-                for j, (orig_i, (ft, t_result)) in enumerate(
-                    second_map.items()
-                ):
-                    st = second_outputs[j].outputs[0].text
-                    full_completions[orig_i] = (
-                        ft
-                        + f"\n<tool_response>\n{t_result}\n</tool_response>\n"
-                        + st
-                    )
+                second_turn_items.append(
+                    (idx, ft, tool_result, cont_prompt)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to build continuation for turn %d: %s",
+                    idx,
+                    exc,
+                )
+            
+        t2 = time.perf_counter()
+        logger.info(
+            "[SFTEval/vLLM] Tool execution: %d tool calls in %.1fs",
+            len(second_turn_items),
+            t2 - t1,
+        )
 
-            # Cleanup vLLM
-            del llm
-            torch.cuda.empty_cache()
-
-        finally:
-            # Restore training model to original device
-            model.to(device)
-            # Clean up temp dir
-            import shutil
-
-            shutil.rmtree(tmpdir, ignore_errors=True)
+        # ==============================================================
+        # TURN 2: summary
+        # ==============================================================
+        if second_turn_items:
+            cont_prompts = [item[3] for item in second_turn_items]
+            second_turns, _ = self._vllm_server_complete(
+                base_url,
+                adapter_name,
+                cont_prompts,
+                n=1,
+                max_tokens=self.max_new_tokens // 2,
+            )
+            
+            for j, (orig_idx, ft, tool_result, _) in enumerate(
+                second_turn_items
+            ):
+                full_completions[orig_idx] = (
+                    ft
+                    + f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
+                    + second_turns[j]
+                )
+            
+            t3 = time.perf_counter()
+            logger.info(
+                "[SFTEval/vLLM] Turn 2: %d completions in %.1fs (%.1f comp/s)",
+                len(second_turns),
+                t3 - t2,
+                len(second_turns) / max(t3 - t2, 1e-6),
+            )
 
         return full_completions
+
+    # ------------------------------------------------------------------
+    # vLLM server helpers
+    # ------------------------------------------------------------------
+    def _vllm_server_complete(
+        self,
+        base_url: str,
+        adapter_name: str,
+        prompts: List[str],
+        n: int,
+        max_tokens: int,
+    ) -> tuple[List[str], List[int]]:
+        """Send prompts to the vLLM ``/v1/completions`` endpoint."""
+        import requests as http_requests
+        json_data = {
+            "model": self.tokenizer.name_or_path,
+            "prompt": prompts,
+            "max_tokens": max_tokens,
+            "temperature": self.temperature,
+            "top_p": 0.9,
+            "n": n,
+        }
+        resp = http_requests.post(
+            f"{base_url}/v1/completions",
+            json=json_data,
+            timeout=1200,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        choices = sorted(data["choices"], key=lambda c: c["index"])
+        texts = [c["text"] for c in choices]
+        index_map = [c["index"] for c in choices]
+        return texts, index_map
+
+    def _load_vllm_adapter(self, checkpoint_dir: Optional[str]) -> bool:
+        """Load a LoRA adapter on the vLLM server (idempotent per path).
+
+        Uses the ``/v1/load_lora_adapter`` endpoint which requires
+        ``VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`` when starting the
+        server (vLLM >= 0.11 V1 engine).
+        """
+        if checkpoint_dir is None:
+            return False
+        if self._vllm_adapter_loaded == checkpoint_dir:
+            return True
+
+        import requests as http_requests
+
+        base_url = self.vllm_server_url.rstrip("/")
+        adapter_name = "sft_eval"
+        abs_path = os.path.abspath(checkpoint_dir)
+
+        # Unload previous adapter (ignore errors on first call)
+        try:
+            http_requests.post(
+                f"{base_url}/v1/unload_lora_adapter",
+                json={"lora_name": adapter_name},
+                timeout=30,
+            )
+        except Exception:
+            pass
+
+        try:
+            resp = http_requests.post(
+                f"{base_url}/v1/load_lora_adapter",
+                json={"lora_name": adapter_name, "lora_path": abs_path},
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                self._vllm_adapter_loaded = checkpoint_dir
+                print(f"[SFTEval] Loaded LoRA adapter from {abs_path}")
+                return True
+
+            if resp.status_code == 404:
+                logger.warning(
+                    "[SFTEval] /v1/load_lora_adapter returned 404.  "
+                    "The vLLM V1 engine requires the env var "
+                    "VLLM_ALLOW_RUNTIME_LORA_UPDATING=True to expose "
+                    "dynamic LoRA endpoints.  Restart the server:\n"
+                    "  VLLM_ALLOW_RUNTIME_LORA_UPDATING=True "
+                    "CUDA_VISIBLE_DEVICES=<gpu> vllm serve <model> "
+                    "--enable-lora --max-lora-rank 64 --port <port>"
+                )
+                return False
+
+            logger.warning("[SFTEval] Adapter load failed: %s", resp.text)
+            return False
+        except Exception as exc:
+            logger.warning("[SFTEval] Adapter load error: %s", exc)
+            return False
 
     # ------------------------------------------------------------------
     # Tool execution helper

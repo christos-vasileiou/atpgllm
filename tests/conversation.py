@@ -22,6 +22,12 @@ import regex as re
 from template_rendering import render_reasoning_template
 from tools import FAULT_SIMULATION_TOOL
 
+def convert_netlist_to_json_payload(record: Dict[str, Any]) -> None:
+    import hashlib
+    netlist_content = record["netlist"]
+    doc_id = hashlib.sha256(netlist_content.encode("utf-8")).hexdigest()[:16]
+    json_payload = {"doc_id": doc_id, "netlist": netlist_content}
+    record["netlist"] = json_payload
 
 @dataclass
 class ConversationExample:
@@ -122,6 +128,9 @@ class ConversationExample:
         answer_content = record.get("answer_content", "")
         snapshot = record.get("snapshot", "")
 
+        # Convert the netlist to a json payload including the doc_id and the netlist content
+        convert_netlist_to_json_payload(record)
+
         # Format the system, user and answer content with the record
         system_content = system_content.format(**record)
         user_content = user_content.format(**record)
@@ -150,7 +159,7 @@ class ConversationExample:
                 arguments['input_vector'] = input_vector_dict
                 arguments['output_vector'] = expected_output_dict
                 arguments['fault'] = fault
-                arguments['netlist'] = record.get('netlist', 'netlist is unknown')
+                arguments['doc_id'] = record.get('netlist', 'netlist is unknown').get('doc_id', 'netlist is unknown')
 
                 tool_call_json = {
                     "name": FAULT_SIMULATION_TOOL['function']['name'],
@@ -163,7 +172,7 @@ class ConversationExample:
                 tool_call_content = (
                     "<think>" + reasoning_content + "</think>\n\n"
                     "I have to verify if the fault is detected by the input and "
-                    "output vectors. I need to call the fault simulation tool.\n\n"
+                    "output vectors. I need to call the fault simulation tool.\n"
                 )
                 messages.append({
                     "role": "assistant",

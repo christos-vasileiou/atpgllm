@@ -5,6 +5,7 @@ from sympy import symbols, parse_expr
 from sympy.core.symbol import Symbol
 from pathlib import Path
 import sys
+import hashlib
 
 # Add the parent directory of atpgllm to sys.path to allow importing from data_preprocessing
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'data_preprocessing'))
@@ -129,7 +130,7 @@ class RewardFunctionFactory:
         entries to prevent unbounded memory growth.
         """
         # Use hash of netlist string as cache key
-        cache_key = hash(netlist_str)
+        cache_key = hashlib.sha256(netlist_str.encode()).hexdigest()[:16]
         
         if cache_key not in self._netlist_cache:
             # Evict oldest entries if cache is full (simple FIFO eviction)

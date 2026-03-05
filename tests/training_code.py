@@ -103,13 +103,49 @@ from typing import Optional, Literal
 # Add the parent directory of atpgllm to sys.path to allow importing from data_preprocessing
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'data_preprocessing'))
 
+
+# =====================================================================
+# MIG (Multi-Instance GPU) visibility fix — MUST run before any
+# torch / CUDA import so that each DDP rank sees exactly one device.
+# =====================================================================
+def _setup_mig_visibility() -> None:
+    """Restrict each DDP rank to its own MIG instance.
+
+    When ``CUDA_VISIBLE_DEVICES`` contains multiple MIG UUIDs, CUDA
+    still exposes only **one** device per process (``cuda:0``).  Without
+    this fix the process with ``LOCAL_RANK ≥ 1`` would try to open
+    ``cuda:<LOCAL_RANK>`` and crash with *"invalid device ordinal"*.
+
+    By slicing ``CUDA_VISIBLE_DEVICES`` **before** ``import torch`` we
+    guarantee every rank sees a single, unique MIG instance as
+    ``cuda:0``.
+
+    We must also reset ``LOCAL_RANK`` to ``0`` because libraries like
+    ``accelerate`` use it as a CUDA device index (e.g.
+    ``torch.distributed.barrier(device_ids=[local_rank])``).  The global
+    ``RANK`` and ``WORLD_SIZE`` are left untouched so distributed
+    communication is unaffected.
+    """
+    local_rank = os.environ.get("LOCAL_RANK")
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if local_rank is not None and cuda_devices:
+        uuids = [u.strip() for u in cuda_devices.split(",") if u.strip()]
+        if any(u.startswith("MIG-") for u in uuids) and len(uuids) > 1:
+            rank = int(local_rank)
+            if rank < len(uuids):
+                os.environ["CUDA_VISIBLE_DEVICES"] = uuids[rank]
+                # Each process now sees exactly one device (cuda:0).
+                # LOCAL_RANK must reflect this so that accelerate /
+                # torch.distributed don't try to address cuda:1+.
+                os.environ["LOCAL_RANK"] = "0"
+
+_setup_mig_visibility()
+
+
 from datasets import load_dataset
 from transformers import AutoTokenizer
-from trl import SFTTrainer, SFTConfig, GRPOConfig
 
-from tool_calling_grpo_trainer import ToolCallingGRPOTrainer
-from dual_adapter_grpo_trainer import DualAdapterGRPOTrainer
-from tools import TOOLS, fault_simulation_tool
+from tools import TOOLS, fault_simulation_tool_handler
 from reward_function_factory import RewardFunctionFactory
 from callbacks import (
     ThroughputMetricsCallback,
@@ -152,9 +188,19 @@ def _get_device_map(use_ddp: bool) -> str | dict:
     * **Single-process mode** (``use_ddp=False``): fall back to
       ``"auto"`` which lets HuggingFace ``accelerate`` spread the model
       across all visible GPUs (useful when the model doesn't fit on one).
+
+    On **MIG** nodes each DDP rank has already been restricted to a
+    single MIG instance by :func:`_setup_mig_visibility`, so
+    ``torch.cuda.device_count()`` returns 1 and we always use
+    ``cuda:0``.
     """
     if not use_ddp:
         return "auto"
+    import torch
+    # On MIG (or any setup where each rank sees exactly one device),
+    # LOCAL_RANK may be >0 but the only valid device is cuda:0.
+    if torch.cuda.device_count() <= 1:
+        return {"": "cuda:0"}
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     return {"": f"cuda:{local_rank}"}
 
@@ -173,6 +219,7 @@ def train_with_sft(
     max_steps: int = -1,
     report_to: str = "wandb",
     use_vllm: bool = False,
+    vllm_server_url: str = None,
     eval_buffer_size: int = 30,
     use_unsloth: bool = False,
     use_ddp: bool = False,
@@ -209,7 +256,17 @@ def train_with_sft(
         from.
     use_vllm : bool
         If *True*, validation generation in the stopping callback uses
-        vLLM for faster batch inference.
+        a **persistent vLLM server** for faster batch inference.  Start
+        the server on a spare GPU before training with dynamic LoRA
+        loading enabled::
+
+            VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \\
+                CUDA_VISIBLE_DEVICES=2 vllm serve <model_name> \\
+                --enable-lora --max-lora-rank 64 --port 8000
+
+    vllm_server_url : str, optional
+        Base URL of the running vLLM server (default
+        ``"http://localhost:8000"`` when ``use_vllm=True``).
     eval_buffer_size : int
         Number of examples to buffer from the test split for the
         stopping callback validation (default 30).
@@ -225,6 +282,11 @@ def train_with_sft(
         the model to fit on a single GPU in 4-bit (e.g. 72B ≈ 36 GB
         fits on H100 80 GB but not A100 40 GB).
     """
+    # Lazy-import SFTTrainer and SFTConfig
+    from trl import SFTTrainer, SFTConfig
+    import torch
+    print(f"Available GPUs: {torch.cuda.is_available()}, Num GPUs: {torch.cuda.device_count()}")
+
     # Validate unsloth availability early
     if use_unsloth:
         _require_unsloth()
@@ -272,9 +334,10 @@ def train_with_sft(
         learning_rate=2e-4,
         lr_scheduler_type="cosine",
         max_steps=max_steps,
-        logging_steps=5,
-        save_steps=5,
+        logging_steps=10,
+        save_steps=10,
         gradient_checkpointing=True,
+        ddp_find_unused_parameters=False if use_ddp else None,
         # DDP + gradient checkpointing + LoRA requires non-reentrant
         # checkpointing to avoid "parameter marked ready twice" errors.
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -293,21 +356,23 @@ def train_with_sft(
 
     shared_callbacks = [
         ThroughputMetricsCallback(),
-        ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id),
+        ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
         SFTStoppingCallback(
             tokenizer=tokenizer,
             dataset_path=dataset_path,
             eval_buffer_size=eval_buffer_size,
-            tool_functions={"fault_simulation_tool": fault_simulation_tool},
+            tool_functions={"fault_simulation_tool": fault_simulation_tool_handler},
             tools_schema=TOOLS,
             format_threshold=0.95,
-            diversity_threshold=0.3,
+            diversity_threshold=0.2,
             diversity_num_generations=10,
             use_vllm=use_vllm,
-            max_new_tokens=4096,
-            min_steps=5,
+            vllm_server_url=vllm_server_url,
+            max_new_tokens=32768 if use_vllm else 8192,
+            min_steps=100,
             patience=1,
             temperature=0.7,
+            generation_batch_size=50 if use_vllm else 8,
         ),
     ]
 
@@ -370,6 +435,12 @@ def train_with_grpo(
         If *True*, use Distributed Data Parallel (DDP) mode.  See
         :func:`train_with_sft` for details.
     """
+    # Lazy-import GRPO trainers and GRPOConfig to avoid pulling in
+    # trl.GRPOTrainer (and its vllm dependency) during SFT-only runs.
+    from trl import GRPOConfig
+    from tool_calling_grpo_trainer import ToolCallingGRPOTrainer
+    from dual_adapter_grpo_trainer import DualAdapterGRPOTrainer
+
     # Validate unsloth availability early
     if use_unsloth:
         _require_unsloth()
@@ -462,8 +533,8 @@ def train_with_grpo(
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=5e-5,
         max_steps=max_steps,
-        logging_steps=5,
-        save_steps=5,
+        logging_steps=10,
+        save_steps=10,
         bf16=True,
         report_to=report_to,
         # GRPO-specific options
@@ -488,7 +559,7 @@ def train_with_grpo(
             train_dataset=train_dataset,
             processing_class=tokenizer,
             policy_lora_config=policy_lora_config,
-            tool_functions=[fault_simulation_tool],
+            tool_functions={'fault_simulation_tool': fault_simulation_tool_handler},
             callbacks=shared_callbacks,
             tools=TOOLS,
         )
@@ -500,7 +571,7 @@ def train_with_grpo(
             train_dataset=train_dataset,
             processing_class=tokenizer,
             peft_config=peft_config_for_trainer,  # Triggers merge_and_unload if model is PeftModel
-            tool_functions=[fault_simulation_tool],
+            tool_functions={'fault_simulation_tool': fault_simulation_tool_handler},
             callbacks=shared_callbacks,
         )
 
@@ -580,6 +651,9 @@ def main() -> None:
     parser.add_argument("--report_to", type=str, default=_report_to(),
                         help="Report to: wandb or none")
     parser.add_argument("--use_vllm", action="store_true", help="Use VLLM")
+    parser.add_argument("--vllm_server_url", type=str, default=None,
+                        help="URL of a running vLLM server for SFT eval generation "
+                             "(e.g. http://localhost:8000). Used when --use_vllm is set.")
     parser.add_argument("--vllm_mode", type=str, default=_vllm_mode(),
                         help="VLLM mode: 'colocate' or 'server'")
     parser.add_argument("--num_generations", type=int, default=_num_generations(),

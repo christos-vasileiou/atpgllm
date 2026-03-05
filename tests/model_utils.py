@@ -21,10 +21,21 @@ Public API
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 
 import torch
+
+# NOTE: unsloth's side-effect import (which monkey-patches transformers,
+# peft and trl) is handled by the *entry-point* script (training_code.py)
+# ONLY when ``--use_unsloth`` is present.  Importing unsloth here
+# unconditionally would pollute non-unsloth training runs, causing
+# dtype checks, unexpected kwargs and other failures in the patched
+# Trainer classes.  The lazy import in ``_lazy_import_unsloth()`` below
+# is safe because it only pulls in ``FastLanguageModel`` — the heavy
+# monkey-patching already happened (or didn't) at startup.
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel
 
@@ -155,6 +166,8 @@ def prepare_lora_model(
 def load_unsloth_model(
     model_name: str,
     max_seq_length: int = 8192,
+    fast_inference: bool = False,
+    device_map: str | dict | None = None,
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     """
     Load a base model and tokenizer using unsloth's ``FastLanguageModel``.
@@ -169,18 +182,35 @@ def load_unsloth_model(
         HuggingFace Hub identifier of the base model.
     max_seq_length : int
         Maximum sequence length the model will see (default 8192).
+    fast_inference : bool
+        If *True*, unsloth spins up a vLLM engine alongside the training
+        model.  This roughly **doubles** GPU memory usage and should only
+        be enabled for GRPO (which needs online generation) on GPUs with
+        enough headroom.  Must be *False* for DDP/MIG where each worker
+        has limited VRAM (e.g. 12 GB MIG instances).  Default: *False*.
+    device_map : str | dict | None
+        Device placement strategy forwarded to unsloth / transformers.
+        On MIG nodes or DDP, pass ``{"": "cuda:0"}`` to pin to the single
+        visible device.  Without this, ``torchrun`` sets ``LOCAL_RANK``
+        and transformers' ``caching_allocator_warmup`` may try to probe
+        device *N* when only device 0 exists → ``invalid device ordinal``.
+        If *None* (default), unsloth picks automatically.
 
     Returns
     -------
     tuple[AutoModelForCausalLM, AutoTokenizer]
     """
     _require_unsloth()
-    model, tokenizer = _FastLM.from_pretrained(
+    kwargs = dict(
         model_name=model_name,
         max_seq_length=max_seq_length,
         dtype=None,           # auto-detect best dtype for the GPU
         load_in_4bit=True,    # 4-bit QLoRA
+        fast_inference=fast_inference,
     )
+    if device_map is not None:
+        kwargs["device_map"] = device_map
+    model, tokenizer = _FastLM.from_pretrained(**kwargs)
     if not tokenizer.eos_token:
         tokenizer.add_special_tokens({"eos_token": "</s>"})
     if not tokenizer.pad_token:
@@ -212,16 +242,43 @@ def prepare_unsloth_lora_model(
     if lora_config is None:
         lora_config = get_lora_config(use_unsloth=True)
 
-    model = _FastLM.get_peft_model(
-        model,
-        r=lora_config.r,
-        lora_alpha=lora_config.lora_alpha,
-        target_modules=list(lora_config.target_modules),
-        lora_dropout=0,                             # required by unsloth
-        bias="none",
-        use_gradient_checkpointing="unsloth",       # long-context optimised
-        random_state=42,
+    # ── PEFT / unsloth version compatibility shim ──────────────────────
+    # Unsloth ≥ 2026.2 internally passes ``target_parameters`` when it
+    # constructs a ``LoraConfig`` inside ``get_peft_model``.  That kwarg
+    # was added in PEFT ≥ 0.14; on older PEFT (e.g. 0.13.2) the call
+    # explodes with ``TypeError: unexpected keyword argument``.
+    #
+    # Workaround: temporarily patch ``LoraConfig.__init__`` to silently
+    # discard the unknown kwarg, then restore the original immediately
+    # after.  If PEFT already supports it, the patch is skipped entirely.
+    _needs_patch = (
+        "target_parameters"
+        not in inspect.signature(LoraConfig.__init__).parameters
     )
+    if _needs_patch:
+        _orig_lora_init = LoraConfig.__init__
+
+        def _compat_lora_init(self, *args, **kwargs):
+            kwargs.pop("target_parameters", None)
+            return _orig_lora_init(self, *args, **kwargs)
+
+        LoraConfig.__init__ = _compat_lora_init
+
+    try:
+        model = _FastLM.get_peft_model(
+            model,
+            r=lora_config.r,
+            lora_alpha=lora_config.lora_alpha,
+            target_modules=list(lora_config.target_modules),
+            lora_dropout=0,                             # required by unsloth
+            bias="none",
+            use_gradient_checkpointing="unsloth",       # long-context optimised
+            random_state=42,
+        )
+    finally:
+        if _needs_patch:
+            LoraConfig.__init__ = _orig_lora_init
+
     model.print_trainable_parameters()
     return model
 
@@ -229,6 +286,8 @@ def prepare_unsloth_lora_model(
 def load_unsloth_model_from_adapter(
     adapter_path: str,
     max_seq_length: int = 8192,
+    fast_inference: bool = False,
+    device_map: str | dict | None = None,
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     """
     Load a previously saved LoRA adapter on top of an unsloth-optimised
@@ -245,6 +304,10 @@ def load_unsloth_model_from_adapter(
         weight files.
     max_seq_length : int
         Maximum sequence length (default 8192).
+    fast_inference : bool
+        See :func:`load_unsloth_model`.  Default: *False*.
+    device_map : str | dict | None
+        See :func:`load_unsloth_model`.  Default: *None*.
 
     Returns
     -------
@@ -263,12 +326,16 @@ def load_unsloth_model_from_adapter(
         )
 
     print(f"[Unsloth] Loading base model: {base_model_name}")
-    model, tokenizer = _FastLM.from_pretrained(
+    kwargs = dict(
         model_name=base_model_name,
         max_seq_length=max_seq_length,
         dtype=None,
         load_in_4bit=True,
+        fast_inference=fast_inference,
     )
+    if device_map is not None:
+        kwargs["device_map"] = device_map
+    model, tokenizer = _FastLM.from_pretrained(**kwargs)
 
     if not tokenizer.eos_token:
         tokenizer.add_special_tokens({"eos_token": "</s>"})

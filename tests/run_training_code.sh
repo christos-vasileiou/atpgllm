@@ -1,62 +1,72 @@
 #!/bin/bash
-#SBATCH --job-name=training        # Job name
+#SBATCH --job-name=sft_vllm        # Job name
 #SBATCH --output=jobs/training_%j.out   # Standard output file (%j will be replaced with job ID)
 #SBATCH --error=jobs/training_%j.err    # Standard error file
 #SBATCH --nodes=1                       # Request 1 node
 #SBATCH --ntasks=1                      # Run a single task
 #SBATCH --cpus-per-task=16              # Request 16 CPUs per task
+#SBATCH --time=24:00:00                 # Request 1 day
 #SBATCH --mem=128G
 #SBATCH --partition=h100
-#SBATCH --gres=gpu:nvidia_h100_nvl:2
+#SBATCH --gres=gpu:4
+#SBATCH --reservation=LLM
+
+set -eo pipefail
+
+# activate virtual environment (activate is alias)
+source /home/cxv200006/work/myenv/bin/activate
+echo "Python Path: $(which python)"
 
 start_time=$(date +%s)
 # =============================================================================
 # Debugging Information
 # =============================================================================
-echo "=============================================="
-echo "Job Information"
-echo "=============================================="
-echo "Job ID: $SLURM_JOB_ID"
-echo "Job Name: $SLURM_JOB_NAME"
-echo "Node: $(hostname)"
-echo "GRES: ${SLURM_GRES:-'(not set)'}"
-echo "Node: $(hostname)"
-echo "Date: $(date)"
-echo "Working Directory: $(pwd)"
-echo ""
 
-echo "=============================================="
-echo "System Information"
-echo "=============================================="
-echo "Python Version: $(python --version 2>&1)"
-echo "PyTorch Version: $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'Not available')"
-echo "CUDA Available: $(python -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo 'Not available')"
-echo "CUDA Version: $(python -c 'import torch; print(torch.version.cuda)' 2>/dev/null || echo 'Not available')"
-echo ""
 
-echo "=============================================="
-echo "ML Library Versions"
-echo "=============================================="
-echo "Transformers Version: $(python -c 'import transformers; print(transformers.__version__)' 2>/dev/null || echo 'Not available')"
-echo "TRL Version: $(python -c 'import trl; print(trl.__version__)' 2>/dev/null || echo 'Not available')"
-echo "PEFT Version: $(python -c 'import peft; print(peft.__version__)' 2>/dev/null || echo 'Not available')"
-echo ""
+# echo "=============================================="
+# echo "Job Information"
+# echo "=============================================="
+# echo "Job ID: $SLURM_JOB_ID"
+# echo "Job Name: $SLURM_JOB_NAME"
+# echo "Node: $(hostname)"
+# echo "GRES: ${SLURM_GRES:-'(not set)'}"
+# echo "Date: $(date)"
+# echo "Working Directory: $(pwd)"
+# echo ""
 
-echo "=============================================="
-echo "GPU Information"
-echo "=============================================="
-nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version --format=csv 2>/dev/null || echo "nvidia-smi not available"
-echo ""
+# echo "=============================================="
+# echo "System Information"
+# echo "=============================================="
+# echo "Python Version: $(python --version 2>&1)"
+# echo "PyTorch Version: $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'Not available')"
+# echo "CUDA Available: $(python -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo 'Not available')"
+# echo "CUDA Version: $(python -c 'import torch; print(torch.version.cuda)' 2>/dev/null || echo 'Not available')"
+# echo ""
 
-echo "=============================================="
-echo "SLURM Environment"
-echo "=============================================="
-echo "SLURM_NTASKS: $SLURM_NTASKS"
-echo "SLURM_CPUS_PER_TASK: $SLURM_CPUS_PER_TASK"
-echo "SLURM_MEM_PER_NODE: $SLURM_MEM_PER_NODE"
-echo "SLURM_GPUS: $SLURM_GPUS"
-echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-'(not set)'}"
-echo ""
+# echo "=============================================="
+# echo "ML Library Versions"
+# echo "=============================================="
+# echo "Transformers Version: $(python -c 'import transformers; print(transformers.__version__)' 2>/dev/null || echo 'Not available')"
+# echo "TRL Version: $(python -c 'import trl; print(trl.__version__)' 2>/dev/null || echo 'Not available')"
+# echo "PEFT Version: $(python -c 'import peft; print(peft.__version__)' 2>/dev/null || echo 'Not available')"
+# echo ""
+
+# echo "=============================================="
+# echo "GPU Information"
+# echo "=============================================="
+# nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version --format=csv 2>/dev/null || echo "nvidia-smi not available"
+# echo ""
+
+# echo "=============================================="
+# echo "SLURM Environment"
+# echo "=============================================="
+# echo "SLURM_NTASKS: $SLURM_NTASKS"
+# echo "SLURM_CPUS_PER_TASK: $SLURM_CPUS_PER_TASK"
+# echo "SLURM_MEM_PER_NODE: $SLURM_MEM_PER_NODE"
+# echo "SLURM_GPUS: $SLURM_GPUS"
+# echo "SLURM_STEP_GPUS: $SLURM_STEP_GPUS"
+# echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-'(not set)'}"
+# echo ""
 
 # =============================================================================
 # Validate Required Environment Variables
@@ -76,9 +86,6 @@ fi
 # Default METHOD to 'sft' if not specified
 METHOD=${METHOD:-sft}
 
-# activate virtual environment (activate is alias)
-activate
-
 # MODEL is required for SFT, optional for GRPO (which can resume from checkpoint)
 if [ -z "$MODEL" ] && [ "$METHOD" != "grpo" ]; then
     echo "ERROR: MODEL environment variable is not set!"
@@ -95,7 +102,18 @@ if [ "$METHOD" == "sft" ]; then
     MAX_STEPS=${MAX_STEPS:-50}
     REPORT_TO=${REPORT_TO:-wandb}
     USE_DUAL_ADAPTER=${USE_DUAL_ADAPTER:-False}
-    USE_VLLM=$(python -c "import vllm" 2>/dev/null && echo True || echo False)
+    # SFT does not need a vLLM engine during the training loop itself.
+    # The SFT stopping callback *can* use vLLM for faster validation,
+    # but on MIG instances (~12 GB) there is not enough VRAM to host
+    # both the training model and a vLLM engine (KV cache = 0 GB).
+    # Default to False; override with USE_VLLM=True for large GPUs.
+    # When USE_VLLM=True, start a persistent vLLM server on a spare GPU
+    # *before* launching training with dynamic LoRA loading enabled:
+    #   VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
+    #       CUDA_VISIBLE_DEVICES=<gpu> vllm serve <model> \
+    #       --enable-lora --max-lora-rank 64 --port 8000
+    USE_VLLM=${USE_VLLM:-False}
+    PORT=${PORT:-8002}
     USE_UNSLOTH=${USE_UNSLOTH:-$(python -c "import unsloth" 2>/dev/null && echo True || echo False)}
     USE_DDP=${USE_DDP:-True}
 elif [ "$METHOD" == "grpo" ]; then
@@ -116,26 +134,81 @@ elif [ "$METHOD" == "grpo" ]; then
     USE_DDP=${USE_DDP:-False}
 fi
 
+
+# =============================================================================
+# GPU Configuration and Setup
+# =============================================================================
+echo "Allocated GPU:"
+echo $CUDA_VISIBLE_DEVICES
+nvidia-smi
+
+IFS=',' read -ra GPU_ARRAY <<< "$CUDA_VISIBLE_DEVICES"
+
+IS_MIG=false
+NUM_GPUS=${#GPU_ARRAY[@]}
+ORIGINAL_CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"
+
+# Determine number of GPUs from CUDA_VISIBLE_DEVICES
+if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+    # Check if any token starts with "MIG-" or "GPU-"
+    if echo "$CUDA_VISIBLE_DEVICES" | grep -qE '(MIG-|GPU-)'; then
+        IS_MIG=true
+        NUM_MIGS=$(nvidia-smi -L | grep -c 'MIG')
+
+        # -----------------------------------------------------------------
+        # NCCL identifies GPUs by PCI Bus ID.  MIG instances on the SAME
+        # physical GPU share one Bus ID, so NCCL rejects them as
+        #   "Duplicate GPU detected: rank X and rank Y both on CUDA device …"
+        #
+        # Workaround: keep only ONE MIG UUID per physical GPU.
+        # We parse `nvidia-smi -L` to group MIG UUIDs under their parent
+        # GPU and pick the first allocated instance from each.
+        # -----------------------------------------------------------------
+        SELECTED_MIGS=$(
+            nvidia-smi -L | awk -v allocated="$CUDA_VISIBLE_DEVICES" '
+            BEGIN {
+                split(allocated, a, ",")
+                for (i in a) wanted[a[i]] = 1
+                gpu = -1
+            }
+            /^GPU / { gpu++ }
+            /MIG-/ {
+                match($0, /(MIG-[a-f0-9-]+)/, m)
+                if (m[1] in wanted && !(gpu in seen)) {
+                    print m[1]
+                    seen[gpu] = 1
+                }
+            }
+            ' | paste -sd, -
+        )
+
+        if [ -n "$SELECTED_MIGS" ]; then
+            export CUDA_VISIBLE_DEVICES="$SELECTED_MIGS"
+        fi
+        NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+
+        echo ""
+        echo "=============================================="
+        echo "MIG (Multi-Instance GPU) Detected"
+        echo "=============================================="
+        echo "Total MIG instances (allocated): $NUM_MIGS"
+        echo "DDP processes (1 per physical GPU): $NUM_GPUS"
+        echo "Selected UUIDs: $CUDA_VISIBLE_DEVICES"
+        echo "=============================================="
+    fi
+fi
+# export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
+# export CUDA_VISIBLE_DEVICES="0,1,2,3"
+export CUDA_LAUNCH_BLOCKING=1
+echo ""
 echo "=============================================="
-echo "Command Arguments"
+echo "GPU Setup Summary"
 echo "=============================================="
-echo "METHOD: $METHOD"
-echo "MODEL: $MODEL"
-echo "TRAIN_DATASET: $TRAIN_DATASET"
-echo "OUTPUT_DIR: $OUTPUT_DIR"
-echo "RESUME_FROM: $RESUME_FROM"
-echo "BUFFER_SIZE: $BUFFER_SIZE"
-echo "PER_DEVICE_TRAIN_BATCH_SIZE: $PER_DEVICE_TRAIN_BATCH_SIZE"
-echo "GRADIENT_ACCUMULATION_STEPS: $GRADIENT_ACCUMULATION_STEPS"
-echo "MAX_STEPS: $MAX_STEPS"
-echo "REPORT_TO: $REPORT_TO"
-echo "NUM_GENERATIONS: $NUM_GENERATIONS"
-echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION"
-echo "USE_DUAL_ADAPTER: $USE_DUAL_ADAPTER"
-echo "USE_VLLM: $USE_VLLM"
-echo "USE_UNSLOTH: $USE_UNSLOTH"
-echo "USE_DDP: $USE_DDP"
+echo "IS_MIG: $IS_MIG"
+echo "NUM_GPUS: $NUM_GPUS"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-'(not set)'}"
 echo "=============================================="
+
 
 # =============================================================================
 # Build Command Arguments
@@ -144,8 +217,11 @@ build_cmd_args() {
     CMD_ARGS=(--method "$METHOD")
 
     # Add --model_name only if it's set and not "None"
-    if [ -n "$MODEL" ] && [ "$MODEL" != "None" ]; then
-        CMD_ARGS+=(--model_name "$MODEL")
+    if [ -n "$MODEL" ]; then
+        echo "MODEL: $MODEL"
+        if [ "$MODEL" != "None" ]; then
+            CMD_ARGS+=(--model_name "$MODEL")
+        fi
     fi
 
     CMD_ARGS+=(
@@ -157,8 +233,18 @@ build_cmd_args() {
         --report_to "$REPORT_TO"
     )
 
-    if [ -n "$USE_VLLM" ] && [ "$USE_VLLM" == "True" ]; then
-        CMD_ARGS+=(--use_vllm)
+    if [ -n "$USE_VLLM" ]; then 
+        if [ "$USE_VLLM" == "True" ]; then
+            CMD_ARGS+=(--use_vllm)
+            if [ "$METHOD" == "sft" ]; then
+                PORT=8002
+                CMD_ARGS+=(--vllm_server_url "http://localhost:$PORT")
+                VLLM_GPU=${GPU_ARRAY[-1]}
+                if [ "$USE_DDP" == "True" ]; then
+                    CMD_ARGS+=("--use_ddp")                
+                fi
+            fi
+        fi
     fi
 
     if [ -n "$USE_UNSLOTH" ] && [ "$USE_UNSLOTH" == "True" ]; then
@@ -181,32 +267,104 @@ build_cmd_args() {
         if [ -n "$USE_DUAL_ADAPTER" ] && [ "$USE_DUAL_ADAPTER" == "True" ]; then
             CMD_ARGS+=(--use_dual_adapter)
         fi
-    elif [ "$METHOD" == "sft" ] && [ "$USE_DDP" == "True" ]; then
-        CMD_ARGS+=(--use_ddp)
     fi
+    echo "=============================================="
+    echo "Command Arguments"
+    echo "=============================================="
+    echo "METHOD: $METHOD"
+    echo "MODEL: $MODEL"
+    echo "TRAIN_DATASET: $TRAIN_DATASET"
+    echo "OUTPUT_DIR: $OUTPUT_DIR"
+    echo "PER_DEVICE_TRAIN_BATCH_SIZE: $PER_DEVICE_TRAIN_BATCH_SIZE"
+    echo "GRADIENT_ACCUMULATION_STEPS: $GRADIENT_ACCUMULATION_STEPS"
+    echo "MAX_STEPS: $MAX_STEPS"
+    echo "REPORT_TO: $REPORT_TO"
+    echo "USE_VLLM: $USE_VLLM"
+    echo "PORT: $PORT (http://localhost:$PORT, otherwise no vLLM server needed)"
+    echo "*VLLM_GPU: $VLLM_GPU (is set automatically if USE_DDP is True)"
+    echo "USE_DUAL_ADAPTER: $USE_DUAL_ADAPTER"
+    echo "USE_UNSLOTH: $USE_UNSLOTH"
+    echo "USE_DDP: $USE_DDP (set only if SFT method)"
+    echo "BUFFER_SIZE: $BUFFER_SIZE (set only if GRPO method)"
+    echo "NUM_GENERATIONS: $NUM_GENERATIONS (set only if GRPO method)"
+    echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION (set only if GRPO method)"
+    echo "=============================================="
+    echo "CMD_ARGS: ${CMD_ARGS[*]}"
+    echo "=============================================="
 }
 
 build_cmd_args
 
 export CMD_ARGS
 
-echo "Allocated GPU:"
-echo $CUDA_VISIBLE_DEVICES
-nvidia-smi
+VLLM_PID=""
+
+find_vllm_pid_for_port() {
+    local port="$1"
+    # Prefer lsof if available (most precise for port ownership).
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -t -i :"$port" -sTCP:LISTEN 2>/dev/null | head -n1
+    # Fallback to ss if lsof is missing.
+    elif command -v ss >/dev/null 2>&1; then
+        ss -ltnp "sport = :$port" 2>/dev/null | awk 'NR>1 {gsub(/pid=/,"",$NF); split($NF,a,","); print a[1]; exit}'
+    # Last resort: any vllm serve process (not port-specific).
+    elif command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "vllm serve" | head -n1
+    fi
+}
+
+# Always try to shut down the vLLM server on exit (including OOM, Ctrl-C, etc.).
+cleanup() {
+    if [ -n "$VLLM_PID" ]; then
+        echo "Stopping vLLM server (PID: $VLLM_PID)..."
+        if kill -0 "$VLLM_PID" 2>/dev/null; then
+            kill "$VLLM_PID" 2>/dev/null || true
+            wait "$VLLM_PID" 2>/dev/null || true
+        fi
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
+# Run the training script — DDP via accelerate or single-process
+if [ "$USE_VLLM" == "True" ] && [ "$METHOD" == "sft" ]; then
+    # If a vLLM server is already up on this port, reuse it instead of starting a new one.
+    if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
+        echo "Detected existing vLLM server on port $PORT, reusing it."
+        VLLM_PID="$(find_vllm_pid_for_port "$PORT")"
+        if [ -n "$VLLM_PID" ]; then
+            echo "Mapped existing vLLM server PID: $VLLM_PID"
+        else
+            echo "Warning: Could not determine PID for existing vLLM server on port $PORT."
+        fi
+    else
+        echo "Running: VLLM_ALLOW_RUNTIME_LORA_UPDATING=True CUDA_VISIBLE_DEVICES=$VLLM_GPU vllm serve $MODEL --enable-lora --max-lora-rank 64 --port $PORT --gpu-memory-utilization 0.8 --max-model-len 32768"
+        VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
+        CUDA_VISIBLE_DEVICES=$VLLM_GPU \
+        vllm serve $MODEL \
+            --enable-lora \
+            --max-lora-rank 64 \
+            --port $PORT \
+            --gpu-memory-utilization 0.8 \
+            --max-model-len 32768 &
+        VLLM_PID=$!
+        echo "Waiting for vLLM server to become ready..."
+
+        until curl -s "http://localhost:$PORT/health" > /dev/null; do
+            sleep 2
+        done
+
+        echo "vLLM server is ready on port $PORT."
+    fi
+
+    export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${GPU_ARRAY[*]:0:$VLLM_GPU}")"
+fi
 
 echo "=============================================="
 echo "Starting Training"
 echo "=============================================="
 
-# Run the training script — DDP via accelerate or single-process
-if [ "$USE_DDP" == "True" && "$METHOD" == "sft" ]; then
-    # Determine number of GPUs from CUDA_VISIBLE_DEVICES or default to 2
-    if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
-        NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
-    else
-        NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
-        NUM_GPUS=${NUM_GPUS:-2}
-    fi
+if [ "$USE_DDP" == "True" ]; then
     echo "Command: accelerate launch --multi_gpu --num_processes $NUM_GPUS --mixed_precision bf16 training_code.py ${CMD_ARGS[*]}"
     echo ""
     accelerate launch \

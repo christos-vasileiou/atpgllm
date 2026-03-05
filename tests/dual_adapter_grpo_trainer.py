@@ -64,7 +64,7 @@ from peft.tuners.lora import LoraLayer
 from trl import GRPOTrainer, GRPOConfig
 from accelerate.utils import gather
 import copy
-from tools import TOOLS
+from tools import TOOLS, ToolHelper
 from revert_template import revert_qwen2_5_template
 
 # Adapter name constants
@@ -95,7 +95,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         policy_lora_config: Optional[LoraConfig] = None,
         ref_adapter_name: str = None,
         tools: list[Callable] | None = None,
-        tool_functions: list = None,
+        tool_functions: dict = None,
         **kwargs,
     ):
         """
@@ -112,6 +112,8 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         ref_adapter_name : str, optional
             Name of the existing SFT adapter. If None, will use the active adapter
             name or default to "default".
+        tool_functions: dict, optional
+            Dictionary of tool functions to use for the tool calling. Key is the tool name, value is the tool function.
         **kwargs
             Additional arguments passed to GRPOTrainer.
         """
@@ -187,7 +189,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         
         # Initialize tools and tool functions
         self.tools = tools
-        self.tool_functions = {tool_function.__name__: tool_function for tool_function in tool_functions} or {}
+        self.tool_functions = tool_functions
         # Override ref_model - we use adapter switching instead
         self.ref_model = None
         
@@ -295,8 +297,15 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         input_ids,
         attention_mask,
         logits_to_keep,
-        **forward_kwargs,
-    ):
+        batch_size=None,
+        compute_entropy=False,
+        pixel_values=None,
+        image_grid_thw=None,
+        num_images=None,
+        pixel_attention_mask=None,
+        image_sizes=None,
+        token_type_ids=None,
+        ):
         """
         Get per-token log probabilities and entropies.
         
@@ -305,7 +314,18 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         """
         # Call parent implementation - the adapter context is set externally
         return super()._get_per_token_logps_and_entropies(
-            model, input_ids, attention_mask, logits_to_keep, **forward_kwargs
+            model=model, 
+            input_ids=input_ids, 
+            attention_mask=attention_mask, 
+            logits_to_keep=logits_to_keep, 
+            batch_size=batch_size, 
+            compute_entropy=compute_entropy, 
+            pixel_values=pixel_values, 
+            image_grid_thw=image_grid_thw, 
+            num_images=num_images, 
+            pixel_attention_mask=pixel_attention_mask, 
+            image_sizes=image_sizes, 
+            token_type_ids=token_type_ids
         )
     
     def _compute_reference_logps(
@@ -689,13 +709,14 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     conv.append({"role": "assistant", "content": completions[idx]})
                 
                 prompt_completion_tools.append(conv)
-            
+
             # Execute tools and append results to conversations
             for i, idx in enumerate(idxs_with_tool):
                 tool_call = tool_calls[i]
                 tool_name = tool_call.get("name")
                 tool_args = tool_call.get("arguments", {})
-                
+                tool_args["netlist"] = ToolHelper.get_netlist(prompts[idx][1]["content"])
+
                 if tool_name in self.tool_functions:
                     tool_call_count += 1
                     try:
