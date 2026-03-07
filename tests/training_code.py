@@ -334,10 +334,10 @@ def train_with_sft(
         learning_rate=2e-4,
         lr_scheduler_type="cosine",
         max_steps=max_steps,
-        logging_steps=10,
+        logging_steps=5,
         save_steps=10,
-        gradient_checkpointing=True,
         ddp_find_unused_parameters=False if use_ddp else None,
+        gradient_checkpointing=True,
         # DDP + gradient checkpointing + LoRA requires non-reentrant
         # checkpointing to avoid "parameter marked ready twice" errors.
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -368,8 +368,9 @@ def train_with_sft(
             diversity_num_generations=10,
             use_vllm=use_vllm,
             vllm_server_url=vllm_server_url,
-            max_new_tokens=32768 if use_vllm else 8192,
-            min_steps=100,
+            max_new_tokens=8192,
+            vllm_max_context=32768,
+            min_steps=50,
             patience=1,
             temperature=0.7,
             generation_batch_size=50 if use_vllm else 8,
@@ -399,6 +400,7 @@ def train_with_grpo(
     report_to: str = "wandb",
     use_vllm: bool = False,
     vllm_mode: Optional[Literal["colocate", "server"]] = None,
+    vllm_server_url: str = None,
     num_generations: int = 8,
     steps_per_generation: int = 1,
     use_dual_adapter: bool = True,
@@ -426,6 +428,15 @@ def train_with_grpo(
     buffer_size : int
         Maximum examples to buffer from the streaming dataset into
         memory.  ``GRPOTrainer`` doesn't support streaming datasets.
+    per_device_train_batch_size : int
+    gradient_accumulation_steps : int
+    max_steps : int
+    report_to : str
+    use_vllm : bool
+    vllm_mode : Optional[Literal["colocate", "server"]]
+    vllm_server_url : str
+    num_generations : int
+    steps_per_generation : int
     use_dual_adapter : bool
         If *True* (default), uses ``DualAdapterGRPOTrainer`` which keeps
         the SFT adapter isolated and avoids ``merge_and_unload``.
@@ -536,19 +547,22 @@ def train_with_grpo(
         logging_steps=10,
         save_steps=10,
         bf16=True,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to=report_to,
         # GRPO-specific options
         loss_type="dapo", # "grpo", "dr_grpo", "dapo", "bnpo", "cispo", default is "dapo"
-        max_completion_length=tokenizer.model_max_length,
+        max_completion_length=16384,
         num_generations=max(num_generations, 2),
         steps_per_generation=steps_per_generation,
         use_vllm=use_vllm,
         vllm_mode=vllm_mode,
+        vllm_server_base_url=vllm_server_url,
     )
 
     shared_callbacks = [
         ThroughputMetricsCallback(),
-        ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id),
+        ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
     ]
 
     if use_dual_adapter:
@@ -623,7 +637,7 @@ def _use_unsloth():
     return os.environ.get('USE_UNSLOTH', '0').lower() in ('1', 'true', 'yes')
 
 def _vllm_mode():
-    return os.environ.get('VLLM_MODE', "colocate")
+    return os.environ.get('VLLM_MODE', "server")
 
 
 def main() -> None:

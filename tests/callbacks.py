@@ -238,24 +238,7 @@ class ContextLengthHistogramCallback(TrainerCallback):
             args.output_dir, f"checkpoint-{state.global_step}"
         )
         os.makedirs(checkpoint_dir, exist_ok=True)
-        self._inject_context_length(checkpoint_dir)
         self._save_histogram(checkpoint_dir, state.global_step)
-
-    def _inject_context_length(self, checkpoint_dir: str) -> None:
-        adapter_config_path = os.path.join(checkpoint_dir, "adapter_config.json")
-        if os.path.exists(adapter_config_path):
-            import json
-            with open(adapter_config_path, "r") as f:
-                adapter_config = json.load(f)
-
-            # Inject context length to prevent vLLM from defaulting to 0
-            adapter_config["max_model_length"] = 32768#self.tokenizer.model_max_length
-            adapter_config["max_position_embeddings"] = 32768#len(self.tokenizer)
-
-            with open(adapter_config_path, "w") as f:
-                json.dump(adapter_config, f, indent=2)
-            print(f"[ContextLengthHistogram] Injected context length {self.tokenizer.model_max_length} into adapter config")
-            print(f"[ContextLengthHistogram] Injected max position embeddings {len(self.tokenizer)} into adapter config")
 
     def _save_histogram(self, directory: str, step: int) -> None:
         lengths = np.array(self.context_lengths)
@@ -421,6 +404,9 @@ class SFTStoppingCallback(TrainerCallback):
         reducing wall-clock time by ~7× compared to sequential generation.
         Increase on high-VRAM GPUs (e.g. H100 80 GB) or decrease if you
         see OOM during evaluation.
+    vllm_max_context : int
+        vLLM server's max_model_len (default 32768). Used to cap max_tokens
+        per request so input_tokens + max_tokens <= vllm_max_context.
     """
 
     def __init__(
@@ -443,6 +429,7 @@ class SFTStoppingCallback(TrainerCallback):
         loss_window: int = 10,
         eval_every_n_saves: int = 1,
         generation_batch_size: int = 8,
+        vllm_max_context: int = 32768,
     ):
         self.tokenizer = tokenizer
         self.dataset_path = dataset_path
@@ -464,6 +451,7 @@ class SFTStoppingCallback(TrainerCallback):
         self.loss_window = loss_window
         self.eval_every_n_saves = eval_every_n_saves
         self._generation_batch_size = generation_batch_size
+        self.vllm_max_context = vllm_max_context
 
         # Lazy-loaded eval dataset
         self._eval_dataset = None
@@ -1080,8 +1068,7 @@ class SFTStoppingCallback(TrainerCallback):
             )
             return self._generate_hf(model, prompts, num_return_sequences)
 
-        adapter_name = "default"
-
+        adapter_name = "sft_eval"
         # ==============================================================
         # TURN 1: think + tool_call
         # ==============================================================
@@ -1195,12 +1182,25 @@ class SFTStoppingCallback(TrainerCallback):
         n: int,
         max_tokens: int,
     ) -> tuple[List[str], List[int]]:
-        """Send prompts to the vLLM ``/v1/completions`` endpoint."""
+        """Send prompts to the vLLM ``/v1/completions`` endpoint.
+
+        Uses ``max_tokens`` (OpenAI-compatible) to control output length.
+        Caps max_tokens so input_tokens + max_tokens <= vllm_max_context
+        (avoids CUDA out-of-bounds when exceeding model's max_position_embeddings).
+        """
         import requests as http_requests
+
+        # Cap max_tokens so we never exceed vllm_max_context (e.g. 32768 for Qwen2.5)
+        max_input_len = max(
+            len(self.tokenizer.encode(p, add_special_tokens=True)) for p in prompts
+        )
+        effective_max_tokens = min(max_tokens, self.vllm_max_context - max_input_len)
+        effective_max_tokens = max(1, effective_max_tokens)  # ensure at least 1
+
         json_data = {
-            "model": self.tokenizer.name_or_path,
+            "model": adapter_name,
             "prompt": prompts,
-            "max_tokens": max_tokens,
+            "max_tokens": effective_max_tokens,
             "temperature": self.temperature,
             "top_p": 0.9,
             "n": n,

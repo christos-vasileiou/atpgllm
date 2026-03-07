@@ -5,16 +5,14 @@
 #SBATCH --nodes=1                       # Request 1 node
 #SBATCH --ntasks=1                      # Run a single task
 #SBATCH --cpus-per-task=16              # Request 16 CPUs per task
-#SBATCH --time=24:00:00                 # Request 1 day
+#SBATCH --time=1-07:30:00
 #SBATCH --mem=128G
 #SBATCH --partition=h100
 #SBATCH --gres=gpu:4
 #SBATCH --reservation=LLM
 
-set -eo pipefail
-
 # activate virtual environment (activate is alias)
-source /home/cxv200006/work/myenv/bin/activate
+source /work/cxv200006/myenv/bin/activate
 echo "Python Path: $(which python)"
 
 start_time=$(date +%s)
@@ -113,6 +111,7 @@ if [ "$METHOD" == "sft" ]; then
     #       CUDA_VISIBLE_DEVICES=<gpu> vllm serve <model> \
     #       --enable-lora --max-lora-rank 64 --port 8000
     USE_VLLM=${USE_VLLM:-False}
+    VLLM_MODE=${VLLM_MODE:-server}
     PORT=${PORT:-8002}
     USE_UNSLOTH=${USE_UNSLOTH:-$(python -c "import unsloth" 2>/dev/null && echo True || echo False)}
     USE_DDP=${USE_DDP:-True}
@@ -129,11 +128,12 @@ elif [ "$METHOD" == "grpo" ]; then
     NUM_GENERATIONS=${NUM_GENERATIONS:-8}
     STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-4}
     USE_DUAL_ADAPTER=${USE_DUAL_ADAPTER:-True}
-    USE_VLLM=$(python -c "import vllm" 2>/dev/null && echo True || echo False)
-    USE_UNSLOTH=${USE_UNSLOTH:-$(python -c "import unsloth" 2>/dev/null && echo True || echo False)}
+    USE_VLLM=${USE_VLLM:-False}
+    VLLM_MODE=${VLLM_MODE:-server}
+    PORT=${PORT:-8002}
+    USE_UNSLOTH=${USE_UNSLOTH:-False}
     USE_DDP=${USE_DDP:-False}
 fi
-
 
 # =============================================================================
 # GPU Configuration and Setup
@@ -141,6 +141,14 @@ fi
 echo "Allocated GPU:"
 echo $CUDA_VISIBLE_DEVICES
 nvidia-smi
+
+# When CUDA_VISIBLE_DEVICES is not set, auto-detect all available GPUs
+if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+    _detected=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ')
+    if [ "$_detected" -gt 0 ]; then
+        export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((_detected - 1)))
+    fi
+fi
 
 IFS=',' read -ra GPU_ARRAY <<< "$CUDA_VISIBLE_DEVICES"
 
@@ -197,8 +205,21 @@ if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
         echo "=============================================="
     fi
 fi
-# export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
-# export CUDA_VISIBLE_DEVICES="0,1,2,3"
+
+# Check if the number of GPUs is sufficient for the vLLM server mode
+if [ $NUM_GPUS -lt 2 ] && [ "$USE_VLLM" == "True" ] && [ "$VLLM_MODE" == "server" ]; then
+    echo "WARNING: $METHOD server mode requires at least 2 GPUs (1 for vLLM, 1 for training)."
+    echo "Available GPUs: ${#GPU_ARRAY[@]}"
+    echo "Falling back to colocate mode."
+    VLLM_MODE="colocate"
+    for i in "${!CMD_ARGS[@]}"; do
+        if [[ "${CMD_ARGS[$i]}" == "--vllm_mode" ]]; then
+            CMD_ARGS[$((i+1))]="colocate"
+            break
+        fi
+    done
+fi
+
 export CUDA_LAUNCH_BLOCKING=1
 echo ""
 echo "=============================================="
@@ -208,7 +229,6 @@ echo "IS_MIG: $IS_MIG"
 echo "NUM_GPUS: $NUM_GPUS"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-'(not set)'}"
 echo "=============================================="
-
 
 # =============================================================================
 # Build Command Arguments
@@ -237,11 +257,20 @@ build_cmd_args() {
         if [ "$USE_VLLM" == "True" ]; then
             CMD_ARGS+=(--use_vllm)
             if [ "$METHOD" == "sft" ]; then
-                PORT=8002
+                PORT=$PORT
                 CMD_ARGS+=(--vllm_server_url "http://localhost:$PORT")
-                VLLM_GPU=${GPU_ARRAY[-1]}
+                if [ "$VLLM_MODE" == "server" ]; then
+                    VLLM_GPU=${GPU_ARRAY[-1]}
+                fi
                 if [ "$USE_DDP" == "True" ]; then
                     CMD_ARGS+=("--use_ddp")                
+                fi
+            elif [ "$METHOD" == "grpo" ]; then
+                PORT=$PORT
+                CMD_ARGS+=(--vllm_server_url "http://localhost:$PORT")
+                CMD_ARGS+=(--vllm_mode "$VLLM_MODE")
+                if [ "$VLLM_MODE" == "server" ]; then
+                    VLLM_GPU=${GPU_ARRAY[-1]}
                 fi
             fi
         fi
@@ -280,8 +309,9 @@ build_cmd_args() {
     echo "MAX_STEPS: $MAX_STEPS"
     echo "REPORT_TO: $REPORT_TO"
     echo "USE_VLLM: $USE_VLLM"
+    echo "VLLM_MODE: ${VLLM_MODE:-(n/a)} (set only if GRPO method)"
     echo "PORT: $PORT (http://localhost:$PORT, otherwise no vLLM server needed)"
-    echo "*VLLM_GPU: $VLLM_GPU (is set automatically if USE_DDP is True)"
+    echo "*VLLM_GPU: $VLLM_GPU (is set automatically when vLLM server mode is used)"
     echo "USE_DUAL_ADAPTER: $USE_DUAL_ADAPTER"
     echo "USE_UNSLOTH: $USE_UNSLOTH"
     echo "USE_DDP: $USE_DDP (set only if SFT method)"
@@ -294,7 +324,6 @@ build_cmd_args() {
 }
 
 build_cmd_args
-
 export CMD_ARGS
 
 VLLM_PID=""
@@ -327,8 +356,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Run the training script — DDP via accelerate or single-process
-if [ "$USE_VLLM" == "True" ] && [ "$METHOD" == "sft" ]; then
-    # If a vLLM server is already up on this port, reuse it instead of starting a new one.
+if [ "$USE_VLLM" == "True" ] && [ "$VLLM_MODE" == "server" ]; then
+    # If a vLLM server is already up on this port, reuse it.
     if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
         echo "Detected existing vLLM server on port $PORT, reusing it."
         VLLM_PID="$(find_vllm_pid_for_port "$PORT")"
@@ -338,23 +367,69 @@ if [ "$USE_VLLM" == "True" ] && [ "$METHOD" == "sft" ]; then
             echo "Warning: Could not determine PID for existing vLLM server on port $PORT."
         fi
     else
-        echo "Running: VLLM_ALLOW_RUNTIME_LORA_UPDATING=True CUDA_VISIBLE_DEVICES=$VLLM_GPU vllm serve $MODEL --enable-lora --max-lora-rank 64 --port $PORT --gpu-memory-utilization 0.8 --max-model-len 32768"
-        VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
-        CUDA_VISIBLE_DEVICES=$VLLM_GPU \
-        vllm serve $MODEL \
-            --enable-lora \
-            --max-lora-rank 64 \
-            --port $PORT \
-            --gpu-memory-utilization 0.8 \
-            --max-model-len 32768 &
-        VLLM_PID=$!
-        echo "Waiting for vLLM server to become ready..."
+        echo ""
+        echo "=============================================="
+        echo "$METHOD vLLM Server Setup"
+        echo "=============================================="
+        echo "vLLM server GPU: ${VLLM_GPU} (last GPU)"
+        echo "Starting vLLM server on GPU $VLLM_GPU (port $PORT)..."
+        VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}
+        
+        if [ "$METHOD" == "sft" ]; then
+            # SFT uses the standard `vllm serve` (OpenAI-compatible API) for
+            # inference-only validation via the SFTStoppingCallback.
+            # max-model-len: Qwen2.5 has max_position_embeddings=32768. Do NOT exceed 32768 or CUDA out-of-bounds will occur.
+            echo "Running: VLLM_ALLOW_RUNTIME_LORA_UPDATING=True CUDA_VISIBLE_DEVICES=$VLLM_GPU vllm serve $MODEL --enable-lora --max-lora-rank 64 --port $PORT --gpu-memory-utilization 0.8 --max-model-len $VLLM_MAX_MODEL_LEN &"
+            VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
+            CUDA_VISIBLE_DEVICES=$VLLM_GPU \
+            vllm serve $MODEL \
+                --enable-lora \
+                --max-lora-rank 64 \
+                --port $PORT \
+                --gpu-memory-utilization 0.8 \
+                --max-model-len "$VLLM_MAX_MODEL_LEN" &
+            VLLM_PID=$!
+            echo "Waiting for vLLM server to become ready (PID: $VLLM_PID)..."
+        elif [ "$METHOD" == "grpo" ]; then
+            # GRPO MUST use `trl vllm-serve` (NOT `vllm serve`).
+            # TRL's GRPOTrainer needs custom endpoints (/get_world_size,
+            # /init_communicator, /update_named_param, /reset_prefix_cache)
+            # for weight synchronisation between the trainer and the vLLM
+            # generation server.  The standard `vllm serve` does not expose
+            # these endpoints and will fail with a 404 on /get_world_size.
+            #
+            # Note: `trl vllm-serve` does NOT support --enable-lora /
+            # --max-lora-rank.  Instead, TRL pushes updated weights directly
+            # to vLLM via the NCCL communicator.
+            VLLM_GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.9}
+            echo "Running: CUDA_VISIBLE_DEVICES=$VLLM_GPU trl vllm-serve --model $MODEL --port $PORT --gpu_memory_utilization $VLLM_GPU_MEM_UTIL --max_model_len $VLLM_MAX_MODEL_LEN &"
+            CUDA_VISIBLE_DEVICES=$VLLM_GPU \
+            trl vllm-serve \
+                --model $MODEL \
+                --port $PORT \
+                --gpu_memory_utilization "$VLLM_GPU_MEM_UTIL" \
+                --max_model_len "$VLLM_MAX_MODEL_LEN" &
+            VLLM_PID=$!
+            echo "Waiting for TRL vLLM server to become ready (PID: $VLLM_PID)..."
+        fi
 
-        until curl -s "http://localhost:$PORT/health" > /dev/null; do
+        _vllm_timeout=300
+        _vllm_elapsed=0
+        while ! curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; do
+            if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+                echo "ERROR: TRL vLLM server process died unexpectedly."
+                exit 1
+            fi
+            if [ "$_vllm_elapsed" -ge "$_vllm_timeout" ]; then
+                echo "ERROR: TRL vLLM server did not become ready within ${_vllm_timeout}s."
+                kill "$VLLM_PID" 2>/dev/null || true
+                exit 1
+            fi
             sleep 2
+            _vllm_elapsed=$((_vllm_elapsed + 2))
         done
-
-        echo "vLLM server is ready on port $PORT."
+        echo "$METHOD vLLM server is ready on port $PORT (took ~${_vllm_elapsed}s)."
+        echo "=============================================="
     fi
 
     export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${GPU_ARRAY[*]:0:$VLLM_GPU}")"

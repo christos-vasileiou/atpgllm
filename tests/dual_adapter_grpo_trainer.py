@@ -71,6 +71,17 @@ from revert_template import revert_qwen2_5_template
 REFERENCE_ADAPTER_NAME = "reference"
 POLICY_ADAPTER_NAME = "policy"
 
+from contextlib import nullcontext
+from accelerate.utils import broadcast_object_list, gather, gather_object
+from trl.data_utils import (
+    apply_chat_template,
+    is_conversational,
+    prepare_multimodal_messages_vllm,
+)
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from trl.models import unwrap_model_for_generation
+from vllm import SamplingParams
+from vllm.sampling_params import GuidedDecodingParams
 
 class DualAdapterGRPOTrainer(GRPOTrainer):
     """
@@ -408,6 +419,61 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         finally:
             # Restore original disable_adapter
             model.disable_adapter = original_disable_adapter
+
+    @profiling_decorator
+    def _move_model_to_vllm(self):
+        """
+        Override to properly sync dual-adapter PEFT model weights to vLLM.
+
+        Merges the active (policy) adapter into the base weights, sends only
+        the 2-D weight matrices to vLLM (skipping biases and LoRA params),
+        then unmerges.
+
+        Biases are skipped because LoRA never modifies them -- the vLLM server
+        already holds the correct base-model biases.  Sending them would also
+        trigger shape mismatches in vLLM's packed QKV / row-parallel loaders
+        which expect 2-D weight tensors.
+        """
+        import inspect
+        
+        # We do NOT use self.model.merge_adapter(). 
+        # We will compute the merged weights explicitly in memory.
+        
+        with torch.no_grad():
+            for name, module in self.model.named_modules():
+                # Only target the PEFT LoRA layers
+                if hasattr(module, "lora_A") and hasattr(module, "base_layer"):
+                    base_layer = module.base_layer
+                    
+                    # 1. Dequantize the 4-bit base weight to 16-bit (bfloat16)
+                    if hasattr(base_layer.weight, "quant_state"):
+                        import bitsandbytes as bnb
+                        merged_weight = bnb.functional.dequantize_4bit(
+                            base_layer.weight.data, 
+                            base_layer.weight.quant_state
+                        ).to(torch.bfloat16)
+                    else:
+                        merged_weight = base_layer.weight.data.clone().to(torch.bfloat16)
+                    
+                    # 2. Bake in ALL active adapters dynamically
+                    for adapter_name in module.active_adapters:
+                        if adapter_name in module.lora_A:
+                            lora_A = module.lora_A[adapter_name].weight.to(torch.bfloat16)
+                            lora_B = module.lora_B[adapter_name].weight.to(torch.bfloat16)
+                            scaling = module.scaling[adapter_name]
+                            
+                            merged_weight += (lora_B @ lora_A) * scaling
+                            
+                    # 3. Construct the clean HuggingFace name for vLLM
+                    vllm_name = name.replace("base_model.model.", "") + ".weight"
+                    
+                    # 4. CRITICAL FIX: Route the tensor to the master GPU (cuda:0) 
+                    # before passing it to the vllm_client's NCCL communicator.
+                    merged_weight = merged_weight.to("cuda:0")
+                    
+                    # 5. Send to vLLM
+                    if hasattr(self, "vllm_client") and self.vllm_client is not None:
+                        self.vllm_client.update_named_param(vllm_name, merged_weight)
     
     def save_model(self, output_dir: str = None, **kwargs):
         """
@@ -680,12 +746,12 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         # Get max model length for truncation
         if self.use_vllm and self.vllm_mode == "colocate":
             max_model_len = getattr(self.llm.llm_engine.model_config, 'max_model_len', 4096)
-        elif not self.use_vllm:
-            max_model_len = getattr(self.model.config, 'max_position_embeddings', 4096)
         else:
-            raise NotImplementedError(
-                f"Unsupported mode detected: use_vllm={self.use_vllm}, vllm_mode={self.vllm_mode}"
-            )
+            max_model_len = getattr(self.model.config, 'max_position_embeddings', 4096)
+        # else:
+        #     raise NotImplementedError(
+        #         f"Unsupported mode detected: use_vllm={self.use_vllm}, vllm_mode={self.vllm_mode}"
+        #     )
         
         while idxs_with_tool:
             # Build conversations with tool calls for samples that need tool execution
@@ -771,14 +837,18 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     # Truncate to max_completion_length
                     ct = pct_ids[i][prompt_length : prompt_length + self.max_completion_length]
                     completion_ids[idx] = ct
-                    # Extend tool_mask for the truncated portion
+                    # Keep tool_mask aligned with completion_ids (CRITICAL: both must have same length)
                     current_mask_len = len(tool_mask[idx])
                     if len(ct) > current_mask_len:
                         tool_mask[idx] += [0] * (len(ct) - current_mask_len)  # Tool result tokens = 0
+                    elif len(ct) < current_mask_len:
+                        tool_mask[idx] = tool_mask[idx][: len(ct)]  # Truncate to match
                     if logprobs is not None:
                         current_logprobs_len = len(logprobs[idx])
                         if len(ct) > current_logprobs_len:
                             logprobs[idx] += [0.0] * (len(ct) - current_logprobs_len)
+                        elif len(ct) < current_logprobs_len:
+                            logprobs[idx] = logprobs[idx][: len(ct)]
             
             # Keep only non-overlong items for further processing
             surviving_indices = [i for i, o in enumerate(overlong) if not o]
@@ -890,7 +960,24 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             self._metrics[mode]["tools/failure_rate"].append(
                 tool_failure_count / tool_call_count if tool_call_count > 0 else 0.0
             )
-        
+
+        # Ensure tool_mask, logprobs, and completion_ids all have identical lengths per sequence.
+        # Mismatches cause shape errors when these are padded into tensors downstream.
+        for i in range(len(tool_mask)):
+            ids_len = len(completion_ids[i])
+
+            if len(tool_mask[i]) != ids_len:
+                if len(tool_mask[i]) > ids_len:
+                    tool_mask[i] = tool_mask[i][:ids_len]
+                else:
+                    tool_mask[i] = tool_mask[i] + [1] * (ids_len - len(tool_mask[i]))
+
+            if logprobs is not None and len(logprobs[i]) != ids_len:
+                if len(logprobs[i]) > ids_len:
+                    logprobs[i] = logprobs[i][:ids_len]
+                else:
+                    logprobs[i] = logprobs[i] + [0.0] * (ids_len - len(logprobs[i]))
+
         # Return tool_mask (indicates which tokens are from model vs tool results)
         return tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count
 
@@ -930,6 +1017,313 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             except json.JSONDecodeError:
                 pass
         return None
+    
+    def _generate_single_turn(self, prompts: list):
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+        
+        # Generate completions using either vLLM or regular generation
+        if self.use_vllm:
+            if self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode:
+                # wake up colocated vLLM instances if needed
+                torch.cuda.empty_cache()  # required to avoid OOM in some cases
+                self.llm.wake_up(tags=["weights"])
+                # Work around for https://github.com/vllm-project/vllm/issues/29341
+                self.llm.collective_rpc("reload_weights")
+
+            # First, update the vLLM weights if needed
+            if self.state.global_step != self._last_loaded_step:
+                self._move_model_to_vllm()
+                self._last_loaded_step = self.state.global_step
+
+            if is_conversational({"prompt": prompts[0]}):
+                prompts = [prepare_multimodal_messages_vllm(prompt) for prompt in prompts]
+
+            # In vLLM, tool call arguments must be JSON strings. See https://github.com/vllm-project/vllm/pull/28820
+            for prompt in prompts:  # iterate over each conversation
+                if is_conversational({"prompt": prompt}):
+                    for message in prompt:  # iterate over each message
+                        if "tool_calls" in message:  # check if message has tool calls
+                            for call in message["tool_calls"]:
+                                args = call["function"]["arguments"]
+                                if isinstance(args, dict):  # only convert dict → JSON string
+                                    call["function"]["arguments"] = json.dumps(args)
+
+            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            if self.vllm_mode == "server":
+                all_prompts = gather_object(prompts)
+                num_generations = self.num_generations if mode == "train" else self.num_generations_eval
+
+                if self.accelerator.is_main_process:
+                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                    # prompt individually.
+                    ordered_set_of_prompts = all_prompts[::num_generations]
+
+                    sampling_params = {
+                        "n": num_generations,
+                        "repetition_penalty": self.repetition_penalty,
+                        "temperature": self.temperature,
+                        "top_p": self.top_p,
+                        "top_k": -1 if self.top_k is None else self.top_k,
+                        "min_p": 0.0 if self.min_p is None else self.min_p,
+                        "max_tokens": self.max_completion_length,
+                        "guided_decoding_regex": self.guided_decoding_regex,
+                        "generation_kwargs": self.args.generation_kwargs,
+                    }
+                    with profiling_context(self, "vLLM.generate"):
+                        if self.rollout_func is not None:
+                            rollout_prompts = ordered_set_of_prompts
+                            if rollout_prompts and is_conversational({"prompt": rollout_prompts[0]}):
+                                rollout_prompts = [
+                                    apply_chat_template(
+                                        {"prompt": p}, self.processing_class, **self.chat_template_kwargs
+                                    )["prompt"]
+                                    for p in rollout_prompts
+                                ]
+                            output = self.rollout_func(rollout_prompts, self)
+                        else:
+                            if is_conversational({"prompt": ordered_set_of_prompts[0]}):
+                                # ==============================================================
+                                # FIX STARTS HERE: Bypass vllm_client.chat() tool limitation
+                                # ==============================================================
+                                # We manually render the conversational messages (and tool schemas) 
+                                # into a raw string using the tokenizer, then use .generate() instead of .chat()
+                                formatted_prompts = [
+                                    self.processing_class.apply_chat_template(
+                                        conversation=conv,
+                                        tools=self.tools,
+                                        chat_template=self.chat_template,
+                                        add_generation_prompt=True,
+                                        tokenize=False,
+                                        **(self.chat_template_kwargs if self.chat_template_kwargs else {})
+                                    ) for conv in ordered_set_of_prompts
+                                ]
+                                output = self.vllm_client.generate(prompts=formatted_prompts, **sampling_params)
+                                # ==============================================================
+                            else:
+                                output = self.vllm_client.generate(prompts=ordered_set_of_prompts, **sampling_params)
+                        # Extract required fields and collect any extra fields for reward functions
+                        required_keys = {"prompt_ids", "completion_ids", "logprobs"}
+                        extra_fields = {k: v for k, v in output.items() if k not in required_keys}
+                        payload = (output["prompt_ids"], output["completion_ids"], output["logprobs"], extra_fields)
+                else:
+                    payload = None
+
+                # Broadcast the completions from the main process to all processes, ensuring each process receives its corresponding slice.
+                obj_list = [payload]
+                broadcast_object_list(obj_list, from_process=0)
+                all_prompt_ids, all_completion_ids, all_logprobs, all_extra_fields = obj_list[0]
+
+                # At this point, we only get 1 copy of each prompt, so we need to repeat them num_generations times
+                all_prompt_ids = [ids for ids in all_prompt_ids for _ in range(num_generations)]
+
+                process_slice = slice(
+                    self.accelerator.process_index * len(prompts),
+                    (self.accelerator.process_index + 1) * len(prompts),
+                )
+                prompt_ids = all_prompt_ids[process_slice]
+                completion_ids = all_completion_ids[process_slice]
+                logprobs = all_logprobs[process_slice]
+
+                # Slice extra fields dict-of-lists per process (extra fields are per-completion, like completion_ids)
+                extra_fields = {}
+                for key, values in all_extra_fields.items():
+                    if isinstance(values, list):
+                        extra_fields[key] = values[process_slice]
+                    else:
+                        extra_fields[key] = values
+
+            # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
+            elif self.vllm_mode == "colocate":
+                if self.rollout_func is not None:
+                    rollout_prompts = prompts
+                    if rollout_prompts and is_conversational({"prompt": rollout_prompts[0]}):
+                        rollout_prompts = [
+                            apply_chat_template(
+                                {"prompt": prompt}, self.processing_class, **self.chat_template_kwargs
+                            )["prompt"]
+                            for prompt in rollout_prompts
+                        ]
+                    output = self.rollout_func(rollout_prompts, self)
+                    required_keys = {"prompt_ids", "completion_ids", "logprobs"}
+                    extra_fields = {k: v for k, v in output.items() if k not in required_keys}
+                    prompt_ids = output["prompt_ids"]
+                    completion_ids = output["completion_ids"]
+                    logprobs = output["logprobs"]
+                else:
+                    if self.guided_decoding_regex:
+                        guided_decoding = GuidedDecodingParams(regex=self.guided_decoding_regex)
+                    else:
+                        guided_decoding = None
+
+                    generation_kwargs = {
+                        "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
+                        "repetition_penalty": self.repetition_penalty,
+                        "temperature": self.temperature,
+                        "top_p": self.top_p,
+                        "top_k": -1 if self.top_k is None else self.top_k,
+                        "min_p": 0.0 if self.min_p is None else self.min_p,
+                        "max_tokens": self.max_completion_length,
+                        "guided_decoding": guided_decoding,
+                        "logprobs": 0,  # enable returning log probabilities; 0 means for the sampled tokens only
+                    }
+                    if self.args.generation_kwargs is not None:
+                        generation_kwargs.update(self.args.generation_kwargs)
+                    sampling_params = SamplingParams(**generation_kwargs)
+
+                    if self.vllm_tensor_parallel_size > 1:
+                        # Gather prompts from all ranks in the TP group and flatten.
+                        # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
+                        orig_size = len(prompts)
+                        gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
+                        torch.distributed.all_gather_object(gathered_prompts, prompts, group=self.tp_group)
+                        all_prompts = [p for sublist in gathered_prompts for p in sublist]
+                    else:
+                        all_prompts = prompts
+
+                    if self.args.vllm_enable_sleep_mode:
+                        self.llm.wake_up(tags=["kv_cache"])
+
+                    with profiling_context(self, "vLLM.generate"):
+                        if is_conversational({"prompt": prompts[0]}):
+                            # ==============================================================
+                            # FIX STARTS HERE: Bulletproof colocate mode against strict tools
+                            # ==============================================================
+                            formatted_prompts = [
+                                self.processing_class.apply_chat_template(
+                                    conversation=conv,
+                                    tools=self.tools,
+                                    chat_template=self.chat_template,
+                                    add_generation_prompt=True,
+                                    tokenize=False,
+                                    **(self.chat_template_kwargs if self.chat_template_kwargs else {})
+                                ) for conv in all_prompts
+                            ]
+                            all_outputs = self.llm.generate(
+                                formatted_prompts, sampling_params=sampling_params, use_tqdm=False
+                            )
+                            # ==============================================================
+                        else:
+                            all_outputs = self.llm.generate(
+                                all_prompts, sampling_params=sampling_params, use_tqdm=False
+                            )
+
+                    all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
+                    all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
+                    all_logprobs = [
+                        [next(iter(lp.values())).logprob for lp in output.logprobs]
+                        for outputs in all_outputs
+                        for output in outputs.outputs
+                    ]
+
+                    if self.vllm_tensor_parallel_size > 1:
+                        # Slice completions for this rank within its TP group.
+                        # Each rank generates all outputs — we keep only our share.
+                        local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
+                        tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
+                        prompt_ids = all_prompt_ids[tp_slice]
+                        completion_ids = all_completion_ids[tp_slice]
+                        logprobs = all_logprobs[tp_slice]
+                    else:
+                        prompt_ids = all_prompt_ids
+                        completion_ids = all_completion_ids
+                        logprobs = all_logprobs
+
+                    extra_fields = {}  # No extra fields for colocate mode
+
+                    if self.args.vllm_enable_sleep_mode:
+                        self.llm.sleep(level=2)
+
+        elif self.use_transformers_paged:
+            if is_conversational({"prompt": prompts[0]}):
+                processor_outputs = self.processing_class.apply_chat_template(
+                    conversation=prompts,
+                    tools=self.tools,
+                    chat_template=self.chat_template,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    **self.chat_template_kwargs,
+                )
+            else:
+                processor_outputs = self.processing_class(text=prompts)
+
+            with (
+                profiling_context(self, "transformers.generate_batch"),
+                unwrap_model_for_generation(
+                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                ) as unwrapped_model,
+                torch.no_grad(),
+                FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
+            ):
+                # Cast to the appropriate dtype based on training configuration
+                if self.args.bf16:
+                    unwrapped_model.to(torch.bfloat16)
+                elif self.args.fp16:
+                    unwrapped_model.to(torch.float16)
+                if self.args.cast_lm_head_to_fp32:
+                    unwrapped_model.lm_head.to(torch.float32)
+                with torch.inference_mode():
+                    # Continuous batching API expects 'inputs' arg only
+                    all_outputs = unwrapped_model.generate_batch(
+                        processor_outputs["input_ids"], generation_config=self.generation_config, progress_bar=False
+                    )
+                    unwrapped_model.train()  # restore training mode, as generate_batch forces eval mode
+            completion_ids = [output.generated_tokens for output in all_outputs.values()]
+            prompt_ids = processor_outputs["input_ids"]
+            logprobs = None  # not used in this case
+            extra_fields = {}  # No extra fields for paged mode
+
+        else:
+            # Regular generation path
+            if is_conversational({"prompt": prompts[0]}):
+                generate_inputs = self.processing_class.apply_chat_template(
+                    conversation=prompts,
+                    tools=self.tools,
+                    chat_template=self.chat_template,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    padding=True,
+                    padding_side="left",
+                    return_tensors="pt",
+                    return_dict=True,
+                    **self.chat_template_kwargs,
+                )
+            else:
+                generate_inputs = self.processing_class(
+                    text=prompts, padding=True, padding_side="left", return_tensors="pt"
+                )
+            generate_inputs = super(GRPOTrainer, self)._prepare_inputs(generate_inputs)
+            with (
+                profiling_context(self, "transformers.generate"),
+                unwrap_model_for_generation(
+                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                ) as unwrapped_model,
+                torch.no_grad(),
+                FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
+            ):
+                prompt_completion_ids = unwrapped_model.generate(
+                    **generate_inputs, generation_config=self.generation_config, disable_compile=True
+                )
+            # Compute prompt length and extract completion ids
+            prompt_ids, prompt_mask = generate_inputs["input_ids"], generate_inputs["attention_mask"]
+            prompt_length = prompt_ids.size(1)
+            completion_ids = prompt_completion_ids[:, prompt_length:]
+
+            # Mask everything after the first EOS token
+            is_eos = completion_ids == self.eos_token_id
+            eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+            eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+            sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+            completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+            prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool(), strict=True)]
+            completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool(), strict=True)]
+            logprobs = None  # not used in this case
+            extra_fields = {}  # No extra fields for non-rollout_func paths
+
+        return prompt_ids, completion_ids, logprobs, extra_fields
+
 
 def load_dual_adapter_model(
     sft_checkpoint_path: str,

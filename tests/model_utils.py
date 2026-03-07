@@ -86,7 +86,7 @@ def load_quantised_model(model_name: str, device_map: str | dict = "auto") -> Au
     Load a base causal language model in 4-bit quantised form using
     ``BitsAndBytesConfig``.  Gradient checkpointing is enabled to save
     memory.
-
+    
     Parameters
     ----------
     model_name : str
@@ -451,6 +451,21 @@ def load_model_from_adapter(
     base_model = prepare_model_for_kbit_training(
         base_model, use_gradient_checkpointing=True,
     )
+
+    # Sanitize adapter_config.json: strip keys that are not valid PEFT/LoRA
+    # parameters.  Older checkpoints may contain 'max_model_length' injected
+    # by ContextLengthHistogramCallback, which causes PeftModel.from_pretrained
+    # to crash with "LoraConfig.__init__() got an unexpected keyword argument".
+    _NON_PEFT_KEYS = {"max_model_length", "max_position_embeddings"}
+    _adapter_cfg_path = os.path.join(adapter_path, "adapter_config.json")
+    if os.path.exists(_adapter_cfg_path):
+        with open(_adapter_cfg_path, "r") as _f:
+            _cfg = json.load(_f)
+        _removed = {k: _cfg.pop(k) for k in _NON_PEFT_KEYS if k in _cfg}
+        if _removed:
+            with open(_adapter_cfg_path, "w") as _f:
+                json.dump(_cfg, _f, indent=2)
+            print(f"[load_model_from_adapter] Removed non-PEFT keys from adapter_config.json: {list(_removed.keys())}")
 
     print(f"Loading LoRA adapter from: {adapter_path}")
     model = PeftModel.from_pretrained(base_model, adapter_path, is_trainable=True)
