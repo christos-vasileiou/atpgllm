@@ -1,15 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=sft_vllm        # Job name
+#SBATCH --job-name=grpo_vllm        # Job name
 #SBATCH --output=jobs/training_%j.out   # Standard output file (%j will be replaced with job ID)
 #SBATCH --error=jobs/training_%j.err    # Standard error file
 #SBATCH --nodes=1                       # Request 1 node
 #SBATCH --ntasks=1                      # Run a single task
-#SBATCH --cpus-per-task=16              # Request 16 CPUs per task
-#SBATCH --time=1-07:30:00
+#SBATCH --cpus-per-task=32              # Request 16 CPUs per task
 #SBATCH --mem=128G
 #SBATCH --partition=h100
 #SBATCH --gres=gpu:4
 #SBATCH --reservation=LLM
+
+# Export the exact path of the Slurm log so Python can find it
+export SLURM_LOG_FILE="jobs/training_${SLURM_JOB_ID}.out"
+export SLURM_ERROR_FILE="jobs/training_${SLURM_JOB_ID}.err"
+export WANDB_PROJECT="huggingface" # Ensure HF Trainer uses my preferred wandb project
 
 # activate virtual environment (activate is alias)
 source /work/cxv200006/myenv/bin/activate
@@ -220,7 +224,6 @@ if [ $NUM_GPUS -lt 2 ] && [ "$USE_VLLM" == "True" ] && [ "$VLLM_MODE" == "server
     done
 fi
 
-export CUDA_LAUNCH_BLOCKING=1
 echo ""
 echo "=============================================="
 echo "GPU Setup Summary"
@@ -253,6 +256,7 @@ build_cmd_args() {
         --report_to "$REPORT_TO"
     )
 
+    # Handle vLLM activation
     if [ -n "$USE_VLLM" ]; then 
         if [ "$USE_VLLM" == "True" ]; then
             CMD_ARGS+=(--use_vllm)
@@ -261,9 +265,6 @@ build_cmd_args() {
                 CMD_ARGS+=(--vllm_server_url "http://localhost:$PORT")
                 if [ "$VLLM_MODE" == "server" ]; then
                     VLLM_GPU=${GPU_ARRAY[-1]}
-                fi
-                if [ "$USE_DDP" == "True" ]; then
-                    CMD_ARGS+=("--use_ddp")                
                 fi
             elif [ "$METHOD" == "grpo" ]; then
                 PORT=$PORT
@@ -276,6 +277,12 @@ build_cmd_args() {
         fi
     fi
 
+    # Handle DDP activation
+    if [ "$USE_DDP" == "True" ]; then
+        CMD_ARGS+=("--use_ddp")                
+    fi
+
+    # Handle unsloth activation
     if [ -n "$USE_UNSLOTH" ] && [ "$USE_UNSLOTH" == "True" ]; then
         CMD_ARGS+=(--use_unsloth)
     fi
@@ -367,18 +374,22 @@ if [ "$USE_VLLM" == "True" ] && [ "$VLLM_MODE" == "server" ]; then
             echo "Warning: Could not determine PID for existing vLLM server on port $PORT."
         fi
     else
-        echo ""
-        echo "=============================================="
-        echo "$METHOD vLLM Server Setup"
-        echo "=============================================="
-        echo "vLLM server GPU: ${VLLM_GPU} (last GPU)"
-        echo "Starting vLLM server on GPU $VLLM_GPU (port $PORT)..."
-        VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}
-        
+        # Qwen2.5 has max_position_embeddings=32768. Do NOT exceed 32768 or CUDA out-of-bounds will occur.
+        MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
+        VLLM_MAX_MODEL_LEN=$MAX_MODEL_LEN
+        MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
+        MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-6144}
+
         if [ "$METHOD" == "sft" ]; then
             # SFT uses the standard `vllm serve` (OpenAI-compatible API) for
             # inference-only validation via the SFTStoppingCallback.
             # max-model-len: Qwen2.5 has max_position_embeddings=32768. Do NOT exceed 32768 or CUDA out-of-bounds will occur.
+            echo ""
+            echo "=============================================="
+            echo "$METHOD vLLM Server Setup"
+            echo "=============================================="
+            echo "vLLM server GPU: ${VLLM_GPU} (last GPU)"
+            echo "Starting vLLM server on GPU $VLLM_GPU (port $PORT)..."
             echo "Running: VLLM_ALLOW_RUNTIME_LORA_UPDATING=True CUDA_VISIBLE_DEVICES=$VLLM_GPU vllm serve $MODEL --enable-lora --max-lora-rank 64 --port $PORT --gpu-memory-utilization 0.8 --max-model-len $VLLM_MAX_MODEL_LEN &"
             VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
             CUDA_VISIBLE_DEVICES=$VLLM_GPU \
@@ -401,14 +412,39 @@ if [ "$USE_VLLM" == "True" ] && [ "$VLLM_MODE" == "server" ]; then
             # Note: `trl vllm-serve` does NOT support --enable-lora /
             # --max-lora-rank.  Instead, TRL pushes updated weights directly
             # to vLLM via the NCCL communicator.
+            
+            # Extract the number before 'B' or 'b' in the model string (e.g., Qwen2.5-72B -> 72)
+            MODEL_SIZE_STR=$(echo "$MODEL" | grep -ioP '\d+(\.\d+)?(?=b)' | head -n 1)
+            MODEL_SIZE=${MODEL_SIZE_STR:-0}
+
+            # Evaluate if the model size is strictly greater than 32
+            IS_LARGE_MODEL=$(awk -v size="$MODEL_SIZE" 'BEGIN { print (size >= 32) ? 1 : 0 }')
+            
+            TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
+            DATA_PARALLEL_SIZE=${DATA_PARALLEL_SIZE:-1}
             VLLM_GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.9}
-            echo "Running: CUDA_VISIBLE_DEVICES=$VLLM_GPU trl vllm-serve --model $MODEL --port $PORT --gpu_memory_utilization $VLLM_GPU_MEM_UTIL --max_model_len $VLLM_MAX_MODEL_LEN &"
+            echo ""
+            echo "=============================================="
+            echo "$METHOD vLLM Server Setup"
+            echo "=============================================="
+            echo "vLLM server GPU: $VLLM_GPU (last GPU)"
+            echo "Starting vLLM server on GPU $VLLM_GPU (port $PORT)..."
+            echo "DATA_PARALLEL_SIZE: $DATA_PARALLEL_SIZE"
+            echo "TENSOR_PARALLEL_SIZE: $TENSOR_PARALLEL_SIZE"
+            echo "VLLM_MAX_MODEL_LEN: $VLLM_MAX_MODEL_LEN"
+            echo "MAX_PROMPT_LENGTH: $MAX_PROMPT_LENGTH"
+            echo "MAX_COMPLETION_LENGTH: $MAX_COMPLETION_LENGTH"
+            echo "=============================================="
+            echo "Running: CUDA_VISIBLE_DEVICES=$VLLM_GPU trl vllm-serve --model $MODEL --port $PORT --gpu_memory_utilization $VLLM_GPU_MEM_UTIL --data-parallel-size $DATA_PARALLEL_SIZE --tensor-parallel-size $TENSOR_PARALLEL_SIZE --max-model-len $VLLM_MAX_MODEL_LEN &"
             CUDA_VISIBLE_DEVICES=$VLLM_GPU \
             trl vllm-serve \
                 --model $MODEL \
                 --port $PORT \
-                --gpu_memory_utilization "$VLLM_GPU_MEM_UTIL" \
-                --max_model_len "$VLLM_MAX_MODEL_LEN" &
+                --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
+                --data-parallel-size "$DATA_PARALLEL_SIZE" \
+                --tensor-parallel-size $TENSOR_PARALLEL_SIZE \
+                --max-model-len "$VLLM_MAX_MODEL_LEN" \
+                --enable_prefix_caching True &
             VLLM_PID=$!
             echo "Waiting for TRL vLLM server to become ready (PID: $VLLM_PID)..."
         fi
@@ -432,19 +468,27 @@ if [ "$USE_VLLM" == "True" ] && [ "$VLLM_MODE" == "server" ]; then
         echo "=============================================="
     fi
 
-    export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${GPU_ARRAY[*]:0:$VLLM_GPU}")"
+    COUNT_VLLM_GPUS=$(echo "$VLLM_GPU" | tr ',' '\n' | wc -l)
+    NUM_TRAIN_GPUS=$((${#GPU_ARRAY[@]} - $COUNT_VLLM_GPUS))
+    TRAINING_GPUS=("${GPU_ARRAY[@]:0:$NUM_TRAIN_GPUS}")
+    export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${TRAINING_GPUS[*]}")"
+    echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES, TRAINING_GPUS: ${#TRAINING_GPUS[@]}, VLLM_GPU: $VLLM_GPU"
 fi
 
+# Set vLLM RPC timeout to 1800000 seconds (30 minutes)
+export VLLM_RPC_TIMEOUT=1800000
+# Set NCCL debug level to INFO
+export NCCL_DEBUG=INFO
 echo "=============================================="
 echo "Starting Training"
 echo "=============================================="
 
 if [ "$USE_DDP" == "True" ]; then
-    echo "Command: accelerate launch --multi_gpu --num_processes $NUM_GPUS --mixed_precision bf16 training_code.py ${CMD_ARGS[*]}"
+    echo "Command: accelerate launch --multi_gpu --num_processes ${#TRAINING_GPUS[@]} --mixed_precision bf16 training_code.py ${CMD_ARGS[*]}"
     echo ""
     accelerate launch \
         --multi_gpu \
-        --num_processes "$NUM_GPUS" \
+        --num_processes "${#TRAINING_GPUS[@]}" \
         --mixed_precision bf16 \
         training_code.py "${CMD_ARGS[@]}"
 else

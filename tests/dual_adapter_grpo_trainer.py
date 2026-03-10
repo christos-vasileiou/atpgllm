@@ -203,6 +203,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         self.tool_functions = tool_functions
         # Override ref_model - we use adapter switching instead
         self.ref_model = None
+        self.print = True
         
     def _update_adapter_weights(self, model: PeftModel, source_adapter_name: str, target_adapter_name: str, tau: float = 1.):
         """
@@ -323,9 +324,22 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         This method is called for both policy and reference model computation.
         We override the parent to ensure we're using the correct adapter context.
         """
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        active = getattr(unwrapped_model, "active_adapter", "")
+        active_list = [active] if isinstance(active, str) else (active if isinstance(active, list) else [])
+        
+        # CRITICAL DDP FIX: 
+        # If the policy adapter is NOT active, we are in the patched reference computation phase. 
+        # We MUST bypass the DDP wrapper and use the unwrapped model to prevent 
+        # DDP's gradient buckets from hanging.
+        if self._policy_adapter_name not in active_list:
+            model_to_use = unwrapped_model
+        else:
+            model_to_use = model
+
         # Call parent implementation - the adapter context is set externally
         return super()._get_per_token_logps_and_entropies(
-            model=model, 
+            model=model_to_use, 
             input_ids=input_ids, 
             attention_mask=attention_mask, 
             logits_to_keep=logits_to_keep, 
@@ -556,6 +570,12 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
+        if self.print:
+            for prompt, completion in zip(prompts, completions):
+                print(prompt)
+                print(completion)
+                print("-" * 100)
+                self.print = False
         # Execute async custom functions in parallel using asyncio.gather
         if async_funcs_info:
             completions = self.processing_class.batch_decode(completion_ids_list, skip_special_tokens=True)
@@ -748,10 +768,6 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             max_model_len = getattr(self.llm.llm_engine.model_config, 'max_model_len', 4096)
         else:
             max_model_len = getattr(self.model.config, 'max_position_embeddings', 4096)
-        # else:
-        #     raise NotImplementedError(
-        #         f"Unsupported mode detected: use_vllm={self.use_vllm}, vllm_mode={self.vllm_mode}"
-        #     )
         
         while idxs_with_tool:
             # Build conversations with tool calls for samples that need tool execution

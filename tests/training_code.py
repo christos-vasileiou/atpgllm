@@ -152,6 +152,8 @@ from callbacks import (
     ContextLengthHistogramCallback,
     SFTStoppingCallback,
 )
+from git_utils import get_git_info
+import wandb
 
 # =====================================================================
 # Re-export public names so that existing imports like
@@ -221,6 +223,7 @@ def train_with_sft(
     use_vllm: bool = False,
     vllm_server_url: str = None,
     eval_buffer_size: int = 30,
+    max_model_len: int = 16384,
     use_unsloth: bool = False,
     use_ddp: bool = False,
     **kwargs,
@@ -270,6 +273,8 @@ def train_with_sft(
     eval_buffer_size : int
         Number of examples to buffer from the test split for the
         stopping callback validation (default 30).
+    max_model_len : int
+        Maximum model length for filtering dataset (default 16384).
     use_unsloth : bool
         If *True*, use unsloth's ``FastLanguageModel`` for model loading
         and LoRA injection.
@@ -301,7 +306,7 @@ def train_with_sft(
     if resume_from:
         print(f"Resuming training from: {resume_from}")
         if use_unsloth:
-            model, tokenizer = load_unsloth_model_from_adapter(resume_from)
+            model, tokenizer = load_unsloth_model_from_adapter(resume_from, max_seq_length=max_model_len, fast_inference=True, device_map=device_map)
         else:
             model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
     else:
@@ -403,6 +408,9 @@ def train_with_grpo(
     vllm_server_url: str = None,
     num_generations: int = 8,
     steps_per_generation: int = 1,
+    max_model_len: int = 8192,
+    max_completion_length: int = 4096,
+    max_prompt_length: int = 4096,
     use_dual_adapter: bool = True,
     use_unsloth: bool = False,
     use_ddp: bool = False,
@@ -437,6 +445,12 @@ def train_with_grpo(
     vllm_server_url : str
     num_generations : int
     steps_per_generation : int
+    max_model_len : int
+        Maximum model length (default 8192).
+    max_completion_length : int
+        Maximum completion length (default 4096).
+    max_prompt_length : int
+        Maximum prompt length (default 4096).
     use_dual_adapter : bool
         If *True* (default), uses ``DualAdapterGRPOTrainer`` which keeps
         the SFT adapter isolated and avoids ``merge_and_unload``.
@@ -446,16 +460,16 @@ def train_with_grpo(
         If *True*, use Distributed Data Parallel (DDP) mode.  See
         :func:`train_with_sft` for details.
     """
+    # Validate unsloth availability early
+    if use_unsloth:
+        _require_unsloth()
+        print("[Unsloth] Enabled – using FastLanguageModel for optimised GRPO training")
+
     # Lazy-import GRPO trainers and GRPOConfig to avoid pulling in
     # trl.GRPOTrainer (and its vllm dependency) during SFT-only runs.
     from trl import GRPOConfig
     from tool_calling_grpo_trainer import ToolCallingGRPOTrainer
     from dual_adapter_grpo_trainer import DualAdapterGRPOTrainer
-
-    # Validate unsloth availability early
-    if use_unsloth:
-        _require_unsloth()
-        print("[Unsloth] Enabled – using FastLanguageModel for optimised GRPO training")
 
     # Determine device_map: per-GPU for DDP, "auto" otherwise
     device_map = _get_device_map(use_ddp)
@@ -469,7 +483,7 @@ def train_with_grpo(
     if resume_from:
         print(f"Resuming GRPO training from SFT checkpoint: {resume_from}")
         if use_unsloth:
-            model, tokenizer = load_unsloth_model_from_adapter(resume_from)
+            model, tokenizer = load_unsloth_model_from_adapter(resume_from, max_seq_length=max_model_len, fast_inference=True, device_map=device_map)
         else:
             model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
 
@@ -516,7 +530,7 @@ def train_with_grpo(
 
     print("Buffering streaming dataset (GRPOTrainer requires non-streaming Dataset)...")
     train_dataset = buffer_streaming_dataset(
-        formatted_data, buffer_size=buffer_size, shuffle=True, seed=42,
+        formatted_data, buffer_size=buffer_size, shuffle=True, seed=42, tokenizer=tokenizer, max_prompt_length=max_prompt_length,
     )
 
     # =========================================================================
@@ -544,7 +558,7 @@ def train_with_grpo(
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=5e-5,
         max_steps=max_steps,
-        logging_steps=10,
+        logging_steps=1,
         save_steps=10,
         bf16=True,
         gradient_checkpointing=True,
@@ -552,12 +566,13 @@ def train_with_grpo(
         report_to=report_to,
         # GRPO-specific options
         loss_type="dapo", # "grpo", "dr_grpo", "dapo", "bnpo", "cispo", default is "dapo"
-        max_completion_length=16384,
         num_generations=max(num_generations, 2),
         steps_per_generation=steps_per_generation,
+        max_completion_length=max_completion_length,
         use_vllm=use_vllm,
         vllm_mode=vllm_mode,
         vllm_server_base_url=vllm_server_url,
+        importance_sampling_level="sequence", # "token" or "sequence" : sequence provides more stable training and better alignment with sequence-level rewards
     )
 
     shared_callbacks = [
@@ -633,6 +648,15 @@ def _num_generations():
 def _steps_per_generation():
     return int(os.environ.get('STEPS_PER_GENERATION', 2))
 
+def _max_model_len():
+    return int(os.environ.get('MAX_MODEL_LEN', 8192))
+
+def _max_completion_length():
+    return int(os.environ.get('MAX_COMPLETION_LENGTH', 4096))
+
+def _max_prompt_length():
+    return int(os.environ.get('MAX_PROMPT_LENGTH', 4096))
+
 def _use_unsloth():
     return os.environ.get('USE_UNSLOTH', '0').lower() in ('1', 'true', 'yes')
 
@@ -674,6 +698,12 @@ def main() -> None:
                         help="Number of generations per prompt to sample.")
     parser.add_argument("--steps_per_generation", type=int, default=_steps_per_generation(),
                         help="Steps per generation")
+    parser.add_argument("--max_model_len", type=int, default=_max_model_len(),
+                        help="Maximum model length")
+    parser.add_argument("--max_completion_length", type=int, default=_max_completion_length(),
+                        help="Maximum completion length")
+    parser.add_argument("--max_prompt_length", type=int, default=_max_prompt_length(),
+                        help="Maximum prompt length")
     parser.add_argument("--use_dual_adapter", action="store_true", default=True,
                         help="Use dual-adapter mode (keeps SFT adapter isolated, avoids merge). Default: True")
     parser.add_argument("--use_unsloth", action="store_true", default=_use_unsloth(),
@@ -696,6 +726,30 @@ def main() -> None:
     args_dict = vars(args)
     args_dict['dataset_path'] = args_dict.pop('dataset')
     method = args_dict.pop('method')
+
+    # 1. Combine CLI args with Git info for the config
+    run_config = {"method": method, **args_dict, **get_git_info()}
+
+    # 2. Initialize wandb explicitly to capture everything from this point forward
+    wandb.init(
+        project=os.environ.get("WANDB_PROJECT", "huggingface"),
+        config=run_config,
+        name=f"{args_dict.get('output_dir', 'run')}" if method in args_dict.get('output_dir') else f"{method}-{args_dict.get('output_dir', 'run')}",
+        settings=wandb.Settings(console="wrap") # Forces capture of Python stdout/stderr
+    )
+
+    # 3. Tell wandb to live-stream the Slurm bash log file to the cloud
+    slurm_log = os.environ.get("SLURM_LOG_FILE")
+    if slurm_log and os.path.exists(slurm_log):
+        # policy="live" continuously uploads the file as Slurm writes to it
+        wandb.save(os.path.abspath(slurm_log), base_path=os.getcwd(), policy="live")
+    
+    # 4. Tell wandb to live-stream the Slurm error file to the cloud
+    slurm_error = os.environ.get("SLURM_ERROR_FILE")
+    if slurm_error and os.path.exists(slurm_error):
+        # policy="live" continuously uploads the file as Slurm writes to it
+        wandb.save(os.path.abspath(slurm_error), base_path=os.getcwd(), policy="live")
+    # -----------------------
 
     if method == "sft":
         train_with_sft(**args_dict)
