@@ -220,10 +220,8 @@ def train_with_sft(
     gradient_accumulation_steps: int = 1,
     max_steps: int = -1,
     report_to: str = "wandb",
-    use_vllm: bool = False,
-    vllm_server_url: str = None,
-    eval_buffer_size: int = 30,
     max_model_len: int = 16384,
+    max_prompt_length: int = 4096,
     use_unsloth: bool = False,
     use_ddp: bool = False,
     **kwargs,
@@ -340,12 +338,12 @@ def train_with_sft(
         lr_scheduler_type="cosine",
         max_steps=max_steps,
         logging_steps=5,
-        save_steps=10,
+        save_steps=5,
         ddp_find_unused_parameters=False if use_ddp else None,
         gradient_checkpointing=True,
         # DDP + gradient checkpointing + LoRA requires non-reentrant
         # checkpointing to avoid "parameter marked ready twice" errors.
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        gradient_checkpointing_kwargs={"use_reentrant": False} if use_ddp else None,
         bf16=True,
         report_to=report_to,
         dataset_text_field="text",
@@ -362,24 +360,6 @@ def train_with_sft(
     shared_callbacks = [
         ThroughputMetricsCallback(),
         ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
-        SFTStoppingCallback(
-            tokenizer=tokenizer,
-            dataset_path=dataset_path,
-            eval_buffer_size=eval_buffer_size,
-            tool_functions={"fault_simulation_tool": fault_simulation_tool_handler},
-            tools_schema=TOOLS,
-            format_threshold=0.95,
-            diversity_threshold=0.2,
-            diversity_num_generations=10,
-            use_vllm=use_vllm,
-            vllm_server_url=vllm_server_url,
-            max_new_tokens=8192,
-            vllm_max_context=32768,
-            min_steps=50,
-            patience=1,
-            temperature=0.7,
-            generation_batch_size=50 if use_vllm else 8,
-        ),
     ]
 
     trainer = SFTTrainer(
@@ -556,7 +536,7 @@ def train_with_grpo(
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=5e-5,
+        learning_rate=2e-5,
         max_steps=max_steps,
         logging_steps=1,
         save_steps=10,
@@ -591,6 +571,7 @@ def train_with_grpo(
             tool_functions={'fault_simulation_tool': fault_simulation_tool_handler},
             callbacks=shared_callbacks,
             tools=TOOLS,
+            vllm_max_model_len=max_model_len if use_vllm else None,
         )
     else:
         trainer = ToolCallingGRPOTrainer(
@@ -612,111 +593,63 @@ def train_with_grpo(
 # CLI helpers (environment variable defaults)
 # =====================================================================
 
-def _model_name():
-    return os.environ.get('MODEL', None)
-
-def _train_dataset():
-    return os.environ.get('TRAIN_DATASET', None)
-
-def _output_dir():
-    return os.environ.get('OUTPUT_DIR', "./finetuned_model")
-
-def _method():
-    return os.environ.get('METHOD', "sft")
-
-def _resume_from():
-    return os.environ.get('RESUME_FROM', None)
-
-def _buffer_size():
-    return int(os.environ.get('BUFFER_SIZE', 10000))
-
-def _per_device_train_batch_size():
-    return int(os.environ.get('PER_DEVICE_TRAIN_BATCH_SIZE', 2))
-
-def _gradient_accumulation_steps():
-    return int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
-
-def _max_steps():
-    return int(os.environ.get('MAX_STEPS', 1))
-
-def _report_to():
-    return os.environ.get('REPORT_TO', "wandb")
-
-def _num_generations():
-    return int(os.environ.get('NUM_GENERATIONS', 8))
-
-def _steps_per_generation():
-    return int(os.environ.get('STEPS_PER_GENERATION', 2))
-
-def _max_model_len():
-    return int(os.environ.get('MAX_MODEL_LEN', 8192))
-
-def _max_completion_length():
-    return int(os.environ.get('MAX_COMPLETION_LENGTH', 4096))
-
-def _max_prompt_length():
-    return int(os.environ.get('MAX_PROMPT_LENGTH', 4096))
-
-def _use_unsloth():
-    return os.environ.get('USE_UNSLOTH', '0').lower() in ('1', 'true', 'yes')
-
-def _vllm_mode():
-    return os.environ.get('VLLM_MODE', "server")
+def _env(key: str, default: str =None):
+    return os.environ.get(key, default)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fine‑tune a quantised LLM with LoRA")
-    parser.add_argument("--model_name", type=str, default=_model_name(),
+    parser = argparse.ArgumentParser(description="Fine‑tune an LLM with quantised LoRA")
+    parser.add_argument("--model_name", type=str, default=_env('MODEL', None),
                         help="Base model name on the HF hub (not required if --resume_from is provided)")
-    parser.add_argument("--dataset", type=str, default=_train_dataset(),
+    parser.add_argument("--dataset", type=str, default=_env('TRAIN_DATASET', None),
                         help="Path to JSONL dataset with training records")
-    parser.add_argument("--output_dir", type=str, default=_output_dir(),
+    parser.add_argument("--output_dir", type=str, default=_env('OUTPUT_DIR', "./finetuned_model"),
                         help="Output directory")
-    parser.add_argument("--method", type=str, default=_method(), choices=["sft", "grpo"],
+    parser.add_argument("--method", type=str, default=_env('METHOD', "sft"), choices=["sft", "grpo"],
                         help="Training method: sft or grpo")
-    parser.add_argument("--resume_from", type=str, default=_resume_from(),
+    parser.add_argument("--resume_from", type=str, default=_env('RESUME_FROM', None),
                         help="Path to a saved adapter directory to resume training from")
-    parser.add_argument("--buffer_size", type=int, default=_buffer_size(),
+    parser.add_argument("--buffer_size", type=int, default=_env('BUFFER_SIZE', 10000),
                         help="Number of examples to buffer from streaming dataset for GRPO")
-    parser.add_argument("--max_steps", type=int, default=_max_steps(),
+    parser.add_argument("--max_steps", type=int, default=_env('MAX_STEPS', 1),
                         help="Maximum number of training steps")
-    parser.add_argument("--per_device_train_batch_size", type=int,
-                        default=_per_device_train_batch_size(),
+    parser.add_argument("--per_device_train_batch_size", type=int, default=_env('PER_DEVICE_TRAIN_BATCH_SIZE', 1),
                         help="Per device train batch size")
-    parser.add_argument("--gradient_accumulation_steps", type=int,
-                        default=_gradient_accumulation_steps(),
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=_env('GRADIENT_ACCUMULATION_STEPS', 2),
                         help="Gradient accumulation steps")
-    parser.add_argument("--report_to", type=str, default=_report_to(),
+    parser.add_argument("--report_to", type=str, default=_env('REPORT_TO', "wandb"),
                         help="Report to: wandb or none")
-    parser.add_argument("--use_vllm", action="store_true", help="Use VLLM")
-    parser.add_argument("--vllm_server_url", type=str, default=None,
+    parser.add_argument("--use_vllm", action="store_true", default=_env('USE_VLLM', '0').lower() in ('1', 'true', 'yes'),
+                        help="Use VLLM for faster inference. Ideal for GRPO training. It can be used for SFT training as well. Requires: pip install vllm")
+    parser.add_argument("--vllm_server_url", type=str, default=_env('VLLM_SERVER_URL', None),
                         help="URL of a running vLLM server for SFT eval generation "
                              "(e.g. http://localhost:8000). Used when --use_vllm is set.")
-    parser.add_argument("--vllm_mode", type=str, default=_vllm_mode(),
-                        help="VLLM mode: 'colocate' or 'server'")
-    parser.add_argument("--num_generations", type=int, default=_num_generations(),
+    parser.add_argument("--vllm_mode", type=str, default=_env('VLLM_MODE', "server"), choices=["colocate", "server"],
+                        help="VLLM mode")
+    parser.add_argument("--num_generations", type=int, default=_env('NUM_GENERATIONS', 8),
                         help="Number of generations per prompt to sample.")
-    parser.add_argument("--steps_per_generation", type=int, default=_steps_per_generation(),
+    parser.add_argument("--steps_per_generation", type=int, default=_env('STEPS_PER_GENERATION', 2),
                         help="Steps per generation")
-    parser.add_argument("--max_model_len", type=int, default=_max_model_len(),
+    parser.add_argument("--max_model_len", type=int, default=_env('MAX_MODEL_LEN', 8192),
                         help="Maximum model length")
-    parser.add_argument("--max_completion_length", type=int, default=_max_completion_length(),
+    parser.add_argument("--max_completion_length", type=int, default=_env('MAX_COMPLETION_LENGTH', 4096),
                         help="Maximum completion length")
-    parser.add_argument("--max_prompt_length", type=int, default=_max_prompt_length(),
+    parser.add_argument("--max_prompt_length", type=int, default=_env('MAX_PROMPT_LENGTH', 4096),
                         help="Maximum prompt length")
-    parser.add_argument("--use_dual_adapter", action="store_true", default=True,
+    parser.add_argument("--use_dual_adapter", action="store_true", default=_env('USE_DUAL_ADAPTER', '1').lower() in ('1', 'true', 'yes'),
                         help="Use dual-adapter mode (keeps SFT adapter isolated, avoids merge). Default: True")
-    parser.add_argument("--use_unsloth", action="store_true", default=_use_unsloth(),
+    parser.add_argument("--use_unsloth", action="store_true", default=_env('USE_UNSLOTH', '0').lower() in ('1', 'true', 'yes'),
                         help="Use unsloth's FastLanguageModel for optimised training "
                              "(2x faster, 80%% less VRAM). Requires: pip install unsloth")
-    parser.add_argument("--use_ddp", action="store_true", default=False,
+    parser.add_argument("--use_ddp", action="store_true", default=_env('USE_DDP', '0').lower() in ('1', 'true', 'yes'),
                         help="Use Distributed Data Parallelization. It's recommended for SFT + unsloth training.")
     args = parser.parse_args()
 
     # Validate integer arguments
     for field in ('buffer_size', 'per_device_train_batch_size',
                   'gradient_accumulation_steps', 'max_steps',
-                  'num_generations', 'steps_per_generation'):
+                  'num_generations', 'steps_per_generation', 
+                  'max_model_len', 'max_completion_length', 'max_prompt_length'):
         try:
             setattr(args, field, int(getattr(args, field)))
         except ValueError:

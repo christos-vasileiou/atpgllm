@@ -107,6 +107,7 @@ def load_quantised_model(model_name: str, device_map: str | dict = "auto") -> Au
         quantization_config=quant_config,
         device_map=device_map,
         trust_remote_code=True,
+        attn_implementation="flash_attention_3",
     )
     return model
 

@@ -48,12 +48,17 @@ Training stops when criteria (1) AND (2) are **both** met for
 from __future__ import annotations
 
 import asyncio
+import gc
+import importlib.util
 import json
 import logging
 import os
+from pathlib import Path
 import sys
 import time
 from typing import Any, Callable, Dict, List, Optional
+
+from typing_extensions import deprecated
 
 import numpy as np
 import regex as re
@@ -61,7 +66,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, TrainerCallback
 from tqdm import tqdm
-from tools import ToolHelper
+from tools import ToolHelper, TOOLS
 
 import matplotlib
 matplotlib.use("Agg")
@@ -90,6 +95,37 @@ FULL_FORMAT_RE = re.compile(
     r'.*?DETECTED_FAULTS:\s*".*?"',
     re.DOTALL,
 )
+
+
+def _ddp_barrier() -> None:
+    """Synchronise all ranks when torch.distributed is initialised (no-op otherwise)."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _move_underlying_params_buffers_to_cpu(underlying: torch.nn.Module) -> None:
+    """Move tensors to CPU in-place so nn.Parameter identity is preserved (DDP-safe)."""
+    for p in underlying.parameters():
+        p.data = p.data.cpu()
+        if p.grad is not None:
+            p.grad = p.grad.cpu()
+    for b in underlying.buffers():
+        b.data = b.data.cpu()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+
+def _move_underlying_params_buffers_to_device(
+    underlying: torch.nn.Module, device: torch.device
+) -> None:
+    nb = device.type == "cuda"
+    for p in underlying.parameters():
+        p.data = p.data.to(device, non_blocking=nb)
+    for b in underlying.buffers():
+        b.data = b.data.to(device, non_blocking=nb)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 # =====================================================================
@@ -300,21 +336,25 @@ class ContextLengthHistogramCallback(TrainerCallback):
             "percentile_75": round(float(np.percentile(lengths, 75)), 2),
             "percentile_95": round(float(np.percentile(lengths, 95)), 2),
         }
+        is_distributed = torch.distributed.is_initialized()
+        is_main = not is_distributed or torch.distributed.get_rank() == 0
         stats_path = os.path.join(directory, "context_length_stats.json")
-        with open(stats_path, "w") as f:
-            json.dump(stats, f, indent=2)
+        if is_main:
+            with open(stats_path, "w") as f:
+                json.dump(stats, f, indent=2)
 
-        print(
-            f"[ContextLengthHistogram] Saved to {fig_path}\n"
-            f"  Sequences: {len(lengths):,} | Mean: {mean_val:,.0f} | "
-            f"Median: {median_val:,.0f} | "
-            f"Range: [{int(lengths.min())}, {int(lengths.max())}]"
-        )
+            print(
+                f"[ContextLengthHistogram] Saved to {fig_path}\n"
+                f"  Sequences: {len(lengths):,} | Mean: {mean_val:,.0f} | "
+                f"Median: {median_val:,.0f} | "
+                f"Range: [{int(lengths.min())}, {int(lengths.max())}]"
+            )
 
 
 # =====================================================================
 # SFTStoppingCallback
 # =====================================================================
+@deprecated("Use `python evaluate_model.py --sft-stop` instead")
 class SFTStoppingCallback(TrainerCallback):
     """
     Monitors SFT training and stops when the model has learned the output
@@ -408,6 +448,12 @@ class SFTStoppingCallback(TrainerCallback):
         vLLM server's max_model_len (default 32768). Used to cap max_tokens
         per request so input_tokens + max_tokens <= vllm_max_context.
     """
+    THINK_RE = THINK_RE
+    TOOL_CALL_RE = TOOL_CALL_RE
+    TOOL_RESPONSE_RE = TOOL_RESPONSE_RE
+    INPUT_VECTOR_RE = INPUT_VECTOR_RE
+    EXPECTED_OUTPUT_RE = EXPECTED_OUTPUT_RE
+    DETECTED_FAULTS_RE = DETECTED_FAULTS_RE
 
     def __init__(
         self,
@@ -422,6 +468,7 @@ class SFTStoppingCallback(TrainerCallback):
         use_vllm: bool = False,
         vllm_server_url: Optional[str] = None,
         max_new_tokens: int = 8192,
+        max_prompt_length: int = 4096,
         min_steps: int = 50,
         patience: int = 1,
         temperature: float = 0.7,
@@ -430,6 +477,7 @@ class SFTStoppingCallback(TrainerCallback):
         eval_every_n_saves: int = 1,
         generation_batch_size: int = 8,
         vllm_max_context: int = 32768,
+        device_map: str = "auto",
     ):
         self.tokenizer = tokenizer
         self.dataset_path = dataset_path
@@ -439,11 +487,12 @@ class SFTStoppingCallback(TrainerCallback):
         self.format_threshold = format_threshold
         self.diversity_threshold = diversity_threshold
         self.diversity_num_generations = diversity_num_generations
-        self.use_vllm = use_vllm
-        self.vllm_server_url = vllm_server_url or (
-            "http://localhost:8000" if use_vllm else None
-        )
+        self.use_vllm = use_vllm and importlib.util.find_spec("vllm") is not None
+        if self.use_vllm:
+            self._max_tool_rounds = 1
+        self.vllm_server_url = vllm_server_url
         self.max_new_tokens = max_new_tokens
+        self.max_prompt_length = max_prompt_length
         self.min_steps = min_steps
         self.patience = patience
         self.temperature = temperature
@@ -452,6 +501,7 @@ class SFTStoppingCallback(TrainerCallback):
         self.eval_every_n_saves = eval_every_n_saves
         self._generation_batch_size = generation_batch_size
         self.vllm_max_context = vllm_max_context
+        self.device_map = device_map
 
         # Lazy-loaded eval dataset
         self._eval_dataset = None
@@ -476,7 +526,7 @@ class SFTStoppingCallback(TrainerCallback):
             return
 
         # Lazy import to avoid circular dependency with training_code.py
-        from training_code import (
+        from dataset_utils import (
             TrainingMode,
             buffer_streaming_dataset,
             format_dataset_for_training,
@@ -494,6 +544,8 @@ class SFTStoppingCallback(TrainerCallback):
             eval_formatted_dataset,
             buffer_size=self.eval_buffer_size,
             shuffle=False,
+            tokenizer=self.tokenizer,
+            max_prompt_length=self.max_prompt_length,
         )
         self._eval_prompts = [ex["prompt"] for ex in self._eval_dataset]
         print(f"[SFTStoppingCallback] Loaded {len(self._eval_prompts)} eval prompts")
@@ -529,50 +581,99 @@ class SFTStoppingCallback(TrainerCallback):
         if state.global_step < self.min_steps:
             return
 
-        # ----- DDP: only rank 0 runs the expensive eval -----
-        # All ranks must still reach the broadcast below so that
-        # ``should_training_stop`` is synchronised.
+        # ----- DDP vs single-process -----
+        # In-process vLLM: every rank moves the training weights to CPU so each
+        # local GPU is free; rank 0 then loads vLLM.  All ranks must enter the
+        # same barriers so no rank runs Trainer/NCCL collectives while others
+        # are blocked in eval (rank skew causes watchdog timeouts).
         is_distributed = torch.distributed.is_initialized()
         is_main = not is_distributed or torch.distributed.get_rank() == 0
         should_stop = False
+
+        underlying = model.module if hasattr(model, "module") else model
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        device = (
+            torch.device(f"cuda:{local_rank}")
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+
+        use_inproc_vllm = self.use_vllm and not self.vllm_server_url
 
         if is_main:
             self._current_checkpoint_dir = os.path.join(
                 args.output_dir, f"checkpoint-{state.global_step}"
             )
-
             backend_label = (
-                "vLLM server" if (self.use_vllm and self.vllm_server_url)
+                "vLLM (in-process)"
+                if use_inproc_vllm
+                else "vLLM server"
+                if (self.use_vllm and self.vllm_server_url)
                 else "HF batched"
             )
             print(f"\n{'=' * 60}")
             print(f"[SFTStoppingCallback] Evaluating at step {state.global_step}")
-            print(f"  Backend: {backend_label}"
-                  f"  |  gen_batch_size: {self._generation_batch_size}"
-                  f"  |  eval prompts: {len(self._eval_prompts) if self._eval_prompts else self.eval_buffer_size}")
+            print(
+                f"  Backend: {backend_label}"
+                f"  |  gen_batch_size: {self._generation_batch_size}"
+                f"  |  eval prompts: "
+                f"{len(self._eval_prompts) if self._eval_prompts else self.eval_buffer_size}"
+            )
             print(f"{'=' * 60}")
-
-            # Lazy-load eval dataset
             self._load_eval_dataset()
 
-            # Switch to eval mode
-            was_training = model.training
-            model.eval()
-            eval_start = time.perf_counter()
+        was_training = model.training
+        model.eval()
 
+        from model_utils import load_optimizer_state_from_cpu, save_optimizer_state_to_cpu
+
+        base_opt = (
+            kwargs["optimizer"].optimizer
+            if hasattr(kwargs["optimizer"], "optimizer")
+            else kwargs["optimizer"]
+        )
+        opt_state_cpu = None
+        old_padding_side = self.tokenizer.padding_side
+        vllm_model = None
+
+        if use_inproc_vllm:
+            opt_state_cpu = save_optimizer_state_to_cpu(kwargs["optimizer"])
+            _move_underlying_params_buffers_to_cpu(underlying)
+            _ddp_barrier()
+
+        if is_main:
+            model_to_generate = None
             try:
+                if use_inproc_vllm:
+                    vllm_model, self._vllm_lora_request, self._vllm_generation_config = self._load_vllm_model(
+                        Path(self._current_checkpoint_dir),
+                        tp_size=1,
+                        gpu_memory_utilization=0.85,
+                        qlora=False,
+                        temperature=0.7,
+                        top_p=0.95,
+                        max_new_tokens=8192,
+                    )
+                    model_to_generate = vllm_model
+                else:
+                    # HF batched generate or vLLM HTTP server (server path may
+                    # fall back to HF on the training model).
+                    model_to_generate = underlying
+
+                eval_start = time.perf_counter()
+
                 # --- Criterion 1: Format Compliance ---
-                format_score, format_details = self._check_format_compliance(model)
+                format_score, format_details = self._check_format_compliance(model_to_generate)
 
                 # --- Criterion 2: Output Diversity ---
-                diversity_score, diversity_details = self._check_diversity(model)
+                diversity_score, diversity_details = self._check_diversity(model_to_generate)
 
                 # --- Criterion 3: Loss Plateau (soft) ---
                 loss_plateaued = self._check_loss_plateau()
 
                 eval_elapsed = time.perf_counter() - eval_start
                 print(f"\n  [Timing] Total eval wall-clock: {eval_elapsed:.1f}s")
-
+                
                 # Log results to console & checkpoint dir
                 self._log_results(
                     state,
@@ -584,7 +685,7 @@ class SFTStoppingCallback(TrainerCallback):
                     args,
                 )
 
-                # Decision
+                # Check if criteria are met
                 format_passed = format_score >= self.format_threshold
                 diversity_passed = diversity_score >= self.diversity_threshold
 
@@ -621,15 +722,47 @@ class SFTStoppingCallback(TrainerCallback):
                     print(f"\n  Continuing SFT: {'; '.join(reasons)}")
 
             finally:
-                if was_training:
-                    model.train()
+                if use_inproc_vllm and vllm_model is not None:
+                    try:
+                        vllm_model.llm_engine.engine_core.shutdown()
+                    except Exception as exc:
+                        logger.warning("vLLM engine shutdown: %s", exc)
+                    del vllm_model
+                    model_to_generate = None
+                    if hasattr(self, "_vllm_lora_request"):
+                        del self._vllm_lora_request
+                    if hasattr(self, "_vllm_generation_config"):
+                        del self._vllm_generation_config
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    gc.collect()
+                    try:
+                        import ray
 
+                        if ray.is_initialized():
+                            ray.shutdown()
+                    except Exception:
+                        pass
+
+        if use_inproc_vllm:
+            assert opt_state_cpu is not None
+            _ddp_barrier()
+            _move_underlying_params_buffers_to_device(underlying, device)
+            load_optimizer_state_from_cpu(
+                base_opt, opt_state_cpu, model=underlying
+            )
+            self.tokenizer.padding_side = old_padding_side
+
+        if was_training:
+            model.train()
+        
         # Synchronise the stop decision across all DDP ranks so that
         # every process breaks out of the training loop together.
         if is_distributed:
-            device = next(model.parameters()).device
+            device_for_broadcast = next(model.parameters()).device
             stop_tensor = torch.tensor(
-                int(should_stop), dtype=torch.int32, device=device,
+                int(should_stop), dtype=torch.int32, device=device_for_broadcast,
             )
             torch.distributed.broadcast(stop_tensor, src=0)
             should_stop = bool(stop_tensor.item())
@@ -637,6 +770,48 @@ class SFTStoppingCallback(TrainerCallback):
         if should_stop:
             control.should_training_stop = True
             self._stopped = True
+
+    def _load_vllm_model(self, adapter_path: Path, tp_size: int = 1, gpu_memory_utilization: float = 0.85, qlora: bool = False, temperature: float = 0.7, top_p: float = 0.95, max_new_tokens: int = 8192):
+        from vllm import LLM, SamplingParams
+        from vllm.lora.request import LoRARequest
+
+        with open(adapter_path / "adapter_config.json", "r") as f:
+            adapter_config = json.load(f)
+        base_model_name = adapter_config["base_model_name_or_path"]
+
+        self.old_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"  # For generation
+
+        quant_kwargs = {}
+        if qlora:
+            # Activates handling for bitsandbytes quantized base models natively.
+            quant_kwargs["quantization"] = "bitsandbytes"
+            quant_kwargs["load_format"] = "bitsandbytes"
+
+        # Initialize vLLM with unmerged dynamic LoRA
+        model = LLM(
+            model=base_model_name,
+            tensor_parallel_size=tp_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            dtype="bfloat16",
+            enable_lora=True,
+            max_lora_rank=adapter_config.get("r", 8),
+            trust_remote_code=True,
+            **quant_kwargs
+        )
+        lora_request = LoRARequest("active_adapter", 1, str(adapter_path))
+        generation_config = SamplingParams(
+            n=1,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_new_tokens,
+            stop_token_ids=[self.tokenizer.eos_token_id, self.tokenizer.pad_token_id],
+        )
+        print(f"vLLM Engine initialized on {tp_size} GPUs.")
+        print(f"Base Model: {base_model_name}")
+        print(f"Adapter dynamically mounted from: {adapter_path.as_posix()}")
+
+        return model, lora_request, generation_config
 
     # ------------------------------------------------------------------
     # Criterion 1 – Format Compliance
@@ -678,8 +853,8 @@ class SFTStoppingCallback(TrainerCallback):
 
         for completion in all_completions[:total]:
             # Check individual components
-            has_think = bool(THINK_RE.search(completion))
-            tc_match = TOOL_CALL_RE.search(completion)
+            has_think = bool(self.THINK_RE.search(completion))
+            tc_match = self.TOOL_CALL_RE.search(completion)
             has_tool_call = bool(tc_match)
             has_tool_json = False
             if tc_match:
@@ -688,17 +863,17 @@ class SFTStoppingCallback(TrainerCallback):
                     has_tool_json = True
                 except (json.JSONDecodeError, ValueError):
                     pass
-            has_iv = bool(INPUT_VECTOR_RE.search(completion))
-            has_eo = bool(EXPECTED_OUTPUT_RE.search(completion))
-            has_df = bool(DETECTED_FAULTS_RE.search(completion))
-
+            has_iv = bool(self.INPUT_VECTOR_RE.search(completion))
+            has_eo = bool(self.EXPECTED_OUTPUT_RE.search(completion))
+            has_df = bool(self.DETECTED_FAULTS_RE.search(completion))
+            
             details["think_ok"] += int(has_think)
             details["tool_call_ok"] += int(has_tool_call)
             details["tool_call_json_ok"] += int(has_tool_json)
             details["input_vector_ok"] += int(has_iv)
             details["expected_output_ok"] += int(has_eo)
             details["detected_faults_ok"] += int(has_df)
-
+            
             # Fully parseable = valid tool call + all summary fields
             if has_tool_json and has_iv and has_eo and has_df:
                 details["fully_parseable"] += 1
@@ -731,11 +906,11 @@ class SFTStoppingCallback(TrainerCallback):
         # not accounted for the score
         detected_faults: List[Optional[str]] = []
         for comp in completions:
-            m = INPUT_VECTOR_RE.search(comp)
+            m = self.INPUT_VECTOR_RE.search(comp)
             input_vectors.append(m.group(1).strip() if m else None)
-            m = EXPECTED_OUTPUT_RE.search(comp)
+            m = self.EXPECTED_OUTPUT_RE.search(comp)
             expected_outputs.append(m.group(1).strip() if m else None)
-            m = DETECTED_FAULTS_RE.search(comp)
+            m = self.DETECTED_FAULTS_RE.search(comp)
             detected_faults.append(m.group(1).strip() if m else None)
 
         parseable = [v for v in input_vectors if v is not None]
@@ -811,8 +986,11 @@ class SFTStoppingCallback(TrainerCallback):
         list[str]
             Full completions (first_turn + tool_response + second_turn).
         """
-        if self.use_vllm and self.vllm_server_url:
-            return self._generate_vllm_server(model, prompts, num_return_sequences)
+        if self.use_vllm:
+            if self.vllm_server_url:
+                return self._generate_vllm_server(model, prompts, num_return_sequences)
+            else:
+                return self._generate_n_completions_vllm(model, prompts, num_return_sequences)
         return self._generate_hf(model, prompts, num_return_sequences)
 
     # ------------------------------------------------------------------
@@ -917,26 +1095,18 @@ class SFTStoppingCallback(TrainerCallback):
             second_turn_items: List[tuple] = []
 
             for idx, ft in enumerate(first_turns):
-                tc_match = TOOL_CALL_RE.search(ft)
-                if not tc_match or not self.tool_functions:
+                tool_call = self._parse_tool_call(ft)
+                if not tool_call:
                     continue
 
-                try:
-                    tc_data = json.loads(tc_match.group(1))
-                except (json.JSONDecodeError, ValueError):
-                    continue
-
-                tool_name = tc_data.get("name", "")
-                tool_args = tc_data.get("arguments", {})
-                tool_args["netlist"] = ToolHelper.get_netlist(prompts[prompt_index_map[idx]])
-                tool_result = self._execute_tool(tool_name, tool_args)
+                tool_call["arguments"].update({"netlist": ToolHelper.get_netlist(prompts[prompt_index_map[idx]])})
+                tool_result = self._execute_tool_call(tool_call)
 
                 try:
                     messages = self._build_continued_messages(
                         prompts[prompt_index_map[idx]],
                         ft,
-                        tc_data,
-                        tool_name,
+                        tool_call,
                         tool_result,
                     )
                     cont_prompt = self.tokenizer.apply_chat_template(
@@ -1095,25 +1265,15 @@ class SFTStoppingCallback(TrainerCallback):
         second_turn_items: List[tuple] = []
 
         for idx, ft in enumerate(first_turns):
-            tc_match = TOOL_CALL_RE.search(ft)
-            if not tc_match or not self.tool_functions:
-                continue
-            try:
-                tc_data = json.loads(tc_match.group(1))
-            except (json.JSONDecodeError, ValueError):
-                continue
-                
-            tool_name = tc_data.get("name", "")
-            tool_args = tc_data.get("arguments", {})
-            tool_args["netlist"] = ToolHelper.get_netlist(prompts[prompt_index_map[idx]])
-            tool_result = self._execute_tool(tool_name, tool_args)
+            tool_call = self._parse_tool_call(ft)
+            tool_call["arguments"].update({"netlist": ToolHelper.get_netlist(prompts[prompt_index_map[idx]])})
+            tool_result = self._execute_tool_call(tool_call)
             
             try:
                 messages = self._build_continued_messages(
                     prompts[prompt_index_map[idx]],
                     ft,
-                    tc_data,
-                    tool_name,
+                    tool_call,
                     tool_result,
                 )
                 cont_prompt = self.tokenizer.apply_chat_template(
@@ -1275,11 +1435,116 @@ class SFTStoppingCallback(TrainerCallback):
             logger.warning("[SFTEval] Adapter load error: %s", exc)
             return False
 
+    def _generate_n_completions_vllm(
+        self,
+        llm,
+        prompts,
+        num_return_sequences: int = 1,
+    ) -> List[str]:
+        """
+        Generate n completions simultaneously using vLLM.
+        Tracks state of n independent generation paths to manage divergent tool calls natively.
+        """
+        # Initialize n completely independent conversation tracks
+        states = [
+            {
+                "prompt_idx": prompt_idx,
+                "current_input": prompt,
+                "full_completion": "",
+                "done": False,
+            }
+            for prompt_idx, prompt in enumerate(prompts)
+            for _ in range(num_return_sequences)
+        ]
+
+        for _round in range(self._max_tool_rounds + 1):
+            # Identify paths that still need generation
+            active_indices = [i for i, state in enumerate(states) if not state["done"]]
+            if not active_indices:
+                break
+            
+            active_inputs = [states[i]["current_input"] for i in active_indices]
+            
+            # Batch generate for all active paths using vLLM
+            outputs = llm.generate(
+                active_inputs,
+                sampling_params=self._vllm_generation_config,
+                lora_request=self._vllm_lora_request,
+                use_tqdm=False, # Disable nested tiny progress bars
+            )
+            
+            for i, output in zip(active_indices, outputs):
+                completion_text = output.outputs[0].text
+                states[i]["full_completion"] += completion_text
+                
+                if _round < self._max_tool_rounds:
+                    tool_call = self._parse_tool_call(completion_text)
+                    if tool_call is not None:
+                        # Get the netlist from the current input
+                        tool_call["arguments"].update({"netlist": ToolHelper.get_netlist(states[i]["current_input"])})
+                        
+                        # Execute tool synchronously for this specific path
+                        tool_result = self._execute_tool_call(tool_call)
+                        
+                        # Rebuild the conversation history just for this specific track
+                        messages = self._build_continued_messages(
+                            states[i]["current_input"],
+                            completion_text,
+                            tool_call,
+                            tool_result,
+                        )
+                        
+                        states[i]["current_input"] = self.tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            tools=TOOLS,
+                            add_generation_prompt=True,
+                        )
+                        states[i]["full_completion"] += f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
+                        # This track needs another round - leave done=False
+                    else:
+                        states[i]["done"] = True
+                else:
+                    # No tool call or max rounds reached
+                    states[i]["done"] = True
+
+        return [state["full_completion"] for state in states]
+
+    def _parse_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse a tool call from model completion text.
+        
+        Expected format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+        
+        Parameters
+        ----------
+        text : str
+            The completion text to parse.
+        
+        Returns
+        -------
+        Optional[Dict]
+            Parsed tool call dict with 'name' and 'arguments', or None.
+        """
+        import regex as re
+        match = self.TOOL_CALL_RE.search(text)
+        if match:
+            try:
+                tool_call_data = json.loads(match.group(1))
+                if "name" in tool_call_data:
+                    return tool_call_data
+            except json.JSONDecodeError:
+                pass
+        return None
+
+
     # ------------------------------------------------------------------
     # Tool execution helper
     # ------------------------------------------------------------------
-    def _execute_tool(self, tool_name: str, tool_args: dict) -> str:
+    def _execute_tool_call(self, tool_call: dict) -> str:
         """Execute a tool function (handles both sync and async)."""
+        tool_name = tool_call.get("name", "")
+        tool_args = tool_call.get("arguments", {})
         func = self.tool_functions.get(tool_name)
         if func is None:
             return f"Error: Unknown tool '{tool_name}'"
@@ -1304,7 +1569,6 @@ class SFTStoppingCallback(TrainerCallback):
         original_prompt: str,
         first_turn: str,
         tool_call_data: dict,
-        tool_name: str,
         tool_result: str,
     ) -> list:
         """
@@ -1312,7 +1576,7 @@ class SFTStoppingCallback(TrainerCallback):
         assistant message (with tool call) and the tool response, ready for
         ``apply_chat_template(add_generation_prompt=True)``.
         """
-        from revert_template import revert_qwen2_5_template
+        from revert_template import revert_qwen2_5_template, revert_chat_template 
 
         # Strip the trailing generation prompt suffix before parsing
         clean = original_prompt
@@ -1336,7 +1600,7 @@ class SFTStoppingCallback(TrainerCallback):
 
         # Tool response
         messages.append(
-            {"role": "tool", "name": tool_name, "content": tool_result}
+            {"role": "tool", "name": tool_call_data.get("name", ""), "content": tool_result}
         )
         return messages
 

@@ -5,7 +5,7 @@ evaluate_model.py
 Evaluation script for dual-adapter models (SFT + GRPO) using pass@k metrics.
 
 This module evaluates a model trained through SFT → GRPO by:
-1. Loading the dual-adapter model via load_dual_adapter_model()
+1. Loading the dual-adapter model via HF PEFT or vLLM natively.
 2. Loading the eval split of `chrivasileiou/asap7-language-of-test`
 3. For each prompt, generating N completions (with tool-calling support)
 4. Executing tool calls (fault simulation) when the model requests them
@@ -17,19 +17,18 @@ The pass@k metric (from the Codex paper, Chen et al. 2021) estimates:
 where n = total completions per problem, c = correct completions.
 
 Usage:
-    python evaluate_model.py \\
-        --sft_checkpoint ./sft_finetuned_model \\
-        --policy_checkpoint ./grpo_finetuned_model/policy_adapter \\
-        --dataset chrivasileiou/asap7-language-of-test \\
-        --n 10 --k 1 5 10 \\
+    python evaluate_model.py \
+        --backend vllm \
+        --tp_size 2 \
+        --adapter ./finetuned_model/combined/policy/ \
+        --dataset chrivasileiou/asap7-language-of-test \
+        --n 10 --k 1 5 10 \
         --temperature 0.6
 
 Environment Variables:
-    SFT_CHECKPOINT: Path to SFT adapter checkpoint
-    POLICY_CHECKPOINT: Path to policy adapter checkpoint
+    ADAPTER_CHECKPOINT: Path to SFT/GRPO adapter checkpoint
     EVAL_DATASET: Dataset identifier (default: chrivasileiou/asap7-language-of-test)
     NUM_SAMPLES: Number of completions per prompt (default: 10)
-    BATCH_SIZE: Batch size for generation (default: 4)
     MAX_EVAL_SAMPLES: Maximum number of eval samples (default: -1 for all)
 """
 
@@ -62,9 +61,10 @@ from peft import PeftModel
 
 from dual_adapter_grpo_trainer import load_dual_adapter_model, REFERENCE_ADAPTER_NAME, POLICY_ADAPTER_NAME
 from training_code import ConversationExample, TrainingMode
+from dataset_utils import buffer_streaming_dataset
 from reward_function_factory import RewardFunctionFactory
-from tools import TOOLS, FAULT_SIMULATION_TOOL, fault_simulation_tool
-from revert_template import revert_qwen2_5_template
+from tools import TOOLS, FAULT_SIMULATION_TOOL, fault_simulation_tool, fault_simulation_tool_handler, ToolHelper
+from revert_template import revert_chat_template
 
 warnings.filterwarnings("ignore")
 
@@ -171,7 +171,7 @@ def execute_tool_call(tool_call: Dict[str, Any]) -> str:
     if tool_name == "fault_simulation_tool":
         try:
             loop = asyncio.new_event_loop()
-            result = loop.run_until_complete(fault_simulation_tool(**tool_args))
+            result = loop.run_until_complete(fault_simulation_tool_handler(**tool_args))
             loop.close()
             return str(result)
         except Exception as e:
@@ -246,12 +246,15 @@ def generate_with_tools(
         if _round < max_tool_rounds:
             tool_call = parse_tool_call(completion_text)
             if tool_call is not None:
+                # Get the netlist from the current input
+                tool_call["arguments"].update({"netlist": ToolHelper.get_netlist(prompt_text)})
+                
                 # Execute the tool
                 tool_result = execute_tool_call(tool_call)
                 
                 # Build the continuation with tool result
                 # Parse the current conversation, add tool result, and prepare for next generation
-                messages = revert_qwen2_5_template(current_input)
+                messages = revert_chat_template(current_input, tokenizer=tokenizer)
                 
                 # Add the assistant message (with tool call)
                 messages.append({"role": "assistant", "content": completion_text})
@@ -319,6 +322,87 @@ def generate_n_completions(
         completions.append(completion)
     return completions
 
+
+
+# =============================================================================
+# GENERATION WITH TOOL CALLING (vLLM)
+# =============================================================================
+
+def generate_n_completions_vllm(
+    llm, # type: vllm.LLM
+    tokenizer: AutoTokenizer,
+    prompt_text: str,
+    n: int,
+    sampling_params, # type: vllm.SamplingParams
+    lora_request, # type: vllm.lora.request.LoRARequest
+    max_tool_rounds: int = 1,
+) -> List[str]:
+    """
+    Generate n completions simultaneously using vLLM.
+    Tracks state of n independent generation paths to manage divergent tool calls natively.
+    """
+    # Initialize n completely independent conversation tracks
+    states = [
+        {
+            "current_input": prompt_text,
+            "full_completion": "",
+            "done": False,
+        }
+        for _ in range(n)
+    ]
+
+    for _round in range(max_tool_rounds + 1):
+        # Identify paths that still need generation
+        active_indices = [i for i, state in enumerate(states) if not state["done"]]
+        if not active_indices:
+            break
+
+        active_inputs = [states[i]["current_input"] for i in active_indices]
+
+        # Batch generate for all active paths using vLLM
+        outputs = llm.generate(
+            active_inputs,
+            sampling_params=sampling_params,
+            lora_request=lora_request,
+            use_tqdm=False, # Disable nested tiny progress bars
+        )
+
+        for i, output in zip(active_indices, outputs):
+            completion_text = output.outputs[0].text
+            states[i]["full_completion"] += completion_text
+            
+            if _round < max_tool_rounds:
+                tool_call = parse_tool_call(completion_text)
+                if tool_call is not None:
+                    # Get the netlist from the current input
+                    tool_call["arguments"].update({"netlist": ToolHelper.get_netlist(states[i]["current_input"])})
+                    # Execute tool synchronously for this specific path
+                    tool_result = execute_tool_call(tool_call)
+                    
+                    # Rebuild the conversation history just for this specific track
+                    messages = revert_chat_template(states[i]["current_input"], tokenizer=tokenizer)
+                    messages.append({"role": "assistant", "content": completion_text})
+                    messages.append({
+                        "role": "tool",
+                        "name": tool_call.get("name", "fault_simulation_tool"),
+                        "content": tool_result,
+                    })
+                    
+                    states[i]["current_input"] = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        tools=TOOLS,
+                        add_generation_prompt=True,
+                    )
+                    states[i]["full_completion"] += f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
+                    # This track needs another round - leave done=False
+                else:
+                    states[i]["done"] = True
+            else:
+                # No tool call or max rounds reached
+                states[i]["done"] = True
+    
+    return [state["full_completion"] for state in states]
 
 # =============================================================================
 # PROMPT FORMATTING
@@ -476,8 +560,7 @@ def is_completion_correct(reward: Dict[str, float], threshold_mode: str = "fault
 # =============================================================================
 
 def evaluate(
-    sft_checkpoint: str,
-    policy_checkpoint: Optional[str] = None,
+    adapter: Path,
     dataset_path: str = "chrivasileiou/asap7-language-of-test",
     n: int = 10,
     k_values: List[int] = None,
@@ -491,16 +574,18 @@ def evaluate(
     seed: int = 42,
     report_to: str = "none",
     output_file: Optional[str] = None,
+    backend: str = "transformers",
+    tp_size: int = 2,
+    gpu_memory_utilization: float = 0.9,
+    qlora: bool = False,
 ) -> Dict[str, Any]:
     """
     Main evaluation function.
     
     Parameters
     ----------
-    sft_checkpoint : str
-        Path to SFT adapter checkpoint.
-    policy_checkpoint : str, optional
-        Path to policy adapter checkpoint.
+    adapter : str
+        Path to SFT/GRPO adapter checkpoint.
     dataset_path : str
         HuggingFace dataset identifier.
     n : int
@@ -551,14 +636,8 @@ def evaluate(
     print("LOADING MODEL")
     print("=" * 70)
     
-    model = load_dual_adapter_model(
-        sft_checkpoint_path=sft_checkpoint,
-        policy_checkpoint_path=policy_checkpoint,
-    )
-    model.eval()
-    
-    # Load tokenizer from the SFT checkpoint's base model
-    with open(os.path.join(sft_checkpoint, "adapter_config.json"), "r") as f:
+    # Load tokenizer from the checkpoint's base model
+    with open(adapter / "adapter_config.json", "r") as f:
         adapter_config = json.load(f)
     base_model_name = adapter_config["base_model_name_or_path"]
     
@@ -567,21 +646,57 @@ def evaluate(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # For generation
     
-    print(f"Model loaded from: SFT={sft_checkpoint}, Policy={policy_checkpoint}")
-    print(f"Base model: {base_model_name}")
-    print(f"Active adapter: {model.active_adapter}")
-    model.print_trainable_parameters()
-    
-    # Set up generation config
-    generation_config = GenerationConfig(
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        do_sample=True,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-    
+    if backend == "vllm":
+        from vllm import LLM, SamplingParams
+        from vllm.lora.request import LoRARequest
+        
+        quant_kwargs = {}
+        if qlora:
+            # Activates handling for bitsandbytes quantized base models natively.
+            quant_kwargs["quantization"] = "bitsandbytes"
+            quant_kwargs["load_format"] = "bitsandbytes"
+
+        # Initialize vLLM with unmerged dynamic LoRA
+        model = LLM(
+            model=base_model_name,
+            tensor_parallel_size=tp_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            dtype="bfloat16",
+            enable_lora=True,
+            max_lora_rank=adapter_config.get("r", 8),
+            trust_remote_code=True,
+            **quant_kwargs
+        )
+        lora_request = LoRARequest("active_adapter", 1, str(adapter))
+        
+        # In vLLM, n=1 here because the generation_vllm function manually submits 'n' active prompts
+        generation_config = SamplingParams(
+            n=1,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_new_tokens,
+            stop_token_ids=[tokenizer.eos_token_id, tokenizer.pad_token_id],
+        )
+        
+        print(f"vLLM Engine initialized on {tp_size} GPUs.")
+        print(f"Base Model: {base_model_name}")
+        print(f"Adapter dynamically mounted from: {adapter.as_posix()}")
+
+    else:
+        # Standard HF PEFT
+        model = load_dual_adapter_model(adapter=adapter)
+        model.eval()
+        
+        generation_config = GenerationConfig(
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=True,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        print(f"Model loaded via Transformers/PEFT from: {adapter.as_posix()}")
+
     # =========================================================================
     # 2. Load Dataset
     # =========================================================================
@@ -589,17 +704,10 @@ def evaluate(
     print("LOADING DATASET")
     print("=" * 70)
     
-    eval_dataset = load_dataset(dataset_path, split="eval", streaming=True)
+    eval_dataset = load_dataset(dataset_path, split="test", streaming=True)
     
     # Buffer the streaming dataset
-    eval_records = []
-    for i, record in enumerate(tqdm(eval_dataset, desc="Loading eval data")):
-        if max_eval_samples > 0 and i >= max_eval_samples:
-            break
-        eval_records.append(record)
-    
-    if not eval_records:
-        raise ValueError("No eval records loaded. Check dataset path and split name.")
+    eval_records = buffer_streaming_dataset(eval_dataset, buffer_size=max_eval_samples, shuffle=False, unique_by="netlist", tokenizer=tokenizer, max_prompt_length=max_new_tokens//4)
     
     print(f"Loaded {len(eval_records)} eval samples from '{dataset_path}' (eval split)")
     
@@ -623,16 +731,17 @@ def evaluate(
             wandb_run = wandb.init(
                 project="atpg-eval",
                 config={
-                    "sft_checkpoint": sft_checkpoint,
-                    "policy_checkpoint": policy_checkpoint,
+                    "adapter": adapter,
                     "dataset": dataset_path,
-                    "n_completions": n,
+                    "n": n,
                     "k_values": k_values,
                     "temperature": temperature,
                     "top_p": top_p,
                     "max_new_tokens": max_new_tokens,
+                    "max_tool_rounds": max_tool_rounds,
                     "threshold_mode": threshold_mode,
                     "num_eval_samples": len(eval_records),
+                    "seed": seed,
                 },
             )
         except ImportError:
@@ -672,14 +781,25 @@ def evaluate(
             continue
         
         # Generate n completions
-        completions = generate_n_completions(
-            model=model,
-            tokenizer=tokenizer,
-            prompt_text=prompt_text,
-            n=n,
-            generation_config=generation_config,
-            max_tool_rounds=max_tool_rounds,
-        )
+        if backend == "vllm":
+            completions = generate_n_completions_vllm(
+                llm=model,
+                tokenizer=tokenizer,
+                prompt_text=prompt_text,
+                n=n,
+                sampling_params=generation_config,
+                lora_request=lora_request,
+                max_tool_rounds=max_tool_rounds,
+            )
+        else:
+            completions = generate_n_completions(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_text=prompt_text,
+                n=n,
+                generation_config=generation_config,
+                max_tool_rounds=max_tool_rounds,
+            )
         
         # Evaluate each completion
         problem_rewards = []
@@ -823,8 +943,7 @@ def evaluate(
         "avg_component_metrics": avg_component_metrics,
         "accuracy_metrics": accuracy_metrics,
         "config": {
-            "sft_checkpoint": sft_checkpoint,
-            "policy_checkpoint": policy_checkpoint,
+            "adapter": str(adapter),
             "dataset": dataset_path,
             "n": n,
             "k_values": k_values,
@@ -834,6 +953,10 @@ def evaluate(
             "max_tool_rounds": max_tool_rounds,
             "threshold_mode": threshold_mode,
             "seed": seed,
+            "backend": backend,
+            "tp_size": tp_size,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "qlora": qlora,
         },
     }
     
@@ -881,6 +1004,918 @@ def evaluate(
 
 
 # =============================================================================
+# SFT STOPPING CRITERIA EVALUATION
+# =============================================================================
+
+def discover_checkpoints(output_dir: Path) -> List[Tuple[int, Path]]:
+    """
+    Find checkpoint-N directories containing adapter_config.json under
+    *output_dir*.  Returns a list of ``(step, path)`` sorted by step.
+    """
+    checkpoints = []
+    if not output_dir.is_dir():
+        return checkpoints
+    for entry in output_dir.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("checkpoint-"):
+            continue
+        try:
+            step = int(entry.name.split("-", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if (entry / "adapter_config.json").exists():
+            checkpoints.append((step, entry))
+    checkpoints.sort(key=lambda x: x[0])
+    return checkpoints
+
+
+def load_sft_eval_prompts(
+    tokenizer: AutoTokenizer,
+    dataset_path: str,
+    eval_buffer_size: int,
+    max_prompt_length: int,
+) -> List[str]:
+    """
+    Load eval prompts using the same pipeline as SFTStoppingCallback:
+    streaming test split -> GRPO format -> buffer -> extract ``prompt`` field.
+    """
+    from dataset_utils import (
+        TrainingMode,
+        buffer_streaming_dataset,
+        format_dataset_for_training,
+    )
+
+    print(
+        f"[SFTStopEval] Loading eval dataset from {dataset_path} "
+        f"(buffer={eval_buffer_size})..."
+    )
+    raw = load_dataset(dataset_path, split="test", streaming=True)
+    formatted = format_dataset_for_training(raw, tokenizer, TrainingMode.GRPO)
+    buffered = buffer_streaming_dataset(
+        formatted,
+        buffer_size=eval_buffer_size,
+        shuffle=False,
+        tokenizer=tokenizer,
+        max_prompt_length=max_prompt_length,
+    )
+    prompts = [ex["prompt"] for ex in buffered]
+    print(f"[SFTStopEval] Loaded {len(prompts)} eval prompts")
+    return prompts
+
+
+def sft_check_format_compliance(
+    completions: List[str],
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Score format compliance over *completions*.
+    Mirrors ``SFTStoppingCallback._check_format_compliance``.
+
+    Returns ``(score, details)`` where *score* is the fraction of fully
+    parseable completions.
+    """
+    from callbacks import (
+        THINK_RE, TOOL_CALL_RE, INPUT_VECTOR_RE,
+        EXPECTED_OUTPUT_RE, DETECTED_FAULTS_RE,
+    )
+
+    total = len(completions)
+    details: Dict[str, int] = {
+        "total": total,
+        "think_ok": 0,
+        "tool_call_ok": 0,
+        "tool_call_json_ok": 0,
+        "input_vector_ok": 0,
+        "expected_output_ok": 0,
+        "detected_faults_ok": 0,
+        "fully_parseable": 0,
+    }
+
+    for comp in completions:
+        has_think = bool(THINK_RE.search(comp))
+        tc_match = TOOL_CALL_RE.search(comp)
+        has_tc = bool(tc_match)
+        has_tc_json = False
+        if tc_match:
+            try:
+                json.loads(tc_match.group(1))
+                has_tc_json = True
+            except (json.JSONDecodeError, ValueError):
+                pass
+        has_iv = bool(INPUT_VECTOR_RE.search(comp))
+        has_eo = bool(EXPECTED_OUTPUT_RE.search(comp))
+        has_df = bool(DETECTED_FAULTS_RE.search(comp))
+
+        details["think_ok"] += int(has_think)
+        details["tool_call_ok"] += int(has_tc)
+        details["tool_call_json_ok"] += int(has_tc_json)
+        details["input_vector_ok"] += int(has_iv)
+        details["expected_output_ok"] += int(has_eo)
+        details["detected_faults_ok"] += int(has_df)
+        if has_tc_json and has_iv and has_eo and has_df:
+            details["fully_parseable"] += 1
+
+    score = details["fully_parseable"] / total if total > 0 else 0.0
+    return score, details
+
+
+def sft_check_diversity(
+    completions: List[str],
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Score output diversity on completions generated for the *same* prompt.
+    Mirrors ``SFTStoppingCallback._check_diversity``.
+
+    Returns ``(score, details)`` where
+    ``score = effective_unique / total_completions``.
+    """
+    from callbacks import INPUT_VECTOR_RE
+
+    vectors: List[Optional[str]] = []
+    for comp in completions:
+        m = INPUT_VECTOR_RE.search(comp)
+        vectors.append(m.group(1).strip() if m else None)
+
+    parseable = [v for v in vectors if v is not None]
+    unique_count = len(set(parseable)) if parseable else 0
+    none_count = sum(1 for v in vectors if v is None)
+    effective_unique = unique_count + min(none_count, 1)
+    score = effective_unique / len(completions) if completions else 0.0
+
+    return score, {
+        "total_generations": len(completions),
+        "parseable_count": len(parseable),
+        "unique_input_vectors": unique_count,
+        "unique_texts": len(set(c.strip() for c in completions)),
+        "unparseable_count": none_count,
+        "effective_unique": effective_unique,
+        "sample_vectors": parseable[:3],
+    }
+
+
+def sft_check_loss_plateau(
+    output_dir: Path,
+    up_to_step: int,
+    loss_window: int = 10,
+    loss_delta: float = 0.01,
+) -> bool:
+    """
+    Read ``trainer_state.json`` and check whether the training loss has
+    plateaued up to *up_to_step*.
+    Mirrors ``SFTStoppingCallback._check_loss_plateau``.
+    """
+    candidates = [
+        output_dir / "trainer_state.json",
+        output_dir / f"checkpoint-{up_to_step}" / "trainer_state.json",
+    ]
+    state_data = None
+    for path in candidates:
+        if path.exists():
+            try:
+                with open(path) as f:
+                    state_data = json.load(f)
+                break
+            except (json.JSONDecodeError, IOError):
+                continue
+
+    if state_data is None:
+        return False
+
+    losses: List[float] = []
+    for entry in state_data.get("log_history", []):
+        loss_val = entry.get("loss")
+        if loss_val is not None:
+            if entry.get("step", 0) > up_to_step:
+                break
+            losses.append(float(loss_val))
+
+    if len(losses) < loss_window:
+        return False
+
+    recent = losses[-loss_window:]
+    older_start = max(0, len(losses) - 2 * loss_window)
+    older_end = len(losses) - loss_window
+    older = losses[older_start:older_end]
+    if not older:
+        return False
+
+    improvement = float(np.mean(older)) - float(np.mean(recent))
+    return improvement < loss_delta
+
+
+# -----------------------------------------------------------------------------
+# Batched generation helpers for SFT stop eval
+# -----------------------------------------------------------------------------
+
+def _sft_eval_generate_vllm(
+    llm,
+    tokenizer: AutoTokenizer,
+    prompts: List[str],
+    n_per_prompt: int,
+    sampling_params,
+    lora_request,
+    max_tool_rounds: int = 1,
+) -> List[str]:
+    """
+    Batched multi-turn generation via vLLM for SFT stopping evaluation.
+    Returns ``len(prompts) * n_per_prompt`` completions.
+    """
+    states = [
+        {
+            "prompt_idx": pi,
+            "current_input": p,
+            "full_completion": "",
+            "done": False,
+        }
+        for pi, p in enumerate(prompts)
+        for _ in range(n_per_prompt)
+    ]
+
+    for _round in range(max_tool_rounds + 1):
+        active = [i for i, s in enumerate(states) if not s["done"]]
+        if not active:
+            break
+
+        outputs = llm.generate(
+            [states[i]["current_input"] for i in active],
+            sampling_params=sampling_params,
+            lora_request=lora_request,
+            use_tqdm=False,
+        )
+
+        for i, out in zip(active, outputs):
+            text = out.outputs[0].text
+            states[i]["full_completion"] += text
+
+            if _round < max_tool_rounds:
+                tc = parse_tool_call(text)
+                if tc is not None:
+                    tc["arguments"].update(
+                        {"netlist": ToolHelper.get_netlist(states[i]["current_input"])}
+                    )
+                    result = execute_tool_call(tc)
+                    msgs = revert_chat_template(
+                        states[i]["current_input"], tokenizer=tokenizer,
+                    )
+                    msgs.append({"role": "assistant", "content": text})
+                    msgs.append({
+                        "role": "tool",
+                        "name": tc.get("name", "fault_simulation_tool"),
+                        "content": result,
+                    })
+                    states[i]["current_input"] = tokenizer.apply_chat_template(
+                        msgs, tokenize=False, tools=TOOLS,
+                        add_generation_prompt=True,
+                    )
+                    states[i]["full_completion"] += (
+                        f"\n<tool_response>\n{result}\n</tool_response>\n"
+                    )
+                else:
+                    states[i]["done"] = True
+            else:
+                states[i]["done"] = True
+
+    return [s["full_completion"] for s in states]
+
+
+@torch.no_grad()
+def _sft_eval_generate_hf(
+    model,
+    tokenizer: AutoTokenizer,
+    prompts: List[str],
+    n_per_prompt: int,
+    max_new_tokens: int = 8192,
+    temperature: float = 0.7,
+    batch_size: int = 8,
+    max_tool_rounds: int = 1,
+) -> List[str]:
+    """
+    Batched two-turn generation via HF ``model.generate()`` for SFT stop eval.
+    Mirrors ``SFTStoppingCallback._generate_hf``.
+    """
+    device = next(model.parameters()).device
+    orig_pad_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
+    try:
+        expanded = []
+        for p in prompts:
+            expanded.extend([p] * n_per_prompt)
+
+        # -- Turn 1 --
+        first_turns: List[str] = []
+        for start in range(0, len(expanded), batch_size):
+            batch = expanded[start : start + batch_size]
+            enc = tokenizer(
+                batch, return_tensors="pt", padding=True,
+                truncation=True, max_length=max_new_tokens,
+            ).to(device)
+            out = model.generate(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=0.9,
+                num_return_sequences=1,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            first_turns.extend(
+                tokenizer.batch_decode(
+                    out[:, enc["input_ids"].shape[1] :], skip_special_tokens=True,
+                )
+            )
+
+        # -- Tool execution --
+        full: List[str] = list(first_turns)
+        turn2_items: List[tuple] = []
+        for idx, ft in enumerate(first_turns):
+            tc = parse_tool_call(ft)
+            if not tc:
+                continue
+            tc["arguments"].update(
+                {"netlist": ToolHelper.get_netlist(expanded[idx])}
+            )
+            result = execute_tool_call(tc)
+            try:
+                msgs = revert_chat_template(expanded[idx], tokenizer=tokenizer)
+                msgs.append({"role": "assistant", "content": ft})
+                msgs.append({
+                    "role": "tool",
+                    "name": tc.get("name", "fault_simulation_tool"),
+                    "content": result,
+                })
+                cont = tokenizer.apply_chat_template(
+                    msgs, tokenize=False, tools=TOOLS,
+                    add_generation_prompt=True,
+                )
+                turn2_items.append((idx, ft, result, cont))
+            except Exception:
+                pass
+
+        # -- Turn 2 --
+        if turn2_items:
+            conts = [item[3] for item in turn2_items]
+            turn2_texts: List[str] = []
+            for start in range(0, len(conts), batch_size):
+                batch = conts[start : start + batch_size]
+                enc = tokenizer(
+                    batch, return_tensors="pt", padding=True,
+                    truncation=True, max_length=max_new_tokens // 2,
+                ).to(device)
+                out = model.generate(
+                    **enc,
+                    max_new_tokens=max_new_tokens // 2,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=0.9,
+                    num_return_sequences=1,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                turn2_texts.extend(
+                    tokenizer.batch_decode(
+                        out[:, enc["input_ids"].shape[1] :],
+                        skip_special_tokens=True,
+                    )
+                )
+            for j, (orig_idx, ft, result, _) in enumerate(turn2_items):
+                full[orig_idx] = (
+                    ft
+                    + f"\n<tool_response>\n{result}\n</tool_response>\n"
+                    + turn2_texts[j]
+                )
+
+        return full
+    finally:
+        tokenizer.padding_side = orig_pad_side
+
+
+# -----------------------------------------------------------------------------
+# Main SFT stopping evaluation pipeline
+# -----------------------------------------------------------------------------
+
+def evaluate_sft_stop(
+    adapter: Path,
+    dataset_path: str = "chrivasileiou/asap7-language-of-test",
+    eval_buffer_size: int = 30,
+    format_threshold: float = 0.95,
+    diversity_threshold: float = 0.30,
+    diversity_num_generations: int = 10,
+    patience: int = 1,
+    min_steps: int = 50,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    max_new_tokens: int = 8192,
+    max_prompt_length: int = 4096,
+    generation_batch_size: int = 8,
+    loss_delta: float = 0.01,
+    loss_window: int = 10,
+    max_tool_rounds: int = 1,
+    backend: str = "vllm",
+    tp_size: int = 2,
+    gpu_memory_utilization: float = 0.9,
+    qlora: bool = False,
+    output_file: Optional[str] = None,
+    report_to: str = "none",
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    Evaluate saved SFT checkpoints against the stopping criteria from
+    ``SFTStoppingCallback`` (format compliance + output diversity + loss
+    plateau).
+
+    Supports two modes depending on what *adapter* points to:
+
+    * **Training output directory** — evaluates every ``checkpoint-N/``
+      subdirectory in order, tracks consecutive passes, and reports which
+      checkpoint (if any) first satisfies the stopping criteria.
+    * **Single checkpoint** — evaluates one checkpoint and reports whether
+      it meets the thresholds.
+
+    Hard criteria (both must pass for *patience* consecutive evaluations):
+        1. Format compliance  >= *format_threshold*  (default 95 %)
+        2. Output diversity   >= *diversity_threshold* (default 30 %)
+
+    Soft metric (informational):
+        3. Loss plateau (read from ``trainer_state.json``)
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    adapter = Path(adapter)
+
+    # ----- discover checkpoints -----
+    if (adapter / "adapter_config.json").exists():
+        step_str = adapter.name.split("-", 1)[1] if adapter.name.startswith("checkpoint-") else "0"
+        try:
+            step_val = int(step_str)
+        except ValueError:
+            step_val = 0
+        checkpoints = [(step_val, adapter)]
+        output_dir = adapter.parent
+    else:
+        checkpoints = discover_checkpoints(adapter)
+        output_dir = adapter
+
+    if not checkpoints:
+        raise FileNotFoundError(
+            f"No valid checkpoints found under {adapter}. "
+            f"Expected checkpoint-N/ directories with adapter_config.json."
+        )
+
+    print("=" * 70)
+    print("SFT STOPPING CRITERIA EVALUATION")
+    print("=" * 70)
+    print(f"  Output directory  : {output_dir}")
+    print(f"  Checkpoints found : {len(checkpoints)}")
+    print(f"  Steps             : {[s for s, _ in checkpoints]}")
+    print(f"  Backend           : {backend}")
+    print(f"  Format threshold  : {format_threshold:.0%}")
+    print(f"  Diversity thresh  : {diversity_threshold:.0%}")
+    print(f"  Patience          : {patience}")
+    print(f"  Min steps         : {min_steps}")
+    print("=" * 70)
+
+    # ----- tokenizer -----
+    first_cfg_path = checkpoints[0][1] / "adapter_config.json"
+    with open(first_cfg_path) as f:
+        first_cfg = json.load(f)
+    base_model_name = first_cfg["base_model_name_or_path"]
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    
+    # ----- eval prompts -----
+    eval_prompts = load_sft_eval_prompts(
+        tokenizer, dataset_path, eval_buffer_size, max_prompt_length,
+    )
+    if not eval_prompts:
+        raise RuntimeError(
+            "No eval prompts loaded. Check dataset_path and eval_buffer_size."
+        )
+
+    # ----- backend initialisation -----
+    llm = None
+    base_model_hf = None
+    peft_model_hf = None
+    sampling_config = None
+
+    if backend == "vllm":
+        from vllm import LLM, SamplingParams
+        from vllm.lora.request import LoRARequest
+
+        max_lora_rank = 8
+        for _, ckpt in checkpoints:
+            try:
+                with open(ckpt / "adapter_config.json") as f:
+                    r = json.load(f).get("r", 8)
+                max_lora_rank = max(max_lora_rank, r)
+            except Exception:
+                pass
+
+        quant_kwargs: Dict[str, Any] = {}
+        if qlora:
+            quant_kwargs = {"quantization": "bitsandbytes", "load_format": "bitsandbytes"}
+
+        llm = LLM(
+            model=base_model_name,
+            tensor_parallel_size=tp_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            dtype="bfloat16",
+            enable_lora=True,
+            max_lora_rank=max_lora_rank,
+            trust_remote_code=True,
+            **quant_kwargs,
+        )
+        sampling_config = SamplingParams(
+            n=1,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_new_tokens,
+            stop_token_ids=[tokenizer.eos_token_id, tokenizer.pad_token_id],
+        )
+        print(
+            f"[SFTStopEval] vLLM engine ready  (base={base_model_name}, "
+            f"tp={tp_size}, max_lora_rank={max_lora_rank})"
+        )
+    else:
+        from transformers import AutoModelForCausalLM
+
+        print(f"[SFTStopEval] Loading base model: {base_model_name}")
+        base_model_hf = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+
+    # ----- wandb -----
+    wandb_run = None
+    if report_to == "wandb":
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project="atpg-sft-stop-eval",
+                config={
+                    "adapter": str(adapter),
+                    "dataset": dataset_path,
+                    "format_threshold": format_threshold,
+                    "diversity_threshold": diversity_threshold,
+                    "diversity_num_generations": diversity_num_generations,
+                    "patience": patience,
+                    "min_steps": min_steps,
+                    "temperature": temperature,
+                    "backend": backend,
+                    "num_checkpoints": len(checkpoints),
+                    "eval_buffer_size": eval_buffer_size,
+                },
+            )
+        except ImportError:
+            print("wandb not installed; skipping.")
+
+    # =====================================================================
+    # Evaluate each checkpoint
+    # =====================================================================
+    consecutive_passes = 0
+    stop_checkpoint: Optional[int] = None
+    all_results: List[Dict[str, Any]] = []
+    eval_start = time.time()
+    prev_hf_adapter: Optional[str] = None
+
+    for ckpt_idx, (step, ckpt_path) in enumerate(checkpoints):
+        print(f"\n{'=' * 60}")
+        print(
+            f"[SFTStopEval] Checkpoint {ckpt_idx + 1}/{len(checkpoints)}: "
+            f"step {step}  ({ckpt_path.name})"
+        )
+        print(f"{'=' * 60}")
+
+        if step < min_steps:
+            msg = f"step {step} < min_steps {min_steps}"
+            print(f"  Skipping: {msg}")
+            all_results.append({
+                "step": step, "checkpoint": str(ckpt_path),
+                "skipped": True, "reason": msg,
+            })
+            continue
+
+        ckpt_start = time.time()
+
+        try:
+            # ----- generate format-compliance completions -----
+            print(
+                f"  [Format] Generating 1 completion for "
+                f"{len(eval_prompts)} prompts..."
+            )
+            if backend == "vllm":
+                lora_req = LoRARequest(
+                    f"ckpt_{step}", ckpt_idx + 1, str(ckpt_path),
+                )
+                fmt_completions = _sft_eval_generate_vllm(
+                    llm, tokenizer, eval_prompts, 1,
+                    sampling_config, lora_req, max_tool_rounds,
+                )
+            else:
+                adapter_name = f"ckpt_{step}"
+                if peft_model_hf is None:
+                    peft_model_hf = PeftModel.from_pretrained(
+                        base_model_hf, str(ckpt_path),
+                        adapter_name=adapter_name,
+                    )
+                else:
+                    peft_model_hf.load_adapter(
+                        str(ckpt_path), adapter_name=adapter_name,
+                    )
+                    peft_model_hf.set_adapter(adapter_name)
+                    if prev_hf_adapter is not None:
+                        try:
+                            peft_model_hf.delete_adapter(prev_hf_adapter)
+                        except Exception:
+                            pass
+                prev_hf_adapter = adapter_name
+                peft_model_hf.eval()
+
+                fmt_completions = _sft_eval_generate_hf(
+                    peft_model_hf, tokenizer, eval_prompts, 1,
+                    max_new_tokens, temperature,
+                    generation_batch_size, max_tool_rounds,
+                )
+
+            format_score, format_details = sft_check_format_compliance(
+                fmt_completions,
+            )
+
+            # ----- generate diversity completions -----
+            print(
+                f"  [Diversity] Generating {diversity_num_generations} "
+                f"completions for 1 prompt..."
+            )
+            if backend == "vllm":
+                div_completions = _sft_eval_generate_vllm(
+                    llm, tokenizer, [eval_prompts[0]],
+                    diversity_num_generations,
+                    sampling_config, lora_req, max_tool_rounds,
+                )
+            else:
+                div_completions = _sft_eval_generate_hf(
+                    peft_model_hf, tokenizer, [eval_prompts[0]],
+                    diversity_num_generations,
+                    max_new_tokens, temperature,
+                    generation_batch_size, max_tool_rounds,
+                )
+
+            diversity_score, diversity_details = sft_check_diversity(
+                div_completions,
+            )
+
+            # ----- loss plateau (soft) -----
+            loss_plateaued = sft_check_loss_plateau(
+                output_dir, step, loss_window, loss_delta,
+            )
+
+            ckpt_elapsed = time.time() - ckpt_start
+
+            # ----- print results -----
+            format_passed = format_score >= format_threshold
+            diversity_passed = diversity_score >= diversity_threshold
+
+            print(f"\n  Results at step {step}:")
+            print(
+                f"    Format compliance : {format_score:6.1%}  "
+                f"{'PASS' if format_passed else 'FAIL'}  "
+                f"(threshold: {format_threshold:.0%})"
+            )
+            t = format_details["total"]
+            for key in [
+                "think_ok", "tool_call_ok", "tool_call_json_ok",
+                "input_vector_ok", "expected_output_ok",
+                "detected_faults_ok", "fully_parseable",
+            ]:
+                label = key.replace("_ok", "").replace("_", " ").title()
+                print(f"      {label:.<28s} {format_details[key]:>3d}/{t}")
+
+            print(
+                f"    Output diversity  : {diversity_score:6.1%}  "
+                f"{'PASS' if diversity_passed else 'FAIL'}  "
+                f"(threshold: {diversity_threshold:.0%})"
+            )
+            dd = diversity_details
+            print(f"      Generations ......... {dd['total_generations']}")
+            print(f"      Parseable ........... {dd['parseable_count']}")
+            print(f"      Unique vectors ...... {dd['unique_input_vectors']}")
+            print(f"      Unique texts ........ {dd['unique_texts']}")
+
+            print(
+                f"    Loss plateau      : "
+                f"{'Yes' if loss_plateaued else 'No'}"
+            )
+            print(f"    Eval time         : {ckpt_elapsed:.1f}s")
+
+            # ----- stopping criteria -----
+            if format_passed and diversity_passed:
+                consecutive_passes += 1
+            else:
+                consecutive_passes = 0
+
+            criteria_met = consecutive_passes >= patience
+
+            if criteria_met and stop_checkpoint is None:
+                stop_checkpoint = step
+                print(f"\n  {'*' * 56}")
+                print(f"  * SFT STOPPING CRITERIA MET at step {step}")
+                print(
+                    f"  *   Format    : {format_score:.1%} "
+                    f">= {format_threshold:.0%}"
+                )
+                print(
+                    f"  *   Diversity : {diversity_score:.1%} "
+                    f">= {diversity_threshold:.0%}"
+                )
+                print(f"  *   Patience  : {consecutive_passes}/{patience}")
+                print(
+                    f"  *   Loss plat.: "
+                    f"{'Yes' if loss_plateaued else 'No'}"
+                )
+                print(f"  {'*' * 56}")
+            elif format_passed and diversity_passed:
+                remaining = patience - consecutive_passes
+                print(
+                    f"\n  Criteria passed ({consecutive_passes}/{patience}). "
+                    f"Waiting for {remaining} more."
+                )
+            else:
+                reasons = []
+                if not format_passed:
+                    reasons.append(
+                        f"Format {format_score:.1%} < {format_threshold:.0%}"
+                    )
+                if not diversity_passed:
+                    reasons.append(
+                        f"Diversity {diversity_score:.1%} "
+                        f"< {diversity_threshold:.0%}"
+                    )
+                print(f"\n  Not yet: {'; '.join(reasons)}")
+
+            # ----- per-checkpoint result -----
+            result: Dict[str, Any] = {
+                "step": step,
+                "checkpoint": str(ckpt_path),
+                "format_score": round(format_score, 4),
+                "format_threshold": format_threshold,
+                "format_details": format_details,
+                "format_passed": format_passed,
+                "diversity_score": round(diversity_score, 4),
+                "diversity_threshold": diversity_threshold,
+                "diversity_details": {
+                    k: v for k, v in diversity_details.items()
+                    if k != "sample_vectors"
+                },
+                "diversity_passed": diversity_passed,
+                "loss_plateaued": loss_plateaued,
+                "consecutive_passes": consecutive_passes,
+                "criteria_met": criteria_met,
+                "eval_time_seconds": round(ckpt_elapsed, 2),
+            }
+            all_results.append(result)
+
+            ckpt_result_path = ckpt_path / "sft_stopping_results.json"
+            with open(ckpt_result_path, "w") as f:
+                json.dump(result, f, indent=2, default=str)
+            print(f"  Saved to {ckpt_result_path}")
+
+            if wandb_run:
+                import wandb
+                wandb.log({
+                    "step": step,
+                    "sft_stop/format_score": format_score,
+                    "sft_stop/diversity_score": diversity_score,
+                    "sft_stop/loss_plateaued": int(loss_plateaued),
+                    "sft_stop/format_passed": int(format_passed),
+                    "sft_stop/diversity_passed": int(diversity_passed),
+                    "sft_stop/consecutive_passes": consecutive_passes,
+                    "sft_stop/criteria_met": int(criteria_met),
+                })
+
+        except Exception as exc:
+            import traceback
+            print(f"\n  ERROR evaluating checkpoint-{step}: {exc}")
+            traceback.print_exc()
+            consecutive_passes = 0
+            all_results.append({
+                "step": step,
+                "checkpoint": str(ckpt_path),
+                "error": str(exc),
+            })
+
+    total_time = time.time() - eval_start
+
+    # ----- cleanup -----
+    if llm is not None:
+        del llm
+    if peft_model_hf is not None:
+        del peft_model_hf
+    if base_model_hf is not None:
+        del base_model_hf
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # =====================================================================
+    # Summary
+    # =====================================================================
+    evaluated = sum(
+        1 for r in all_results
+        if "skipped" not in r and "error" not in r
+    )
+    print(f"\n{'=' * 70}")
+    print("SFT STOPPING EVALUATION SUMMARY")
+    print(f"{'=' * 70}")
+    print(f"  Checkpoints evaluated : {evaluated}/{len(checkpoints)}")
+    print(f"  Total eval time       : {total_time:.1f}s ({total_time / 60:.1f}m)")
+
+    if stop_checkpoint is not None:
+        print(f"\n  RECOMMENDED STOP: checkpoint-{stop_checkpoint}")
+        print(
+            f"    First checkpoint where format >= {format_threshold:.0%} AND "
+            f"diversity >= {diversity_threshold:.0%}"
+        )
+        print(f"    for {patience} consecutive evaluation(s).")
+    else:
+        print("\n  NO STOPPING POINT FOUND")
+        print(
+            f"    No checkpoint met both thresholds for "
+            f"{patience} consecutive eval(s)."
+        )
+        print(
+            "    Consider: longer training, lower thresholds, or patience=1."
+        )
+
+    # Summary table
+    print(
+        f"\n  {'Step':>6s}  {'Format':>8s}  {'Divers':>8s}  "
+        f"{'Plateau':>8s}  {'Consec':>6s}  Status"
+    )
+    print(
+        f"  {'-' * 6}  {'-' * 8}  {'-' * 8}  "
+        f"{'-' * 8}  {'-' * 6}  {'-' * 14}"
+    )
+    for r in all_results:
+        if "skipped" in r:
+            print(f"  {r['step']:>6d}  {'--':>8s}  {'--':>8s}  "
+                  f"{'--':>8s}  {'--':>6s}  skipped")
+        elif "error" in r:
+            print(f"  {r['step']:>6d}  {'--':>8s}  {'--':>8s}  "
+                  f"{'--':>8s}  {'--':>6s}  ERROR")
+        else:
+            loss_str = "Yes" if r["loss_plateaued"] else "No"
+            status = "PASS" if r["criteria_met"] else "FAIL"
+            marker = " <-- STOP" if (
+                r["criteria_met"] and r["step"] == stop_checkpoint
+            ) else ""
+            print(
+                f"  {r['step']:>6d}  {r['format_score']:>7.1%}  "
+                f"{r['diversity_score']:>7.1%}  "
+                f"{loss_str:>8s}  "
+                f"{r['consecutive_passes']:>6d}  "
+                f"{status}{marker}"
+            )
+    print("=" * 70)
+
+    # ----- compile final results -----
+    results: Dict[str, Any] = {
+        "config": {
+            "adapter": str(adapter),
+            "dataset": dataset_path,
+            "format_threshold": format_threshold,
+            "diversity_threshold": diversity_threshold,
+            "diversity_num_generations": diversity_num_generations,
+            "patience": patience,
+            "min_steps": min_steps,
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_new_tokens": max_new_tokens,
+            "backend": backend,
+            "eval_buffer_size": eval_buffer_size,
+            "seed": seed,
+        },
+        "checkpoints": all_results,
+        "stop_checkpoint_step": stop_checkpoint,
+        "total_eval_time_seconds": round(total_time, 2),
+    }
+
+    if output_file:
+        os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+        with open(output_file, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"\nResults saved to: {output_file}")
+
+    if wandb_run:
+        import wandb
+        wandb.log({"sft_stop/stop_checkpoint_step": stop_checkpoint or -1})
+        wandb.finish()
+
+    return results
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -895,126 +1930,280 @@ def main():
         epilog="""
 Examples:
   # Basic evaluation with pass@1
-  python evaluate_model.py --sft_checkpoint ./sft_model --n 1 --k 1
+  python evaluate_model.py --adapter ./sft_finetuned_model/ --n 1 --k 1
 
   # Full evaluation with pass@1,5,10
   python evaluate_model.py \\
-      --sft_checkpoint ./sft_model \\
-      --policy_checkpoint ./grpo_model/policy_adapter \\
+      --adapter ./finetuned_model/combined/policy/ \\
+      --backend vllm \\
       --n 10 --k 1 5 10 \\
       --temperature 0.6 \\
       --output eval_results.json
 
   # Quick evaluation on a subset
   python evaluate_model.py \\
-      --sft_checkpoint ./sft_model \\
+      --adapter ./finetuned_model/combined/reference/ \\
+      --backend transformers \\
       --max_eval_samples 50 --n 5 --k 1 5
+
+  # SFT stopping criteria evaluation (all checkpoints in a training dir)
+  python evaluate_model.py \\
+      --sft_stop \\
+      --adapter ./sft_7b_exper1/ \\
+      --backend vllm --tp_size 2 \\
+      --format_threshold 0.95 --diversity_threshold 0.30 \\
+      --patience 1 --min_steps 50 \\
+      --output sft_stop_results.json
+
+  # SFT stopping criteria evaluation (single checkpoint)
+  python evaluate_model.py \\
+      --sft_stop \\
+      --adapter ./sft_7b_exper1/checkpoint-100/ \\
+      --backend vllm --tp_size 2
         """,
     )
     
     parser.add_argument(
-        "--sft_checkpoint", type=str, 
-        default=_env("SFT_CHECKPOINT"),
-        help="Path to SFT adapter checkpoint",
+        "--adapter", 
+        type=str, 
+        default=_env("ADAPTER_CHECKPOINT"), 
+        required=True,
+        help="Path to the adapter checkpoint",
     )
-    parser.add_argument(
-        "--policy_checkpoint", type=str, 
-        default=_env("POLICY_CHECKPOINT"),
-        help="Path to policy adapter checkpoint (optional, for GRPO-trained models)",
-    )
-    parser.add_argument(
-        "--dataset", type=str,
-        default=_env("EVAL_DATASET", "chrivasileiou/asap7-language-of-test"),
+    parser.add_argument( 
+        "--dataset", 
+        type=str, 
+        default=_env("EVAL_DATASET", "chrivasileiou/asap7-language-of-test"), 
         help="HuggingFace dataset identifier",
     )
     parser.add_argument(
-        "--n", type=int, 
-        default=int(_env("NUM_SAMPLES", "10")),
+        "--n", 
+        type=int, 
+        default=int(_env("NUM_SAMPLES", "10")), 
         help="Number of completions per prompt",
     )
     parser.add_argument(
-        "--k", type=int, nargs="+", 
-        default=[1, 5, 10],
+        "--k", 
+        type=int, 
+        nargs="+", 
+        default=[1, 5, 10], 
         help="k values for pass@k (e.g., --k 1 5 10)",
     )
     parser.add_argument(
-        "--temperature", type=float, 
-        default=float(_env("TEMPERATURE", "0.6")),
+        "--temperature", 
+        type=float, 
+        default=float(_env("TEMPERATURE", "0.6")), 
         help="Generation temperature",
     )
     parser.add_argument(
-        "--top_p", type=float, 
-        default=float(_env("TOP_P", "0.95")),
-        help="Nucleus sampling threshold",
+        "--top_p", 
+        type=float, 
+        default=float(_env("TOP_P", "0.95")), 
+        help="Nucleus sampling threshold"
     )
     parser.add_argument(
-        "--max_new_tokens", type=int, 
-        default=int(_env("MAX_NEW_TOKENS", "4096")),
-        help="Maximum new tokens per generation",
+        "--max_new_tokens", 
+        type=int, 
+        default=int(_env("MAX_NEW_TOKENS", "8192")), 
+        help="Maximum new tokens per generation"
     )
     parser.add_argument(
-        "--max_eval_samples", type=int, 
-        default=int(_env("MAX_EVAL_SAMPLES", "-1")),
+        "--max_eval_samples", 
+        type=int, 
+        default=int(_env("MAX_EVAL_SAMPLES", "-1")), 
         help="Maximum eval samples (-1 for all)",
     )
     parser.add_argument(
-        "--max_tool_rounds", type=int, 
-        default=int(_env("MAX_TOOL_ROUNDS", "1")),
-        help="Maximum tool call rounds per generation",
+        "--max_tool_rounds", 
+        type=int, 
+        default=int(_env("MAX_TOOL_ROUNDS", "1")), 
+        help="Maximum tool call rounds per generation"
     )
     parser.add_argument(
-        "--threshold_mode", type=str,
-        default=_env("THRESHOLD_MODE", "fault_detected"),
-        choices=["fault_detected", "positive_reward", "full_accuracy"],
-        help="Correctness threshold mode for pass@k",
+        "--threshold_mode", 
+        type=str, 
+        default=_env("THRESHOLD_MODE", "fault_detected"), 
+        choices=["fault_detected", "positive_reward", "full_accuracy"], 
+        help="Correctness threshold mode for pass@k"
     )
     parser.add_argument(
-        "--config_path", type=str,
-        default=_env("SIM_CONFIG", "sim_config.json"),
-        help="Path to sim_config.json",
+        "--config_path", 
+        type=str, 
+        default=_env("SIM_CONFIG", "sim_config.json"), 
+        help="Path to sim_config.json"
     )
     parser.add_argument(
-        "--seed", type=int, 
-        default=int(_env("SEED", "42")),
-        help="Random seed",
+        "--seed", 
+        type=int, 
+        default=int(_env("SEED", "42")), 
+        help="Random seed"
     )
     parser.add_argument(
-        "--report_to", type=str,
-        default=_env("REPORT_TO", "none"),
-        choices=["wandb", "none"],
-        help="Reporting backend",
+        "--report_to", 
+        type=str, 
+        default=_env("REPORT_TO", "none"), 
+        choices=["wandb", "none"], 
+        help="Reporting backend"
     )
     parser.add_argument(
-        "--output", type=str,
-        default=_env("OUTPUT_FILE"),
-        help="Output file for detailed results (JSON)",
+        "--output_file", 
+        type=str, 
+        default=_env("OUTPUT_FILE"), 
+        help="Output file for detailed results (JSON)"
     )
     
-    args = parser.parse_args()
-    
-    if args.sft_checkpoint is None:
-        parser.error("--sft_checkpoint is required (or set SFT_CHECKPOINT env var)")
-    
-    results = evaluate(
-        sft_checkpoint=args.sft_checkpoint,
-        policy_checkpoint=args.policy_checkpoint,
-        dataset_path=args.dataset,
-        n=args.n,
-        k_values=args.k,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_new_tokens=args.max_new_tokens,
-        max_eval_samples=args.max_eval_samples,
-        max_tool_rounds=args.max_tool_rounds,
-        threshold_mode=args.threshold_mode,
-        config_path=args.config_path,
-        seed=args.seed,
-        report_to=args.report_to,
-        output_file=args.output,
+    # Backend Arguments
+    parser.add_argument(
+        "--backend", 
+        type=str, 
+        default="transformers", 
+        choices=["transformers", "vllm"], 
+        help="Inference engine backend to use."
     )
-    
-    return results
+    parser.add_argument(
+        "--tp_size", 
+        type=int, 
+        default=len(_env("CUDA_VISIBLE_DEVICES", "1").split(",")), 
+        help="Tensor parallel size (number of GPUs) for vLLM."
+    )
+    parser.add_argument(
+        "--gpu_memory_utilization", 
+        type=float, 
+        default=0.7, 
+        help="GPU memory utilization for vLLM."
+    )
+    parser.add_argument(
+        "--qlora", 
+        action="store_true", 
+        help="Use if the base model is a BitsAndBytes quantized model (4-bit/8-bit)."
+    )
 
+    # SFT Stopping Criteria Arguments
+    sft_group = parser.add_argument_group(
+        "SFT stopping criteria",
+        "Evaluate checkpoints against SFTStoppingCallback criteria "
+        "(format compliance + output diversity). Activated by --sft_stop.",
+    )
+    sft_group.add_argument(
+        "--sft_stop",
+        action="store_true",
+        help="Evaluate SFT stopping criteria across saved checkpoints "
+             "instead of pass@k. --adapter should point to the training "
+             "output directory (containing checkpoint-N/ subdirs) or a "
+             "single checkpoint.",
+    )
+    sft_group.add_argument(
+        "--format_threshold",
+        type=float,
+        default=0.95,
+        help="Min format compliance fraction (default: 0.95).",
+    )
+    sft_group.add_argument(
+        "--diversity_threshold",
+        type=float,
+        default=0.30,
+        help="Min output diversity fraction (default: 0.30).",
+    )
+    sft_group.add_argument(
+        "--diversity_num_generations",
+        type=int,
+        default=10,
+        help="Number of completions for the diversity check (default: 10).",
+    )
+    sft_group.add_argument(
+        "--patience",
+        type=int,
+        default=1,
+        help="Consecutive passing evaluations required before declaring "
+             "stop (default: 1).",
+    )
+    sft_group.add_argument(
+        "--min_steps",
+        type=int,
+        default=50,
+        help="Skip checkpoints before this training step (default: 50).",
+    )
+    sft_group.add_argument(
+        "--eval_buffer_size",
+        type=int,
+        default=30,
+        help="Number of eval prompts to buffer from the test split "
+             "(default: 30).",
+    )
+    sft_group.add_argument(
+        "--max_prompt_length",
+        type=int,
+        default=4096,
+        help="Max prompt token length for eval buffering (default: 4096).",
+    )
+    sft_group.add_argument(
+        "--generation_batch_size",
+        type=int,
+        default=8,
+        help="Batch size for generation during eval (default: 8).",
+    )
+    sft_group.add_argument(
+        "--loss_delta",
+        type=float,
+        default=0.01,
+        help="Minimum loss improvement to not flag plateau (default: 0.01).",
+    )
+    sft_group.add_argument(
+        "--loss_window",
+        type=int,
+        default=10,
+        help="Number of log entries for plateau detection (default: 10).",
+    )
+
+    args = parser.parse_args()
+
+    if args.sft_stop:
+        evaluate_sft_stop(
+            adapter=Path(args.adapter),
+            dataset_path=args.dataset,
+            eval_buffer_size=args.eval_buffer_size,
+            format_threshold=args.format_threshold,
+            diversity_threshold=args.diversity_threshold,
+            diversity_num_generations=args.diversity_num_generations,
+            patience=args.patience,
+            min_steps=args.min_steps,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_new_tokens=args.max_new_tokens,
+            max_prompt_length=args.max_prompt_length,
+            generation_batch_size=args.generation_batch_size,
+            loss_delta=args.loss_delta,
+            loss_window=args.loss_window,
+            max_tool_rounds=args.max_tool_rounds,
+            backend=args.backend,
+            tp_size=args.tp_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            qlora=args.qlora,
+            output_file=args.output_file,
+            report_to=args.report_to,
+            seed=args.seed,
+        )
+    else:
+        evaluate(
+            adapter=Path(args.adapter),
+            dataset_path=args.dataset,
+            n=args.n,
+            k_values=args.k,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_new_tokens=args.max_new_tokens,
+            max_eval_samples=args.max_eval_samples,
+            max_tool_rounds=args.max_tool_rounds,
+            threshold_mode=args.threshold_mode,
+            config_path=args.config_path,
+            seed=args.seed,
+            report_to=args.report_to,
+            output_file=args.output_file,
+            backend=args.backend,
+            tp_size=args.tp_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            qlora=args.qlora,
+        )
 
 if __name__ == "__main__":
     main()

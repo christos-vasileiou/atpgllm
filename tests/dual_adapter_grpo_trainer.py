@@ -65,7 +65,7 @@ from trl import GRPOTrainer, GRPOConfig
 from accelerate.utils import gather
 import copy
 from tools import TOOLS, ToolHelper
-from revert_template import revert_qwen2_5_template
+from revert_template import revert_qwen2_5_template, revert_chat_template
 
 # Adapter name constants
 REFERENCE_ADAPTER_NAME = "reference"
@@ -85,15 +85,30 @@ from vllm.sampling_params import GuidedDecodingParams
 
 class DualAdapterGRPOTrainer(GRPOTrainer):
     """
-    GRPOTrainer variant that uses a dual-adapter approach to avoid merging.
-    
-    Key differences from standard GRPOTrainer:
-    1. Does NOT merge the SFT adapter - keeps it isolated
-    2. Adds a separate "policy" adapter for GRPO training
-    3. Overrides reference computation to use SFT adapter instead of disabling all
-    
-    This preserves the SFT model's behavior with quantization while allowing
-    continued training with GRPO.
+    GRPOTrainer variant that uses a dual-adapter (LoRA-on-LoRA) approach.
+
+    Standard GRPOTrainer calls merge_and_unload() when given a PeftModel,
+    permanently fusing the SFT LoRA into the 4-bit base weights.  This causes
+    precision loss because the merged result gets re-quantised to 4-bit.
+
+    Instead we keep *two* LoRA adapters side by side:
+      - "reference"  (frozen SFT adapter)  — acts as the reference model
+      - "policy"     (trainable adapter)    — updated by GRPO
+
+    During forward:
+      policy logps    = base + reference + policy   (both adapters active)
+      reference logps = base + reference            (only SFT adapter active)
+
+    This avoids any merge and preserves the SFT adapter's full-precision
+    contribution throughout training.
+
+    Multi-turn tool calling:
+      After the initial generation, completions are scanned for <tool_call> tags.
+      Matched tool calls are executed, results appended to the conversation, and
+      the model is asked to continue.  This loop repeats until no tool calls
+      remain or the context window is exhausted.  The loop is DDP-safe: all
+      ranks synchronise before each vLLM generation call so collective ops
+      never deadlock.
     """
     
     def __init__(
@@ -107,6 +122,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         ref_adapter_name: str = None,
         tools: list[Callable] | None = None,
         tool_functions: dict = None,
+        vllm_max_model_len: int = None,
         **kwargs,
     ):
         """
@@ -128,14 +144,16 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         **kwargs
             Additional arguments passed to GRPOTrainer.
         """
-        # Validate that we have a PeftModel
+        # ── Validate input ──
         if not isinstance(model, PeftModel):
             raise ValueError(
                 "DualAdapterGRPOTrainer requires a PeftModel with an existing adapter. "
                 "If you're starting from scratch, use the standard GRPOTrainer instead."
             )
-        
-        # Store the original SFT adapter name before any modifications
+
+        # ── Phase 1: Resolve the SFT (reference) adapter name ──
+        # The model already has an SFT adapter loaded.  Figure out its name
+        # and normalise it to REFERENCE_ADAPTER_NAME for clarity.
         if ref_adapter_name is None:
             ref_adapter_name = model.active_adapter
             if isinstance(ref_adapter_name, list):
@@ -144,23 +162,22 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         self._ref_adapter_name = ref_adapter_name
         self._policy_adapter_name = POLICY_ADAPTER_NAME
         
-        # Rename the SFT adapter if it has the default name to avoid confusion
         if ref_adapter_name == "default" and REFERENCE_ADAPTER_NAME != "default":
             print(f"Renaming SFT adapter from 'default' to '{REFERENCE_ADAPTER_NAME}'")
             self._rename_adapter(model, "default", REFERENCE_ADAPTER_NAME)
             self._ref_adapter_name = REFERENCE_ADAPTER_NAME
-        
-        # Get or create policy LoRA config
+
+        # ── Phase 2: Create the policy adapter ──
+        # A second LoRA adapter is added alongside the frozen SFT one.
+        # Its weights are initialised as a copy of the SFT adapter (tau=1)
+        # so training starts from the SFT checkpoint.
         if policy_lora_config is None:
-            # Use the same config as the SFT adapter
             policy_lora_config = self._get_adapter_config(model, self._ref_adapter_name)
             print(f"Using SFT adapter config for policy adapter: r={policy_lora_config.r}")
         
-        # Add the policy adapter (this stacks on top of the SFT adapter)
         print(f"Adding policy adapter '{self._policy_adapter_name}' next to SFT adapter '{self._ref_adapter_name}'")
         model.add_adapter(adapter_name=self._policy_adapter_name, peft_config=policy_lora_config)
         
-        # Update grpo adapter weight to reference adapter weights (initialization step)
         self._update_adapter_weights(
             model=model, 
             source_adapter_name=self._ref_adapter_name, 
@@ -168,16 +185,15 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             tau=1.,
         )
 
-        # Set which adapters are active and trainable
-        # We want both adapters active, but only policy is trainable
+        # ── Phase 3: Freeze SFT, make policy trainable ──
         self._setup_adapter_training(model)
-        
-        # Print adapter info
         print(f"Active adapters: {model.active_adapter}")
         model.print_trainable_parameters()
-        
-        # Call parent __init__ but WITHOUT peft_config to prevent merge_and_unload
-        # We've already set up the adapters manually above
+
+        # ── Phase 4: Initialise the GRPOTrainer base class ──
+        # peft_config=None prevents the parent from calling merge_and_unload().
+        # tools=None because TRL's built-in tool support is incompatible with
+        # our custom multi-turn tool loop; we handle tools ourselves below.
         super().__init__(
             model=model,
             reward_funcs=reward_funcs,
@@ -188,22 +204,24 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             peft_config=None,  # CRITICAL: Don't pass peft_config to prevent merge!
             **kwargs,
         )
-        
+
+        # ── Phase 5: Set up async reward infrastructure & tool state ──
+        # If any reward function is an async coroutine, spin up a dedicated
+        # daemon event loop so they can run concurrently via asyncio.gather().
         self._has_async_reward_funcs = any(asyncio.iscoroutinefunction(func) for func in self.reward_funcs)
         if self._has_async_reward_funcs:
             self.async_reward_loop_thread, self.async_reward_loop, self.async_reward_loop_ready_event = (
                 start_event_loop_in_daemon(name="GRPOTrainer-AsyncRewardLoop")
             )
-            # wait until the event loop is running in the daemon thread
             self.async_reward_loop_ready_event.wait()
             atexit.register(shutdown_event_loop_in_daemon, self.async_reward_loop_thread, self.async_reward_loop)
         
-        # Initialize tools and tool functions
         self.tools = tools
         self.tool_functions = tool_functions
-        # Override ref_model - we use adapter switching instead
+        self._vllm_max_model_len = vllm_max_model_len
+        # We use adapter switching for ref logps — no separate ref_model needed.
         self.ref_model = None
-        self.print = True
+        self.print = False
         
     def _update_adapter_weights(self, model: PeftModel, source_adapter_name: str, target_adapter_name: str, tau: float = 1.):
         """
@@ -320,24 +338,25 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         ):
         """
         Get per-token log probabilities and entropies.
-        
-        This method is called for both policy and reference model computation.
-        We override the parent to ensure we're using the correct adapter context.
+
+        Called for both policy and reference forward passes.  The active adapter
+        at call time determines which set of logps we compute.
+
+        DDP bypass: when computing reference logps the policy adapter is
+        disabled, so no policy LoRA parameters participate in the forward pass.
+        DDP expects ALL parameters that require gradients to be used, and would
+        hang waiting for gradient buckets that never arrive.  Bypassing the DDP
+        wrapper for the reference pass avoids this.
         """
         unwrapped_model = self.accelerator.unwrap_model(model)
         active = getattr(unwrapped_model, "active_adapter", "")
         active_list = [active] if isinstance(active, str) else (active if isinstance(active, list) else [])
         
-        # CRITICAL DDP FIX: 
-        # If the policy adapter is NOT active, we are in the patched reference computation phase. 
-        # We MUST bypass the DDP wrapper and use the unwrapped model to prevent 
-        # DDP's gradient buckets from hanging.
         if self._policy_adapter_name not in active_list:
             model_to_use = unwrapped_model
         else:
             model_to_use = model
 
-        # Call parent implementation - the adapter context is set externally
         return super()._get_per_token_logps_and_entropies(
             model=model_to_use, 
             input_ids=input_ids, 
@@ -404,17 +423,21 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 
     def _patch_disable_adapter(self):
         """
-        Patch the model's disable_adapter to use our SFT-only context instead.
-        
-        This is a temporary patch applied during training to ensure reference
-        computation uses SFT adapter instead of disabling all adapters.
+        Monkey-patch model.disable_adapter() for the duration of training.
+
+        The parent GRPOTrainer computes reference logps inside a
+        ``with model.disable_adapter():`` block, which would disable BOTH
+        adapters (SFT + policy).  We need it to keep the SFT adapter active.
+
+        Rather than copy-pasting the entire parent method just to change one
+        context manager, we swap disable_adapter with a version that switches
+        to the SFT-only adapter instead of disabling everything.
         """
         model = self.accelerator.unwrap_model(self.model)
         original_disable_adapter = model.disable_adapter
         
         @contextlib.contextmanager
         def patched_disable_adapter():
-            """Patched version that switches to SFT adapter instead of disabling all."""
             with self._use_sft_adapter_only(model):
                 yield
         
@@ -422,44 +445,43 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         return original_disable_adapter
     
     def train(self, *args, **kwargs):
-        """
-        Override train to patch disable_adapter behavior.
-        """
+        """Install the disable_adapter patch before training, restore after."""
         model = self.accelerator.unwrap_model(self.model)
         original_disable_adapter = self._patch_disable_adapter()
         
         try:
             return super().train(*args, **kwargs)
         finally:
-            # Restore original disable_adapter
             model.disable_adapter = original_disable_adapter
 
     @profiling_decorator
     def _move_model_to_vllm(self):
         """
-        Override to properly sync dual-adapter PEFT model weights to vLLM.
+        Sync the merged (base + SFT + policy) weights to the vLLM server.
 
-        Merges the active (policy) adapter into the base weights, sends only
-        the 2-D weight matrices to vLLM (skipping biases and LoRA params),
-        then unmerges.
+        The vLLM server holds the original base-model weights.  After each
+        training step we need to push the updated weights so generation
+        reflects the latest policy.
 
-        Biases are skipped because LoRA never modifies them -- the vLLM server
-        already holds the correct base-model biases.  Sending them would also
-        trigger shape mismatches in vLLM's packed QKV / row-parallel loaders
-        which expect 2-D weight tensors.
+        Per-layer pipeline:
+          1. Dequantise the 4-bit base weight → bfloat16
+          2. Add ΔW from every active LoRA adapter  (W' = W + B·A·s)
+          3. Map the PEFT parameter name back to the HuggingFace name that
+             vLLM expects (strip "base_model.model." prefix)
+          4. Move the tensor to cuda:0 (the vLLM NCCL communicator lives there)
+          5. Push via vllm_client.update_named_param()
+
+        Biases are skipped — LoRA never touches them and vLLM already has the
+        correct base-model biases.
         """
         import inspect
         
-        # We do NOT use self.model.merge_adapter(). 
-        # We will compute the merged weights explicitly in memory.
-        
         with torch.no_grad():
             for name, module in self.model.named_modules():
-                # Only target the PEFT LoRA layers
                 if hasattr(module, "lora_A") and hasattr(module, "base_layer"):
                     base_layer = module.base_layer
-                    
-                    # 1. Dequantize the 4-bit base weight to 16-bit (bfloat16)
+
+                    # Step 1: dequantise base weight
                     if hasattr(base_layer.weight, "quant_state"):
                         import bitsandbytes as bnb
                         merged_weight = bnb.functional.dequantize_4bit(
@@ -468,24 +490,18 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                         ).to(torch.bfloat16)
                     else:
                         merged_weight = base_layer.weight.data.clone().to(torch.bfloat16)
-                    
-                    # 2. Bake in ALL active adapters dynamically
+
+                    # Step 2: fold in each active LoRA  (W' = W + Σ B_i · A_i · s_i)
                     for adapter_name in module.active_adapters:
                         if adapter_name in module.lora_A:
                             lora_A = module.lora_A[adapter_name].weight.to(torch.bfloat16)
                             lora_B = module.lora_B[adapter_name].weight.to(torch.bfloat16)
                             scaling = module.scaling[adapter_name]
-                            
                             merged_weight += (lora_B @ lora_A) * scaling
-                            
-                    # 3. Construct the clean HuggingFace name for vLLM
+
+                    # Steps 3-5: rename, move to cuda:0, push to vLLM server
                     vllm_name = name.replace("base_model.model.", "") + ".weight"
-                    
-                    # 4. CRITICAL FIX: Route the tensor to the master GPU (cuda:0) 
-                    # before passing it to the vllm_client's NCCL communicator.
                     merged_weight = merged_weight.to("cuda:0")
-                    
-                    # 5. Send to vLLM
                     if hasattr(self, "vllm_client") and self.vllm_client is not None:
                         self.vllm_client.update_named_param(vllm_name, merged_weight)
     
@@ -499,11 +515,6 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             output_dir = self.args.output_dir
         
         model = self.accelerator.unwrap_model(self.model)
-        
-        # Save the policy adapter
-        policy_dir = f"{output_dir}/policy_adapter"
-        print(f"Saving policy adapter to: {policy_dir}")
-        model.save_pretrained(policy_dir, selected_adapters=[self._policy_adapter_name])
         
         # Save tokenizer
         if self.processing_class is not None:
@@ -526,22 +537,32 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 
     @profiling_decorator
     def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+        """
+        Score every (prompt, completion) pair with all registered reward functions.
+
+        Three kinds of reward function are supported, processed in order:
+          1. nn.Module  — a learned reward model; gets tokenised text, returns logits
+          2. async def  — collected first, then run concurrently via asyncio.gather
+                          on a dedicated daemon event loop
+          3. regular def — called synchronously one by one
+
+        Returns a (B*G, num_reward_funcs) tensor gathered across all DDP ranks.
+        """
         device = self.accelerator.device
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
 
-        # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
+        # Build kwargs dict from all non-standard input columns for custom reward fns
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
         reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-
-        # This allows for dynamic reward shaping based on training progress.
         reward_kwargs["trainer_state"] = self.state
 
-        async_funcs_info = []  # async custom functions for asyncio.gather
+        async_funcs_info = []
         
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names, strict=True)
         ):
-            if isinstance(reward_func, nn.Module):  # Module (no PretrainedModel) for compat with compiled models
+            # Path 1: Neural reward model — tokenise, forward, take logits[:,0]
+            if isinstance(reward_func, nn.Module):
                 with profiling_context(self, reward_func_name):
                     if is_conversational(inputs[0]):
                         messages = [{"messages": p + c} for p, c in zip(prompts, completions, strict=True)]
@@ -556,17 +577,19 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     )
                     reward_inputs = super()._prepare_inputs(reward_inputs)
                     with torch.inference_mode():
-                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
-            elif asyncio.iscoroutinefunction(reward_func):  # Separate async reward funcs to run them in parallel later
+                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
+
+            # Path 2: Async function — defer to batch execution below
+            elif asyncio.iscoroutinefunction(reward_func):
                 async_funcs_info.append((i, reward_func, reward_func_name))
+
+            # Path 3: Synchronous callable
             else:
-                # Run synchronous reward function
                 with profiling_context(self, reward_func_name):
                     completions = self.processing_class.batch_decode(completion_ids_list, skip_special_tokens=True)
                     output_reward_func = reward_func(
                         prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
                     )
-                    # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
@@ -576,7 +599,8 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 print(completion)
                 print("-" * 100)
                 self.print = False
-        # Execute async custom functions in parallel using asyncio.gather
+
+        # Run all async reward functions concurrently on the daemon event loop
         if async_funcs_info:
             completions = self.processing_class.batch_decode(completion_ids_list, skip_special_tokens=True)
             async def _invoke_async_reward(index, func, func_name):
@@ -595,7 +619,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             for idx, output_reward_func in async_results:
                 rewards_per_func[:, idx] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
-        # If all reward functions return None for a given row, issue a detailed warning
+        # Warn if every reward function returned None for any sample
         if torch.isnan(rewards_per_func).all(dim=1).any():
             nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
             row_reward_kwargs = {
@@ -608,59 +632,61 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 "Please ensure that at least one reward function returns a valid reward."
             )
 
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
+        # Gather across DDP ranks — rewards must be global for per-group normalisation
         rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
     def _generate(self, prompts: list):
         """
-        Override the generation function to implement custom tool calling.
-        
-        This method is called by _generate_and_score_completions and must return:
-        - prompt_ids: list of lists of token IDs for prompts
-        - completion_ids: list of lists of token IDs for completions
-        - tool_mask: list of lists (1 for model tokens, 0 for tool result tokens) or None
-        - completions: list of decoded completions (strings or message dicts)
-        - total_completion_tokens: total tokens across all completions (for DAPO loss)
-        - logprobs: list of lists of log probabilities (or None if not using vLLM IS)
-        - extra_fields: dict of extra fields to pass to reward functions
+        Full generation pipeline: initial completion → tool loop → metrics.
+
+        Called once per training step by _generate_and_score_completions.
+        All DDP ranks enter and exit this method together.
+
+        Pipeline:
+          1. _generate_single_turn  — produce initial completions via vLLM
+          2. Decode token IDs → text / message dicts
+          3. _custom_tool_call_loop — parse tool calls, execute tools,
+             re-generate; repeat until no more tool calls or context full
+          4. Gather global metrics across DDP ranks (prompt/completion
+             lengths, truncation ratios, tool call counts, throughput)
+
+        Returns the tuple expected by the parent class:
+          (prompt_ids, completion_ids, tool_mask, completions,
+           total_completion_tokens, logprobs, extra_fields)
         """
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
         generation_start_time = time.perf_counter()
         
-        # Copy the prompts to avoid modifying the original list
         prompts = [revert_qwen2_5_template(prompt) for prompt in prompts]
         prompts = copy.deepcopy(prompts)
         
-        # Ensure left-padding for decoder-only models during generation
         original_padding_side = self.processing_class.padding_side
         self.processing_class.padding_side = "left"
         
         try:
-            # Step 1: Initial generation (reuse parent's single-turn generation)
+            # ── Step 1: Initial single-turn generation via vLLM ──
             prompt_ids, completion_ids, logprobs, extra_fields = self._generate_single_turn(prompts)
-            
-            # Step 2: Decode completions
+
+            # ── Step 2: Decode raw token IDs into text / message dicts ──
             if is_conversational({"prompt": prompts[0]}):
                 contents = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
                 completions = [[{"role": "assistant", "content": content}] for content in contents]
             else:
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
                 completions = [revert_qwen2_5_template("<|im_start|>assistant\n" + completion + "<|im_end|>") for completion in completions]
-            
-            # Step 3: Implement your tool calling loop here
-            # Parse tool calls from completions, execute tools, regenerate if needed
+
+            # ── Step 3: Multi-turn tool calling loop ──
+            # Scans completions for <tool_call> tags, executes matched tools,
+            # appends results to the conversation, and re-generates.  Modifies
+            # completion_ids/completions/logprobs in place and returns a
+            # tool_mask (1=model token, 0=injected tool-result token).
             tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count = self._custom_tool_call_loop(
-                prompts, 
-                prompt_ids, 
-                completion_ids, 
-                completions, 
-                logprobs
+                prompts, prompt_ids, completion_ids, completions, logprobs,
             )
-            
-            # Step 4: Compute metrics (copied from parent)
+
+            # ── Step 4: Aggregate metrics across DDP ranks ──
             prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)
             if tool_mask is not None:
                 completion_lengths = torch.tensor([sum(mask) for mask in tool_mask], device=device)
@@ -670,25 +696,22 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             agg_prompt_lengths = self.accelerator.gather(prompt_lengths)
             agg_completion_lengths = self.accelerator.gather(completion_lengths)
             total_prompt_tokens = agg_prompt_lengths.sum()
-            total_completion_tokens = agg_completion_lengths.sum()  # = num_items_in_batch, required for the DAPO loss
-            
-            # Log metrics
+            total_completion_tokens = agg_completion_lengths.sum()
+
             if mode == "train":
                 self.state.num_input_tokens_seen += (agg_prompt_lengths.sum() + total_completion_tokens).item()
             self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
 
-            # Log completion lengths, mean, min, max
             self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
             self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
             self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
-            
-            # Check for truncated sequences
+
             eos_and_pad = [self.eos_token_id, self.pad_token_id]
             is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
             agg_is_truncated = self.accelerator.gather(is_truncated)
             self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
             term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
-            if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
+            if len(term_completion_lengths) == 0:
                 term_completion_lengths = torch.zeros(1, device=device)
             self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
             self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
@@ -704,7 +727,6 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 )
                 self._metrics[mode]["tools/failure_frequency"].append(failure_frequency)
 
-            # Generation throughput: tokens produced per second during inference
             generation_elapsed = time.perf_counter() - generation_start_time
             if generation_elapsed > 0 and total_completion_tokens.item() > 0:
                 gen_tokens_per_sec = total_completion_tokens.item() / generation_elapsed
@@ -721,7 +743,6 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 extra_fields,
             )
         finally:
-            # Restore original padding side
             self.processing_class.padding_side = original_padding_side
 
     def _custom_tool_call_loop(self, prompts, prompt_ids, completion_ids, completions, logprobs):
@@ -752,135 +773,193 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             self.processing_class.padding_side = original_padding_side
     
     def _custom_tool_call_loop_impl(self, prompts, prompt_ids, completion_ids, completions, logprobs):
-        """Implementation of the tool call loop (called with left-padding set)."""
-        # Initialize tool_mask - all 1s initially (all model tokens)
+        """
+        Core tool-call loop.  Iterates until no rank has pending tool calls.
+
+        Each iteration has four DDP-safe phases:
+
+        Phase 1 (local per rank):
+            Build the full conversation (prompt + completion + tool result) for
+            each sample that contains a <tool_call>.  Execute the matched tool
+            function and append the result.  Tokenise the conversation and drop
+            samples that now exceed max_model_len (overlong check).
+
+        Phase 2 (DDP collective):
+            All ranks vote on whether *any* rank still has prompts that need a
+            continuation.  If no rank has work, the loop exits.  The minimum
+            max_tokens across ranks is broadcast so vLLM respects the tightest
+            context-window constraint.
+
+        Phase 3 (DDP collective):
+            _generate_tool_continuation sends prompts to vLLM with n=1 (one
+            completion per unique prompt, no deduplication).  Handles variable
+            prompt counts per rank via gather/broadcast.
+
+        Phase 4 (local per rank):
+            Stitch the new completion onto the existing token sequence.  Update
+            tool_mask (1=model token, 0=tool-injected token), completion_ids,
+            and logprobs.  Parse the new completion for further tool calls —
+            if found, the loop repeats.
+        """
         tool_mask = [[1] * len(ids) for ids in completion_ids]
         tool_call_count = 0
         tool_failure_count = 0
         
-        # Parse initial tool calls from completions
+        device = self.accelerator.device
+
         tool_calls = [self._parse_tool_call(completion) for completion in completions]
         idxs_with_tool = [idx for idx, tc in enumerate(tool_calls) if tc is not None]
         tool_calls = [tool_calls[idx] for idx in idxs_with_tool]
-        
-        # Get max model length for truncation
-        if self.use_vllm and self.vllm_mode == "colocate":
+
+        # Determine the hard context-window limit.  For vLLM server mode this
+        # is the server's --max-model-len (not the model's max_position_embeddings).
+        if self._vllm_max_model_len is not None:
+            max_model_len = self._vllm_max_model_len
+        elif self.use_vllm and self.vllm_mode == "colocate":
             max_model_len = getattr(self.llm.llm_engine.model_config, 'max_model_len', 4096)
         else:
             max_model_len = getattr(self.model.config, 'max_position_embeddings', 4096)
-        
-        while idxs_with_tool:
-            # Build conversations with tool calls for samples that need tool execution
-            prompt_completion_tools = []
-            
-            for i, idx in enumerate(idxs_with_tool):
-                # Start with the original prompt
-                if is_conversational({"prompt": prompts[idx]}):
-                    conv = copy.deepcopy(prompts[idx])
-                else:
-                    # Convert non-conversational to conversational format
-                    conv = [{"role": "user", "content": prompts[idx]}]
-                
-                # Append the assistant's response (which contains the tool call)
-                if isinstance(completions[idx], list):
-                    # Already in message format
-                    for msg in completions[idx]:
-                        conv.append(msg)
-                else:
-                    # String format - wrap in assistant message
-                    conv.append({"role": "assistant", "content": completions[idx]})
-                
-                prompt_completion_tools.append(conv)
 
-            # Execute tools and append results to conversations
-            for i, idx in enumerate(idxs_with_tool):
-                tool_call = tool_calls[i]
-                tool_name = tool_call.get("name")
-                tool_args = tool_call.get("arguments", {})
-                tool_args["netlist"] = ToolHelper.get_netlist(prompts[idx][1]["content"])
+        while True:
+            # ==================================================================
+            # Phase 1 (local): execute tools, check overlong
+            # ==================================================================
+            prompts_for_gen = []
+            local_max_tokens = self.max_completion_length
 
-                if tool_name in self.tool_functions:
-                    tool_call_count += 1
-                    try:
-                        func = self.tool_functions[tool_name]
-                        # Handle async functions
-                        if asyncio.iscoroutinefunction(func):
-                            if self._has_async_reward_funcs:
-                                # Use existing event loop
-                                future = asyncio.run_coroutine_threadsafe(
-                                    func(**tool_args), self.async_reward_loop
-                                )
-                                result = future.result(timeout=60)  # 60s timeout
+            if idxs_with_tool:
+                prompt_completion_tools = []
+                for i, idx in enumerate(idxs_with_tool):
+                    if is_conversational({"prompt": prompts[idx]}):
+                        conv = copy.deepcopy(prompts[idx])
+                    else:
+                        conv = [{"role": "user", "content": prompts[idx]}]
+
+                    if isinstance(completions[idx], list):
+                        for msg in completions[idx]:
+                            conv.append(msg)
+                    else:
+                        conv.append({"role": "assistant", "content": completions[idx]})
+
+                    prompt_completion_tools.append(conv)
+
+                for i, idx in enumerate(idxs_with_tool):
+                    tool_call = tool_calls[i]
+                    tool_name = tool_call.get("name")
+                    tool_args = tool_call.get("arguments", {})
+                    tool_args["netlist"] = ToolHelper.get_netlist(prompts[idx][1]["content"])
+
+                    if tool_name in self.tool_functions:
+                        tool_call_count += 1
+                        try:
+                            func = self.tool_functions[tool_name]
+                            if asyncio.iscoroutinefunction(func):
+                                if self._has_async_reward_funcs:
+                                    future = asyncio.run_coroutine_threadsafe(
+                                        func(**tool_args), self.async_reward_loop
+                                    )
+                                    result = future.result(timeout=60)
+                                else:
+                                    result = asyncio.get_event_loop().run_until_complete(func(**tool_args))
                             else:
-                                # Create new event loop for this call
-                                result = asyncio.get_event_loop().run_until_complete(func(**tool_args))
-                        else:
-                            result = func(**tool_args)
-                    except Exception as e:
+                                result = func(**tool_args)
+                        except Exception as e:
+                            tool_failure_count += 1
+                            result = f"Tool execution failed: {e}"
+                    else:
                         tool_failure_count += 1
-                        result = f"Tool execution failed: {e}"
-                else:
-                    tool_failure_count += 1
-                    result = f"Unknown tool: {tool_name}. Available tools: {list(self.tool_functions.keys())}"
-                
-                # Append tool result to conversation
-                tool_message = {"role": "tool", "name": tool_name, "content": str(result)}
-                prompt_completion_tools[i].append(tool_message)
-                
-                # Also track in completions for the final output
-                if isinstance(completions[idx], list):
-                    completions[idx].append(tool_message)
-            
-            # Tokenize to check lengths and prepare for next generation
-            tokenized_convs = [
-                self.processing_class.apply_chat_template(
-                    conv,
-                    tokenize=True,
-                    tools=self.tools,
-                    add_generation_prompt=True,
+                        result = f"Unknown tool: {tool_name}. Available tools: {list(self.tool_functions.keys())}"
+
+                    tool_message = {"role": "tool", "name": tool_name, "content": str(result)}
+                    prompt_completion_tools[i].append(tool_message)
+
+                    if isinstance(completions[idx], list):
+                        completions[idx].append(tool_message)
+
+                tokenized_convs = [
+                    self.processing_class.apply_chat_template(
+                        conv, tokenize=True, tools=self.tools, add_generation_prompt=True,
+                    )
+                    for conv in prompt_completion_tools
+                ]
+                pct_ids = [t if isinstance(t, list) else t["input_ids"] for t in tokenized_convs]
+
+                overlong = [len(pct) >= max_model_len for pct in pct_ids]
+
+                for i, idx in enumerate(idxs_with_tool):
+                    if overlong[i]:
+                        prompt_length = len(prompt_ids[idx])
+                        ct = pct_ids[i][prompt_length : prompt_length + self.max_completion_length]
+                        completion_ids[idx] = ct
+                        current_mask_len = len(tool_mask[idx])
+                        if len(ct) > current_mask_len:
+                            tool_mask[idx] += [0] * (len(ct) - current_mask_len)
+                        elif len(ct) < current_mask_len:
+                            tool_mask[idx] = tool_mask[idx][: len(ct)]
+                        if logprobs is not None:
+                            current_logprobs_len = len(logprobs[idx])
+                            if len(ct) > current_logprobs_len:
+                                logprobs[idx] += [0.0] * (len(ct) - current_logprobs_len)
+                            elif len(ct) < current_logprobs_len:
+                                logprobs[idx] = logprobs[idx][: len(ct)]
+
+                surviving_indices = [i for i, o in enumerate(overlong) if not o]
+                idxs_with_tool = [idxs_with_tool[i] for i in surviving_indices]
+                prompt_completion_tools = [prompt_completion_tools[i] for i in surviving_indices]
+                pct_ids = [pct_ids[i] for i in surviving_indices]
+
+                if idxs_with_tool:
+                    _MIN_CONTINUATION_TOKENS = 64
+                    max_pct_len = max(len(pct) for pct in pct_ids)
+                    available_tokens = max(max_model_len - max_pct_len, _MIN_CONTINUATION_TOKENS)
+                    local_max_tokens = min(self.max_completion_length, available_tokens)
+                    prompts_for_gen = prompt_completion_tools
+
+            # ==================================================================
+            # Phase 2 (DDP sync): decide whether to continue & agree on limits
+            # ==================================================================
+            # All ranks vote: does *any* rank still have prompts needing a
+            # continuation?  If not, every rank breaks out together.
+            local_has_gen = len(prompts_for_gen) > 0
+            if self.accelerator.num_processes > 1:
+                sync_tensor = torch.tensor([1 if local_has_gen else 0], device=device)
+                any_has_gen = self.accelerator.gather(sync_tensor).sum().item() > 0
+            else:
+                any_has_gen = local_has_gen
+
+            if not any_has_gen:
+                break
+
+            # Use the tightest budget so no rank overflows its context window.
+            if self.accelerator.num_processes > 1:
+                mt_tensor = torch.tensor([local_max_tokens], device=device, dtype=torch.long)
+                continuation_max_tokens = int(self.accelerator.gather(mt_tensor).min().item())
+            else:
+                continuation_max_tokens = local_max_tokens
+
+            # ==================================================================
+            # Phase 3 (DDP collective): generate tool-call continuations
+            # ==================================================================
+            # All ranks enter _generate_tool_continuation together (even those
+            # with empty prompt lists) so the internal gather/broadcast ops
+            # don't deadlock.
+            prompt_completion_tool_ids, post_tool_ids, post_tool_logprobs, _ = (
+                self._generate_tool_continuation(
+                    prompts_for_gen, max_tokens_override=continuation_max_tokens
                 )
-                for conv in prompt_completion_tools
-            ]
-            pct_ids = [t if isinstance(t, list) else t["input_ids"] for t in tokenized_convs]
-            
-            # Check for overlong sequences
-            overlong = [len(pct) >= max_model_len for pct in pct_ids]
-            
-            # Handle overlong sequences - truncate and remove from further processing
-            for i, idx in enumerate(idxs_with_tool):
-                if overlong[i]:
-                    prompt_length = len(prompt_ids[idx])
-                    # Truncate to max_completion_length
-                    ct = pct_ids[i][prompt_length : prompt_length + self.max_completion_length]
-                    completion_ids[idx] = ct
-                    # Keep tool_mask aligned with completion_ids (CRITICAL: both must have same length)
-                    current_mask_len = len(tool_mask[idx])
-                    if len(ct) > current_mask_len:
-                        tool_mask[idx] += [0] * (len(ct) - current_mask_len)  # Tool result tokens = 0
-                    elif len(ct) < current_mask_len:
-                        tool_mask[idx] = tool_mask[idx][: len(ct)]  # Truncate to match
-                    if logprobs is not None:
-                        current_logprobs_len = len(logprobs[idx])
-                        if len(ct) > current_logprobs_len:
-                            logprobs[idx] += [0.0] * (len(ct) - current_logprobs_len)
-                        elif len(ct) < current_logprobs_len:
-                            logprobs[idx] = logprobs[idx][: len(ct)]
-            
-            # Keep only non-overlong items for further processing
-            surviving_indices = [i for i, o in enumerate(overlong) if not o]
-            idxs_with_tool = [idxs_with_tool[i] for i in surviving_indices]
-            prompt_completion_tools = [prompt_completion_tools[i] for i in surviving_indices]
-            pct_ids = [pct_ids[i] for i in surviving_indices]
-            
-            if not idxs_with_tool:
-                break  # All overlong, exit tool loop
-            
-            # Generate new completions after tool execution
-            prompt_completion_tool_ids, post_tool_ids, post_tool_logprobs, _ = self._generate_single_turn(
-                prompt_completion_tools
             )
-            
-            # Sanity check: ensure chat template is prefix-preserving
+
+            # ==================================================================
+            # Phase 4 (local): stitch results, parse next tool calls
+            # ==================================================================
+            # Ranks that had no prompts in this iteration skip straight to the
+            # top of the loop (their idxs_with_tool stays empty for the next
+            # Phase 2 vote).
+            if not idxs_with_tool:
+                continue
+
+            # 4a. Sanity check: the re-tokenised conversation should still
+            #     start with the original prompt tokens (prefix-preserving).
             for i, idx in enumerate(idxs_with_tool):
                 pct = prompt_completion_tool_ids[i]
                 orig_prompt = prompt_ids[idx]
@@ -889,58 +968,55 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                         "The chat template may not be prefix-preserving. This could affect training quality."
                     )
                     break
-            
-            # Truncate so that pct[len(prompt_ids[idx]) :] + post_tool does not exceed max_completion_length
+
+            # 4b. Truncate if (old_completion + tool_result + new_completion)
+            #     exceeds max_completion_length.  Trim from the tail of the
+            #     new model output first, then the tool-result prefix.
             for i, idx in enumerate(idxs_with_tool):
                 prompt_len = len(prompt_ids[idx])
                 completion_tool_ids = prompt_completion_tool_ids[i][prompt_len:]
                 excess_length = len(completion_tool_ids) + len(post_tool_ids[i]) - self.max_completion_length
-                
+
                 if excess_length > 0:
-                    # First try truncating post_tool_ids
                     if len(post_tool_ids[i]) > excess_length:
                         post_tool_ids[i] = post_tool_ids[i][:-excess_length]
                         if post_tool_logprobs is not None and post_tool_logprobs[i]:
                             post_tool_logprobs[i] = post_tool_logprobs[i][:-excess_length]
                     else:
-                        # Need to also truncate completion_tool_ids
                         remaining_excess = excess_length - len(post_tool_ids[i])
                         post_tool_ids[i] = []
                         if post_tool_logprobs is not None:
                             post_tool_logprobs[i] = []
                         if remaining_excess > 0:
                             prompt_completion_tool_ids[i] = prompt_completion_tool_ids[i][:-remaining_excess]
-            
-            # Update tool_mask, completion_ids, and logprobs
+
+            # 4c. Stitch: concatenate old_completion + tool_tokens + new_output
+            #     and update tool_mask / logprobs to match.
+            #     tool_mask: 0 for injected tool-result tokens, 1 for model tokens.
+            #     logprobs:  0.0 placeholders for non-model tokens.
             for i, idx in enumerate(idxs_with_tool):
                 prompt_length = len(prompt_ids[idx])
                 old_completion_length = len(completion_ids[idx])
-                
-                # New completion = everything after prompt in pct + post_tool
+
                 new_completion = prompt_completion_tool_ids[i][prompt_length:] + post_tool_ids[i]
-                
-                # Tool result length = (new completion length) - (old completion length) - (post_tool length)
+
                 pct_completion_len = len(prompt_completion_tool_ids[i]) - prompt_length
                 tool_result_length = pct_completion_len - old_completion_length
                 post_tool_length = len(post_tool_ids[i])
-                
-                # Update tool_mask: keep existing, add 0s for tool result, add 1s for post-tool model output
+
                 tool_mask[idx] = tool_mask[idx] + [0] * tool_result_length + [1] * post_tool_length
-                
-                # Update completion_ids
                 completion_ids[idx] = new_completion
-                
-                # Update logprobs
+
                 if logprobs is not None:
                     logprobs[idx] = logprobs[idx] + [0.0] * tool_result_length
                     if post_tool_logprobs is not None and post_tool_logprobs[i]:
                         logprobs[idx] = logprobs[idx] + post_tool_logprobs[i]
                     else:
                         logprobs[idx] = logprobs[idx] + [0.0] * post_tool_length
-            
-            # Decode post-tool completions and add to completions list
+
+            # 4d. Decode the new model output and check for further tool calls.
             post_tool_texts = self.processing_class.batch_decode(post_tool_ids, skip_special_tokens=True)
-            
+
             for i, idx in enumerate(idxs_with_tool):
                 if post_tool_texts[i]:
                     post_tool_msg = revert_qwen2_5_template("<|im_start|>assistant\n" + post_tool_texts[i] + "<|im_end|>")
@@ -950,13 +1026,11 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                         elif isinstance(post_tool_msg, dict):
                             completions[idx].append(post_tool_msg)
                     else:
-                        # Convert to list format
                         completions[idx] = [
                             {"role": "assistant", "content": completions[idx]},
-                            post_tool_msg
+                            post_tool_msg,
                         ]
-            
-            # Check for further tool calls in post-tool completions
+
             new_tool_calls = [self._parse_tool_call(text) for text in post_tool_texts]
             new_idxs_with_tool = []
             new_tool_calls_filtered = []
@@ -964,7 +1038,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 if new_tool_calls[i] is not None:
                     new_idxs_with_tool.append(idx)
                     new_tool_calls_filtered.append(new_tool_calls[i])
-            
+
             idxs_with_tool = new_idxs_with_tool
             tool_calls = new_tool_calls_filtered
         
@@ -1034,20 +1108,119 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 pass
         return None
     
-    def _generate_single_turn(self, prompts: list):
+    def _generate_tool_continuation(self, prompts: list, max_tokens_override: int = None):
+        """
+        Generate continuations for the tool-call loop.
+
+        Unlike _generate_single_turn, this method:
+        - Uses n=1 (each prompt gets exactly one completion, no deduplication)
+        - Handles DDP with variable-length prompt lists per rank
+        - Does not sync model weights (already done by the initial generation)
+
+        All ranks MUST call this together even if some have empty prompt lists,
+        because it uses DDP collective operations internally.
+        """
+        device = self.accelerator.device
+        effective_max_tokens = max_tokens_override or self.max_completion_length
+
+        if not (self.use_vllm and self.vllm_mode == "server"):
+            if not prompts:
+                return [], [], [], {}
+            return self._generate_single_turn(prompts, max_tokens_override=max_tokens_override)
+
+        local_count = len(prompts)
+
+        counts_tensor = torch.tensor([local_count], device=device)
+        all_counts = self.accelerator.gather(counts_tensor)
+
+        all_prompts = gather_object(prompts)
+
+        if self.accelerator.is_main_process and all_prompts:
+            for prompt in all_prompts:
+                if is_conversational({"prompt": prompt}):
+                    for message in prompt:
+                        if "tool_calls" in message:
+                            for call in message["tool_calls"]:
+                                args = call["function"]["arguments"]
+                                if isinstance(args, dict):
+                                    call["function"]["arguments"] = json.dumps(args)
+
+            if is_conversational({"prompt": all_prompts[0]}):
+                formatted_prompts = [
+                    self.processing_class.apply_chat_template(
+                        conversation=conv,
+                        tools=self.tools,
+                        chat_template=self.chat_template,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                        **(self.chat_template_kwargs or {}),
+                    )
+                    for conv in all_prompts
+                ]
+            else:
+                formatted_prompts = all_prompts
+
+            sampling_params = {
+                "n": 1,
+                "repetition_penalty": self.repetition_penalty,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_k": -1 if self.top_k is None else self.top_k,
+                "min_p": 0.0 if self.min_p is None else self.min_p,
+                "max_tokens": effective_max_tokens,
+                "guided_decoding_regex": self.guided_decoding_regex,
+                "generation_kwargs": self.args.generation_kwargs,
+            }
+            output = self.vllm_client.generate(
+                prompts=formatted_prompts, **sampling_params
+            )
+            payload = (
+                output["prompt_ids"],
+                output["completion_ids"],
+                output["logprobs"],
+            )
+        elif self.accelerator.is_main_process:
+            payload = ([], [], [])
+        else:
+            payload = None
+
+        obj_list = [payload]
+        broadcast_object_list(obj_list, from_process=0)
+        all_prompt_ids, all_completion_ids, all_logprobs = obj_list[0]
+
+        counts = [int(c) for c in all_counts.tolist()]
+        offset = sum(counts[: self.accelerator.process_index])
+        prompt_ids = all_prompt_ids[offset : offset + local_count]
+        completion_ids = all_completion_ids[offset : offset + local_count]
+        logprobs_out = all_logprobs[offset : offset + local_count]
+
+        return prompt_ids, completion_ids, logprobs_out, {}
+
+    def _generate_single_turn(self, prompts: list, max_tokens_override: int = None):
+        """
+        Produce completions for the *initial* generation (one turn, no tools).
+
+        Used only by _generate() for the first round.  Tool-call continuations
+        use _generate_tool_continuation() instead, which avoids the n=num_generations
+        deduplication and handles variable prompt counts across DDP ranks.
+
+        Three backend paths:
+          1. vLLM server  — gather prompts to rank 0, generate via HTTP,
+                            broadcast results back, slice per rank.
+          2. vLLM colocate — each GPU runs its own vLLM engine locally.
+          3. Transformers  — standard HF generate() or generate_batch().
+        """
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
         
-        # Generate completions using either vLLM or regular generation
         if self.use_vllm:
+            # Wake colocated vLLM if it was sleeping to free memory
             if self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode:
-                # wake up colocated vLLM instances if needed
-                torch.cuda.empty_cache()  # required to avoid OOM in some cases
+                torch.cuda.empty_cache()
                 self.llm.wake_up(tags=["weights"])
-                # Work around for https://github.com/vllm-project/vllm/issues/29341
                 self.llm.collective_rpc("reload_weights")
 
-            # First, update the vLLM weights if needed
+            # Push the latest merged weights to the vLLM server (once per step)
             if self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
@@ -1055,17 +1228,20 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             if is_conversational({"prompt": prompts[0]}):
                 prompts = [prepare_multimodal_messages_vllm(prompt) for prompt in prompts]
 
-            # In vLLM, tool call arguments must be JSON strings. See https://github.com/vllm-project/vllm/pull/28820
-            for prompt in prompts:  # iterate over each conversation
+            # vLLM requires tool_call arguments to be JSON strings, not dicts
+            for prompt in prompts:
                 if is_conversational({"prompt": prompt}):
-                    for message in prompt:  # iterate over each message
-                        if "tool_calls" in message:  # check if message has tool calls
+                    for message in prompt:
+                        if "tool_calls" in message:
                             for call in message["tool_calls"]:
                                 args = call["function"]["arguments"]
-                                if isinstance(args, dict):  # only convert dict → JSON string
+                                if isinstance(args, dict):
                                     call["function"]["arguments"] = json.dumps(args)
 
-            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            # ── Path 1: vLLM server mode (DDP collective) ──
+            # Prompts arrive duplicated num_generations times.  We deduplicate,
+            # generate n=num_generations completions per unique prompt on rank 0,
+            # then broadcast and slice results back to each rank.
             if self.vllm_mode == "server":
                 all_prompts = gather_object(prompts)
                 num_generations = self.num_generations if mode == "train" else self.num_generations_eval
@@ -1076,6 +1252,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     # prompt individually.
                     ordered_set_of_prompts = all_prompts[::num_generations]
 
+                    effective_max_tokens = max_tokens_override if max_tokens_override is not None else self.max_completion_length
                     sampling_params = {
                         "n": num_generations,
                         "repetition_penalty": self.repetition_penalty,
@@ -1083,7 +1260,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                         "top_p": self.top_p,
                         "top_k": -1 if self.top_k is None else self.top_k,
                         "min_p": 0.0 if self.min_p is None else self.min_p,
-                        "max_tokens": self.max_completion_length,
+                        "max_tokens": effective_max_tokens,
                         "guided_decoding_regex": self.guided_decoding_regex,
                         "generation_kwargs": self.args.generation_kwargs,
                     }
@@ -1150,7 +1327,9 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     else:
                         extra_fields[key] = values
 
-            # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
+            # ── Path 2: vLLM colocate mode (local per GPU) ──
+            # Each GPU has its own vLLM engine and generates locally with n=1.
+            # No cross-rank communication needed for generation itself.
             elif self.vllm_mode == "colocate":
                 if self.rollout_func is not None:
                     rollout_prompts = prompts
@@ -1173,6 +1352,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     else:
                         guided_decoding = None
 
+                    effective_max_tokens = max_tokens_override if max_tokens_override is not None else self.max_completion_length
                     generation_kwargs = {
                         "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
                         "repetition_penalty": self.repetition_penalty,
@@ -1180,7 +1360,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                         "top_p": self.top_p,
                         "top_k": -1 if self.top_k is None else self.top_k,
                         "min_p": 0.0 if self.min_p is None else self.min_p,
-                        "max_tokens": self.max_completion_length,
+                        "max_tokens": effective_max_tokens,
                         "guided_decoding": guided_decoding,
                         "logprobs": 0,  # enable returning log probabilities; 0 means for the sampled tokens only
                     }
@@ -1251,6 +1431,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     if self.args.vllm_enable_sleep_mode:
                         self.llm.sleep(level=2)
 
+        # ── Path 3a: Transformers paged / continuous batching ──
         elif self.use_transformers_paged:
             if is_conversational({"prompt": prompts[0]}):
                 processor_outputs = self.processing_class.apply_chat_template(
@@ -1291,8 +1472,8 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             logprobs = None  # not used in this case
             extra_fields = {}  # No extra fields for paged mode
 
+        # ── Path 3b: Transformers standard generate() ──
         else:
-            # Regular generation path
             if is_conversational({"prompt": prompts[0]}):
                 generate_inputs = self.processing_class.apply_chat_template(
                     conversation=prompts,
@@ -1340,10 +1521,15 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 
         return prompt_ids, completion_ids, logprobs, extra_fields
 
+from pathlib import Path
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Utility: load a checkpoint saved by DualAdapterGRPOTrainer
+# ──────────────────────────────────────────────────────────────────────────
 
 def load_dual_adapter_model(
-    sft_checkpoint_path: str,
-    policy_checkpoint_path: str = None,
+    adapter: Path,
     device_map: str = "auto",
 ) -> PeftModel:
     """
@@ -1351,10 +1537,8 @@ def load_dual_adapter_model(
     
     Parameters
     ----------
-    sft_checkpoint_path : str
-        Path to the SFT adapter checkpoint.
-    policy_checkpoint_path : str, optional
-        Path to the policy adapter checkpoint. If None, only SFT adapter is loaded.
+    adapter : str
+        Path to the SFT/GRPO adapter checkpoint.
     device_map : str
         Device map for model loading.
     
@@ -1368,7 +1552,7 @@ def load_dual_adapter_model(
     import os
     
     # Load adapter config to get base model
-    with open(os.path.join(sft_checkpoint_path, "adapter_config.json"), "r") as f:
+    with open(adapter / "adapter_config.json", "r") as f:
         adapter_config = json.load(f)
     base_model_name = adapter_config["base_model_name_or_path"]
     
@@ -1387,12 +1571,17 @@ def load_dual_adapter_model(
     )
     
     # Load SFT adapter
-    model = PeftModel.from_pretrained(base_model, sft_checkpoint_path, adapter_name=REFERENCE_ADAPTER_NAME)
+    model = PeftModel.from_pretrained(base_model, adapter.as_posix(), adapter_name=REFERENCE_ADAPTER_NAME)
     
-    # Load policy adapter if provided
-    if policy_checkpoint_path is not None:
-        model.load_adapter(policy_checkpoint_path, adapter_name=POLICY_ADAPTER_NAME)
-        model.set_adapter(POLICY_ADAPTER_NAME)
+    # Create a mapping to toggle between POLICY and REFERENCE adapter names.
+    toggle_map = {POLICY_ADAPTER_NAME: REFERENCE_ADAPTER_NAME, REFERENCE_ADAPTER_NAME: POLICY_ADAPTER_NAME}
+    # Get the adapter's name from the stem of the adapter path.
+    adapter_name = adapter.stem
+    # If the current adapter is recognized (either POLICY or REFERENCE), toggle and load the other adapter.
+    if adapter_name in toggle_map:
+        toggled_adapter_name = toggle_map[adapter_name]
+        # Load the adapter with the toggled name from its parent directory.
+        model.load_adapter(adapter.parent / toggled_adapter_name, adapter_name=toggled_adapter_name)
     
     return model
 

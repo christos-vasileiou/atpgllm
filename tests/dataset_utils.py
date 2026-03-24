@@ -206,8 +206,21 @@ def format_dataset_for_training(dataset, tokenizer: AutoTokenizer, training_mode
         the field is ``text``; for GRPO the field is ``prompt``.  Returns
         the same type as the input dataset.
     """
+    import os
     is_streaming = isinstance(dataset, IterableDataset)
-    use_tools = 'tools' in tokenizer.chat_template or 'tool' in tokenizer.chat_template
+
+    # Matches Verilog gate/module instantiations: <cell_type> <instance_name> ( ... )
+    # - instance_name may be a normal identifier or an escaped identifier (starts with '\')
+    # - escaped identifiers can contain '/', '*', '[', ']', etc. up to the first whitespace
+    GATE_INGREDIENT = r"(?m)^(?!\s*(?:module|endmodule|input|output|inout|wire|wand|wor|tri|tri0|tri1|trireg|reg|logic|assign|parameter|localparam|specify|endspecify|genvar|generate|endgenerate|always|always_ff|always_comb|always_latch|initial|begin|end|if|else|case|endcase|for|while|repeat|forever)\b)\s*" \
+                  r"[^\s(]+\s+(?:\\\S+|[A-Za-z_][A-Za-z0-9_$]*)\s*\("
+    regex_instances = re.compile(GATE_INGREDIENT)
+    def filter_fn(record):
+        gates_cnt = len(regex_instances.findall(record['netlist']))
+        return gates_cnt not in (1, 5, 84)
+    dataset = dataset.filter(filter_fn)
+
+    use_tools = hasattr(tokenizer, 'chat_template') and tokenizer.chat_template and ('tools' in tokenizer.chat_template or 'tool' in tokenizer.chat_template)
 
     if training_mode == TrainingMode.SFT:
         def format_fn(record):
@@ -217,17 +230,14 @@ def format_dataset_for_training(dataset, tokenizer: AutoTokenizer, training_mode
             )
             return {"text": prompt}
 
-        return dataset.map(
-            format_fn,
-            remove_columns=dataset.column_names if not is_streaming else None,
-        )
+        return dataset.map(format_fn)
 
     elif training_mode == TrainingMode.GRPO:
         def format_fn(record):
             convo = ConversationExample.from_record(record, use_tools=use_tools)
             prompt_messages = [
                 m for m in convo.messages
-                if m["role"] != "assistant" and m["role"] != "tool"
+                if m["role"] not in ("assistant", "tool")
             ]
             prompt = tokenizer.apply_chat_template(
                 prompt_messages, tokenize=False,
@@ -242,18 +252,16 @@ def format_dataset_for_training(dataset, tokenizer: AutoTokenizer, training_mode
         raise ValueError(f"Unknown training mode: {training_mode}")
 
 
-def plot_max_gates_by_prompt_length(
+def plot_max_gates_by_context_length(
     dataset, 
     tokenizer, 
-    text_key="netlist",           # Change this if your text is nested, e.g., ex["netlist"]["netlist"]
-    nested_text_key=None,         # Set to "netlist" if your structure is x["netlist"]["netlist"]
-    prompt_lengths=[(i+1)*1024 for i in range(16)],
+    context_lengths=[(i+1)*1024 for i in range(16)],
     batch_size=1000,
     image_filename="max_gates_vs_length.png"
 ):
     """
     Passes through the dataset ONCE to compute token lengths and gate counts,
-    then evaluates max gates across multiple prompt length thresholds and plots it.
+    then evaluates max gates across multiple context length thresholds and plots it.
     """
     # 1. Compile regex once
     regex_instances = re.compile(r"\s*\w+\s+\w+\s*\(\s*\.\w+\(\s*\w+")
@@ -286,21 +294,23 @@ def plot_max_gates_by_prompt_length(
         if not batch:
             break
             
-        # Extract texts for this batch
-        texts = list(set([ex[text_key][nested_text_key] for ex in batch]))
-        
+        # Extract texts for this batch. 
+        # ex -> {"netlist": {"id": ..., "netlist": ...}}, derived from format_dataset_for_training() and GRPO vs SFT training mode
+        netlists = list(set([ex["netlist"]["netlist"] for ex in batch]))
+        prompts = [ex["prompt"] for ex in batch]
+
         # Fast Rust tokenization (only grabbing lengths, skipping masks/type_ids for speed)
-        encodings = tokenizer(
-            texts, 
+        prompt_encodings = tokenizer(
+            prompts, 
             add_special_tokens=False, 
             truncation=False, 
             return_attention_mask=False, 
             return_token_type_ids=False
         )
-        batch_token_lengths = [len(ids) for ids in encodings["input_ids"]]
+        batch_token_lengths = [len(ids) for ids in prompt_encodings["input_ids"]]
         
         # Fast list comprehension for regex matching
-        batch_gate_counts = [len(regex_instances.findall(text)) for text in texts]
+        batch_gate_counts = [len(regex_instances.findall(netlist)) for netlist in netlists]
         
         # Store the pairs
         stats.extend(zip(batch_token_lengths, batch_gate_counts))
@@ -320,9 +330,9 @@ def plot_max_gates_by_prompt_length(
     max_gate_list = []
     
     # Sort prompt lengths to ensure plot is in order
-    prompt_lengths = sorted(prompt_lengths)
+    context_lengths = sorted(context_lengths)
     
-    for p_len in prompt_lengths:
+    for p_len in context_lengths:
         # Filter all gate counts where the token length is STRICTLY LESS than p_len
         valid_gate_counts = [gates for tokens, gates in stats if tokens < p_len]
         
@@ -333,16 +343,16 @@ def plot_max_gates_by_prompt_length(
     
     # 4. Generate and save the plot
     plt.figure(figsize=(10, 6))
-    plt.plot(prompt_lengths, max_gate_list, marker='o', linestyle='-', color='#1f77b4', linewidth=2)
+    plt.plot(context_lengths, max_gate_list, marker='o', linestyle='-', color='#1f77b4', linewidth=2)
     plt.title('Maximum Gate Count vs. Maximum Prompt Length', fontsize=14, pad=15)
     plt.xlabel('Max Prompt Length (Tokens)', fontsize=12)
     plt.ylabel('Maximum Gate Count Filtered', fontsize=12)
     plt.grid(True, linestyle='--', alpha=0.7)
-    plt.xticks(prompt_lengths)
+    plt.xticks(context_lengths)
     
     # Add data labels slightly offset from the points
     for i, txt in enumerate(max_gate_list):
-        plt.annotate(txt, (prompt_lengths[i], max_gate_list[i]), 
+        plt.annotate(txt, (context_lengths[i], max_gate_list[i]), 
                      textcoords="offset points", xytext=(0,10), ha='center')
     
     plt.tight_layout()
@@ -351,3 +361,107 @@ def plot_max_gates_by_prompt_length(
     
     print(f"\nPlot saved successfully to: {image_filename}")
     return results
+
+
+def plot_max_tokens_by_gate_count(
+    dataset, 
+    tokenizer, 
+    batch_size=1000,
+    image_filename="max_tokens_vs_gates.png"
+):
+    """
+    Passes through the dataset ONCE to compute token lengths and gate counts,
+    then evaluates the maximum token length for each unique gate count and plots it.
+    """
+    # 1. Compile regex once
+    regex_instances = re.compile(r"\s*\w+\s+\w+\s*\(\s*\.\w+\(\s*\w+")
+    stats = []
+    
+    dataset_iter = iter(dataset)
+    
+    # 2. Setup the smart progress bar
+    try:
+        total_items = len(dataset)
+    except (TypeError, AttributeError):
+        total_items = None
+        
+    pbar = tqdm(total=total_items, desc="Extracting tokens & gates", unit="ex")
+
+    # 3. Process dataset in batches
+    while True:
+        batch = []
+        try:
+            for _ in range(batch_size):
+                batch.append(next(dataset_iter))
+        except StopIteration:
+            pass # End of dataset
+            
+        if not batch:
+            break
+            
+        # ex -> {"netlist": ...}, derived from format_dataset_for_training() and GRPO vs SFT training mode
+        netlists = [ex["netlist"] for ex in batch]
+        texts = [ex["text"] for ex in batch]
+
+        # Fast Rust tokenization
+        text_encodings = tokenizer(
+            texts, 
+            add_special_tokens=False, 
+            truncation=False, 
+            return_attention_mask=False, 
+            return_token_type_ids=False
+        )
+
+        batch_token_lengths = [len(ids) for ids in text_encodings["input_ids"]]
+        batch_gate_counts = [len(regex_instances.findall(netlist)) for netlist in netlists]
+        
+        stats.extend(zip(batch_token_lengths, batch_gate_counts))
+        
+        # Update progress bar
+        pbar.update(len(batch))
+
+    pbar.close()
+
+    if not stats:
+        raise ValueError("Dataset was empty or texts could not be extracted.")
+
+    # 4. Calculate maximum tokens for each gate count
+    print("\nCalculating maximum context window for each netlist size...")
+    gate_to_max_tokens = {}
+    
+    for tokens, gates in stats:
+        # If we haven't seen this gate count yet, or if this token length is larger, update it
+        if gates not in gate_to_max_tokens or tokens > gate_to_max_tokens[gates]:
+            gate_to_max_tokens[gates] = tokens
+
+    # Sort the dictionary by gate count so the X-axis plots in chronological order
+    sorted_gate_counts = sorted(gate_to_max_tokens.keys())
+    max_token_lengths = [gate_to_max_tokens[g] for g in sorted_gate_counts]
+
+    # Print a quick summary to the console
+    print(f"Found {len(sorted_gate_counts)} unique gate counts (min: {min(sorted_gate_counts)}, max: {max(sorted_gate_counts)})")
+
+    # 5. Generate and save the plot
+    plt.figure(figsize=(12, 6))
+    
+    # Using a slightly smaller marker '.' since we might have ~100 points
+    plt.plot(sorted_gate_counts, max_token_lengths, marker='.', linestyle='-', color='#d62728', linewidth=1.5, markersize=8)
+    
+    plt.title('Maximum Token Length vs. Netlist Size', fontsize=14, pad=15)
+    plt.xlabel('Netlist Size (Gate Count)', fontsize=12)
+    plt.ylabel('Maximum Context Window (Tokens)', fontsize=12)
+    
+    # Add gridlines for readability
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Set X-axis ticks to step by 5 or 10 so it isn't completely crowded
+    step = 10 if max(sorted_gate_counts) > 50 else 5
+    plt.xticks(range(0, max(sorted_gate_counts) + step, step))
+
+    plt.tight_layout()
+    plt.savefig(image_filename, dpi=300)
+    plt.close()
+    
+    print(f"\nPlot saved successfully to: {image_filename}")
+    
+    return gate_to_max_tokens

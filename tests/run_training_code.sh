@@ -15,8 +15,14 @@ export SLURM_LOG_FILE="jobs/training_${SLURM_JOB_ID}.out"
 export SLURM_ERROR_FILE="jobs/training_${SLURM_JOB_ID}.err"
 export WANDB_PROJECT="huggingface" # Ensure HF Trainer uses my preferred wandb project
 
-# activate virtual environment (activate is alias)
-source /work/cxv200006/myenv/bin/activate
+# activate virtual environment (prefer Slurm /work path, fall back to shared /proj path)
+if [ -f "/work/cxv200006/myenv/bin/activate" ]; then
+    # shellcheck source=/dev/null
+    source /work/cxv200006/myenv/bin/activate
+elif [ -f "/proj/trela/christos/myenv/bin/activate" ]; then
+    # shellcheck source=/dev/null
+    source /proj/trela/christos/myenv/bin/activate
+fi
 echo "Python Path: $(which python)"
 
 start_time=$(date +%s)
@@ -137,6 +143,9 @@ elif [ "$METHOD" == "grpo" ]; then
     PORT=${PORT:-8002}
     USE_UNSLOTH=${USE_UNSLOTH:-False}
     USE_DDP=${USE_DDP:-False}
+    MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
+    MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
+    MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-6144}
 fi
 
 # =============================================================================
@@ -298,6 +307,9 @@ build_cmd_args() {
             --buffer_size "$BUFFER_SIZE"
             --num_generations "$NUM_GENERATIONS"
             --steps_per_generation "$STEPS_PER_GENERATION"
+            --max_model_len "$MAX_MODEL_LEN"
+            --max_completion_length "$MAX_COMPLETION_LENGTH"
+            --max_prompt_length "$MAX_PROMPT_LENGTH"
         )
         # This condition checks whether the variable USE_DUAL_ADAPTER is set (not empty) and its value is exactly "True".
         if [ -n "$USE_DUAL_ADAPTER" ] && [ "$USE_DUAL_ADAPTER" == "True" ]; then
@@ -364,131 +376,118 @@ trap cleanup EXIT INT TERM
 
 # Run the training script — DDP via accelerate or single-process
 if [ "$USE_VLLM" == "True" ] && [ "$VLLM_MODE" == "server" ]; then
-    # If a vLLM server is already up on this port, reuse it.
-    if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
-        echo "Detected existing vLLM server on port $PORT, reusing it."
-        VLLM_PID="$(find_vllm_pid_for_port "$PORT")"
-        if [ -n "$VLLM_PID" ]; then
-            echo "Mapped existing vLLM server PID: $VLLM_PID"
-        else
-            echo "Warning: Could not determine PID for existing vLLM server on port $PORT."
-        fi
-    else
-        # Qwen2.5 has max_position_embeddings=32768. Do NOT exceed 32768 or CUDA out-of-bounds will occur.
-        MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
-        VLLM_MAX_MODEL_LEN=$MAX_MODEL_LEN
-        MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-        MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-6144}
+    # MAX_MODEL_LEN, MAX_PROMPT_LENGTH, MAX_COMPLETION_LENGTH are set in the
+    # method-defaults block above and also passed to Python via CMD_ARGS.
+    VLLM_MAX_MODEL_LEN=$MAX_MODEL_LEN
 
-        if [ "$METHOD" == "sft" ]; then
-            # SFT uses the standard `vllm serve` (OpenAI-compatible API) for
-            # inference-only validation via the SFTStoppingCallback.
-            # max-model-len: Qwen2.5 has max_position_embeddings=32768. Do NOT exceed 32768 or CUDA out-of-bounds will occur.
-            echo ""
-            echo "=============================================="
-            echo "$METHOD vLLM Server Setup"
-            echo "=============================================="
-            echo "vLLM server GPU: ${VLLM_GPU} (last GPU)"
-            echo "Starting vLLM server on GPU $VLLM_GPU (port $PORT)..."
-            echo "Running: VLLM_ALLOW_RUNTIME_LORA_UPDATING=True CUDA_VISIBLE_DEVICES=$VLLM_GPU vllm serve $MODEL --enable-lora --max-lora-rank 64 --port $PORT --gpu-memory-utilization 0.8 --max-model-len $VLLM_MAX_MODEL_LEN &"
-            VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
-            CUDA_VISIBLE_DEVICES=$VLLM_GPU \
-            vllm serve $MODEL \
-                --enable-lora \
-                --max-lora-rank 64 \
-                --port $PORT \
-                --gpu-memory-utilization 0.8 \
-                --max-model-len "$VLLM_MAX_MODEL_LEN" &
-            VLLM_PID=$!
-            echo "Waiting for vLLM server to become ready (PID: $VLLM_PID)..."
-        elif [ "$METHOD" == "grpo" ]; then
-            # GRPO MUST use `trl vllm-serve` (NOT `vllm serve`).
-            # TRL's GRPOTrainer needs custom endpoints (/get_world_size,
-            # /init_communicator, /update_named_param, /reset_prefix_cache)
-            # for weight synchronisation between the trainer and the vLLM
-            # generation server.  The standard `vllm serve` does not expose
-            # these endpoints and will fail with a 404 on /get_world_size.
-            #
-            # Note: `trl vllm-serve` does NOT support --enable-lora /
-            # --max-lora-rank.  Instead, TRL pushes updated weights directly
-            # to vLLM via the NCCL communicator.
-            
-            # Extract the number before 'B' or 'b' in the model string (e.g., Qwen2.5-72B -> 72)
-            MODEL_SIZE_STR=$(echo "$MODEL" | grep -ioP '\d+(\.\d+)?(?=b)' | head -n 1)
-            MODEL_SIZE=${MODEL_SIZE_STR:-0}
+    # if [ "$METHOD" == "sft" ]; then
+    #     # SFT uses the standard `vllm serve` (OpenAI-compatible API) for
+    #     # inference-only validation via the SFTStoppingCallback.
+    #     # max-model-len: Qwen2.5 has max_position_embeddings=32768. Do NOT exceed 32768 or CUDA out-of-bounds will occur.
+    #     echo ""
+    #     echo "=============================================="
+    #     echo "$METHOD vLLM Server Setup"
+    #     echo "=============================================="
+    #     echo "vLLM server GPU: ${VLLM_GPU} (last GPU)"
+    #     echo "Starting vLLM server on GPU $VLLM_GPU (port $PORT)..."
+    #     echo "Running: VLLM_ALLOW_RUNTIME_LORA_UPDATING=True CUDA_VISIBLE_DEVICES=$VLLM_GPU vllm serve $MODEL --enable-lora --max-lora-rank 64 --port $PORT --gpu-memory-utilization 0.8 --max-model-len $VLLM_MAX_MODEL_LEN &"
+    #     VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
+    #     CUDA_VISIBLE_DEVICES=$VLLM_GPU \
+    #     vllm serve $MODEL \
+    #         --enable-lora \
+    #         --max-lora-rank 64 \
+    #         --port $PORT \
+    #         --gpu-memory-utilization 0.8 \
+    #         --max-model-len "$VLLM_MAX_MODEL_LEN" &
+    #     VLLM_PID=$!
+    #     echo "Waiting for vLLM server to become ready (PID: $VLLM_PID)..."
+    # elif [ "$METHOD" == "grpo" ]; then
+    if [ "$METHOD" == "grpo" ]; then
+        # GRPO MUST use `trl vllm-serve` (NOT `vllm serve`).
+        # TRL's GRPOTrainer needs custom endpoints (/get_world_size,
+        # /init_communicator, /update_named_param, /reset_prefix_cache)
+        # for weight synchronisation between the trainer and the vLLM
+        # generation server.  The standard `vllm serve` does not expose
+        # these endpoints and will fail with a 404 on /get_world_size.
+        #
+        # Note: `trl vllm-serve` does NOT support --enable-lora /
+        # --max-lora-rank.  Instead, TRL pushes updated weights directly
+        # to vLLM via the NCCL communicator.
+        
+        # Extract the number before 'B' or 'b' in the model string (e.g., Qwen2.5-72B -> 72)
+        MODEL_SIZE_STR=$(echo "$MODEL" | grep -ioP '\d+(\.\d+)?(?=b)' | head -n 1)
+        MODEL_SIZE=${MODEL_SIZE_STR:-0}
 
-            # Evaluate if the model size is strictly greater than 32
-            IS_LARGE_MODEL=$(awk -v size="$MODEL_SIZE" 'BEGIN { print (size >= 32) ? 1 : 0 }')
-            
-            TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
-            DATA_PARALLEL_SIZE=${DATA_PARALLEL_SIZE:-1}
-            VLLM_GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.9}
-            echo ""
-            echo "=============================================="
-            echo "$METHOD vLLM Server Setup"
-            echo "=============================================="
-            echo "vLLM server GPU: $VLLM_GPU (last GPU)"
-            echo "Starting vLLM server on GPU $VLLM_GPU (port $PORT)..."
-            echo "DATA_PARALLEL_SIZE: $DATA_PARALLEL_SIZE"
-            echo "TENSOR_PARALLEL_SIZE: $TENSOR_PARALLEL_SIZE"
-            echo "VLLM_MAX_MODEL_LEN: $VLLM_MAX_MODEL_LEN"
-            echo "MAX_PROMPT_LENGTH: $MAX_PROMPT_LENGTH"
-            echo "MAX_COMPLETION_LENGTH: $MAX_COMPLETION_LENGTH"
-            echo "=============================================="
-            echo "Running: CUDA_VISIBLE_DEVICES=$VLLM_GPU trl vllm-serve --model $MODEL --port $PORT --gpu_memory_utilization $VLLM_GPU_MEM_UTIL --data-parallel-size $DATA_PARALLEL_SIZE --tensor-parallel-size $TENSOR_PARALLEL_SIZE --max-model-len $VLLM_MAX_MODEL_LEN &"
-            CUDA_VISIBLE_DEVICES=$VLLM_GPU \
-            trl vllm-serve \
-                --model $MODEL \
-                --port $PORT \
-                --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
-                --data-parallel-size "$DATA_PARALLEL_SIZE" \
-                --tensor-parallel-size $TENSOR_PARALLEL_SIZE \
-                --max-model-len "$VLLM_MAX_MODEL_LEN" \
-                --enable_prefix_caching True &
-            VLLM_PID=$!
-            echo "Waiting for TRL vLLM server to become ready (PID: $VLLM_PID)..."
-        fi
-
-        _vllm_timeout=300
-        _vllm_elapsed=0
-        while ! curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; do
-            if ! kill -0 "$VLLM_PID" 2>/dev/null; then
-                echo "ERROR: TRL vLLM server process died unexpectedly."
-                exit 1
-            fi
-            if [ "$_vllm_elapsed" -ge "$_vllm_timeout" ]; then
-                echo "ERROR: TRL vLLM server did not become ready within ${_vllm_timeout}s."
-                kill "$VLLM_PID" 2>/dev/null || true
-                exit 1
-            fi
-            sleep 2
-            _vllm_elapsed=$((_vllm_elapsed + 2))
-        done
-        echo "$METHOD vLLM server is ready on port $PORT (took ~${_vllm_elapsed}s)."
+        # Evaluate if the model size is strictly greater than 32
+        IS_LARGE_MODEL=$(awk -v size="$MODEL_SIZE" 'BEGIN { print (size >= 32) ? 1 : 0 }')
+        
+        TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
+        DATA_PARALLEL_SIZE=${DATA_PARALLEL_SIZE:-1}
+        VLLM_GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.9}
+        echo ""
         echo "=============================================="
+        echo "$METHOD vLLM Server Setup"
+        echo "=============================================="
+        echo "vLLM server GPU: $VLLM_GPU (last GPU)"
+        echo "Starting vLLM server on GPU $VLLM_GPU (port $PORT)..."
+        echo "DATA_PARALLEL_SIZE: $DATA_PARALLEL_SIZE"
+        echo "TENSOR_PARALLEL_SIZE: $TENSOR_PARALLEL_SIZE"
+        echo "VLLM_MAX_MODEL_LEN: $VLLM_MAX_MODEL_LEN"
+        echo "MAX_PROMPT_LENGTH: $MAX_PROMPT_LENGTH"
+        echo "MAX_COMPLETION_LENGTH: $MAX_COMPLETION_LENGTH"
+        echo "=============================================="
+        echo "Running: CUDA_VISIBLE_DEVICES=$VLLM_GPU trl vllm-serve --model $MODEL --port $PORT --gpu_memory_utilization $VLLM_GPU_MEM_UTIL --data-parallel-size $DATA_PARALLEL_SIZE --tensor-parallel-size $TENSOR_PARALLEL_SIZE --max-model-len $VLLM_MAX_MODEL_LEN &"
+        CUDA_VISIBLE_DEVICES=$VLLM_GPU \
+        trl vllm-serve \
+            --model $MODEL \
+            --port $PORT \
+            --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
+            --data-parallel-size "$DATA_PARALLEL_SIZE" \
+            --tensor-parallel-size $TENSOR_PARALLEL_SIZE \
+            --max-model-len "$VLLM_MAX_MODEL_LEN" \
+            --enable_prefix_caching True &
+        VLLM_PID=$!
+        echo "Waiting for TRL vLLM server to become ready (PID: $VLLM_PID)..."
+        COUNT_VLLM_GPUS=$(echo "$VLLM_GPU" | tr ',' '\n' | wc -l)
+        NUM_TRAIN_GPUS=$((${#GPU_ARRAY[@]} - $COUNT_VLLM_GPUS))
+        TRAINING_GPUS=("${GPU_ARRAY[@]:0:$NUM_TRAIN_GPUS}")
+        export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${TRAINING_GPUS[*]}")"
     fi
 
-    COUNT_VLLM_GPUS=$(echo "$VLLM_GPU" | tr ',' '\n' | wc -l)
-    NUM_TRAIN_GPUS=$((${#GPU_ARRAY[@]} - $COUNT_VLLM_GPUS))
-    TRAINING_GPUS=("${GPU_ARRAY[@]:0:$NUM_TRAIN_GPUS}")
-    export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${TRAINING_GPUS[*]}")"
+    _vllm_timeout=300
+    _vllm_elapsed=0
+    while ! curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; do
+        if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+            echo "ERROR: TRL vLLM server process died unexpectedly."
+            exit 1
+        fi
+        if [ "$_vllm_elapsed" -ge "$_vllm_timeout" ]; then
+            echo "ERROR: TRL vLLM server did not become ready within ${_vllm_timeout}s."
+            kill "$VLLM_PID" 2>/dev/null || true
+            exit 1
+        fi
+        sleep 2
+        _vllm_elapsed=$((_vllm_elapsed + 2))
+    done
+    echo "$METHOD vLLM server is ready on port $PORT (took ~${_vllm_elapsed}s)."
+    echo "=============================================="
     echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES, TRAINING_GPUS: ${#TRAINING_GPUS[@]}, VLLM_GPU: $VLLM_GPU"
 fi
 
-# Set vLLM RPC timeout to 1800000 seconds (30 minutes)
-export VLLM_RPC_TIMEOUT=1800000
-# Set NCCL debug level to INFO
-export NCCL_DEBUG=INFO
 echo "=============================================="
 echo "Starting Training"
 echo "=============================================="
+# GRPO+vLLM server: CUDA_VISIBLE_DEVICES is trimmed to training GPUs; NUM_GPUS must match.
+if [ "${#TRAINING_GPUS[@]}" -gt 0 ]; then
+    export NUM_GPUS="${#TRAINING_GPUS[@]}"
+fi
 
 if [ "$USE_DDP" == "True" ]; then
-    echo "Command: accelerate launch --multi_gpu --num_processes ${#TRAINING_GPUS[@]} --mixed_precision bf16 training_code.py ${CMD_ARGS[*]}"
+    echo "Command: accelerate launch --multi_gpu --num_processes $NUM_GPUS --mixed_precision bf16 training_code.py ${CMD_ARGS[*]}"
     echo ""
     accelerate launch \
         --multi_gpu \
-        --num_processes "${#TRAINING_GPUS[@]}" \
+        --num_processes $NUM_GPUS \
         --mixed_precision bf16 \
         training_code.py "${CMD_ARGS[@]}"
 else
