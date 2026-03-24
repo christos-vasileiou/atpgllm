@@ -24,8 +24,13 @@ from __future__ import annotations
 import inspect
 import json
 import os
+from copy import deepcopy
 
 import torch
+
+from transformers import Trainer
+from transformers.trainer_pt_utils import get_parameter_names
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
 # NOTE: unsloth's side-effect import (which monkey-patches transformers,
 # peft and trl) is handled by the *entry-point* script (training_code.py)
@@ -107,9 +112,134 @@ def load_quantised_model(model_name: str, device_map: str | dict = "auto") -> Au
         quantization_config=quant_config,
         device_map=device_map,
         trust_remote_code=True,
-        attn_implementation="flash_attention_3",
+        # attn_implementation="flash_attention_2",
     )
     return model
+
+
+def _remove_accelerate_hooks_robust(model) -> None:
+    """
+    Remove accelerate hooks from wrapped models (e.g. PEFT) safely.
+    
+    ``accelerate.remove_hook_from_submodules`` can fail on wrapper modules when
+    attributes are proxied through ``__getattr__`` (as in ``PeftModel``).  In
+    that case we retry on likely wrapped/base modules.
+    """
+    from accelerate.hooks import remove_hook_from_submodules
+    
+    candidates = [model]
+    if hasattr(model, "get_base_model"):
+        try:
+            base = model.get_base_model()
+            if base is not None:
+                candidates.append(base)
+        except Exception:
+            pass
+    for attr in ("base_model", "model"):
+        obj = getattr(model, attr, None)
+        if obj is not None:
+            candidates.append(obj)
+    
+    seen = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        obj_id = id(candidate)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        try:
+            remove_hook_from_submodules(candidate)
+        except AttributeError:
+            # PEFT wrappers may proxy _hf_hook and fail on delattr at wrapper
+            # level. This is safe to ignore after retrying inner modules.
+            continue
+
+
+def unload_model_to_cpu(model, clear_cuda_cache: bool = True):
+    """
+    Remove accelerate dispatch hooks (if present) and move model to CPU.
+    
+    Returns
+    -------
+    model
+        The same model object, now resident on CPU.
+    """
+    # Import lazily so non-accelerate code paths are not affected.
+    # A dispatched model has per-block hooks; remove them first so tensors are
+    # materialized correctly before `.to("cpu")`.
+    _remove_accelerate_hooks_robust(model)
+    model.to("cpu")
+    
+    if clear_cuda_cache and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return model
+
+
+def save_optimizer_state_to_cpu(optimizer) -> dict:
+    """
+    Snapshot optimizer state to a CPU-only state dict.
+    
+    This is intended for temporary model re-creation flows where the model is
+    rebuilt on GPUs and optimizer state must be restored afterwards.
+    """
+    state = deepcopy(optimizer.state_dict())
+    for param_state in state.get("state", {}).values():
+        for k, v in list(param_state.items()):
+            if torch.is_tensor(v):
+                param_state[k] = v.detach().to("cpu")
+    return state
+
+
+def load_optimizer_state_from_cpu(optimizer, state_dict: dict, model=None) -> None:
+    """
+    Restore optimizer state from a CPU snapshot and place tensors correctly.
+    
+    Parameters
+    ----------
+    optimizer
+        Optimizer instance bound to the *new* model parameters.
+    state_dict : dict
+        State dictionary produced by :func:`save_optimizer_state_to_cpu`.
+    model : optional
+        If provided, optimizer tensors are moved to each parameter's current
+        device after ``optimizer.load_state_dict(...)``.
+    """
+    optimizer.load_state_dict(state_dict)
+    
+    # Align state tensors with the current parameter device placement.
+    # This is needed when restoring CPU snapshots into GPU-resident training.
+    if model is not None:
+        for param in model.parameters():
+            if param not in optimizer.state:
+                continue
+            param_state = optimizer.state[param]
+            for k, v in list(param_state.items()):
+                if torch.is_tensor(v):
+                    param_state[k] = v.to(param.device, non_blocking=True)
+
+
+def build_optimizer_for_model(model, args):
+    # 1) Resolve optimizer implementation from args.optim (e.g. paged_adamw_32bit)
+    opt_cls, opt_kwargs = Trainer.get_optimizer_cls_and_kwargs(args, model)
+
+    # 2) Recreate Trainer-style param groups (decay / no-decay)
+    decay_names = get_parameter_names(model, ALL_LAYERNORM_LAYERS)
+    decay_names = [n for n in decay_names if "bias" not in n]
+
+    grouped = [
+        {
+            "params": [p for n, p in model.named_parameters() if n in decay_names and p.requires_grad],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if n not in decay_names and p.requires_grad],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    # 3) Create optimizer
+    return opt_cls(grouped, **opt_kwargs)
 
 
 def get_lora_config(use_unsloth: bool = False) -> LoraConfig:
