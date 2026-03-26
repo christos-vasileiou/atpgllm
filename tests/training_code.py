@@ -150,7 +150,9 @@ from reward_function_factory import RewardFunctionFactory
 from callbacks import (
     ThroughputMetricsCallback,
     ContextLengthHistogramCallback,
+    TrainingStateCheckpointCallback,
     SFTStoppingCallback,
+    validate_training_state_checkpoint,
 )
 from git_utils import get_git_info
 import wandb
@@ -216,6 +218,7 @@ def train_with_sft(
     dataset_path: str,
     output_dir: str,
     resume_from: str = None,
+    resume_training_state: bool = False,
     per_device_train_batch_size: int = 1,
     gradient_accumulation_steps: int = 1,
     max_steps: int = -1,
@@ -254,7 +257,26 @@ def train_with_sft(
         will be saved.
     resume_from : str, optional
         Path to a previously saved adapter directory to resume training
-        from.
+        from.  Loads the LoRA adapter weights only — training starts
+        from step 0 with a fresh optimizer unless
+        ``resume_training_state`` is also set.
+    resume_training_state : bool
+        When *True* **and** ``resume_from`` points to a Trainer
+        checkpoint directory (one that contains ``trainer_state.json``,
+        ``optimizer.pt``, ``scheduler.pt``, etc.), the full training
+        state is restored: optimizer weights, LR schedule position,
+        global step / epoch counters, and RNG seeds.  Training resumes
+        exactly where it left off.
+
+        Combine the two flags for crash recovery::
+
+            python training_code.py \\
+                --resume_from ./output_dir/checkpoint-50 \\
+                --resume_training_state \\
+                --output_dir ./output_dir ...
+
+        Without ``--resume_training_state``, ``--resume_from`` loads
+        only the adapter weights and starts a fresh training run.
     use_vllm : bool
         If *True*, validation generation in the stopping callback uses
         a **persistent vLLM server** for faster batch inference.  Start
@@ -289,6 +311,18 @@ def train_with_sft(
     from trl import SFTTrainer, SFTConfig
     import torch
     print(f"Available GPUs: {torch.cuda.is_available()}, Num GPUs: {torch.cuda.device_count()}")
+
+    # -- Validate resume flags -----------------------------------------
+    resume_checkpoint = None
+    if resume_training_state:
+        if not resume_from:
+            raise ValueError(
+                "--resume_training_state requires --resume_from to point "
+                "to a Trainer checkpoint directory."
+            )
+        validate_training_state_checkpoint(resume_from)
+        resume_checkpoint = resume_from
+        print(f"[Resume] Will restore full training state from: {resume_from}")
 
     # Validate unsloth availability early
     if use_unsloth:
@@ -360,6 +394,7 @@ def train_with_sft(
     shared_callbacks = [
         ThroughputMetricsCallback(),
         ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
+        TrainingStateCheckpointCallback(),
     ]
 
     trainer = SFTTrainer(
@@ -369,7 +404,7 @@ def train_with_sft(
         args=training_args,
         callbacks=shared_callbacks,
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(output_dir)
 
 
@@ -378,6 +413,7 @@ def train_with_grpo(
     dataset_path: str,
     output_dir: str,
     resume_from: str = None,
+    resume_training_state: bool = False,
     buffer_size: int = 10000,
     per_device_train_batch_size: int = 8,
     gradient_accumulation_steps: int = 1,
@@ -412,7 +448,26 @@ def train_with_grpo(
         Directory to store the resulting model.
     resume_from : str, optional
         Path to a previously saved adapter directory to resume from.
-        Required for dual-adapter mode.
+        Required for dual-adapter mode.  Loads adapter weights only —
+        training starts from step 0 with a fresh optimizer unless
+        ``resume_training_state`` is also set.
+    resume_training_state : bool
+        When *True* **and** ``resume_from`` points to a Trainer
+        checkpoint directory (one that contains ``trainer_state.json``,
+        ``optimizer.pt``, ``scheduler.pt``, etc.), the full training
+        state is restored: optimizer weights, LR schedule position,
+        global step / epoch counters, and RNG seeds.  Training resumes
+        exactly where it left off.
+
+        Combine the two flags for crash recovery::
+
+            python training_code.py --method grpo \\
+                --resume_from ./output_dir/checkpoint-20 \\
+                --resume_training_state \\
+                --output_dir ./output_dir ...
+
+        Without ``--resume_training_state``, ``--resume_from`` loads
+        only the adapter weights and starts a fresh training run.
     buffer_size : int
         Maximum examples to buffer from the streaming dataset into
         memory.  ``GRPOTrainer`` doesn't support streaming datasets.
@@ -440,6 +495,18 @@ def train_with_grpo(
         If *True*, use Distributed Data Parallel (DDP) mode.  See
         :func:`train_with_sft` for details.
     """
+    # -- Validate resume flags -----------------------------------------
+    resume_checkpoint = None
+    if resume_training_state:
+        if not resume_from:
+            raise ValueError(
+                "--resume_training_state requires --resume_from to point "
+                "to a Trainer checkpoint directory."
+            )
+        validate_training_state_checkpoint(resume_from)
+        resume_checkpoint = resume_from
+        print(f"[Resume] Will restore full training state from: {resume_from}")
+
     # Validate unsloth availability early
     if use_unsloth:
         _require_unsloth()
@@ -558,6 +625,7 @@ def train_with_grpo(
     shared_callbacks = [
         ThroughputMetricsCallback(),
         ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
+        TrainingStateCheckpointCallback(),
     ]
 
     if use_dual_adapter:
@@ -585,7 +653,7 @@ def train_with_grpo(
             callbacks=shared_callbacks,
         )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(output_dir)
 
 
@@ -608,7 +676,19 @@ def main() -> None:
     parser.add_argument("--method", type=str, default=_env('METHOD', "sft"), choices=["sft", "grpo"],
                         help="Training method: sft or grpo")
     parser.add_argument("--resume_from", type=str, default=_env('RESUME_FROM', None),
-                        help="Path to a saved adapter directory to resume training from")
+                        help="Path to a saved adapter directory to resume training from. "
+                             "Loads LoRA adapter weights only (training starts from step 0 "
+                             "with a fresh optimizer). Combine with --resume_training_state "
+                             "to also restore optimizer, LR schedule, step counter, and RNG "
+                             "seeds for full crash recovery.")
+    parser.add_argument("--resume_training_state", action="store_true",
+                        default=_env('RESUME_TRAINING_STATE', '0').lower() in ('1', 'true', 'yes'),
+                        help="Restore the full training state (optimizer weights, LR schedule, "
+                             "step/epoch counters, RNG seeds) from the checkpoint specified by "
+                             "--resume_from. Without this flag, --resume_from only loads adapter "
+                             "weights. Requires --resume_from to point to a Trainer checkpoint "
+                             "directory (e.g., output_dir/checkpoint-50/) containing "
+                             "trainer_state.json and optimizer state files.")
     parser.add_argument("--buffer_size", type=int, default=_env('BUFFER_SIZE', 10000),
                         help="Number of examples to buffer from streaming dataset for GRPO")
     parser.add_argument("--max_steps", type=int, default=_env('MAX_STEPS', 1),

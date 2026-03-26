@@ -74,6 +74,15 @@ import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
 
+
+# =====================================================================
+# Files produced by the HuggingFace Trainer checkpoint mechanism
+# =====================================================================
+_TRAINER_STATE_FILE = "trainer_state.json"
+_OPTIMIZER_FILES = ("optimizer.pt", "optimizer.safetensors")
+_SCHEDULER_FILE = "scheduler.pt"
+_RNG_STATE_PREFIX = "rng_state"
+
 # =====================================================================
 # Regex patterns for format checking (mirrors RewardFunctionFactory)
 # =====================================================================
@@ -349,6 +358,177 @@ class ContextLengthHistogramCallback(TrainerCallback):
                 f"Median: {median_val:,.0f} | "
                 f"Range: [{int(lengths.min())}, {int(lengths.max())}]"
             )
+
+
+# =====================================================================
+# TrainingStateCheckpointCallback
+# =====================================================================
+class TrainingStateCheckpointCallback(TrainerCallback):
+    """
+    Ensures every checkpoint is fully resumable and logs a clear summary.
+
+    The HuggingFace Trainer already persists optimizer state, LR
+    scheduler state, RNG seeds, and training progress (step / epoch) in
+    every checkpoint directory.  This callback adds two things on top:
+
+    1. **Verification** – after each save it confirms that all required
+       files (``trainer_state.json``, optimizer, scheduler, RNG) are
+       present and warns loudly if anything is missing.
+    2. **Visibility** – prints step, epoch, current LR, and a
+       *RESUMABLE / INCOMPLETE* tag so the user can tell at a glance
+       which checkpoints are safe to resume from.
+
+    Additionally, a small ``training_state_summary.json`` file is
+    written into each checkpoint with the same information in a
+    machine-readable format.
+
+    To resume from a checkpoint, combine the two CLI flags::
+
+        python training_code.py \\
+            --resume_from <output_dir>/checkpoint-<N> \\
+            --resume_training_state \\
+            --output_dir <output_dir> ...
+
+    ``--resume_from`` loads the adapter weights; adding
+    ``--resume_training_state`` also restores the optimizer, LR
+    schedule, global step, epoch counter, and RNG seeds so training
+    continues exactly where it left off.
+    """
+
+    def on_save(self, args, state, control, **kwargs):
+        is_distributed = (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+        if is_distributed and torch.distributed.get_rank() != 0:
+            return
+
+        checkpoint_dir = os.path.join(
+            args.output_dir, f"checkpoint-{state.global_step}"
+        )
+        if not os.path.isdir(checkpoint_dir):
+            return
+
+        # -- Collect file inventory ------------------------------------
+        has_trainer_state = os.path.exists(
+            os.path.join(checkpoint_dir, _TRAINER_STATE_FILE)
+        )
+        has_optimizer = any(
+            os.path.exists(os.path.join(checkpoint_dir, f))
+            for f in _OPTIMIZER_FILES
+        )
+        has_scheduler = os.path.exists(
+            os.path.join(checkpoint_dir, _SCHEDULER_FILE)
+        )
+        rng_files = [
+            f for f in os.listdir(checkpoint_dir)
+            if f.startswith(_RNG_STATE_PREFIX)
+        ]
+        has_rng = len(rng_files) > 0
+
+        # -- Extract current learning rate -----------------------------
+        current_lr = None
+        if state.log_history:
+            for entry in reversed(state.log_history):
+                if "learning_rate" in entry:
+                    current_lr = entry["learning_rate"]
+                    break
+
+        resumable = (
+            has_trainer_state and has_optimizer
+            and has_scheduler and has_rng
+        )
+        status = "RESUMABLE" if resumable else "INCOMPLETE"
+        lr_str = f"{current_lr:.2e}" if current_lr is not None else "N/A"
+
+        print(
+            f"[TrainingStateCheckpoint] Step {state.global_step} | "
+            f"Epoch {state.epoch:.4f} | LR {lr_str} | {status}"
+        )
+        if not resumable:
+            missing = []
+            if not has_trainer_state:
+                missing.append(_TRAINER_STATE_FILE)
+            if not has_optimizer:
+                missing.append("optimizer.pt/.safetensors")
+            if not has_scheduler:
+                missing.append(_SCHEDULER_FILE)
+            if not has_rng:
+                missing.append("rng_state_*.pth")
+            print(
+                f"  WARNING: Checkpoint incomplete — missing: "
+                f"{', '.join(missing)}"
+            )
+        else:
+            print(
+                f"  Resume with: --resume_from {checkpoint_dir} "
+                f"--resume_training_state"
+            )
+
+        # -- Write machine-readable summary ----------------------------
+        summary = {
+            "global_step": state.global_step,
+            "epoch": state.epoch,
+            "max_steps": state.max_steps,
+            "learning_rate": current_lr,
+            "num_input_tokens_seen": getattr(
+                state, "num_input_tokens_seen", 0
+            ),
+            "total_flos": state.total_flos,
+            "best_metric": state.best_metric,
+            "resumable": resumable,
+            "files": {
+                "trainer_state": has_trainer_state,
+                "optimizer": has_optimizer,
+                "scheduler": has_scheduler,
+                "rng_states": rng_files,
+            },
+        }
+        summary_path = os.path.join(
+            checkpoint_dir, "training_state_summary.json"
+        )
+        try:
+            with open(summary_path, "w") as f:
+                json.dump(summary, f, indent=2)
+        except OSError as exc:
+            logger.warning(
+                "Could not write training state summary: %s", exc
+            )
+
+
+def validate_training_state_checkpoint(checkpoint_dir: str) -> None:
+    """Raise if *checkpoint_dir* lacks files needed for state resumption.
+
+    Called from the training entry-points when ``--resume_training_state``
+    is set, **before** the Trainer is constructed, so the user gets an
+    immediate, actionable error instead of a cryptic failure mid-training.
+    """
+    trainer_state = os.path.join(checkpoint_dir, _TRAINER_STATE_FILE)
+    if not os.path.exists(trainer_state):
+        raise FileNotFoundError(
+            f"Cannot resume training state: '{trainer_state}' not found.\n"
+            f"The --resume_from path must point to a Trainer checkpoint "
+            f"directory (e.g. output_dir/checkpoint-50/) that was saved "
+            f"during a previous training run — not a bare adapter directory "
+            f"produced by trainer.save_model().\n"
+            f"Contents of '{checkpoint_dir}': "
+            f"{os.listdir(checkpoint_dir) if os.path.isdir(checkpoint_dir) else 'NOT A DIRECTORY'}"
+        )
+    has_optimizer = any(
+        os.path.exists(os.path.join(checkpoint_dir, f))
+        for f in _OPTIMIZER_FILES
+    )
+    if not has_optimizer:
+        raise FileNotFoundError(
+            f"Cannot resume training state: no optimizer file found in "
+            f"'{checkpoint_dir}'.\nExpected one of: {_OPTIMIZER_FILES}"
+        )
+    if not os.path.exists(os.path.join(checkpoint_dir, _SCHEDULER_FILE)):
+        logger.warning(
+            "Scheduler state file '%s' not found in '%s'. "
+            "The LR schedule will restart from the beginning.",
+            _SCHEDULER_FILE, checkpoint_dir,
+        )
 
 
 # =====================================================================

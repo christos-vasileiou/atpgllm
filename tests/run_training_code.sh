@@ -8,7 +8,6 @@
 #SBATCH --mem=128G
 #SBATCH --partition=h100
 #SBATCH --gres=gpu:4
-#SBATCH --reservation=LLM
 
 # Export the exact path of the Slurm log so Python can find it
 export SLURM_LOG_FILE="jobs/training_${SLURM_JOB_ID}.out"
@@ -105,6 +104,7 @@ if [ "$METHOD" == "sft" ]; then
     TRAIN_DATASET=${TRAIN_DATASET:-chrivasileiou/asap7-language-of-test}
     OUTPUT_DIR=${OUTPUT_DIR:-sft_finetuned_model}
     RESUME_FROM=${RESUME_FROM:-}
+    RESUME_TRAINING_STATE=${RESUME_TRAINING_STATE:-False}
     PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-2}
     GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
     MAX_STEPS=${MAX_STEPS:-50}
@@ -123,6 +123,8 @@ if [ "$METHOD" == "sft" ]; then
     USE_VLLM=${USE_VLLM:-False}
     VLLM_MODE=${VLLM_MODE:-server}
     PORT=${PORT:-8002}
+    MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
+    MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
     USE_UNSLOTH=${USE_UNSLOTH:-$(python -c "import unsloth" 2>/dev/null && echo True || echo False)}
     USE_DDP=${USE_DDP:-True}
 elif [ "$METHOD" == "grpo" ]; then
@@ -130,6 +132,7 @@ elif [ "$METHOD" == "grpo" ]; then
     TRAIN_DATASET=${TRAIN_DATASET:-chrivasileiou/asap7-language-of-test}
     OUTPUT_DIR=${OUTPUT_DIR:-grpo_finetuned_model}
     RESUME_FROM=${RESUME_FROM:-sft_finetuned_model/checkpoint-150}
+    RESUME_TRAINING_STATE=${RESUME_TRAINING_STATE:-False}
     BUFFER_SIZE=${BUFFER_SIZE:-10000}
     PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-2}
     GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
@@ -301,15 +304,25 @@ build_cmd_args() {
         CMD_ARGS+=(--resume_from "$RESUME_FROM")
     fi
 
+    # Add --resume_training_state to restore optimizer, LR schedule, step,
+    # and RNG seeds from the checkpoint specified by --resume_from.
+    if [ "$RESUME_TRAINING_STATE" == "True" ]; then
+        CMD_ARGS+=(--resume_training_state)
+    fi
+
+    # Shared by both SFT and GRPO
+    CMD_ARGS+=(
+        --max_model_len "$MAX_MODEL_LEN"
+        --max_prompt_length "$MAX_PROMPT_LENGTH"
+    )
+
     # Add GRPO-specific arguments only for GRPO method
     if [ "$METHOD" == "grpo" ]; then
         CMD_ARGS+=(
             --buffer_size "$BUFFER_SIZE"
             --num_generations "$NUM_GENERATIONS"
             --steps_per_generation "$STEPS_PER_GENERATION"
-            --max_model_len "$MAX_MODEL_LEN"
             --max_completion_length "$MAX_COMPLETION_LENGTH"
-            --max_prompt_length "$MAX_PROMPT_LENGTH"
         )
         # This condition checks whether the variable USE_DUAL_ADAPTER is set (not empty) and its value is exactly "True".
         if [ -n "$USE_DUAL_ADAPTER" ] && [ "$USE_DUAL_ADAPTER" == "True" ]; then
@@ -323,20 +336,28 @@ build_cmd_args() {
     echo "MODEL: $MODEL"
     echo "TRAIN_DATASET: $TRAIN_DATASET"
     echo "OUTPUT_DIR: $OUTPUT_DIR"
+    echo "RESUME_FROM: ${RESUME_FROM:-(not set)}"
+    echo "RESUME_TRAINING_STATE: $RESUME_TRAINING_STATE"
     echo "PER_DEVICE_TRAIN_BATCH_SIZE: $PER_DEVICE_TRAIN_BATCH_SIZE"
     echo "GRADIENT_ACCUMULATION_STEPS: $GRADIENT_ACCUMULATION_STEPS"
     echo "MAX_STEPS: $MAX_STEPS"
+    echo "MAX_MODEL_LEN: $MAX_MODEL_LEN"
+    echo "MAX_PROMPT_LENGTH: $MAX_PROMPT_LENGTH"
     echo "REPORT_TO: $REPORT_TO"
     echo "USE_VLLM: $USE_VLLM"
-    echo "VLLM_MODE: ${VLLM_MODE:-(n/a)} (set only if GRPO method)"
+    echo "VLLM_MODE: ${VLLM_MODE:-(n/a)} (GRPO only)"
     echo "PORT: $PORT (http://localhost:$PORT, otherwise no vLLM server needed)"
-    echo "*VLLM_GPU: $VLLM_GPU (is set automatically when vLLM server mode is used)"
+    echo "*VLLM_GPU: ${VLLM_GPU:-(auto)} (set when vLLM server mode is used)"
     echo "USE_DUAL_ADAPTER: $USE_DUAL_ADAPTER"
     echo "USE_UNSLOTH: $USE_UNSLOTH"
-    echo "USE_DDP: $USE_DDP (set only if SFT method)"
-    echo "BUFFER_SIZE: $BUFFER_SIZE (set only if GRPO method)"
-    echo "NUM_GENERATIONS: $NUM_GENERATIONS (set only if GRPO method)"
-    echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION (set only if GRPO method)"
+    echo "USE_DDP: $USE_DDP"
+    if [ "$METHOD" == "grpo" ]; then
+        echo "--- GRPO-specific ---"
+        echo "BUFFER_SIZE: $BUFFER_SIZE"
+        echo "NUM_GENERATIONS: $NUM_GENERATIONS"
+        echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION"
+        echo "MAX_COMPLETION_LENGTH: $MAX_COMPLETION_LENGTH"
+    fi
     echo "=============================================="
     echo "CMD_ARGS: ${CMD_ARGS[*]}"
     echo "=============================================="

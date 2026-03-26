@@ -786,14 +786,16 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 
         Phase 2 (DDP collective):
             All ranks vote on whether *any* rank still has prompts that need a
-            continuation.  If no rank has work, the loop exits.  The minimum
-            max_tokens across ranks is broadcast so vLLM respects the tightest
-            context-window constraint.
+            continuation.  If no rank has work, the loop exits.
 
         Phase 3 (DDP collective):
             _generate_tool_continuation sends prompts to vLLM with n=1 (one
-            completion per unique prompt, no deduplication).  Handles variable
-            prompt counts per rank via gather/broadcast.
+            completion per unique prompt, no deduplication) and
+            max_tokens=max_completion_length.  vLLM internally caps each
+            completion to min(max_tokens, max_model_len - prompt_length),
+            so short prompts get the full budget while long prompts are
+            naturally limited.  Handles variable prompt counts per rank
+            via gather/broadcast.
 
         Phase 4 (local per rank):
             Stitch the new completion onto the existing token sequence.  Update
@@ -909,14 +911,10 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 pct_ids = [pct_ids[i] for i in surviving_indices]
 
                 if idxs_with_tool:
-                    _MIN_CONTINUATION_TOKENS = 64
-                    max_pct_len = max(len(pct) for pct in pct_ids)
-                    available_tokens = max(max_model_len - max_pct_len, _MIN_CONTINUATION_TOKENS)
-                    local_max_tokens = min(self.max_completion_length, available_tokens)
                     prompts_for_gen = prompt_completion_tools
 
             # ==================================================================
-            # Phase 2 (DDP sync): decide whether to continue & agree on limits
+            # Phase 2 (DDP sync): decide whether to continue
             # ==================================================================
             # All ranks vote: does *any* rank still have prompts needing a
             # continuation?  If not, every rank breaks out together.
@@ -930,23 +928,21 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             if not any_has_gen:
                 break
 
-            # Use the tightest budget so no rank overflows its context window.
-            if self.accelerator.num_processes > 1:
-                mt_tensor = torch.tensor([local_max_tokens], device=device, dtype=torch.long)
-                continuation_max_tokens = int(self.accelerator.gather(mt_tensor).min().item())
-            else:
-                continuation_max_tokens = local_max_tokens
-
             # ==================================================================
             # Phase 3 (DDP collective): generate tool-call continuations
             # ==================================================================
             # All ranks enter _generate_tool_continuation together (even those
             # with empty prompt lists) so the internal gather/broadcast ops
             # don't deadlock.
+            #
+            # max_tokens is set to max_completion_length for all prompts.
+            # vLLM internally caps each completion to
+            # min(max_tokens, max_model_len - prompt_length), so short prompts
+            # get the full budget while long prompts are naturally limited.
+            # Phase 1's overlong check already removed prompts that exceed
+            # max_model_len, so no request can cause a vLLM rejection.
             prompt_completion_tool_ids, post_tool_ids, post_tool_logprobs, _ = (
-                self._generate_tool_continuation(
-                    prompts_for_gen, max_tokens_override=continuation_max_tokens
-                )
+                self._generate_tool_continuation(prompts_for_gen)
             )
 
             # ==================================================================
