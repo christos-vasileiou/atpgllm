@@ -13,7 +13,7 @@ from .fault_coverage_calc import fault_sim, logic_and, logic_buf, logic_not, log
 from ..utils import is_main_process
 import torch.distributed as dist
 from io import StringIO
-from typing import Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import json
 import warnings
 
@@ -79,282 +79,358 @@ def convert_to_df(pred_simulation):
   df.index.name = None
   return df
 
-# Extract the fault and net
-def test_generation_reward(prompts: list, completions: list, **kwargs):
+
+def _cell_to_int(val: Any) -> Optional[int]:
+  if val == "x" or (isinstance(val, float) and pd.isna(val)):
+    return None
+  try:
+    return int(val)
+  except (TypeError, ValueError):
+    return None
+
+
+def _simulation_table_from_completion(
+    completion: str, simulation_fn: Callable[[str], List[str]]
+) -> Optional[pd.DataFrame]:
+  """Prefer JSON <tool_response> (Good/Bad machine dicts); else legacy markdown / string table."""
+  df = extract_json_tool_response_and_convert_to_df(completion)
+  if df is not None and not df.empty:
+    if "Good Machine" in df.columns and "Bad Machine" in df.columns:
+      return df
+  rows = simulation_fn(completion)
+  if not rows:
+    return None
+  try:
+    return convert_to_df(rows[0])
+  except Exception:
+    return None
+
+
+def _fault_detected_at_pos(simulation_df: pd.DataFrame) -> bool:
+  """True if some primary output differs between good and bad machine (observable detection)."""
+  if simulation_df is None or simulation_df.empty or "POs" not in simulation_df.columns:
+    return False
+  po_rows = simulation_df.loc[simulation_df["POs"]]
+  if po_rows.empty:
+    return False
+  for _, row in po_rows.iterrows():
+    g = _cell_to_int(row["Good Machine"])
+    b = _cell_to_int(row["Bad Machine"])
+    if g is None or b is None:
+      continue
+    if g != b:
+      return True
+  return False
+
+
+def _fault_site_activated(simulation_df: pd.DataFrame, fault_net: str, stuck_at: int) -> bool:
+  if simulation_df is None or fault_net not in simulation_df.index:
+    return False
+  row = simulation_df.loc[fault_net]
+  g = _cell_to_int(row["Good Machine"])
+  b = _cell_to_int(row["Bad Machine"])
+  if g is None or b is None:
+    return False
+  return b == stuck_at and g != b
+
+
+def _po_prediction_score(
+    simulation_df: pd.DataFrame, pred_expected_output: str
+) -> Tuple[float, int]:
+  """Fraction of POs where EXPECTED_OUTPUT matches simulated good machine (0..1, count)."""
+  if simulation_df is None or "POs" not in simulation_df.columns:
+    return 0.0, 0
+  po_rows = simulation_df.loc[simulation_df["POs"]]
+  if po_rows.empty:
+    return 0.0, 0
+  sep = ":" if ":" in pred_expected_output else "="
+  try:
+    pred = convert_string_to_dict(pred_expected_output, sep=sep)
+  except Exception:
+    return 0.0, len(po_rows)
+  ok = 0
+  total = 0
+  for po, row in po_rows.iterrows():
+    if po not in pred:
+      continue
+    total += 1
+    sim_g = _cell_to_int(row["Good Machine"])
+    if sim_g is None:
+      continue
+    if int(pred[po]) == sim_g:
+      ok += 1
+  denom = total if total else len(po_rows)
+  return (ok / denom) if denom else 0.0, total
+
+
+def _pi_assignment_score(
+    simulation_df: pd.DataFrame, pred_input_vector: str
+) -> Tuple[float, int]:
+  """Fraction of PIs where INPUT_VECTOR matches simulated good machine."""
+  if simulation_df is None or "PIs" not in simulation_df.columns:
+    return 0.0, 0
+  pi_rows = simulation_df.loc[simulation_df["PIs"]]
+  if pi_rows.empty:
+    return 0.0, 0
+  sep = ":" if ":" in pred_input_vector else "="
+  try:
+    pred = convert_string_to_dict(pred_input_vector, sep=sep)
+  except Exception:
+    return 0.0, len(pi_rows)
+  ok = 0
+  total = 0
+  for pi, row in pi_rows.iterrows():
+    if pi not in pred:
+      continue
+    total += 1
+    sim_g = _cell_to_int(row["Good Machine"])
+    if sim_g is None:
+      continue
+    if int(pred[pi]) == sim_g:
+      ok += 1
+  denom = total if total else len(pi_rows)
+  return (ok / denom) if denom else 0.0, total
+
+
+def _tool_response_po_consistency_bonus(completion: str, simulation_df: pd.DataFrame) -> float:
+  """Small bonus if <tool_response> Good/Bad PO values match authoritative simulation."""
+  raw = extract_json_tool_response_and_convert_to_df(completion)
+  if (
+    raw is None
+    or raw.empty
+    or simulation_df is None
+    or "POs" not in simulation_df.columns
+    or "Good Machine" not in raw.columns
+    or "Bad Machine" not in raw.columns
+  ):
+    return 0.0
+  po_rows = simulation_df.loc[simulation_df["POs"]]
+  if po_rows.empty:
+    return 0.0
+  good_hits, bad_hits, n = 0, 0, 0
+  for po in po_rows.index:
+    if po not in raw.index:
+      continue
+    n += 1
+    sg = _cell_to_int(po_rows.loc[po, "Good Machine"])
+    sb = _cell_to_int(po_rows.loc[po, "Bad Machine"])
+    tg = _cell_to_int(raw.loc[po, "Good Machine"])
+    tb = _cell_to_int(raw.loc[po, "Bad Machine"])
+    if sg is not None and tg is not None and sg == tg:
+      good_hits += 1
+    if sb is not None and tb is not None and sb == tb:
+      bad_hits += 1
+  if n == 0:
+    return 0.0
+  return 1.5 * ((good_hits + bad_hits) / (2 * n))
+
+
+def _mentions_target_fault(text: str, fault: str, fault_net: str) -> float:
+  if not text:
+    return 0.0
+  t = re.sub(r"\s+", " ", text.lower())
+  needle = f"{fault.lower()} {fault_net.lower()}"
+  if needle in t:
+    return 1.0
+  if f"{fault.lower()}{fault_net.lower()}" in t.replace(" ", ""):
+    return 1.0
+  return 0.0
+
+
+def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> List[Dict[str, float]]:
   """
-  Calculate the reward for the test generation task.
+  GRPO-oriented reward for ATPG-style completions: learn a test vector that *detects* the target fault.
 
-  This function evaluates the quality of generated test vectors for fault detection in digital circuits.
-  It analyzes the provided prompts, completions, and netlists to compute rewards based on various criteria
-  such as simulation accuracy, input vector validity, and fault detection effectiveness.
+  Authoritative signal: the fault simulator (``fault_sim`` / ``fast_fault_sim``) on the model's
+  ``INPUT_VECTOR`` and ``EXPECTED_OUTPUT``. Components (non-overlapping so ``sum(values)`` is meaningful):
 
-  Parameters:
-  prompts (list): A list of input prompts describing the fault detection scenarios.
-  completions (list): A list of generated completions corresponding to each prompt.
-  netlists (list): A list of netlists representing the circuit structures.
-  fault_fn (function): Function to extract fault information.
-  simulation_fn (function): Function to extract simulation results.
-  input_vector_fn (function): Function to extract input vectors.
-  expected_output_fn (function): Function to extract expected outputs.
-  detected_faults_fn (function): Function to extract detected faults.
-  lib_gate_funcs (dict): Dictionary containing the logic functions for each gate type.
-  eval_mode (bool): A boolean indicating whether to evaluate the rewards.
+  - **fault_detect_inpvector** — bonus for PO observation (good≠bad on some PO) plus fault-site
+    activation (bad value at fault net equals stuck-at and differs from good).
+  - **expected_output** / **input_vector** — match of declared vectors to simulated good machine
+    on POs / PIs.
+  - **fault_simulation** — tool JSON ``<tool_response>`` PO values vs gold simulation.
+  - **detected_faults** — target fault string appears in ``DETECTED_FAULTS``.
+  - **pred_simulation** / **pred_vs_fault_sim_acc** — completion simulation table vs gold (if present).
+  - **format** — light shaping for thinking / tool_call / tool_response / tags.
 
-  Returns:
-  list: A list of dictionaries, each containing reward scores for different aspects of the test generation task.
-        The keys in each dictionary are:
-        - 'format': Reward for correct formatting of the completion.
-        - 'pred_simulation': Reward for accuracy of the predicted simulation.
-        - 'fault_simulation': Reward for accuracy of the fault simulation.
-        - 'input_vector': Reward for correctness of the generated input vector.
-        - 'expected_output': Reward for correctness of the expected output.
-        - 'detected_faults': Reward for correctly identifying detected faults.
-        - 'fault_detect_inpvector': Reward for effectiveness of the input vector in detecting the fault.
+  Optional kwargs: ``reward_weight_fault_detected_po`` (default 12), ``reward_weight_fault_site`` (4),
+  ``reward_weight_po_match`` (5), ``reward_weight_pi_match`` (3), ``reward_weight_tool_json_bonus`` (1),
+  ``reward_weight_fault_mention`` (1.5), ``reward_format_weight`` (0.12).
+
+  Returns per-completion component dicts (summed by the trainer).
   """
-  netlists = kwargs.get('netlists', None)
+  netlists = kwargs.get("netlists", None)
   if netlists is None:
     raise ValueError("netlists must be provided")
-  fault_fn = kwargs.get('fault_fn', None)
-  if fault_fn is None:
-    raise ValueError("fault_fn must be provided")
-  simulation_fn = kwargs.get('simulation_fn', None)
-  if simulation_fn is None:
-    raise ValueError("simulation_fn must be provided")
-  input_vector_fn = kwargs.get('input_vector_fn', None)
-  if input_vector_fn is None:
-    raise ValueError("input_vector_fn must be provided")
-  expected_output_fn = kwargs.get('expected_output_fn', None)
-  if expected_output_fn is None:
-    raise ValueError("expected_output_fn must be provided")
-  detected_faults_fn = kwargs.get('detected_faults_fn', None)
-  if detected_faults_fn is None:
-    raise ValueError("detected_faults_fn must be provided")
-  eval_mode = kwargs.get('eval_mode', False)
-  lib_gate_funcs = kwargs.get('lib_gate_funcs', None)
-  thinking_fn = kwargs.get('thinking_fn', None)
-  tool_call_fn = kwargs.get('tool_call_fn', None)
-  tool_response_fn = kwargs.get('tool_response_fn', None)
-  
+
+  fault_fn = kwargs.get("fault_fn", None)
+  simulation_fn = kwargs.get("simulation_fn", None)
+  input_vector_fn = kwargs.get("input_vector_fn", None)
+  expected_output_fn = kwargs.get("expected_output_fn", None)
+  detected_faults_fn = kwargs.get("detected_faults_fn", None)
+  if fault_fn is None or simulation_fn is None or input_vector_fn is None:
+    raise ValueError("fault_fn, simulation_fn, and input_vector_fn must be provided")
+  if expected_output_fn is None or detected_faults_fn is None:
+    raise ValueError("expected_output_fn and detected_faults_fn must be provided")
+
+  lib_gate_funcs = kwargs.get("lib_gate_funcs", None)
+  thinking_fn = kwargs.get("thinking_fn", None)
+  tool_call_fn = kwargs.get("tool_call_fn", None)
+  tool_response_fn = kwargs.get("tool_response_fn", None)
+
   if lib_gate_funcs is None:
-    gate_func = {'IB': logic_buf, 'AN': logic_and, 'OR': logic_or, 'XO': logic_xor, 'IV': logic_not, 'ND': logic_nand, 'NR': logic_nor, 'XN': logic_xnor}
+    gate_func = {
+      "IB": logic_buf,
+      "AN": logic_and,
+      "OR": logic_or,
+      "XO": logic_xor,
+      "IV": logic_not,
+      "ND": logic_nand,
+      "NR": logic_nor,
+      "XN": logic_xnor,
+    }
+    fault_sim_runner = fault_sim
   else:
     gate_func = lib_gate_funcs
-    fault_sim = kwargs.get('fault_sim', None)
-    # When using library gate functions, fault_sim MUST be provided as it requires OptimizedNetlist
-    if fault_sim is None:
+    fault_sim_runner = kwargs.get("fault_sim", None)
+    if fault_sim_runner is None:
       raise ValueError("fault_sim function must be provided when using lib_gate_funcs")
 
-  rewards = []
-  
+  w_detect = float(kwargs.get("reward_weight_fault_detected_po", 12.0))
+  w_site = float(kwargs.get("reward_weight_fault_site", 4.0))
+  w_po = float(kwargs.get("reward_weight_po_match", 5.0))
+  w_pi = float(kwargs.get("reward_weight_pi_match", 3.0))
+  w_tool_json = float(kwargs.get("reward_weight_tool_json_bonus", 1.0))
+  w_fault_mention = float(kwargs.get("reward_weight_fault_mention", 1.5))
+  format_weight = float(kwargs.get("reward_format_weight", 0.12))
+
+  rewards: List[Dict[str, float]] = []
+
   for prompt, completion, netlist in zip(prompts, completions, netlists):
-    fault = fault_fn(prompt)
-    if fault:
-      fault, net = fault[0]
-    
-    # Calculate Reward for Fault Simulation
-    reward = {'format': 0, 
-              'pred_simulation': 0, 
-              'fault_simulation': 0, 
-              'input_vector': 0, 
-              'expected_output': 0, 
-              'detected_faults': 0, 
-              'fault_detect_inpvector': 0,
-              'pred_vs_fault_sim_acc': 0,
-              'fault_detected_by_pred_input_vector_acc': 0,
-              'expected_output_acc': 0,
-              'input_vector_acc': 0,
-              'detected_faults_acc': 0
-              }
-    
-    # Extract the thinking
-    if thinking_fn is not None:
-      pred_thinking = thinking_fn(completion)
-      if pred_thinking:
-        pred_thinking = pred_thinking[0]
-        reward['format'] += 0.125
-      else:
-        reward['format'] -= 1
+    # Keys are non-overlapping so sum(...) is a well-defined total (GRPO / logging).
+    out: Dict[str, float] = {
+      "format": 0.0,
+      "fault_detect_inpvector": 0.0,
+      "fault_simulation": 0.0,
+      "expected_output": 0.0,
+      "input_vector": 0.0,
+      "detected_faults": 0.0,
+      "pred_simulation": 0.0,
+      "pred_vs_fault_sim_acc": 0.0,
+      "fault_detected_by_pred_input_vector_acc": 0.0,
+      "expected_output_acc": 0.0,
+      "input_vector_acc": 0.0,
+      "detected_faults_acc": 0.0,
+      # Extra scalars for dashboards (also included in sum — keep small):
+      "sim_table_bonus": 0.0,
+    }
 
-    # Extract the tool call
-    if tool_call_fn is not None:
-      pred_tool_call = tool_call_fn(completion)
-      if pred_tool_call:
-        pred_tool_call = pred_tool_call[0]
-        reward['format'] += 0.125
-      else:
-        reward['format'] -= 1
+    fault_info = fault_fn(prompt)
+    fault, net = (None, None)
+    if fault_info:
+      fault, net = fault_info[0]
+    stuck_at = int(fault[-1]) if fault else -1
 
-    # Extract the tool response
-    if tool_response_fn is not None:
-      pred_tool_response = tool_response_fn(completion)
-      if pred_tool_response:
-        pred_tool_response = pred_tool_response[0]
-        reward['format'] += 0.125
-      else:
-        reward['format'] -= 1
+    # Light format shaping (optional extractors)
+    for fn in (thinking_fn, tool_call_fn, tool_response_fn):
+      if fn is not None:
+        try:
+          out["format"] += format_weight if fn(completion) else -0.35
+        except Exception:
+          out["format"] -= 0.35
 
-    # Extract the simulation
-    pred_simulation = simulation_fn(completion)
-    if pred_simulation:
-      pred_simulation = pred_simulation[0]
-      reward['format'] += 0.125
+    pred_input = (input_vector_fn(completion) or [None])[0]
+    pred_output = (expected_output_fn(completion) or [None])[0]
+    pred_faults = (detected_faults_fn(completion) or [None])[0]
+
+    if pred_input:
+      out["format"] += format_weight
     else:
-      reward['format'] -= 1
-
-    # Extract the input vector
-    pred_input_vector = input_vector_fn(completion)
-    if pred_input_vector:
-      pred_input_vector = pred_input_vector[0]
-      reward['format'] += 0.125
+      out["format"] -= 0.8
+    if pred_output:
+      out["format"] += format_weight
     else:
-      reward['format'] -= 1
-
-    # Extract the expected output
-    pred_expected_output = expected_output_fn(completion)
-    if pred_expected_output:
-      pred_expected_output = pred_expected_output[0]
-      reward['format'] += 0.125
+      out["format"] -= 0.8
+    if pred_faults:
+      out["format"] += format_weight
     else:
-      reward['format'] -= 1
+      out["format"] -= 0.5
 
-    # Extract the detected faults
-    pred_detected_faults = detected_faults_fn(completion)
-    if pred_detected_faults:
-      pred_detected_faults = pred_detected_faults[0]
-      reward['format'] += 0.125
-    else:
-      reward['format'] -= 1
+    sim_from_completion = _simulation_table_from_completion(completion, simulation_fn)
+    if sim_from_completion is not None:
+      out["sim_table_bonus"] = 0.35
 
-    if fault and pred_simulation:
+    if not (fault and net and pred_input and pred_output and netlist):
+      rewards.append(out)
+      continue
+
+    try:
+      result = fault_sim_runner(
+        pred_input,
+        pred_output,
+        f"{fault} {net}",
+        netlist,
+        gate_func,
+        return_rewards=True,
+      )
+      fault_simulation, _fault_sim_rewards = result
+    except Exception:
+      rewards.append(out)
+      continue
+
+    if not isinstance(fault_simulation, pd.DataFrame) or fault_simulation.empty:
+      rewards.append(out)
+      continue
+    if "error" in fault_simulation.columns:
+      rewards.append(out)
+      continue
+
+    detected = _fault_detected_at_pos(fault_simulation)
+    site_ok = _fault_site_activated(fault_simulation, net, stuck_at)
+    po_score, _ = _po_prediction_score(fault_simulation, pred_output)
+    pi_score, _ = _pi_assignment_score(fault_simulation, pred_input)
+
+    tool_bonus = _tool_response_po_consistency_bonus(completion, fault_simulation)
+    mention = _mentions_target_fault(pred_faults, fault, net) if pred_faults else 0.0
+
+    out["fault_detect_inpvector"] = w_detect * float(detected) + w_site * float(site_ok)
+    out["expected_output"] = w_po * po_score
+    out["input_vector"] = w_pi * pi_score
+    out["fault_simulation"] = w_tool_json * tool_bonus
+    out["detected_faults"] = w_fault_mention * mention
+    out["fault_detected_by_pred_input_vector_acc"] = float(detected)
+    out["expected_output_acc"] = 1.0 if po_score >= 0.999 else 0.0
+    out["input_vector_acc"] = 1.0 if pi_score >= 0.999 else 0.0
+    out["detected_faults_acc"] = 1.0 if mention >= 0.99 else 0.0
+
+    if sim_from_completion is not None and "POs" in fault_simulation.columns:
       try:
-        # +1 Parse the simulation and convert it to a DataFrame
-        pred_simulation = convert_to_df(pred_simulation)
-        if pred_simulation.loc[net, "Good Machine"] == 'x':
-          reward['pred_simulation'] -= 2.5
-        else:
-          reward['pred_simulation'] += .5
-          # Check if the Good Machine value is different than Bad Machine for the requested net + if the fault simulation trigger the requested fault
-          reward['pred_simulation'] += int(pred_simulation.loc[net, "Good Machine"] != pred_simulation.loc[net, "Bad Machine"])
-          reward['pred_simulation'] += int(pred_simulation.loc[net, "Bad Machine"] == int(fault[-1]))
-      except:
-        pred_simulation = None
-        reward['pred_simulation'] -= 2.5
-    else:
-      reward['pred_simulation'] -= 3.5
-    
-    if pred_input_vector and pred_expected_output and fault and net and netlist:
-      try:
-        # Run Fault Simulation
-        fault_simulation, fault_sim_rewards = fault_sim(pred_input_vector, pred_expected_output, f"{fault} {net}", netlist, gate_func, return_rewards=True)
-        # Reward the simulation
-        # +2 if LLM simulation and actual simulation are the same!
-        if isinstance(pred_simulation, pd.DataFrame) and isinstance(fault_simulation, pd.DataFrame):
-          # Reward the generated simulation
-          # Calculate row-wise accuracy
-          row_matches = pred_simulation.eq(fault_simulation[["Good Machine", "Bad Machine"]])
-          
-          # Weight each row based on its importance
-          # Rows in fault path are most important (weight 2.0)
-          # Primary outputs are next most important (weight 1.5) 
-          # All other rows have base weight 1.0
-          weights = pd.DataFrame(1.0, index=row_matches.index, columns=row_matches.columns)
-          reward['pred_vs_fault_sim_acc'] += (row_matches.sum() / row_matches.count()).mean()
-          weights[fault_simulation["Fault Propagation Path"] | fault_simulation["Backtrack Sensitizing Inputs"]] = 2
-          weights.loc[net, :] = 5
-          
-          # Calculate weighted accuracy
-          weighted_accuracy = ((row_matches * weights).sum() / weights.sum()).mean()
-          
-          # Scale reward exponentially to incentivize high accuracy
-          # This gives:
-          #  ^2 -----------------------------    ^3 -------------------------------   ^4 -------------------------------
-          # 50% accuracy -> 2.25x base reward  | 50% accuracy -> 3.38x base reward   | 50% accuracy -> 5.06x base reward   |
-          # 75% accuracy -> 3.06x base reward  | 75% accuracy -> 5.36x base reward   | 75% accuracy -> 9.38x base reward   |
-          # 95% accuracy -> 3.80x base reward  | 95% accuracy -> 7.41x base reward   | 95% accuracy -> 14.46x base reward  |
-          # 100% accuracy -> 4.00x base reward | 100% accuracy -> 9.00x base reward  | 100% accuracy -> 16.00x base reward |
-          exponent = 4
-          base_reward = 1.0 if weighted_accuracy < 0.9 else 2.0 # force >90% accuracy.
-          reward['fault_simulation'] += base_reward * (1 + weighted_accuracy) ** exponent - base_reward
-          
-          # Calculate a smoother reward using weights for each subcondition
-          fault_detection_condition = fault_simulation.loc[net, "Bad Machine"] == int(fault[-1]) and \
-                                      fault_simulation.loc[net, 'Good Machine'] != fault_simulation.loc[net, 'Bad Machine']
-          
-          # Reward if the fault is detected by the predicted input vector
-          reward['fault_detected_by_pred_input_vector_acc'] += int(fault_detection_condition)
-          if not fault_detection_condition:
-            # Penalize heavily if the fault is not detected
-            reward['fault_detect_inpvector'] -= 5
-          
-          # Reward based on validity of generated Good-Machine input values and generated input vector
-          if fault_sim_rewards.get('input_nets_match', False):
-            # Convert the predicted input vector string to a dictionary
-            input_vector_dict = convert_string_to_dict(pred_input_vector, sep=':' if ':' in pred_input_vector else '=')
-            # Get the input values from the simulation
-            pred_input_vector_from_sim_dict = pred_simulation[fault_simulation['PIs']]['Good Machine'].to_dict()
-            # Get weights for primary inputs
-            input_vector_weights = weights[fault_simulation['PIs']]['Good Machine'].to_dict()
-            # Calculate weighted matches between predicted and actual input values
-            weighted_input_matches = [(iv==pi)*wi for iv, pi, wi in zip(input_vector_dict.values(), pred_input_vector_from_sim_dict.values(), input_vector_weights.values())]
-            # Calculate weighted accuracy for input vector
-            weighted_input_accuracy = sum(weighted_input_matches) / sum(input_vector_weights.values())
-            # Apply exponential scaling to reward
-            exponent = 2
-            base_reward = 2.0
-            reward['fault_detect_inpvector'] += base_reward * (1 + weighted_input_accuracy) ** exponent - base_reward
-            # Additional reward for perfect accuracy
-            reward['input_vector_acc'] += int(weighted_input_accuracy==1)
-          
-          # Reward based on validity of generated Good-Machine output values and generated expected output vector
-          if fault_sim_rewards.get('output_nets_match', False):
-            # Convert the predicted output vector string to a dictionary
-            output_vector_dict = convert_string_to_dict(pred_expected_output, sep=':' if ':' in pred_expected_output else '=')
-            # Get the output values from the simulation
-            pred_expected_output_from_sim_dict = pred_simulation[fault_simulation['POs']]['Good Machine'].to_dict()
-            # Get weights for primary outputs
-            output_vector_weights = weights[fault_simulation['POs']]['Good Machine'].to_dict()
-            # Calculate weighted matches between predicted and actual output values
-            weighted_output_matches = [(ov==pv)*wo for ov, pv, wo in zip(output_vector_dict.values(), pred_expected_output_from_sim_dict.values(), output_vector_weights.values())]
-            # Calculate weighted accuracy for output vector
-            weighted_output_accuracy = sum(weighted_output_matches) / sum(output_vector_weights.values())
-            # Apply exponential scaling to reward
-            exponent = 2
-            base_reward = 2.0
-            reward['expected_output'] += base_reward * (1 + weighted_output_accuracy) ** exponent - base_reward
-            # Additional reward for perfect accuracy
-            reward['expected_output_acc'] += int(weighted_output_accuracy==1)
-          
-          # Reward the detected Fault Path. From the point where the fault occurs and onwards
-          # Extract fault path information from simulation
-          detected_fault_path_df = fault_simulation[fault_simulation["Fault Propagation Path"]].reset_index()[["Bad Machine", "index"]]
-          # Format the bad machine values as fault types (sa0, sa1)
-          detected_fault_path_df['Bad Machine'] = detected_fault_path_df['Bad Machine'].apply(lambda x: f"sa{x}").values
-          # Parse the predicted detected faults string into a numpy array
-          pred_detected_faults_np = np.array([(fault, loc) for fault_loc in pred_detected_faults.split(',') for fault, loc in [fault_loc.strip().split()]])
-          # Check if the predicted fault path matches the actual fault path
-          if detected_fault_path_df.shape[0] == pred_detected_faults_np.shape[0] and np.array_equal(detected_fault_path_df['index'].values, pred_detected_faults_np[:, 1]):
-            # Count how many values are equal between the two arrays
-            equal_values = sum(a == b for a, b in zip(detected_fault_path_df['index'].values, pred_detected_faults_np[:, 1]))
-            accuracy = equal_values / len(detected_fault_path_df['index'].values)
-            # Apply exponential scaling to reward
-            exponent = 2
-            base_reward = 2.0 
-            reward['detected_faults'] += base_reward * (1 + accuracy) ** exponent - base_reward
-            # Additional reward for perfect accuracy
-            reward['detected_faults_acc'] += int(accuracy==1)
-        else:
-          # Penalize if either simulation is missing
-          reward['fault_detect_inpvector'] -= 2
-          reward['fault_simulation'] -= 2
-      except:
+        po_gold = fault_simulation.loc[fault_simulation["POs"]]
+        po_pred = sim_from_completion.reindex(po_gold.index)
+        matches = []
+        for idx in po_gold.index:
+          if idx not in po_pred.index:
+            continue
+          for col in ("Good Machine", "Bad Machine"):
+            a, b = _cell_to_int(po_gold.loc[idx, col]), _cell_to_int(po_pred.loc[idx, col])
+            if a is not None and b is not None:
+              matches.append(float(a == b))
+        if matches:
+          acc = sum(matches) / len(matches)
+          out["pred_vs_fault_sim_acc"] = acc
+          out["pred_simulation"] = 3.0 * (acc - 0.5)
+      except Exception:
         pass
-    else:
-      # Penalize heavily if required inputs are missing
-      reward['fault_detect_inpvector'] -= 5
-      reward['fault_simulation'] -= 5
-    rewards.append(reward)
-  
+
+    rewards.append(out)
+
   return rewards
+
+
+def test_generation_reward(prompts: list, completions: list, **kwargs):
+  """Alias for :func:`test_generation_grpo_reward` (same signature and kwargs)."""
+  return test_generation_grpo_reward(prompts, completions, **kwargs)
+
 
 # Example usage
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import regex as re
 import json
-from typing import Dict, Any, List
+import codecs
+from typing import Dict, Any, List, Optional, Tuple
 from sympy import symbols, parse_expr
 from sympy.core.symbol import Symbol
 from pathlib import Path
@@ -15,8 +16,69 @@ from atpgllm.llm.reward_funcs import (
     extract_json_tool_response_and_convert_to_df, 
     extract_markdown_table, 
     markdown_table_to_dataframe, 
-    test_generation_reward
+    test_generation_reward,
+    test_generation_grpo_reward
 )
+
+
+def _unescape_prompt_string_value(s: str) -> str:
+    """Decode Python-style escapes (e.g. \\n, \\t) in a substring captured from a prompt."""
+    if not s:
+        return s
+    try:
+        return s.encode("latin-1", "backslashreplace").decode("unicode_escape")
+    except (UnicodeDecodeError, UnicodeError):
+        return s
+
+
+# Prompt dict snippets: {'doc_id': '...', 'netlist': '...'} or JSON-style double quotes.
+# Values use non-greedy character-class matching so embedded quotes must be escaped (\\' or \").
+_PROMPT_DOC_ID_RE = re.compile(
+    r"""
+    (?ix)
+    ['"]? doc_id ['"]? \s* : \s*
+    (?:
+        ' (?P<doc_sq> (?: \\. | [^'\\] )* ) '
+    |   " (?P<doc_dq> (?: \\. | [^"\\] )* ) "
+    )
+    """,
+    re.VERBOSE,
+)
+_PROMPT_NETLIST_RE = re.compile(
+    r"""
+    (?ix)
+    ['"]? netlist ['"]? \s* : \s*
+    (?:
+        ' (?P<nl_sq> (?: \\. | [^'\\] )* ) '
+    |   " (?P<nl_dq> (?: \\. | [^"\\] )* ) "
+    )
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+
+def parse_doc_id_and_netlist_from_prompt(prompt: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract doc_id and netlist string from a user prompt that embeds a dict-like blob.
+
+    Handles single- or double-quoted keys/values, optional whitespace, and escaped
+    characters inside quoted values (including multiline netlists in code blocks).
+    """
+    doc_id: Optional[str] = None
+    netlist: Optional[str] = None
+
+    m_doc = _PROMPT_DOC_ID_RE.search(prompt)
+    if m_doc:
+        raw = m_doc.group("doc_sq") if m_doc.group("doc_sq") is not None else m_doc.group("doc_dq")
+        doc_id = _unescape_prompt_string_value(raw).strip()
+
+    m_nl = _PROMPT_NETLIST_RE.search(prompt)
+    if m_nl:
+        raw = m_nl.group("nl_sq") if m_nl.group("nl_sq") is not None else m_nl.group("nl_dq")
+        netlist = _unescape_prompt_string_value(raw)
+
+    return doc_id, netlist
+
 
 # =============================================================================
 # REWARD FUNCTION FACTORY
@@ -121,7 +183,7 @@ class RewardFunctionFactory:
             'expr_str': expr_str
         }
     
-    def get_or_create_netlist(self, netlist_str: str) -> OptimizedNetlist:
+    def validate_and_get_netlist_from_prompt(self, prompt: str, netlist: str | dict) -> OptimizedNetlist:
         """
         Get a cached OptimizedNetlist or create and cache a new one.
         
@@ -130,23 +192,34 @@ class RewardFunctionFactory:
         entries to prevent unbounded memory growth.
         """
         # Use hash of netlist string as cache key
-        cache_key = hashlib.sha256(netlist_str.encode()).hexdigest()[:16]
-        
-        if cache_key not in self._netlist_cache:
-            # Evict oldest entries if cache is full (simple FIFO eviction)
-            if len(self._netlist_cache) >= self._max_cache_size:
-                # Remove the first (oldest) entry
-                oldest_key = next(iter(self._netlist_cache))
-                del self._netlist_cache[oldest_key]
-            
-            self._netlist_cache[cache_key] = OptimizedNetlist(
-                netlist_str, 
-                self.gate_funcs, 
-                self.DECL_RE, 
-                self.NAME_RE
-            )
-        
-        return self._netlist_cache[cache_key]
+        if isinstance(netlist, dict):
+            cache_key = netlist["doc_id"]
+            netlist_str = netlist["netlist"]
+        else:
+            cache_key = hashlib.sha256(netlist.encode()).hexdigest()[:16]
+            netlist_str = netlist
+        # Netlist validation: doc_id in the prompt must match the dataset netlist key.
+        # parse_doc_id_and_netlist_from_prompt finds doc_id and netlist with multiline-safe
+        # quoting (JSON/Python-style); netlist extraction is available for callers/tests.
+        doc_id, _prompt_netlist = parse_doc_id_and_netlist_from_prompt(prompt)
+        are_same = doc_id is not None and doc_id == cache_key
+        if are_same:
+            if cache_key not in self._netlist_cache:
+                # Evict oldest entries if cache is full (simple FIFO eviction)
+                if len(self._netlist_cache) >= self._max_cache_size:
+                    # Remove the first (oldest) entry
+                    oldest_key = next(iter(self._netlist_cache))
+                    del self._netlist_cache[oldest_key]
+                
+                self._netlist_cache[cache_key] = OptimizedNetlist(
+                    netlist_str, 
+                    self.gate_funcs, 
+                    self.DECL_RE, 
+                    self.NAME_RE
+                )
+            return self._netlist_cache[cache_key]
+        # If the netlist is not the same, return None.
+        return None
     
     def clear_cache(self):
         """Clear the netlist cache to free memory."""
@@ -221,7 +294,7 @@ class RewardFunctionFactory:
         gate_funcs = self.gate_funcs
         decl_re = self.DECL_RE
         name_re = self.NAME_RE
-        get_or_create_netlist = self.get_or_create_netlist
+        validate_and_get_netlist_from_prompt = self.validate_and_get_netlist_from_prompt
         
         def reward_fn(prompts: List[str], completions: List[str], **kwargs) -> List[float]:
             """
@@ -255,8 +328,8 @@ class RewardFunctionFactory:
             
             try:
                 reward_kwargs['netlists'] = [
-                    get_or_create_netlist(netlist) if isinstance(netlist, str) else netlist
-                    for netlist in netlists
+                    validate_and_get_netlist_from_prompt(prompt, netlist) if isinstance(netlist, str) or isinstance(netlist, dict) else netlist
+                    for prompt, netlist in zip(prompts, netlists)
                 ]
             except Exception as e:
                 print(f"Warning: Failed to parse some netlists: {e}")
@@ -264,7 +337,9 @@ class RewardFunctionFactory:
             
             # Run the reward calculation
             try:
-                ret_rewards = test_generation_reward(prompts, completions, **reward_kwargs)
+                
+                # ret_rewards = test_generation_reward(prompts, completions, **reward_kwargs)
+                ret_rewards = test_generation_grpo_reward(prompts, completions, **reward_kwargs)
                 # Sum all reward components into a single scalar per completion
                 ret_rewards = [sum(ret_r.values()) for ret_r in ret_rewards]
             except Exception as e:

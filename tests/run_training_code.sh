@@ -475,7 +475,7 @@ if [ "$USE_VLLM" == "True" ] && [ "$VLLM_MODE" == "server" ]; then
         export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${TRAINING_GPUS[*]}")"
     fi
 
-    _vllm_timeout=300
+    _vllm_timeout=1800
     _vllm_elapsed=0
     while ! curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; do
         if ! kill -0 "$VLLM_PID" 2>/dev/null; then
