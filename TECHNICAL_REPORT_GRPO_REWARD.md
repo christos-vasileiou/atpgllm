@@ -128,5 +128,5 @@ Tune the **`reward_weight_*`** kwargs if PO detection should dominate even more,
 
 ## Code reference
 
-- Entry point: **`test_generation_grpo_reward`** in [`reward_funcs.py`](reward_funcs.py).
+- Entry point: **`test_generation_grpo_reward`** in [`reward_funcs.py`](atpgllm/llm/reward_funcs.py).
 - Helpers: **`_fault_detected_at_pos`**, **`_fault_site_activated`**, **`_po_prediction_score`**, **`_pi_assignment_score`**, **`_tool_response_po_consistency_bonus`**, **`_simulation_table_from_completion`**, **`_mentions_target_fault`**.
