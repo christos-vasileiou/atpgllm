@@ -227,6 +227,9 @@ def train_with_sft(
     max_prompt_length: int = 4096,
     use_unsloth: bool = False,
     use_ddp: bool = False,
+    lora_rank: int = 8,
+    lora_alpha: int = 16,
+    lora_target_modules: list[str] | None = None,
     **kwargs,
 ) -> None:
     """
@@ -306,7 +309,18 @@ def train_with_sft(
         GPUs (pipeline parallelism, no data parallelism).  DDP requires
         the model to fit on a single GPU in 4-bit (e.g. 72B ≈ 36 GB
         fits on H100 80 GB but not A100 40 GB).
+    lora_rank, lora_alpha, lora_target_modules
+        LoRA hyper-parameters (see :func:`model_utils.get_lora_config`).
+        Ignored when ``resume_from`` loads an existing adapter (architecture
+        comes from the checkpoint).
     """
+    lora_config = get_lora_config(
+        use_unsloth=use_unsloth,
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=lora_target_modules,
+    )
+
     # Lazy-import SFTTrainer and SFTConfig
     from trl import SFTTrainer, SFTConfig
     import torch
@@ -344,7 +358,7 @@ def train_with_sft(
     else:
         if use_unsloth:
             model, tokenizer = load_unsloth_model(model_name)
-            model = prepare_unsloth_lora_model(model)
+            model = prepare_unsloth_lora_model(model, lora_config)
         else:
             tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             if not tokenizer.eos_token:
@@ -352,7 +366,7 @@ def train_with_sft(
             if not tokenizer.pad_token:
                 tokenizer.pad_token = tokenizer.eos_token
             base_model = load_quantised_model(model_name, device_map=device_map)
-            model = prepare_lora_model(base_model)
+            model = prepare_lora_model(base_model, lora_config)
 
     # Synchronize the model's config with the tokenizer's special token IDs
     model = smart_sync_model_config(model, tokenizer)
@@ -430,6 +444,9 @@ def train_with_grpo(
     use_dual_adapter: bool = True,
     use_unsloth: bool = False,
     use_ddp: bool = False,
+    lora_rank: int = 8,
+    lora_alpha: int = 16,
+    lora_target_modules: list[str] | None = None,
     **kwargs,
 ) -> None:
     """
@@ -494,6 +511,10 @@ def train_with_grpo(
     use_ddp : bool
         If *True*, use Distributed Data Parallel (DDP) mode.  See
         :func:`train_with_sft` for details.
+    lora_rank, lora_alpha, lora_target_modules
+        LoRA hyper-parameters for new adapters / policy adapter
+        (:func:`model_utils.get_lora_config`).  When loading from
+        ``resume_from``, existing adapter shapes still apply where relevant.
     """
     # -- Validate resume flags -----------------------------------------
     resume_checkpoint = None
@@ -524,7 +545,12 @@ def train_with_grpo(
         print(f"[DDP] Enabled – loading model with device_map={device_map}")
 
     # Define LoRA config — needed for both fresh start and resume
-    lora_config = get_lora_config(use_unsloth=use_unsloth)
+    lora_config = get_lora_config(
+        use_unsloth=use_unsloth,
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=lora_target_modules,
+    )
 
     # Load model and tokenizer
     if resume_from:
@@ -723,13 +749,37 @@ def main() -> None:
                              "(2x faster, 80%% less VRAM). Requires: pip install unsloth")
     parser.add_argument("--use_ddp", action="store_true", default=_env('USE_DDP', '0').lower() in ('1', 'true', 'yes'),
                         help="Use Distributed Data Parallelization. It's recommended for SFT + unsloth training.")
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=int(_env("LORA_RANK", "8")),
+        help="LoRA rank (env: LORA_RANK, default: 8)",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=int(_env("LORA_ALPHA", "16")),
+        help="LoRA alpha (env: LORA_ALPHA, default: 16)",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default=_env("LORA_TARGET_MODULES", "") or "",
+        help="Comma-separated module names (e.g. q_proj,v_proj). Empty = default attention+MLP set. Env: LORA_TARGET_MODULES",
+    )
     args = parser.parse_args()
+
+    _ltm = (args.lora_target_modules or "").strip()
+    args.lora_target_modules = (
+        [m.strip() for m in _ltm.split(",") if m.strip()] if _ltm else None
+    )
 
     # Validate integer arguments
     for field in ('buffer_size', 'per_device_train_batch_size',
                   'gradient_accumulation_steps', 'max_steps',
-                  'num_generations', 'steps_per_generation', 
-                  'max_model_len', 'max_completion_length', 'max_prompt_length'):
+                  'num_generations', 'steps_per_generation',
+                  'max_model_len', 'max_completion_length', 'max_prompt_length',
+                  'lora_rank', 'lora_alpha'):
         try:
             setattr(args, field, int(getattr(args, field)))
         except ValueError:

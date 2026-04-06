@@ -151,6 +151,12 @@ elif [ "$METHOD" == "grpo" ]; then
     MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-6144}
 fi
 
+# LoRA hyper-parameters (read by training_code.py via environment / argparse defaults)
+LORA_RANK=${LORA_RANK:-8}
+LORA_ALPHA=${LORA_ALPHA:-16}
+LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-}
+export LORA_RANK LORA_ALPHA LORA_TARGET_MODULES
+
 # =============================================================================
 # GPU Configuration and Setup
 # =============================================================================
@@ -351,6 +357,9 @@ build_cmd_args() {
     echo "USE_DUAL_ADAPTER: $USE_DUAL_ADAPTER"
     echo "USE_UNSLOTH: $USE_UNSLOTH"
     echo "USE_DDP: $USE_DDP"
+    echo "LORA_RANK: $LORA_RANK"
+    echo "LORA_ALPHA: $LORA_ALPHA"
+    echo "LORA_TARGET_MODULES: ${LORA_TARGET_MODULES:-'(default: q/k/v/o_proj + gate/up/down_proj)'}"
     if [ "$METHOD" == "grpo" ]; then
         echo "--- GRPO-specific ---"
         echo "BUFFER_SIZE: $BUFFER_SIZE"
@@ -401,28 +410,6 @@ if [ "$USE_VLLM" == "True" ] && [ "$VLLM_MODE" == "server" ]; then
     # method-defaults block above and also passed to Python via CMD_ARGS.
     VLLM_MAX_MODEL_LEN=$MAX_MODEL_LEN
 
-    # if [ "$METHOD" == "sft" ]; then
-    #     # SFT uses the standard `vllm serve` (OpenAI-compatible API) for
-    #     # inference-only validation via the SFTStoppingCallback.
-    #     # max-model-len: Qwen2.5 has max_position_embeddings=32768. Do NOT exceed 32768 or CUDA out-of-bounds will occur.
-    #     echo ""
-    #     echo "=============================================="
-    #     echo "$METHOD vLLM Server Setup"
-    #     echo "=============================================="
-    #     echo "vLLM server GPU: ${VLLM_GPU} (last GPU)"
-    #     echo "Starting vLLM server on GPU $VLLM_GPU (port $PORT)..."
-    #     echo "Running: VLLM_ALLOW_RUNTIME_LORA_UPDATING=True CUDA_VISIBLE_DEVICES=$VLLM_GPU vllm serve $MODEL --enable-lora --max-lora-rank 64 --port $PORT --gpu-memory-utilization 0.8 --max-model-len $VLLM_MAX_MODEL_LEN &"
-    #     VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
-    #     CUDA_VISIBLE_DEVICES=$VLLM_GPU \
-    #     vllm serve $MODEL \
-    #         --enable-lora \
-    #         --max-lora-rank 64 \
-    #         --port $PORT \
-    #         --gpu-memory-utilization 0.8 \
-    #         --max-model-len "$VLLM_MAX_MODEL_LEN" &
-    #     VLLM_PID=$!
-    #     echo "Waiting for vLLM server to become ready (PID: $VLLM_PID)..."
-    # elif [ "$METHOD" == "grpo" ]; then
     if [ "$METHOD" == "grpo" ]; then
         # GRPO MUST use `trl vllm-serve` (NOT `vllm serve`).
         # TRL's GRPOTrainer needs custom endpoints (/get_world_size,

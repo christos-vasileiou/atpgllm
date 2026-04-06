@@ -28,8 +28,11 @@ def extract_json_tool_response_and_convert_to_df(text: str) -> Optional[pd.DataF
           groups = match.groups()
           return pd.DataFrame.from_dict(json.loads(groups[0]))
       except json.JSONDecodeError:
-          import ast
-          return pd.DataFrame.from_dict(ast.literal_eval(groups[0]))
+          try:
+              import ast
+              return pd.DataFrame.from_dict(ast.literal_eval(groups[0]))
+          except SyntaxError:
+              return None
   return None
 
 

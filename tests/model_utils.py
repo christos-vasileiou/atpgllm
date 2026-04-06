@@ -242,21 +242,43 @@ def build_optimizer_for_model(model, args):
     return opt_cls(grouped, **opt_kwargs)
 
 
-def get_lora_config(use_unsloth: bool = False) -> LoraConfig:
+_DEFAULT_LORA_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+
+
+def get_lora_config(
+    use_unsloth: bool = False,
+    r: int | None = None,
+    lora_alpha: int | None = None,
+    target_modules: list[str] | None = None,
+) -> LoraConfig:
     """
     Return the standard LoRA configuration used for both SFT and GRPO
     training.  This ensures consistency when continuing from SFT to GRPO.
 
     When *use_unsloth* is ``True`` the dropout is forced to 0 because
     unsloth's fused kernels do not support non-zero LoRA dropout.
+
+    Parameters
+    ----------
+    r, lora_alpha, target_modules
+        Optional overrides; when omitted, defaults match the historical
+        behaviour (``r=8``, ``lora_alpha=16``, full attention + MLP set).
     """
+    _r = 8 if r is None else r
+    _alpha = 16 if lora_alpha is None else lora_alpha
+    _targets = list(target_modules) if target_modules is not None else list(_DEFAULT_LORA_TARGET_MODULES)
     return LoraConfig(
-        r=8,
-        lora_alpha=16,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
+        r=_r,
+        lora_alpha=_alpha,
+        target_modules=_targets,
         lora_dropout=0 if use_unsloth else 0.05,
         bias="none",
         task_type="CAUSAL_LM",
