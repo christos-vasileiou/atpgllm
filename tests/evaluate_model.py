@@ -7,7 +7,7 @@ Evaluation script for dual-adapter models (SFT + GRPO) using pass@k metrics.
 This module evaluates a model trained through SFT → GRPO by:
 1. Loading the dual-adapter model via HF PEFT or vLLM natively.
 2. Loading the eval split of `chrivasileiou/asap7-language-of-test`
-3. For each prompt, generating N completions (with tool-calling support)
+3. For batches of prompts, generating N completions each (with tool-calling support)
 4. Executing tool calls (fault simulation) when the model requests them
 5. Computing rewards via RewardFunctionFactory
 6. Calculating pass@k metrics (pass@1, pass@5, pass@10, etc.)
@@ -30,6 +30,8 @@ Environment Variables:
     EVAL_DATASET: Dataset identifier (default: chrivasileiou/asap7-language-of-test)
     NUM_SAMPLES: Number of completions per prompt (default: 10)
     MAX_EVAL_SAMPLES: Maximum number of eval samples (default: -1 for all)
+    EVAL_PROMPT_BATCH_SIZE: Prompts per fused generation batch (default: 8)
+    GENERATION_MICRO_BATCH_SIZE: HF generate micro-batch (default: 8)
 """
 
 from __future__ import annotations
@@ -290,123 +292,258 @@ def generate_n_completions(
     n: int,
     generation_config: GenerationConfig,
     max_tool_rounds: int = 1,
+    micro_batch_size: int = 8,
 ) -> List[str]:
     """
-    Generate n completions for a single prompt.
-    
-    Parameters
-    ----------
-    model : PeftModel
-        The model.
-    tokenizer : AutoTokenizer
-        The tokenizer.
-    prompt_text : str
-        The formatted prompt.
-    n : int
-        Number of completions to generate.
-    generation_config : GenerationConfig
-        Generation configuration.
-    max_tool_rounds : int
-        Maximum tool call rounds per completion.
-    
-    Returns
-    -------
-    List[str]
-        List of n completion strings.
+    Generate n completions for a single prompt (delegates to batched HF generation).
     """
-    completions = []
-    for _ in range(n):
-        completion = generate_with_tools(
-            model, tokenizer, prompt_text, generation_config, max_tool_rounds
-        )
-        completions.append(completion)
-    return completions
-
+    return generate_batch_n_completions_hf(
+        model=model,
+        tokenizer=tokenizer,
+        prompt_texts=[prompt_text],
+        n=n,
+        generation_config=generation_config,
+        max_tool_rounds=max_tool_rounds,
+        micro_batch_size=micro_batch_size,
+    )
 
 
 # =============================================================================
 # GENERATION WITH TOOL CALLING (vLLM)
 # =============================================================================
 
-def generate_n_completions_vllm(
-    llm, # type: vllm.LLM
+def generate_batch_n_completions_vllm(
+    llm,  # type: vllm.LLM
     tokenizer: AutoTokenizer,
-    prompt_text: str,
+    prompt_texts: List[str],
     n: int,
-    sampling_params, # type: vllm.SamplingParams
-    lora_request, # type: vllm.lora.request.LoRARequest
+    sampling_params,  # type: vllm.SamplingParams
+    lora_request,  # type: vllm.lora.request.LoRARequest
     max_tool_rounds: int = 1,
 ) -> List[str]:
     """
-    Generate n completions simultaneously using vLLM.
-    Tracks state of n independent generation paths to manage divergent tool calls natively.
+    For B prompts, generate n independent completions each (B * n total paths).
+
+    Each round batches all active paths in one ``llm.generate`` call so vLLM can
+    schedule work across prompts, not just across samples of a single prompt.
     """
-    # Initialize n completely independent conversation tracks
     states = [
         {
-            "current_input": prompt_text,
+            "current_input": p,
             "full_completion": "",
             "done": False,
         }
+        for p in prompt_texts
         for _ in range(n)
     ]
 
     for _round in range(max_tool_rounds + 1):
-        # Identify paths that still need generation
         active_indices = [i for i, state in enumerate(states) if not state["done"]]
         if not active_indices:
             break
 
         active_inputs = [states[i]["current_input"] for i in active_indices]
 
-        # Batch generate for all active paths using vLLM
         outputs = llm.generate(
             active_inputs,
             sampling_params=sampling_params,
             lora_request=lora_request,
-            use_tqdm=False, # Disable nested tiny progress bars
+            use_tqdm=False,
         )
+
+        if len(outputs) != len(active_inputs):
+            raise RuntimeError(
+                f"vLLM returned {len(outputs)} outputs for {len(active_inputs)} "
+                "requests; refusing to continue with misaligned tool-round state."
+            )
 
         for i, output in zip(active_indices, outputs):
             completion_text = output.outputs[0].text
             states[i]["full_completion"] += completion_text
-            
+
             if _round < max_tool_rounds:
                 tool_call = parse_tool_call(completion_text)
                 if tool_call is not None:
-                    # Get the netlist from the current input
-                    tool_call["arguments"].update({"netlist": ToolHelper.get_netlist(states[i]["current_input"])})
-                    # Execute tool synchronously for this specific path
+                    tool_call["arguments"].update(
+                        {"netlist": ToolHelper.get_netlist(states[i]["current_input"])}
+                    )
                     tool_result = execute_tool_call(tool_call)
-                    
-                    # Rebuild the conversation history just for this specific track
-                    messages = revert_chat_template(states[i]["current_input"], tokenizer=tokenizer)
+
+                    messages = revert_chat_template(
+                        states[i]["current_input"], tokenizer=tokenizer
+                    )
                     messages.append({"role": "assistant", "content": completion_text})
                     messages.append({
                         "role": "tool",
                         "name": tool_call.get("name", "fault_simulation_tool"),
                         "content": tool_result,
                     })
-                    
+
                     states[i]["current_input"] = tokenizer.apply_chat_template(
                         messages,
                         tokenize=False,
                         tools=TOOLS,
                         add_generation_prompt=True,
                     )
-                    states[i]["full_completion"] += f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
-                    # This track needs another round - leave done=False
+                    states[i]["full_completion"] += (
+                        f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
+                    )
                 else:
                     states[i]["done"] = True
             else:
-                # No tool call or max rounds reached
                 states[i]["done"] = True
-    
+
     return [state["full_completion"] for state in states]
+
+
+def generate_n_completions_vllm(
+    llm,  # type: vllm.LLM
+    tokenizer: AutoTokenizer,
+    prompt_text: str,
+    n: int,
+    sampling_params,  # type: vllm.SamplingParams
+    lora_request,  # type: vllm.lora.request.LoRARequest
+    max_tool_rounds: int = 1,
+) -> List[str]:
+    """Generate n completions for one prompt via :func:`generate_batch_n_completions_vllm`."""
+    return generate_batch_n_completions_vllm(
+        llm,
+        tokenizer,
+        [prompt_text],
+        n,
+        sampling_params,
+        lora_request,
+        max_tool_rounds=max_tool_rounds,
+    )
+
+
+@torch.no_grad()
+def generate_batch_n_completions_hf(
+    model: PeftModel,
+    tokenizer: AutoTokenizer,
+    prompt_texts: List[str],
+    n: int,
+    generation_config: GenerationConfig,
+    max_tool_rounds: int = 1,
+    micro_batch_size: int = 8,
+) -> List[str]:
+    """
+    For B prompts, generate n completions each using batched ``model.generate``.
+
+    Expands to B * n sequences and micro-batches forward passes to limit memory.
+    Tool rounds follow the same state machine as the vLLM batch path.
+    """
+    device = next(model.parameters()).device
+    orig_pad_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
+    try:
+        expanded_prompts: List[str] = []
+        for p in prompt_texts:
+            expanded_prompts.extend([p] * n)
+
+        states = [
+            {"current_input": p, "full_completion": "", "done": False}
+            for p in expanded_prompts
+        ]
+
+        for _round in range(max_tool_rounds + 1):
+            active_indices = [i for i, s in enumerate(states) if not s["done"]]
+            if not active_indices:
+                break
+
+            for start in range(0, len(active_indices), micro_batch_size):
+                batch_indices = active_indices[start : start + micro_batch_size]
+                batch_inputs = [states[i]["current_input"] for i in batch_indices]
+
+                enc = tokenizer(
+                    batch_inputs,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=tokenizer.model_max_length,
+                ).to(device)
+
+                out = model.generate(**enc, generation_config=generation_config)
+                prompt_len = enc["input_ids"].shape[1]
+                decoded = tokenizer.batch_decode(
+                    out[:, prompt_len:], skip_special_tokens=True
+                )
+
+                if len(decoded) != len(batch_indices):
+                    raise RuntimeError(
+                        f"HF generate returned {len(decoded)} decodes for "
+                        f"{len(batch_indices)} inputs."
+                    )
+
+                for idx, completion_text in zip(batch_indices, decoded):
+                    states[idx]["full_completion"] += completion_text
+
+                    if _round < max_tool_rounds:
+                        tool_call = parse_tool_call(completion_text)
+                        if tool_call is not None:
+                            tool_call["arguments"].update(
+                                {
+                                    "netlist": ToolHelper.get_netlist(
+                                        states[idx]["current_input"]
+                                    )
+                                }
+                            )
+                            tool_result = execute_tool_call(tool_call)
+                            messages = revert_chat_template(
+                                states[idx]["current_input"], tokenizer=tokenizer
+                            )
+                            messages.append(
+                                {"role": "assistant", "content": completion_text}
+                            )
+                            messages.append({
+                                "role": "tool",
+                                "name": tool_call.get("name", "fault_simulation_tool"),
+                                "content": tool_result,
+                            })
+                            states[idx]["current_input"] = tokenizer.apply_chat_template(
+                                messages,
+                                tokenize=False,
+                                tools=TOOLS,
+                                add_generation_prompt=True,
+                            )
+                            states[idx]["full_completion"] += (
+                                f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
+                            )
+                        else:
+                            states[idx]["done"] = True
+                    else:
+                        states[idx]["done"] = True
+
+        return [s["full_completion"] for s in states]
+    finally:
+        tokenizer.padding_side = orig_pad_side
 
 # =============================================================================
 # PROMPT FORMATTING
 # =============================================================================
+
+def _eval_record_as_dict(record: Any) -> Dict[str, Any]:
+    """Normalize a single dataset row to a plain dict (HuggingFace row or mapping)."""
+    if isinstance(record, dict):
+        return record
+    try:
+        return dict(record)
+    except (TypeError, ValueError) as e:
+        raise TypeError(
+            f"Each eval sample must be a mapping with conversation fields; "
+            f"got {type(record).__name__!r}. "
+            f"When batching, index the dataset with integers (e.g. ds[i]), "
+            f"not by iterating a slice that yields column names."
+        ) from e
+
+
+def _eval_record_fault_meta(record: Any) -> Tuple[str, str]:
+    """Safe fault / module_name for error reports when formatting fails."""
+    if isinstance(record, dict):
+        return str(record.get("fault", "")), str(record.get("module_name", ""))
+    return "", ""
+
 
 def format_eval_prompt(record: Dict[str, Any], tokenizer: AutoTokenizer) -> str:
     """
@@ -428,7 +565,7 @@ def format_eval_prompt(record: Dict[str, Any], tokenizer: AutoTokenizer) -> str:
         The formatted prompt string.
     """
     use_tools = 'tools' in tokenizer.chat_template or 'tool' in tokenizer.chat_template
-    convo = ConversationExample.from_record(dict(record), use_tools=use_tools)
+    convo = ConversationExample.from_record(_eval_record_as_dict(record), use_tools=use_tools)
     
     # Keep only system and user messages for the prompt
     prompt_messages = [
@@ -482,15 +619,16 @@ def evaluate_completions(
     
     # Build kwargs
     netlists = []
-    for record in records:
-        netlist_str = record.get('netlist', '')
+    for prompt, record in zip(prompts, records):
+        rec = _eval_record_as_dict(record)
+        netlist_str = rec.get('netlist', '')
         try:
-            netlists.append(reward_factory.get_or_create_netlist(netlist_str))
+            netlists.append(reward_factory.validate_and_get_netlist_from_prompt(prompt, netlist_str))
         except Exception:
             netlists.append(netlist_str)
     
     # Build fault kwargs from records
-    faults = [record.get('fault', '') for record in records]
+    faults = [_eval_record_as_dict(r).get('fault', '') for r in records]
     
     reward_kwargs = {
         "fault_fn": lambda x, **kw: RewardFunctionFactory.fault_fn(x, **kw),
@@ -566,7 +704,7 @@ def evaluate(
     k_values: List[int] = None,
     temperature: float = 0.6,
     top_p: float = 0.95,
-    max_new_tokens: int = 4096,
+    max_new_tokens: int = 4096*4,
     max_eval_samples: int = -1,
     max_tool_rounds: int = 1,
     threshold_mode: str = "fault_detected",
@@ -578,6 +716,8 @@ def evaluate(
     tp_size: int = 2,
     gpu_memory_utilization: float = 0.9,
     qlora: bool = False,
+    eval_prompt_batch_size: int = 8,
+    generation_micro_batch_size: int = 8,
 ) -> Dict[str, Any]:
     """
     Main evaluation function.
@@ -612,7 +752,13 @@ def evaluate(
         Reporting backend ("wandb", "none").
     output_file : str, optional
         Path to save detailed results as JSON.
-    
+    eval_prompt_batch_size : int
+        How many dataset prompts to run through generation together. Each batch
+        issues one fused multi-path generation of ``batch_size * n`` sequences
+        per tool round (vLLM), improving GPU utilization vs one prompt at a time.
+    generation_micro_batch_size : int
+        Transformers backend only: cap on parallel sequences per ``generate`` call.
+
     Returns
     -------
     Dict[str, Any]
@@ -657,16 +803,27 @@ def evaluate(
             quant_kwargs["load_format"] = "bitsandbytes"
 
         # Initialize vLLM with unmerged dynamic LoRA
-        model = LLM(
-            model=base_model_name,
-            tensor_parallel_size=tp_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-            dtype="bfloat16",
-            enable_lora=True,
-            max_lora_rank=adapter_config.get("r", 8),
-            trust_remote_code=True,
-            **quant_kwargs
-        )
+        try:
+            model = LLM(
+                model=base_model_name,
+                tensor_parallel_size=tp_size,
+                gpu_memory_utilization=gpu_memory_utilization,
+                dtype="bfloat16",
+                enable_lora=True,
+                max_lora_rank=adapter_config.get("r", 8),
+                trust_remote_code=True,
+                **quant_kwargs
+            )
+        except (RuntimeError, ValueError) as e:
+            em = str(e).lower()
+            if "memory" in em or "free memory" in em or "gpu" in em:
+                raise RuntimeError(
+                    f"{e}\n\n"
+                    f"vLLM could not reserve GPU memory (utilization target={gpu_memory_utilization}). "
+                    "Lower --gpu_memory_utilization, reduce --tp_size if misconfigured, or free VRAM "
+                    "from other processes."
+                ) from e
+            raise
         lora_request = LoRARequest("active_adapter", 1, str(adapter))
         
         # In vLLM, n=1 here because the generation_vllm function manually submits 'n' active prompts
@@ -742,6 +899,8 @@ def evaluate(
                     "threshold_mode": threshold_mode,
                     "num_eval_samples": len(eval_records),
                     "seed": seed,
+                    "eval_prompt_batch_size": eval_prompt_batch_size,
+                    "generation_micro_batch_size": generation_micro_batch_size,
                 },
             )
         except ImportError:
@@ -751,7 +910,10 @@ def evaluate(
     # 5. Generation & Evaluation Loop
     # =========================================================================
     print("\n" + "=" * 70)
-    print(f"EVALUATING: n={n}, k={k_values}, temperature={temperature}")
+    print(
+        f"EVALUATING: n={n}, k={k_values}, temperature={temperature}, "
+        f"prompt_batch_size={eval_prompt_batch_size}"
+    )
     print(f"Threshold mode: {threshold_mode}")
     print("=" * 70)
     
@@ -761,97 +923,185 @@ def evaluate(
     
     eval_start_time = time.time()
     
-    for idx, record in enumerate(tqdm(eval_records, desc="Evaluating")):
-        problem_start = time.time()
+    n_records = len(eval_records)
+    batch_starts = list(range(0, n_records, max(1, eval_prompt_batch_size)))
+    
+    for batch_start in tqdm(batch_starts, desc="Evaluating"):
+        batch_end = min(batch_start + eval_prompt_batch_size, n_records)
+        global_indices = list(range(batch_start, batch_end))
+        # Index rows by int: slicing ``Dataset[start:end]`` and iterating can yield
+        # column names (strings) on some versions, not one dict per row.
+        chunk = [eval_records[i] for i in global_indices]
         
-        # Format the prompt
-        try:
-            prompt_text = format_eval_prompt(record, tokenizer)
-        except Exception as e:
-            print(f"Warning: Failed to format prompt for sample {idx}: {e}")
-            all_num_correct.append(0)
-            all_results.append({
-                "idx": idx,
-                "fault": record.get("fault", ""),
-                "module_name": record.get("module_name", ""),
-                "error": f"prompt_format_error: {e}",
-                "num_correct": 0,
-                "n": n,
-            })
-            continue
+        ok_prompts: List[str] = []
+        ok_records: List[Dict[str, Any]] = []
+        ok_slot: List[int] = []  # index within this chunk (0 .. len(chunk)-1)
         
-        # Generate n completions
-        if backend == "vllm":
-            completions = generate_n_completions_vllm(
-                llm=model,
-                tokenizer=tokenizer,
-                prompt_text=prompt_text,
-                n=n,
-                sampling_params=generation_config,
-                lora_request=lora_request,
-                max_tool_rounds=max_tool_rounds,
-            )
-        else:
-            completions = generate_n_completions(
-                model=model,
-                tokenizer=tokenizer,
-                prompt_text=prompt_text,
-                n=n,
-                generation_config=generation_config,
-                max_tool_rounds=max_tool_rounds,
-            )
+        chunk_num_correct: List[Optional[int]] = [None] * len(chunk)
+        chunk_rewards: List[Optional[List[Dict[str, float]]]] = [None] * len(chunk)
+        chunk_time_seconds: List[Optional[float]] = [None] * len(chunk)
+        chunk_problem_result: List[Optional[Dict[str, Any]]] = [None] * len(chunk)
         
-        # Evaluate each completion
-        problem_rewards = []
-        num_correct = 0
-        
-        for comp_idx, completion in enumerate(completions):
+        for slot, (idx, record) in enumerate(zip(global_indices, chunk)):
             try:
-                rewards = evaluate_completions(
-                    reward_factory=reward_factory,
-                    prompts=[prompt_text],
-                    completions=[completion],
-                    records=[record],
-                )
-                reward = rewards[0]
+                prompt_text = format_eval_prompt(record, tokenizer)
+                ok_prompts.append(prompt_text)
+                ok_records.append(record)
+                ok_slot.append(slot)
             except Exception as e:
-                reward = {
+                print(f"Warning: Failed to format prompt for sample {idx}: {e}")
+                fault_s, mod_s = _eval_record_fault_meta(record)
+                chunk_num_correct[slot] = 0
+                chunk_rewards[slot] = []
+                chunk_time_seconds[slot] = 0.0
+                chunk_problem_result[slot] = {
+                    "idx": idx,
+                    "fault": fault_s,
+                    "module_name": mod_s,
+                    "error": f"prompt_format_error: {e}",
+                    "num_correct": 0,
+                    "n": n,
+                }
+        
+        if ok_prompts:
+            gen_t0 = time.time()
+            if backend == "vllm":
+                flat_completions = generate_batch_n_completions_vllm(
+                    llm=model,
+                    tokenizer=tokenizer,
+                    prompt_texts=ok_prompts,
+                    n=n,
+                    sampling_params=generation_config,
+                    lora_request=lora_request,
+                    max_tool_rounds=max_tool_rounds,
+                )
+            else:
+                flat_completions = generate_batch_n_completions_hf(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_texts=ok_prompts,
+                    n=n,
+                    generation_config=generation_config,
+                    max_tool_rounds=max_tool_rounds,
+                    micro_batch_size=generation_micro_batch_size,
+                )
+            gen_dt = time.time() - gen_t0
+            
+            expected_flat = len(ok_prompts) * n
+            if len(flat_completions) != expected_flat:
+                print(
+                    f"Warning: expected {expected_flat} completions "
+                    f"({len(ok_prompts)} prompts × n={n}), got {len(flat_completions)}; "
+                    "padding or truncating to match."
+                )
+                if len(flat_completions) < expected_flat:
+                    flat_completions = flat_completions + [""] * (
+                        expected_flat - len(flat_completions)
+                    )
+                else:
+                    flat_completions = flat_completions[:expected_flat]
+
+            prompts_rep = [p for p in ok_prompts for _ in range(n)]
+            records_rep = [r for r in ok_records for _ in range(n)]
+            try:
+                rewards_flat = evaluate_completions(
+                    reward_factory=reward_factory,
+                    prompts=prompts_rep,
+                    completions=flat_completions,
+                    records=records_rep,
+                )
+            except Exception as e:
+                print(f"Warning: Batch reward computation failed: {e}")
+                import traceback
+                traceback.print_exc()
+                zero_r = {
                     'format': 0, 'pred_simulation': 0, 'fault_simulation': 0,
                     'input_vector': 0, 'expected_output': 0, 'detected_faults': 0,
                     'fault_detect_inpvector': 0, 'pred_vs_fault_sim_acc': 0,
                     'fault_detected_by_pred_input_vector_acc': 0,
                     'expected_output_acc': 0, 'input_vector_acc': 0,
-                    'detected_faults_acc': 0
+                    'detected_faults_acc': 0,
                 }
+                rewards_flat = [zero_r] * (len(ok_prompts) * n)
+
+            n_reward = len(rewards_flat)
+            if n_reward != len(prompts_rep):
+                print(
+                    f"Warning: reward list length {n_reward} != "
+                    f"{len(prompts_rep)} (prompts × completions); adjusting."
+                )
+                if n_reward < len(prompts_rep):
+                    zero_r = {
+                        'format': 0, 'pred_simulation': 0, 'fault_simulation': 0,
+                        'input_vector': 0, 'expected_output': 0, 'detected_faults': 0,
+                        'fault_detect_inpvector': 0, 'pred_vs_fault_sim_acc': 0,
+                        'fault_detected_by_pred_input_vector_acc': 0,
+                        'expected_output_acc': 0, 'input_vector_acc': 0,
+                        'detected_faults_acc': 0,
+                    }
+                    rewards_flat = rewards_flat + [zero_r] * (
+                        len(prompts_rep) - n_reward
+                    )
+                else:
+                    rewards_flat = rewards_flat[: len(prompts_rep)]
             
-            problem_rewards.append(reward)
-            if is_completion_correct(reward, threshold_mode=threshold_mode):
-                num_correct += 1
+            per_problem_time = gen_dt / max(len(ok_prompts), 1)
+            
+            for j, slot in enumerate(ok_slot):
+                problem_rewards = rewards_flat[j * n : (j + 1) * n]
+                num_correct = sum(
+                    1
+                    for r in problem_rewards
+                    if is_completion_correct(r, threshold_mode=threshold_mode)
+                )
+                idx = global_indices[slot]
+                record = ok_records[j]
+                
+                chunk_num_correct[slot] = num_correct
+                chunk_rewards[slot] = problem_rewards
+                chunk_time_seconds[slot] = round(per_problem_time, 2)
+                chunk_problem_result[slot] = {
+                    "idx": idx,
+                    "fault": record.get("fault", ""),
+                    "module_name": record.get("module_name", ""),
+                    "num_correct": num_correct,
+                    "n": n,
+                    "time_seconds": chunk_time_seconds[slot],
+                    "rewards_summary": {
+                        "mean_total_reward": np.mean(
+                            [sum(r.values()) for r in problem_rewards]
+                        ),
+                        "fault_detection_rate": num_correct / n,
+                        "mean_format_reward": np.mean(
+                            [r.get('format', 0) for r in problem_rewards]
+                        ),
+                        "mean_fault_sim_reward": np.mean(
+                            [r.get('fault_simulation', 0) for r in problem_rewards]
+                        ),
+                    },
+                }
         
-        all_num_correct.append(num_correct)
-        all_rewards.append(problem_rewards)
+        for slot in range(len(chunk)):
+            if chunk_problem_result[slot] is None:
+                idx = global_indices[slot]
+                rec = chunk[slot]
+                fault_s, mod_s = _eval_record_fault_meta(rec)
+                chunk_num_correct[slot] = chunk_num_correct[slot] or 0
+                chunk_rewards[slot] = chunk_rewards[slot] or []
+                chunk_problem_result[slot] = {
+                    "idx": idx,
+                    "fault": fault_s,
+                    "module_name": mod_s,
+                    "error": "internal_error: incomplete batch slot",
+                    "num_correct": 0,
+                    "n": n,
+                }
+            all_num_correct.append(chunk_num_correct[slot])
+            all_rewards.append(chunk_rewards[slot])
+            all_results.append(chunk_problem_result[slot])
         
-        problem_time = time.time() - problem_start
-        
-        # Store per-problem result
-        problem_result = {
-            "idx": idx,
-            "fault": record.get("fault", ""),
-            "module_name": record.get("module_name", ""),
-            "num_correct": num_correct,
-            "n": n,
-            "time_seconds": round(problem_time, 2),
-            "rewards_summary": {
-                "mean_total_reward": np.mean([sum(r.values()) for r in problem_rewards]),
-                "fault_detection_rate": num_correct / n,
-                "mean_format_reward": np.mean([r.get('format', 0) for r in problem_rewards]),
-                "mean_fault_sim_reward": np.mean([r.get('fault_simulation', 0) for r in problem_rewards]),
-            },
-        }
-        all_results.append(problem_result)
-        
-        # Log to wandb periodically
-        if wandb_run and (idx + 1) % 10 == 0:
+        last_idx = global_indices[-1]
+        if wandb_run and (last_idx + 1) % 10 == 0:
             running_pass_at_k = {}
             for k in k_values:
                 if k <= n:
@@ -861,16 +1111,28 @@ def evaluate(
                         k,
                     )
                     running_pass_at_k[f"running_pass@{k}"] = np.mean(pass_k)
+            _rates = [
+                r["rewards_summary"]["fault_detection_rate"]
+                for r in all_results
+                if "error" not in r and "rewards_summary" in r
+            ]
             wandb.log({
-                "eval_step": idx + 1,
+                "eval_step": last_idx + 1,
                 **running_pass_at_k,
-                "running_fault_detection_rate": np.mean([r["rewards_summary"]["fault_detection_rate"] for r in all_results if "error" not in r]),
+                "running_fault_detection_rate": float(np.mean(_rates)) if _rates else 0.0,
             })
         
-        # Print progress every 10 samples
-        if (idx + 1) % 10 == 0:
-            running_rate = np.mean([r["rewards_summary"]["fault_detection_rate"] for r in all_results if "error" not in r])
-            print(f"  [{idx+1}/{len(eval_records)}] Running fault detection rate: {running_rate:.3f}")
+        if (last_idx + 1) % 10 == 0:
+            _rates = [
+                r["rewards_summary"]["fault_detection_rate"]
+                for r in all_results
+                if "error" not in r and "rewards_summary" in r
+            ]
+            running_rate = float(np.mean(_rates)) if _rates else 0.0
+            print(
+                f"  [{last_idx+1}/{n_records}] "
+                f"Running fault detection rate: {running_rate:.3f}"
+            )
     
     eval_time = time.time() - eval_start_time
     
@@ -957,6 +1219,8 @@ def evaluate(
             "tp_size": tp_size,
             "gpu_memory_utilization": gpu_memory_utilization,
             "qlora": qlora,
+            "eval_prompt_batch_size": eval_prompt_batch_size,
+            "generation_micro_batch_size": generation_micro_batch_size,
         },
     }
     
@@ -1218,62 +1482,15 @@ def _sft_eval_generate_vllm(
     Batched multi-turn generation via vLLM for SFT stopping evaluation.
     Returns ``len(prompts) * n_per_prompt`` completions.
     """
-    states = [
-        {
-            "prompt_idx": pi,
-            "current_input": p,
-            "full_completion": "",
-            "done": False,
-        }
-        for pi, p in enumerate(prompts)
-        for _ in range(n_per_prompt)
-    ]
-
-    for _round in range(max_tool_rounds + 1):
-        active = [i for i, s in enumerate(states) if not s["done"]]
-        if not active:
-            break
-
-        outputs = llm.generate(
-            [states[i]["current_input"] for i in active],
-            sampling_params=sampling_params,
-            lora_request=lora_request,
-            use_tqdm=False,
-        )
-
-        for i, out in zip(active, outputs):
-            text = out.outputs[0].text
-            states[i]["full_completion"] += text
-
-            if _round < max_tool_rounds:
-                tc = parse_tool_call(text)
-                if tc is not None:
-                    tc["arguments"].update(
-                        {"netlist": ToolHelper.get_netlist(states[i]["current_input"])}
-                    )
-                    result = execute_tool_call(tc)
-                    msgs = revert_chat_template(
-                        states[i]["current_input"], tokenizer=tokenizer,
-                    )
-                    msgs.append({"role": "assistant", "content": text})
-                    msgs.append({
-                        "role": "tool",
-                        "name": tc.get("name", "fault_simulation_tool"),
-                        "content": result,
-                    })
-                    states[i]["current_input"] = tokenizer.apply_chat_template(
-                        msgs, tokenize=False, tools=TOOLS,
-                        add_generation_prompt=True,
-                    )
-                    states[i]["full_completion"] += (
-                        f"\n<tool_response>\n{result}\n</tool_response>\n"
-                    )
-                else:
-                    states[i]["done"] = True
-            else:
-                states[i]["done"] = True
-
-    return [s["full_completion"] for s in states]
+    return generate_batch_n_completions_vllm(
+        llm,
+        tokenizer,
+        prompts,
+        n_per_prompt,
+        sampling_params,
+        lora_request,
+        max_tool_rounds=max_tool_rounds,
+    )
 
 
 @torch.no_grad()
@@ -2004,7 +2221,7 @@ Examples:
     parser.add_argument(
         "--max_new_tokens", 
         type=int, 
-        default=int(_env("MAX_NEW_TOKENS", "8192")), 
+        default=int(_env("MAX_NEW_TOKENS", "16384")), 
         help="Maximum new tokens per generation"
     )
     parser.add_argument(
@@ -2076,6 +2293,20 @@ Examples:
         "--qlora", 
         action="store_true", 
         help="Use if the base model is a BitsAndBytes quantized model (4-bit/8-bit)."
+    )
+    parser.add_argument(
+        "--eval_prompt_batch_size",
+        type=int,
+        default=int(_env("EVAL_PROMPT_BATCH_SIZE", "8")),
+        help="Number of dataset prompts to generate in each fused batch (default: 8). "
+             "Use 1 to mimic the old one-prompt-at-a-time behavior.",
+    )
+    parser.add_argument(
+        "--generation_micro_batch_size",
+        type=int,
+        default=int(_env("GENERATION_MICRO_BATCH_SIZE", "8")),
+        help="Transformers backend: max parallel sequences per generate() call "
+             "when expanding to batch_size * n paths (default: 8).",
     )
 
     # SFT Stopping Criteria Arguments
@@ -2203,6 +2434,8 @@ Examples:
             tp_size=args.tp_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             qlora=args.qlora,
+            eval_prompt_batch_size=args.eval_prompt_batch_size,
+            generation_micro_batch_size=args.generation_micro_batch_size,
         )
 
 if __name__ == "__main__":

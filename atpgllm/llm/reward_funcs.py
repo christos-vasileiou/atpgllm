@@ -22,18 +22,25 @@ from fault_sim import convert_string_to_dict
 warnings.filterwarnings("ignore")
 
 def extract_json_tool_response_and_convert_to_df(text: str) -> Optional[pd.DataFrame]:
+  """Parse first ``<tool_response>{...}</tool_response>`` blob into a DataFrame, or None."""
   match = re.search(r"<tool_response>\s*(\{.*?\})\s*</tool_response>", text, re.DOTALL)
-  if match:
-      try:
-          groups = match.groups()
-          return pd.DataFrame.from_dict(json.loads(groups[0]))
-      except json.JSONDecodeError:
-          try:
-              import ast
-              return pd.DataFrame.from_dict(ast.literal_eval(groups[0]))
-          except SyntaxError:
-              return None
-  return None
+  if not match:
+    return None
+  blob = match.group(1)
+  parsed: Any = None
+  try:
+    parsed = json.loads(blob)
+  except json.JSONDecodeError:
+    try:
+      import ast
+      parsed = ast.literal_eval(blob)
+    except (SyntaxError, ValueError, TypeError):
+      return None
+  try:
+    return pd.DataFrame.from_dict(parsed)
+  except (ValueError, TypeError):
+    # e.g. nested dict layout pandas rejects ("Mixing dicts with non-Series...")
+    return None
 
 
 def extract_markdown_table(text: str) -> str:
