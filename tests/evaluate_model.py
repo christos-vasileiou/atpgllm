@@ -27,6 +27,7 @@ Usage:
 
 Environment Variables:
     ADAPTER_CHECKPOINT: Path to SFT/GRPO adapter checkpoint
+    WANDB_RUN_NAME: Optional override for the Weights & Biases run display name
     EVAL_DATASET: Dataset identifier (default: chrivasileiou/asap7-language-of-test)
     NUM_SAMPLES: Number of completions per prompt (default: 10)
     MAX_EVAL_SAMPLES: Maximum number of eval samples (default: -1 for all)
@@ -139,7 +140,8 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     Returns
     -------
     Optional[Dict]
-        Parsed tool call dict with 'name' and 'arguments', or None.
+        Parsed tool call dict with at least ``name`` (``arguments`` may be
+        missing; use :func:`ensure_tool_call_arguments_dict` before mutating).
     """
     import regex as re
     match = re.search(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', text, re.DOTALL)
@@ -151,6 +153,33 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
         except json.JSONDecodeError:
             pass
     return None
+
+
+def ensure_tool_call_arguments_dict(tool_call: Dict[str, Any]) -> None:
+    """
+    Ensure ``tool_call['arguments']`` is a dict so callers can ``.update()`` netlist.
+
+    The model may emit OpenAI-style ``parameters`` / ``params`` / ``args``, omit
+    ``arguments``, or set it to null. ``parse_tool_call`` only requires ``name``,
+    so without this, ``tool_call['arguments'].update(...)`` raises KeyError.
+    """
+    args = tool_call.get("arguments")
+    if isinstance(args, dict):
+        return
+    if isinstance(args, str) and args.strip():
+        try:
+            parsed = json.loads(args)
+            if isinstance(parsed, dict):
+                tool_call["arguments"] = parsed
+                return
+        except json.JSONDecodeError:
+            pass
+    for alt in ("parameters", "params", "args"):
+        val = tool_call.get(alt)
+        if isinstance(val, dict):
+            tool_call["arguments"] = dict(val)
+            return
+    tool_call["arguments"] = {}
 
 
 def execute_tool_call(tool_call: Dict[str, Any]) -> str:
@@ -248,37 +277,38 @@ def generate_with_tools(
         if _round < max_tool_rounds:
             tool_call = parse_tool_call(completion_text)
             if tool_call is not None:
-                # Get the netlist from the current input
-                tool_call["arguments"].update({"netlist": ToolHelper.get_netlist(prompt_text)})
-                
-                # Execute the tool
-                tool_result = execute_tool_call(tool_call)
-                
-                # Build the continuation with tool result
-                # Parse the current conversation, add tool result, and prepare for next generation
-                messages = revert_chat_template(current_input, tokenizer=tokenizer)
-                
-                # Add the assistant message (with tool call)
-                messages.append({"role": "assistant", "content": completion_text})
-                
-                # Add tool result
-                messages.append({
-                    "role": "tool",
-                    "name": tool_call.get("name", "fault_simulation_tool"),
-                    "content": tool_result,
-                })
-                
-                # Re-format with chat template
-                current_input = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    tools=TOOLS,
-                    add_generation_prompt=True,
-                )
-                
-                # Add tool response to full completion for reward evaluation
-                full_completion += f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
-                continue
+                try:
+                    ensure_tool_call_arguments_dict(tool_call)
+                    tool_call["arguments"].update(
+                        {"netlist": ToolHelper.get_netlist(prompt_text)}
+                    )
+                    tool_result = execute_tool_call(tool_call)
+                    messages = revert_chat_template(
+                        current_input, tokenizer=tokenizer
+                    )
+                    messages.append(
+                        {"role": "assistant", "content": completion_text}
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "name": tool_call.get("name", "fault_simulation_tool"),
+                        "content": tool_result,
+                    })
+                    current_input = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        tools=TOOLS,
+                        add_generation_prompt=True,
+                    )
+                    full_completion += (
+                        f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
+                    )
+                    continue
+                except Exception as e:
+                    full_completion += (
+                        f"\n<tool_response>\nTool round failed: {e}\n</tool_response>\n"
+                    )
+                    break
         
         break  # No tool call or max rounds reached
     
@@ -364,30 +394,42 @@ def generate_batch_n_completions_vllm(
             if _round < max_tool_rounds:
                 tool_call = parse_tool_call(completion_text)
                 if tool_call is not None:
-                    tool_call["arguments"].update(
-                        {"netlist": ToolHelper.get_netlist(states[i]["current_input"])}
-                    )
-                    tool_result = execute_tool_call(tool_call)
+                    try:
+                        ensure_tool_call_arguments_dict(tool_call)
+                        tool_call["arguments"].update(
+                            {
+                                "netlist": ToolHelper.get_netlist(
+                                    states[i]["current_input"]
+                                )
+                            }
+                        )
+                        tool_result = execute_tool_call(tool_call)
 
-                    messages = revert_chat_template(
-                        states[i]["current_input"], tokenizer=tokenizer
-                    )
-                    messages.append({"role": "assistant", "content": completion_text})
-                    messages.append({
-                        "role": "tool",
-                        "name": tool_call.get("name", "fault_simulation_tool"),
-                        "content": tool_result,
-                    })
+                        messages = revert_chat_template(
+                            states[i]["current_input"], tokenizer=tokenizer
+                        )
+                        messages.append({"role": "assistant", "content": completion_text})
+                        messages.append({
+                            "role": "tool",
+                            "name": tool_call.get("name", "fault_simulation_tool"),
+                            "content": tool_result,
+                        })
 
-                    states[i]["current_input"] = tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        tools=TOOLS,
-                        add_generation_prompt=True,
-                    )
-                    states[i]["full_completion"] += (
-                        f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
-                    )
+                        states[i]["current_input"] = tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            tools=TOOLS,
+                            add_generation_prompt=True,
+                        )
+                        states[i]["full_completion"] += (
+                            f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
+                        )
+                    except Exception as e:
+                        err = f"Tool round failed: {e}"
+                        states[i]["full_completion"] += (
+                            f"\n<tool_response>\n{err}\n</tool_response>\n"
+                        )
+                        states[i]["done"] = True
                 else:
                     states[i]["done"] = True
             else:
@@ -482,34 +524,46 @@ def generate_batch_n_completions_hf(
                     if _round < max_tool_rounds:
                         tool_call = parse_tool_call(completion_text)
                         if tool_call is not None:
-                            tool_call["arguments"].update(
-                                {
-                                    "netlist": ToolHelper.get_netlist(
-                                        states[idx]["current_input"]
+                            try:
+                                ensure_tool_call_arguments_dict(tool_call)
+                                tool_call["arguments"].update(
+                                    {
+                                        "netlist": ToolHelper.get_netlist(
+                                            states[idx]["current_input"]
+                                        )
+                                    }
+                                )
+                                tool_result = execute_tool_call(tool_call)
+                                messages = revert_chat_template(
+                                    states[idx]["current_input"], tokenizer=tokenizer
+                                )
+                                messages.append(
+                                    {"role": "assistant", "content": completion_text}
+                                )
+                                messages.append({
+                                    "role": "tool",
+                                    "name": tool_call.get(
+                                        "name", "fault_simulation_tool"
+                                    ),
+                                    "content": tool_result,
+                                })
+                                states[idx]["current_input"] = (
+                                    tokenizer.apply_chat_template(
+                                        messages,
+                                        tokenize=False,
+                                        tools=TOOLS,
+                                        add_generation_prompt=True,
                                     )
-                                }
-                            )
-                            tool_result = execute_tool_call(tool_call)
-                            messages = revert_chat_template(
-                                states[idx]["current_input"], tokenizer=tokenizer
-                            )
-                            messages.append(
-                                {"role": "assistant", "content": completion_text}
-                            )
-                            messages.append({
-                                "role": "tool",
-                                "name": tool_call.get("name", "fault_simulation_tool"),
-                                "content": tool_result,
-                            })
-                            states[idx]["current_input"] = tokenizer.apply_chat_template(
-                                messages,
-                                tokenize=False,
-                                tools=TOOLS,
-                                add_generation_prompt=True,
-                            )
-                            states[idx]["full_completion"] += (
-                                f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
-                            )
+                                )
+                                states[idx]["full_completion"] += (
+                                    f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
+                                )
+                            except Exception as e:
+                                err = f"Tool round failed: {e}"
+                                states[idx]["full_completion"] += (
+                                    f"\n<tool_response>\n{err}\n</tool_response>\n"
+                                )
+                                states[idx]["done"] = True
                         else:
                             states[idx]["done"] = True
                     else:
@@ -693,6 +747,37 @@ def is_completion_correct(reward: Dict[str, float], threshold_mode: str = "fault
         raise ValueError(f"Unknown threshold mode: {threshold_mode}")
 
 
+def wandb_run_name_from_adapter(adapter: Path) -> str:
+    """
+    Build a short Weights & Biases run *name* from the adapter path so runs are
+    identifiable by experiment folder and checkpoint (e.g. SFT adapter dir vs
+    GRPO ``.../checkpoint-N/combined/policy``).
+    """
+    try:
+        p = adapter.resolve()
+    except (OSError, RuntimeError):
+        p = Path(os.path.abspath(str(adapter)))
+
+    parts = p.parts
+    tokens: Tuple[str, ...]
+
+    if len(parts) >= 3 and parts[-1] == "policy" and parts[-2] == "combined":
+        ckpt_token = parts[-3]
+        exp_token = parts[-4] if len(parts) >= 4 else ""
+        tokens = (exp_token, ckpt_token, "policy") if exp_token else (ckpt_token, "policy")
+    elif p.name.startswith("checkpoint-"):
+        exp = p.parent.name
+        tokens = (exp, p.name) if exp else (p.name,)
+    else:
+        tokens = (p.parent.name, p.name) if p.parent.name else (p.name,)
+
+    base = "_".join(t for t in tokens if t)
+    base = base.replace(" ", "_")
+    if len(base) > 128:
+        base = base[-128:]
+    return base or "atpg_eval"
+
+
 # =============================================================================
 # MAIN EVALUATION PIPELINE
 # =============================================================================
@@ -718,6 +803,7 @@ def evaluate(
     qlora: bool = False,
     eval_prompt_batch_size: int = 8,
     generation_micro_batch_size: int = 8,
+    wandb_run_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Main evaluation function.
@@ -758,6 +844,8 @@ def evaluate(
         per tool round (vLLM), improving GPU utilization vs one prompt at a time.
     generation_micro_batch_size : int
         Transformers backend only: cap on parallel sequences per ``generate`` call.
+    wandb_run_name : str, optional
+        Weights & Biases run display name. If omitted, derived from *adapter*.
 
     Returns
     -------
@@ -885,10 +973,13 @@ def evaluate(
     if report_to == "wandb":
         try:
             import wandb
+            wb_name = wandb_run_name or wandb_run_name_from_adapter(adapter)
             wandb_run = wandb.init(
                 project="atpg-eval",
+                name=wb_name,
+                tags=["passatk"],
                 config={
-                    "adapter": adapter,
+                    "adapter": str(adapter),
                     "dataset": dataset_path,
                     "n": n,
                     "k_values": k_values,
@@ -1547,6 +1638,7 @@ def _sft_eval_generate_hf(
             tc = parse_tool_call(ft)
             if not tc:
                 continue
+            ensure_tool_call_arguments_dict(tc)
             tc["arguments"].update(
                 {"netlist": ToolHelper.get_netlist(expanded[idx])}
             )
@@ -1632,6 +1724,7 @@ def evaluate_sft_stop(
     output_file: Optional[str] = None,
     report_to: str = "none",
     seed: int = 42,
+    wandb_run_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate saved SFT checkpoints against the stopping criteria from
@@ -1769,8 +1862,13 @@ def evaluate_sft_stop(
     if report_to == "wandb":
         try:
             import wandb
+            wb_name = wandb_run_name or (
+                wandb_run_name_from_adapter(adapter) + "_sft_stop"
+            )
             wandb_run = wandb.init(
                 project="atpg-sft-stop-eval",
+                name=wb_name,
+                tags=["sft_stop"],
                 config={
                     "adapter": str(adapter),
                     "dataset": dataset_path,
@@ -2263,6 +2361,12 @@ Examples:
         help="Reporting backend"
     )
     parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=_env("WANDB_RUN_NAME"),
+        help="Weights & Biases run display name (default: derived from --adapter).",
+    )
+    parser.add_argument(
         "--output_file", 
         type=str, 
         default=_env("OUTPUT_FILE"), 
@@ -2413,6 +2517,7 @@ Examples:
             output_file=args.output_file,
             report_to=args.report_to,
             seed=args.seed,
+            wandb_run_name=args.wandb_run_name or None,
         )
     else:
         evaluate(
@@ -2436,6 +2541,7 @@ Examples:
             qlora=args.qlora,
             eval_prompt_batch_size=args.eval_prompt_batch_size,
             generation_micro_batch_size=args.generation_micro_batch_size,
+            wandb_run_name=args.wandb_run_name or None,
         )
 
 if __name__ == "__main__":

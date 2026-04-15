@@ -8,11 +8,11 @@
 #SBATCH --mem=128G
 #SBATCH --partition=h100
 #SBATCH --gres=gpu:4
+#SBATCH --reservation=vasileoiou
 
 # Export the exact path of the Slurm log so Python can find it
 export SLURM_LOG_FILE="jobs/training_${SLURM_JOB_ID}.out"
 export SLURM_ERROR_FILE="jobs/training_${SLURM_JOB_ID}.err"
-export WANDB_PROJECT="huggingface" # Ensure HF Trainer uses my preferred wandb project
 
 # activate virtual environment (prefer Slurm /work path, fall back to shared /proj path)
 if [ -f "/work/cxv200006/myenv/bin/activate" ]; then

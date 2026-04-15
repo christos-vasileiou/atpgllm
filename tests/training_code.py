@@ -386,7 +386,7 @@ def train_with_sft(
         lr_scheduler_type="cosine",
         max_steps=max_steps,
         logging_steps=5,
-        save_steps=5,
+        save_steps=10,
         ddp_find_unused_parameters=False if use_ddp else None,
         gradient_checkpointing=True,
         # DDP + gradient checkpointing + LoRA requires non-reentrant
@@ -395,7 +395,7 @@ def train_with_sft(
         bf16=True,
         report_to=report_to,
         dataset_text_field="text",
-        max_length=8192,
+        max_length=max_model_len,
         # Enable token counting so ThroughputMetricsCallback can compute tokens/sec
         include_num_input_tokens_seen=True,
         # DDP with IterableDataset: each process must fetch its own batch
@@ -611,7 +611,7 @@ def train_with_grpo(
     # =========================================================================
     print("Initializing reward function factory...")
     reward_factory = RewardFunctionFactory(config_path='sim_config.json')
-    reward_fn = reward_factory.create_reward_function()
+    reward_fn = reward_factory.create_reward_function(return_component_dicts=True)
     
     # Set up training arguments using GRPOConfig.  RL typically requires more
     # exploration, so use a smaller learning rate and more steps.
@@ -689,6 +689,46 @@ def train_with_grpo(
 
 def _env(key: str, default: str =None):
     return os.environ.get(key, default)
+
+
+# Keys uploaded to wandb: shared by SFT and GRPO, plus GRPO-only tuning knobs.
+_WANDB_CONFIG_KEYS_SFT = frozenset({
+    "model_name",
+    "dataset_path",
+    "output_dir",
+    "resume_from",
+    "resume_training_state",
+    "per_device_train_batch_size",
+    "gradient_accumulation_steps",
+    "max_steps",
+    "report_to",
+    "max_model_len",
+    "use_unsloth",
+    "use_ddp",
+    "lora_rank",
+    "lora_alpha",
+    "lora_target_modules",
+})
+_WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
+    "buffer_size",
+    "num_generations",
+    "steps_per_generation",
+    "max_completion_length",
+    "max_prompt_length",
+    "use_dual_adapter",
+    "use_vllm",
+    "vllm_mode",
+    "vllm_server_url",
+})
+
+
+def _wandb_run_config(method: str, args_dict: dict, git_info: dict) -> dict:
+    """Subset of CLI args that actually tune the active training path (SFT vs GRPO)."""
+    keys = _WANDB_CONFIG_KEYS_SFT | (
+        _WANDB_CONFIG_KEYS_GRPO_ONLY if method == "grpo" else frozenset()
+    )
+    body = {k: args_dict[k] for k in sorted(keys) if k in args_dict}
+    return {"method": method, **body, **git_info}
 
 
 def main() -> None:
@@ -790,14 +830,21 @@ def main() -> None:
     args_dict['dataset_path'] = args_dict.pop('dataset')
     method = args_dict.pop('method')
 
-    # 1. Combine CLI args with Git info for the config
-    run_config = {"method": method, **args_dict, **get_git_info()}
+    # name wandb run according to the output directory and lora rank and alpha
+    wandb_name = f"r{args_dict.get('lora_rank', 8)}-alpha{args_dict.get('lora_alpha', 16)}" 
+    if method in args_dict.get('output_dir'):
+        wandb_name = f"{args_dict.get('output_dir', 'run')}-{wandb_name}" 
+    else:
+        wandb_name = f"{method}-{args_dict.get('output_dir', 'run')}-{wandb_name}" 
+
+    # 1. Wandb config: only hyperparameters that apply to the chosen method (plus git metadata)
+    run_config = _wandb_run_config(method, args_dict, get_git_info())
 
     # 2. Initialize wandb explicitly to capture everything from this point forward
     wandb.init(
-        project=os.environ.get("WANDB_PROJECT", "huggingface"),
+        project=os.environ.get("WANDB_PROJECT", f"{method}-training"),
         config=run_config,
-        name=f"{args_dict.get('output_dir', 'run')}" if method in args_dict.get('output_dir') else f"{method}-{args_dict.get('output_dir', 'run')}",
+        name=wandb_name,
         settings=wandb.Settings(console="wrap") # Forces capture of Python stdout/stderr
     )
 

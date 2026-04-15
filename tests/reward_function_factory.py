@@ -277,12 +277,20 @@ class RewardFunctionFactory:
         """Extract tool response from completion."""
         return RewardFunctionFactory.TOOL_RESPONSE_RE.findall(x)
     
-    def create_reward_function(self) -> callable:
+    def create_reward_function(self, return_component_dicts: bool = False) -> callable:
         """
         Create a reward function suitable for GRPOTrainer.
         
+        Parameters
+        ----------
+        return_component_dicts
+            If True, each reward is a component dict from ``test_generation_grpo_reward``; use
+            with :class:`DualAdapterGRPOTrainer`, which sums values for the GRPO loss and logs
+            per-component means. If False (default), returns one scalar per completion (sum of
+            components) for trainers that only accept floats.
+        
         Returns a function with signature:
-            reward_fn(prompts: List[str], completions: List[str], **kwargs) -> List[float]
+            reward_fn(prompts, completions, **kwargs) -> List[Dict[str, float]] or List[float]
         
         The reward function:
         1. Parses model completions to extract INPUT_VECTOR, EXPECTED_OUTPUT, etc.
@@ -296,7 +304,7 @@ class RewardFunctionFactory:
         name_re = self.NAME_RE
         validate_and_get_netlist_from_prompt = self.validate_and_get_netlist_from_prompt
         
-        def reward_fn(prompts: List[str], completions: List[str], **kwargs) -> List[float]:
+        def reward_fn(prompts: List[str], completions: List[str], **kwargs):
             """
             Evaluate model-generated test vectors by running actual fault simulation.
             """
@@ -340,8 +348,8 @@ class RewardFunctionFactory:
                 
                 # ret_rewards = test_generation_reward(prompts, completions, **reward_kwargs)
                 ret_rewards = test_generation_grpo_reward(prompts, completions, **reward_kwargs)
-                # Sum all reward components into a single scalar per completion
-                ret_rewards = [sum(ret_r.values()) for ret_r in ret_rewards]
+                if not return_component_dicts:
+                    ret_rewards = [sum(ret_r.values()) for ret_r in ret_rewards]
             except Exception as e:
                 print(f"Warning: Reward calculation failed: {e}")
                 import traceback

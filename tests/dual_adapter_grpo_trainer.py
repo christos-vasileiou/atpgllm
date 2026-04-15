@@ -62,8 +62,8 @@ from torch import nn
 from peft import LoraConfig, PeftModel
 from peft.tuners.lora import LoraLayer
 from trl import GRPOTrainer, GRPOConfig
-from accelerate.utils import gather
 import copy
+import math
 from tools import TOOLS, ToolHelper
 from revert_template import revert_qwen2_5_template, revert_chat_template
 
@@ -535,6 +535,60 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         with open(f"{output_dir}/adapter_info.json", "w") as f:
             json.dump(adapter_info, f, indent=2)
 
+    def _reward_output_to_scalars_and_components(
+        self, output_reward_func: list, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[str] | None]:
+        """
+        Convert reward function output into per-row scalar totals (for GRPO) and an optional
+        per-row, per-component matrix for dashboard metrics.
+
+        Supports:
+          - list[float] / list of numeric scalars (legacy)
+          - list[dict[str, float]] from :func:`test_generation_grpo_reward` (via factory)
+        """
+        row_scalars: list[float] = []
+        first_dict: dict | None = next((r for r in output_reward_func if isinstance(r, dict)), None)
+        if first_dict is None:
+            for r in output_reward_func:
+                if r is None or (isinstance(r, float) and math.isnan(r)):
+                    row_scalars.append(float("nan"))
+                else:
+                    row_scalars.append(float(r))
+            return torch.tensor(row_scalars, dtype=torch.float32, device=device), None, None
+
+        keys = sorted(first_dict.keys())
+        rows: list[list[float]] = []
+        for r in output_reward_func:
+            if isinstance(r, dict):
+                row_scalars.append(float(sum(r.values())))
+                rows.append([float(r.get(k, 0.0)) for k in keys])
+            elif r is None or (isinstance(r, float) and math.isnan(r)):
+                row_scalars.append(float("nan"))
+                rows.append([float("nan")] * len(keys))
+            else:
+                row_scalars.append(float(r))
+                rows.append([float("nan")] * len(keys))
+        comp_mat = torch.tensor(rows, dtype=torch.float32, device=device)
+        return torch.tensor(row_scalars, dtype=torch.float32, device=device), comp_mat, keys
+
+    def _log_reward_component_means(
+        self, comp_mat: torch.Tensor, keys: list[str], reward_func_name: str
+    ) -> None:
+        """Append global (DDP-gathered) component means to ``self._metrics`` for WandB / logs."""
+        if comp_mat is None or not keys:
+            return
+        metrics_root = getattr(self, "_metrics", None)
+        if metrics_root is None:
+            return
+        mode = "train" if self.model.training else "eval"
+        bucket = metrics_root.setdefault(mode, {})
+        gathered = gather(comp_mat)
+        means = torch.nanmean(gathered, dim=0)
+        for j, key in enumerate(keys):
+            sub = f"rewards/{reward_func_name}/component_mean/{key}"
+            bucket.setdefault(sub, [])
+            bucket[sub].append(float(means[j].item()))
+
     @profiling_decorator
     def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
         """
@@ -591,7 +645,12 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                         prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
                     )
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-                    rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                    scalars, comp_mat, comp_keys = self._reward_output_to_scalars_and_components(
+                        output_reward_func, device=device
+                    )
+                    rewards_per_func[:, i] = scalars
+                    if comp_mat is not None and comp_keys is not None:
+                        self._log_reward_component_means(comp_mat, comp_keys, reward_func_name)
 
         if self.print:
             for prompt, completion in zip(prompts, completions):
@@ -616,8 +675,16 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 return await asyncio.gather(*coros)
 
             async_results = asyncio.run_coroutine_threadsafe(_run_async_funcs(), self.async_reward_loop).result()
+            idx_to_reward_name = {i: name for i, _, name in async_funcs_info}
             for idx, output_reward_func in async_results:
-                rewards_per_func[:, idx] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                scalars, comp_mat, comp_keys = self._reward_output_to_scalars_and_components(
+                    output_reward_func, device=device
+                )
+                rewards_per_func[:, idx] = scalars
+                if comp_mat is not None and comp_keys is not None:
+                    self._log_reward_component_means(
+                        comp_mat, comp_keys, idx_to_reward_name.get(idx, str(idx))
+                    )
 
         # Warn if every reward function returned None for any sample
         if torch.isnan(rewards_per_func).all(dim=1).any():
