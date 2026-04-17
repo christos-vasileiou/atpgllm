@@ -429,6 +429,7 @@ def train_with_grpo(
     resume_from: str = None,
     resume_training_state: bool = False,
     buffer_size: int = 10000,
+    skip_buffer_size: int = 0,
     per_device_train_batch_size: int = 8,
     gradient_accumulation_steps: int = 1,
     max_steps: int = -1,
@@ -488,6 +489,12 @@ def train_with_grpo(
     buffer_size : int
         Maximum examples to buffer from the streaming dataset into
         memory.  ``GRPOTrainer`` doesn't support streaming datasets.
+    skip_buffer_size : int
+        First advance the stream past this many **valid** examples (same
+        dedupe / length rules as buffering). Then collect up to
+        ``buffer_size`` examples for training. The two counts are independent:
+        e.g. ``skip_buffer_size=5000`` and ``buffer_size=10000`` yields up to
+        10000 buffered rows taken from positions 5000 onward (ignored when 0).
     per_device_train_batch_size : int
     gradient_accumulation_steps : int
     max_steps : int
@@ -602,8 +609,24 @@ def train_with_grpo(
     formatted_data = format_dataset_for_training(data, tokenizer, TrainingMode.GRPO)
 
     print("Buffering streaming dataset (GRPOTrainer requires non-streaming Dataset)...")
+    if resume_training_state and skip_buffer_size:
+        print(
+            "[GRPO] Warning: --resume_training_state restores trainer step/checkpoint state; "
+            "non-zero --skip_buffer_size also skips a dataset prefix. Combine only if intentional."
+        )
+    if skip_buffer_size:
+        print(
+            f"[GRPO] Stream: skip first {skip_buffer_size} valid example(s), "
+            f"then buffer up to {buffer_size} (independent quotas; skip does not shrink the buffer cap)."
+        )
     train_dataset = buffer_streaming_dataset(
-        formatted_data, buffer_size=buffer_size, shuffle=True, seed=42, tokenizer=tokenizer, max_prompt_length=max_prompt_length,
+        formatted_data,
+        buffer_size=buffer_size,
+        shuffle=True,
+        seed=42,
+        tokenizer=tokenizer,
+        max_prompt_length=max_prompt_length,
+        skip_buffer_size=skip_buffer_size,
     )
 
     # =========================================================================
@@ -711,6 +734,7 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
 })
 _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "buffer_size",
+    "skip_buffer_size",
     "num_generations",
     "steps_per_generation",
     "max_completion_length",
@@ -755,8 +779,21 @@ def main() -> None:
                              "weights. Requires --resume_from to point to a Trainer checkpoint "
                              "directory (e.g., output_dir/checkpoint-50/) containing "
                              "trainer_state.json and optimizer state files.")
-    parser.add_argument("--buffer_size", type=int, default=_env('BUFFER_SIZE', 10000),
-                        help="Number of examples to buffer from streaming dataset for GRPO")
+    parser.add_argument(
+        "--buffer_size",
+        type=int,
+        default=_env('BUFFER_SIZE', 10000),
+        help="GRPO: max examples to collect **after** any --skip_buffer_size offset (skip does not "
+             "reduce this count). Env: BUFFER_SIZE",
+    )
+    parser.add_argument(
+        "--skip_buffer_size",
+        type=int,
+        default=_env("SKIP_BUFFER_SIZE", 0),
+        help="GRPO only: advance past this many valid samples in stream order (pre-shuffle), "
+             "then start filling up to --buffer_size rows — the two limits are independent. "
+             "Env: SKIP_BUFFER_SIZE (default: 0)",
+    )
     parser.add_argument("--max_steps", type=int, default=_env('MAX_STEPS', 1),
                         help="Maximum number of training steps")
     parser.add_argument("--per_device_train_batch_size", type=int, default=_env('PER_DEVICE_TRAIN_BATCH_SIZE', 1),
@@ -815,7 +852,7 @@ def main() -> None:
     )
 
     # Validate integer arguments
-    for field in ('buffer_size', 'per_device_train_batch_size',
+    for field in ('buffer_size', 'skip_buffer_size', 'per_device_train_batch_size',
                   'gradient_accumulation_steps', 'max_steps',
                   'num_generations', 'steps_per_generation',
                   'max_model_len', 'max_completion_length', 'max_prompt_length',
@@ -824,6 +861,9 @@ def main() -> None:
             setattr(args, field, int(getattr(args, field)))
         except ValueError:
             parser.error(f"Invalid {field}: {getattr(args, field)}")
+
+    if args.skip_buffer_size < 0:
+        parser.error("skip_buffer_size must be >= 0")
 
     # Convert args to dict and fix parameter naming
     args_dict = vars(args)

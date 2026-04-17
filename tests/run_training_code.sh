@@ -100,7 +100,7 @@ if [ -z "$MODEL" ] && [ "$METHOD" != "grpo" ]; then
     exit 1
 fi
 if [ "$METHOD" == "sft" ]; then
-    MODEL=${MODEL:-Qwen/Qwen2.5-72B-Instruct}
+    MODEL=${MODEL:-Qwen/Qwen2.5-7B-Instruct}
     TRAIN_DATASET=${TRAIN_DATASET:-chrivasileiou/asap7-language-of-test}
     OUTPUT_DIR=${OUTPUT_DIR:-sft_finetuned_model}
     RESUME_FROM=${RESUME_FROM:-}
@@ -149,6 +149,7 @@ elif [ "$METHOD" == "grpo" ]; then
     MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
     MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
     MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-6144}
+    SKIP_BUFFER_SIZE=${SKIP_BUFFER_SIZE:-0}
 fi
 
 # LoRA hyper-parameters (read by training_code.py via environment / argparse defaults)
@@ -326,6 +327,7 @@ build_cmd_args() {
     if [ "$METHOD" == "grpo" ]; then
         CMD_ARGS+=(
             --buffer_size "$BUFFER_SIZE"
+            --skip_buffer_size "${SKIP_BUFFER_SIZE:-0}"
             --num_generations "$NUM_GENERATIONS"
             --steps_per_generation "$STEPS_PER_GENERATION"
             --max_completion_length "$MAX_COMPLETION_LENGTH"
@@ -363,6 +365,7 @@ build_cmd_args() {
     if [ "$METHOD" == "grpo" ]; then
         echo "--- GRPO-specific ---"
         echo "BUFFER_SIZE: $BUFFER_SIZE"
+        echo "SKIP_BUFFER_SIZE: ${SKIP_BUFFER_SIZE:-0}"
         echo "NUM_GENERATIONS: $NUM_GENERATIONS"
         echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION"
         echo "MAX_COMPLETION_LENGTH: $MAX_COMPLETION_LENGTH"

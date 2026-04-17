@@ -7,7 +7,10 @@ GRPO training pipelines.
 
 * :func:`buffer_streaming_dataset` — materialise a streaming
   ``IterableDataset`` into a regular ``Dataset`` (required by
-  ``GRPOTrainer``).
+  ``GRPOTrainer``). ``skip_buffer_size`` and ``buffer_size`` are
+  **independent**: the stream pointer advances past ``skip_buffer_size``
+  valid rows first, then up to ``buffer_size`` rows are collected for the
+  buffer (skips do not count toward ``buffer_size``).
 * :func:`format_dataset_for_training` — convert raw records into the
   chat-prompt format expected by ``SFTTrainer`` or ``GRPOTrainer``.
 """
@@ -78,8 +81,40 @@ def buffer_streaming_dataset(
     max_prompt_length: int = 16384,
     batch_size: int = 1000,
     num_workers: int = 4,
+    skip_buffer_size: int = 0,
 ) -> Dataset:
-    
+    """Materialise a streaming iterable into a :class:`datasets.Dataset`.
+
+    **Two-phase stream consumption (independent quotas).** Valid examples are
+    those passing uniqueness on ``unique_by`` and ``max_prompt_length``.
+
+    1. Advance the logical stream pointer: discard the first
+       ``skip_buffer_size`` valid examples. This count does **not** reduce
+       ``buffer_size``.
+    2. **Then** append at most ``buffer_size`` further valid examples into the
+       returned dataset (``buffer_size == 0`` means keep reading until the
+       stream ends).
+
+    Order is the streaming iterator **before** ``shuffle``.
+
+    Parameters
+    ----------
+    skip_buffer_size : int, default 0
+        Skip this many **valid** examples (unique by ``unique_by``, under
+        ``max_prompt_length``) from the start of the stream before filling the
+        buffer. Use when resuming GRPO on the same stream to avoid retraining on
+        prompts already covered in a prior run. Order follows the streaming
+        iterator **before** ``shuffle``.
+    """
+    try:
+        skip_buffer_size = int(skip_buffer_size)
+        buffer_size = int(buffer_size)
+    except (TypeError, ValueError) as e:
+        raise ValueError("buffer_size and skip_buffer_size must be integers") from e
+    if skip_buffer_size < 0:
+        raise ValueError("skip_buffer_size must be >= 0")
+    if buffer_size < 0:
+        raise ValueError("buffer_size must be >= 0 (0 means buffer the rest of the stream)")
     if tokenizer is None:
         raise ValueError("A tokenizer must be provided.")
 
@@ -107,9 +142,9 @@ def buffer_streaming_dataset(
     unique_values = set()
     
     desc = (
-        f"Buffering dataset (max {buffer_size}, unique by '{unique_by}')"
+        f"Buffering dataset (max {buffer_size}, unique by '{unique_by}', skip {skip_buffer_size})"
         if buffer_size > 0
-        else "Buffering entire dataset"
+        else f"Buffering entire dataset (skip {skip_buffer_size})"
     )
     pbar = tqdm(total=buffer_size if buffer_size > 0 else None, desc=desc, file=sys.stdout)
 
@@ -128,19 +163,29 @@ def buffer_streaming_dataset(
             yield current_batch
 
     is_fast_tokenizer = getattr(tokenizer, "is_fast", False)
+    skipped_valid = 0  # valid examples consumed in the skip phase only
+
+    def consume_valid_batch(valid_batch: list) -> bool:
+        """Apply skip phase then buffer phase; return True when buffer quota is met."""
+        nonlocal skipped_valid
+        for ex in valid_batch:
+            # Phase 1 — stream offset: skip_buffer_size valid items (not counted toward buffer_size).
+            if skipped_valid < skip_buffer_size:
+                skipped_valid += 1
+                continue
+            # Phase 2 — buffer: up to buffer_size samples (0 = unbounded until EOF).
+            if buffer_size > 0 and len(examples) >= buffer_size:
+                return True
+            examples.append(ex)
+            pbar.update(1)
+        return buffer_size > 0 and len(examples) >= buffer_size
 
     # 2. Process Data
     if is_fast_tokenizer:
         # FAST PATH: Rely on Rust's internal multithreading via batching
         for batch in unique_batch_generator():
             valid_batch = process_batch(batch, tokenizer, unique_by, max_prompt_length)
-            
-            # Append only what we strictly need to hit buffer_size
-            needed = buffer_size - len(examples) if buffer_size > 0 else len(valid_batch)
-            examples.extend(valid_batch[:needed])
-            pbar.update(len(valid_batch[:needed]))
-            
-            if buffer_size > 0 and len(examples) >= buffer_size:
+            if consume_valid_batch(valid_batch):
                 break
     else:
         # SLOW PATH: Fallback to Python Multiprocessing for legacy tokenizers
@@ -149,29 +194,45 @@ def buffer_streaming_dataset(
                 executor.submit(process_batch, batch, tokenizer, unique_by, max_prompt_length)
                 for batch in unique_batch_generator()
             ]
-            
-            for future in concurrent.futures.as_completed(futures):
+            # Iterate in submission order so skip_buffer_size matches stream order.
+            for future in futures:
                 valid_batch = future.result()
-                needed = buffer_size - len(examples) if buffer_size > 0 else len(valid_batch)
-                examples.extend(valid_batch[:needed])
-                pbar.update(len(valid_batch[:needed]))
-                
-                if buffer_size > 0 and len(examples) >= buffer_size:
-                    # Cancel remaining tasks to free up CPU
-                    for f in futures: f.cancel()
+                if consume_valid_batch(valid_batch):
+                    for f in futures:
+                        f.cancel()
                     break
 
     pbar.close()
 
+    if skipped_valid < skip_buffer_size:
+        print(
+            f"WARNING: stream ended after skipping {skipped_valid} valid example(s); "
+            f"requested skip_buffer_size={skip_buffer_size}. "
+            "Increase dataset size or lower skip_buffer_size."
+        )
+
     if not examples:
-        raise ValueError("No examples were buffered. Check max_prompt_length or dataset content.")
+        raise ValueError(
+            "No examples were buffered after filtering. "
+            f"(skip_buffer_size={skip_buffer_size}, skipped_valid={skipped_valid}, "
+            "max_prompt_length, or empty stream). Check dataset path and filters."
+        )
 
     dataset = Dataset.from_list(examples)
 
     if shuffle:
         dataset = dataset.shuffle(seed=seed)
 
-    print(f"Buffered {len(dataset)} examples into memory.")
+    if skip_buffer_size > 0 and buffer_size > 0 and len(dataset) < buffer_size:
+        print(
+            f"WARNING: after skip_buffer_size={skip_buffer_size}, only {len(dataset)} example(s) "
+            f"were collected; buffer_size={buffer_size} was the target (skip does not reduce that quota)."
+        )
+
+    print(
+        f"Buffered {len(dataset)} example(s) into memory "
+        f"(skip phase: skipped_valid={skipped_valid}/{skip_buffer_size}, buffer cap={buffer_size or 'none'})."
+    )
     return dataset
 
 def format_dataset_for_training(dataset, tokenizer: AutoTokenizer, training_mode: str):
