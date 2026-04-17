@@ -652,7 +652,7 @@ def train_with_grpo(
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=2e-5,
+        learning_rate=2e-6,
         max_steps=max_steps,
         logging_steps=1,
         save_steps=10,
