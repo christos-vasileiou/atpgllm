@@ -13,11 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'data_preprocessing
 
 from fault_sim import OptimizedNetlist, fast_fault_sim
 from atpgllm.llm.reward_funcs import (
-    extract_json_tool_response_and_convert_to_df, 
-    extract_markdown_table, 
-    markdown_table_to_dataframe, 
+    extract_json_tool_response_and_convert_to_df,
+    extract_markdown_table,
+    markdown_table_to_dataframe,
     test_generation_reward,
-    test_generation_grpo_reward
+    test_generation_grpo_reward,
+    train_scalar_from_reward_components,
 )
 
 
@@ -349,7 +350,9 @@ class RewardFunctionFactory:
                 # ret_rewards = test_generation_reward(prompts, completions, **reward_kwargs)
                 ret_rewards = test_generation_grpo_reward(prompts, completions, **reward_kwargs)
                 if not return_component_dicts:
-                    ret_rewards = [sum(ret_r.values()) for ret_r in ret_rewards]
+                    ret_rewards = [
+                        train_scalar_from_reward_components(ret_r) for ret_r in ret_rewards
+                    ]
             except Exception as e:
                 print(f"Warning: Reward calculation failed: {e}")
                 import traceback

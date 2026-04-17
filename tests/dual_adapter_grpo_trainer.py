@@ -66,6 +66,7 @@ import copy
 import math
 from tools import TOOLS, ToolHelper
 from revert_template import revert_qwen2_5_template, revert_chat_template
+from atpgllm.llm.reward_funcs import REWARD_LOGONLY_SUFFIX, train_scalar_from_reward_components
 
 # Adapter name constants
 REFERENCE_ADAPTER_NAME = "reference"
@@ -542,6 +543,9 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         Convert reward function output into per-row scalar totals (for GRPO) and an optional
         per-row, per-component matrix for dashboard metrics.
 
+        Dict outputs: the training scalar sums values for all keys **except** those whose names
+        end with ``_logonly`` (monitor-only metrics; see ``train_scalar_from_reward_components``).
+
         Supports:
           - list[float] / list of numeric scalars (legacy)
           - list[dict[str, float]] from :func:`test_generation_grpo_reward` (via factory)
@@ -557,10 +561,11 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             return torch.tensor(row_scalars, dtype=torch.float32, device=device), None, None
 
         keys = sorted(first_dict.keys())
+
         rows: list[list[float]] = []
         for r in output_reward_func:
             if isinstance(r, dict):
-                row_scalars.append(float(sum(r.values())))
+                row_scalars.append(train_scalar_from_reward_components(r))
                 rows.append([float(r.get(k, 0.0)) for k in keys])
             elif r is None or (isinstance(r, float) and math.isnan(r)):
                 row_scalars.append(float("nan"))
@@ -574,7 +579,12 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
     def _log_reward_component_means(
         self, comp_mat: torch.Tensor, keys: list[str], reward_func_name: str
     ) -> None:
-        """Append global (DDP-gathered) component means to ``self._metrics`` for WandB / logs."""
+        """
+        Append global (DDP-gathered) component means to ``self._metrics`` for WandB / logs.
+
+        Keys ending with ``REWARD_LOGONLY_SUFFIX`` are logged under the same name with that
+        suffix removed so dashboards stay aligned with historical run keys.
+        """
         if comp_mat is None or not keys:
             return
         metrics_root = getattr(self, "_metrics", None)
@@ -585,7 +595,9 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         gathered = gather(comp_mat)
         means = torch.nanmean(gathered, dim=0)
         for j, key in enumerate(keys):
-            sub = f"rewards/{reward_func_name}/component_mean/{key}"
+            # Strip ``_logonly`` for W&B paths so charts match pre-refactor metric names.
+            log_key = key[: -len(REWARD_LOGONLY_SUFFIX)] if str(key).endswith(REWARD_LOGONLY_SUFFIX) else key
+            sub = f"rewards/{reward_func_name}/component_mean/{log_key}"
             bucket.setdefault(sub, [])
             bucket[sub].append(float(means[j].item()))
 

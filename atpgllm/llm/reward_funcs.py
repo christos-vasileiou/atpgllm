@@ -21,6 +21,18 @@ from fault_sim import convert_string_to_dict
 
 warnings.filterwarnings("ignore")
 
+# Keys ending with this suffix are logged to dashboards but excluded from the GRPO scalar
+# (see ``train_scalar_from_reward_components`` and DualAdapterGRPOTrainer reward parsing).
+REWARD_LOGONLY_SUFFIX = "_logonly"
+
+
+def train_scalar_from_reward_components(components: Dict[str, float]) -> float:
+  """Training scalar: sum all components except ``*_logonly`` monitor-only entries."""
+  return float(
+    sum(v for k, v in components.items() if not str(k).endswith(REWARD_LOGONLY_SUFFIX))
+  )
+
+
 def extract_json_tool_response_and_convert_to_df(text: str) -> Optional[pd.DataFrame]:
   """Parse first ``<tool_response>{...}</tool_response>`` blob into a DataFrame, or None."""
   match = re.search(r"<tool_response>\s*(\{.*?\})\s*</tool_response>", text, re.DOTALL)
@@ -252,22 +264,32 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
   GRPO-oriented reward for ATPG-style completions: learn a test vector that *detects* the target fault.
 
   Authoritative signal: the fault simulator (``fault_sim`` / ``fast_fault_sim``) on the model's
-  ``INPUT_VECTOR`` and ``EXPECTED_OUTPUT``. Components (non-overlapping so ``sum(values)`` is meaningful):
+  ``INPUT_VECTOR`` and ``EXPECTED_OUTPUT``.
 
-  - **fault_detect_inpvector** — bonus for PO observation (good≠bad on some PO) plus fault-site
-    activation (bad value at fault net equals stuck-at and differs from good).
-  - **expected_output** / **input_vector** — match of declared vectors to simulated good machine
-    on POs / PIs.
-  - **fault_simulation** — tool JSON ``<tool_response>`` PO values vs gold simulation.
-  - **detected_faults** — target fault string appears in ``DETECTED_FAULTS``.
-  - **pred_simulation** / **pred_vs_fault_sim_acc** — completion simulation table vs gold (if present).
-  - **format** — light shaping for thinking / tool_call / tool_response / tags.
+  **Training scalar** — DualAdapterGRPOTrainer sums all numeric values except keys ending in
+  ``_logonly`` (dashboard-only). Prefer tuning the documented ``reward_weight_*`` kwargs.
 
-  Optional kwargs: ``reward_weight_fault_detected_po`` (default 12), ``reward_weight_fault_site`` (4),
-  ``reward_weight_po_match`` (5), ``reward_weight_pi_match`` (3), ``reward_weight_tool_json_bonus`` (1),
+  Main train components:
+
+  - **fault_detect_inpvector** — binary detection plus *dense* PO observability (fraction of POs
+    where good≠bad) and *shaped* fault-site score (partial credit when bad matches stuck-at).
+  - **expected_output** / **input_vector** — weighted PO/PI match plus optional perfect-match bonus.
+  - **fault_simulation** — tool JSON ``<tool_response>`` PO consistency vs gold simulation.
+  - **detected_faults** — mention of target fault in ``DETECTED_FAULTS`` plus optional perfect bonus.
+  - **pred_simulation** — weighted accuracy of completion simulation table vs gold (if present).
+  - **format** / **sim_table_bonus** — template and JSON-table shaping.
+
+  Keys ending with ``_logonly`` mirror discrete accuracies for W&B only (not in the policy loss).
+
+  Optional kwargs include ``reward_weight_fault_detected_po`` (12), ``reward_weight_fault_site`` (4),
+  ``reward_weight_po_obs`` (2.5), ``reward_site_partial_credit`` (0.38),
+  ``reward_weight_po_match`` (5), ``reward_weight_pi_match`` (3),
+  ``reward_perfect_po_bonus`` / ``reward_perfect_pi_bonus`` / ``reward_perfect_mention_bonus`` (1),
+  ``reward_weight_pred_table`` (2.75), ``reward_pred_table_acc_bias`` (0.2;
+  train term is ``weight * max(0, acc - bias)``), ``reward_weight_tool_json_bonus`` (1),
   ``reward_weight_fault_mention`` (1.5), ``reward_format_weight`` (0.12).
 
-  Returns per-completion component dicts (summed by the trainer).
+  Returns per-completion component dicts (trainer sums train keys only).
   """
   netlists = kwargs.get("netlists", None)
   if netlists is None:
@@ -308,10 +330,17 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
 
   w_detect = float(kwargs.get("reward_weight_fault_detected_po", 12.0))
   w_site = float(kwargs.get("reward_weight_fault_site", 4.0))
+  w_po_obs = float(kwargs.get("reward_weight_po_obs", 2.5))
+  site_partial = float(kwargs.get("reward_site_partial_credit", 0.38))
   w_po = float(kwargs.get("reward_weight_po_match", 5.0))
   w_pi = float(kwargs.get("reward_weight_pi_match", 3.0))
   w_tool_json = float(kwargs.get("reward_weight_tool_json_bonus", 1.0))
   w_fault_mention = float(kwargs.get("reward_weight_fault_mention", 1.5))
+  w_pred_table = float(kwargs.get("reward_weight_pred_table", 2.75))
+  pred_table_acc_bias = float(kwargs.get("reward_pred_table_acc_bias", 0.2))
+  perfect_po = float(kwargs.get("reward_perfect_po_bonus", 1.0))
+  perfect_pi = float(kwargs.get("reward_perfect_pi_bonus", 1.0))
+  perfect_mention = float(kwargs.get("reward_perfect_mention_bonus", 1.0))
   format_weight = float(kwargs.get("reward_format_weight", 0.12))
 
   rewards: List[Dict[str, float]] = []
@@ -326,13 +355,12 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
       "input_vector": 0.0,
       "detected_faults": 0.0,
       "pred_simulation": 0.0,
-      "pred_vs_fault_sim_acc": 0.0,
-      "fault_detected_by_pred_input_vector_acc": 0.0,
-      "expected_output_acc": 0.0,
-      "input_vector_acc": 0.0,
-      "detected_faults_acc": 0.0,
-      # Extra scalars for dashboards (also included in sum — keep small):
       "sim_table_bonus": 0.0,
+      "pred_vs_fault_sim_acc_logonly": 0.0,
+      "fault_detected_by_pred_input_vector_acc_logonly": 0.0,
+      "expected_output_acc_logonly": 0.0,
+      "input_vector_acc_logonly": 0.0,
+      "detected_faults_acc_logonly": 0.0,
     }
 
     fault_info = fault_fn(prompt)
@@ -356,11 +384,11 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
     if pred_input:
       out["format"] += format_weight
     else:
-      out["format"] -= 0.8
+      out["format"] -= 0.5
     if pred_output:
       out["format"] += format_weight
     else:
-      out["format"] -= 0.8
+      out["format"] -= 0.5
     if pred_faults:
       out["format"] += format_weight
     else:
@@ -403,15 +431,19 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
     tool_bonus = _tool_response_po_consistency_bonus(completion, fault_simulation)
     mention = _mentions_target_fault(pred_faults, fault, net) if pred_faults else 0.0
 
-    out["fault_detect_inpvector"] = w_detect * float(detected) + w_site * float(site_ok)
-    out["expected_output"] = w_po * po_score
-    out["input_vector"] = w_pi * pi_score
+    out["fault_detect_inpvector"] = (
+        w_detect * float(detected) 
+        + w_site * site_ok
+    )
+    out["fault_detected_by_pred_input_vector_acc_logonly"] = float(detected)
+
+    out["expected_output"] = w_po * po_score + (perfect_po if po_score >= 0.999 else 0.0)
+    out["input_vector"] = w_pi * pi_score + (perfect_pi if pi_score >= 0.999 else 0.0)
     out["fault_simulation"] = w_tool_json * tool_bonus
-    out["detected_faults"] = w_fault_mention * mention
-    out["fault_detected_by_pred_input_vector_acc"] = float(detected)
-    out["expected_output_acc"] = 1.0 if po_score >= 0.999 else 0.0
-    out["input_vector_acc"] = 1.0 if pi_score >= 0.999 else 0.0
-    out["detected_faults_acc"] = 1.0 if mention >= 0.99 else 0.0
+    out["detected_faults"] = w_fault_mention * mention + (perfect_mention if mention >= 0.99 else 0.0)
+    out["expected_output_acc_logonly"] = 1.0 if po_score >= 0.999 else 0.0
+    out["input_vector_acc_logonly"] = 1.0 if pi_score >= 0.999 else 0.0
+    out["detected_faults_acc_logonly"] = 1.0 if mention >= 0.99 else 0.0
 
     if sim_from_completion is not None and "POs" in fault_simulation.columns:
       try:
@@ -427,8 +459,9 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
               matches.append(float(a == b))
         if matches:
           acc = sum(matches) / len(matches)
-          out["pred_vs_fault_sim_acc"] = acc
-          out["pred_simulation"] = 3.0 * (acc - 0.5)
+          out["pred_vs_fault_sim_acc_logonly"] = acc
+          # Single train signal (old sum used both raw acc and 3*(acc-0.5), double-counting).
+          out["pred_simulation"] = w_pred_table * max(0.0, acc - pred_table_acc_bias)
       except Exception:
         pass
 
