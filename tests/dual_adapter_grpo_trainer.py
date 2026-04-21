@@ -50,10 +50,13 @@ import asyncio
 import contextlib
 import atexit
 import json
+import os
 import re
+import shutil
 import time
 import threading
 import warnings
+from pathlib import Path
 from typing import Any, Callable, List, Optional, Union
 from trl.extras.profiling import profiling_context, profiling_decorator
 from trl.data_utils import is_conversational, apply_chat_template
@@ -152,44 +155,66 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 "If you're starting from scratch, use the standard GRPOTrainer instead."
             )
 
-        # ── Phase 1: Resolve the SFT (reference) adapter name ──
-        # The model already has an SFT adapter loaded.  Figure out its name
-        # and normalise it to REFERENCE_ADAPTER_NAME for clarity.
-        if ref_adapter_name is None:
-            ref_adapter_name = model.active_adapter
-            if isinstance(ref_adapter_name, list):
-                ref_adapter_name = ref_adapter_name[0]
-        
-        self._ref_adapter_name = ref_adapter_name
-        self._policy_adapter_name = POLICY_ADAPTER_NAME
-        
-        if ref_adapter_name == "default" and REFERENCE_ADAPTER_NAME != "default":
-            print(f"Renaming SFT adapter from 'default' to '{REFERENCE_ADAPTER_NAME}'")
-            self._rename_adapter(model, "default", REFERENCE_ADAPTER_NAME)
-            self._ref_adapter_name = REFERENCE_ADAPTER_NAME
-
-        # ── Phase 2: Create the policy adapter ──
-        # A second LoRA adapter is added alongside the frozen SFT one.
-        # Its weights are initialised as a copy of the SFT adapter (tau=1)
-        # so training starts from the SFT checkpoint.
-        if policy_lora_config is None:
-            policy_lora_config = self._get_adapter_config(model, self._ref_adapter_name)
-            print(f"Using SFT adapter config for policy adapter: r={policy_lora_config.r}")
-        
-        print(f"Adding policy adapter '{self._policy_adapter_name}' next to SFT adapter '{self._ref_adapter_name}'")
-        model.add_adapter(adapter_name=self._policy_adapter_name, peft_config=policy_lora_config)
-        
-        self._update_adapter_weights(
-            model=model, 
-            source_adapter_name=self._ref_adapter_name, 
-            target_adapter_name=self._policy_adapter_name, 
-            tau=1.,
+        # ── Fast path: model already has BOTH reference + policy adapters ──
+        # This happens when resuming a GRPO training run: the checkpoint
+        # loader has already attached both adapters, so we must NOT re-create
+        # the policy adapter (which would wipe its trained weights).
+        already_dual = (
+            REFERENCE_ADAPTER_NAME in model.peft_config
+            and POLICY_ADAPTER_NAME in model.peft_config
         )
 
-        # ── Phase 3: Freeze SFT, make policy trainable ──
-        self._setup_adapter_training(model)
-        print(f"Active adapters: {model.active_adapter}")
-        model.print_trainable_parameters()
+        if already_dual:
+            print(
+                "[DualAdapterGRPOTrainer] Detected existing dual-adapter model "
+                f"(adapters: {list(model.peft_config.keys())}). "
+                "Skipping adapter setup — resuming previous GRPO state."
+            )
+            self._ref_adapter_name = REFERENCE_ADAPTER_NAME
+            self._policy_adapter_name = POLICY_ADAPTER_NAME
+            # Make sure trainable flags and active adapter are still correct.
+            self._setup_adapter_training(model)
+            print(f"Active adapters: {model.active_adapter}")
+            model.print_trainable_parameters()
+        else:
+            # ── Phase 1: Resolve the SFT (reference) adapter name ──
+            # The model already has an SFT adapter loaded.  Figure out its
+            # name and normalise it to REFERENCE_ADAPTER_NAME for clarity.
+            if ref_adapter_name is None:
+                ref_adapter_name = model.active_adapter
+                if isinstance(ref_adapter_name, list):
+                    ref_adapter_name = ref_adapter_name[0]
+
+            self._ref_adapter_name = ref_adapter_name
+            self._policy_adapter_name = POLICY_ADAPTER_NAME
+
+            if ref_adapter_name == "default" and REFERENCE_ADAPTER_NAME != "default":
+                print(f"Renaming SFT adapter from 'default' to '{REFERENCE_ADAPTER_NAME}'")
+                self._rename_adapter(model, "default", REFERENCE_ADAPTER_NAME)
+                self._ref_adapter_name = REFERENCE_ADAPTER_NAME
+
+            # ── Phase 2: Create the policy adapter ──
+            # A second LoRA adapter is added alongside the frozen SFT one.
+            # Its weights are initialised as a copy of the SFT adapter (tau=1)
+            # so training starts from the SFT checkpoint.
+            if policy_lora_config is None:
+                policy_lora_config = self._get_adapter_config(model, self._ref_adapter_name)
+                print(f"Using SFT adapter config for policy adapter: r={policy_lora_config.r}")
+
+            print(f"Adding policy adapter '{self._policy_adapter_name}' next to SFT adapter '{self._ref_adapter_name}'")
+            model.add_adapter(adapter_name=self._policy_adapter_name, peft_config=policy_lora_config)
+
+            self._update_adapter_weights(
+                model=model,
+                source_adapter_name=self._ref_adapter_name,
+                target_adapter_name=self._policy_adapter_name,
+                tau=1.,
+            )
+
+            # ── Phase 3: Freeze SFT, make policy trainable ──
+            self._setup_adapter_training(model)
+            print(f"Active adapters: {model.active_adapter}")
+            model.print_trainable_parameters()
 
         # ── Phase 4: Initialise the GRPOTrainer base class ──
         # peft_config=None prevents the parent from calling merge_and_unload().
@@ -506,35 +531,101 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     if hasattr(self, "vllm_client") and self.vllm_client is not None:
                         self.vllm_client.update_named_param(vllm_name, merged_weight)
     
-    def save_model(self, output_dir: str = None, **kwargs):
+    def save_model(self, output_dir: str = None, _internal_call: bool = False, **kwargs):
         """
-        Save the policy adapter (and optionally the SFT adapter).
-        
-        By default, only saves the policy adapter since SFT adapter hasn't changed.
+        Save a checkpoint that is fully resumable for GRPO → GRPO continuation.
+
+        Layout produced
+        ---------------
+        ``output_dir/``
+
+          * ``reference/``               — full frozen SFT adapter
+              * ``adapter_config.json``
+              * ``adapter_model.safetensors``
+
+          * ``policy/``                  — trainable GRPO adapter
+              * ``adapter_config.json``
+              * ``adapter_model.safetensors``
+
+          * ``adapter_config.json``      — **top-level copy of policy**
+          * ``adapter_model.safetensors``  (required by the HuggingFace Trainer's
+                                           ``_load_from_checkpoint`` when the
+                                           user passes ``resume_from_checkpoint``)
+
+          * ``tokenizer*``               — tokenizer files
+          * ``adapter_info.json``        — names & active-adapter metadata
+
+          * ``combined/``                — backward-compat mirror of
+                                           ``reference/`` + ``policy/`` (only
+                                           emitted on the final user-invoked
+                                           save, not on every checkpoint) —
+                                           kept so existing evaluation
+                                           pipelines (``evaluate_model.py``)
+                                           keep working unchanged.
+
+        Rationale
+        ---------
+        * The top-level policy copy lets ``Trainer.train(resume_from_checkpoint=...)``
+          reload adapter weights via its standard ``model.load_adapter()`` call.
+        * The ``reference/`` + ``policy/`` subdirs carry both adapters so the
+          full dual-adapter state can be reconstructed via
+          :func:`load_dual_adapter_checkpoint`.
         """
         if output_dir is None:
             output_dir = self.args.output_dir
-        
+
+        os.makedirs(output_dir, exist_ok=True)
         model = self.accelerator.unwrap_model(self.model)
-        
-        # Save tokenizer
+
+        # 1) Save both adapters into subdirectories ``reference/`` and ``policy/``.
+        #    PEFT places a non-"default" adapter into <save_dir>/<adapter_name>/.
+        model.save_pretrained(
+            output_dir,
+            selected_adapters=[self._ref_adapter_name, self._policy_adapter_name],
+            safe_serialization=True,
+        )
+
+        # 2) Copy the policy adapter files to the top level of the checkpoint.
+        #    The HuggingFace Trainer's ``_load_from_checkpoint`` looks for
+        #    ``adapter_model.safetensors`` / ``adapter_config.json`` at the root
+        #    of the resume-from directory.  Without this copy, resuming with
+        #    ``--resume_training_state`` would silently skip weight reloading.
+        policy_subdir = os.path.join(output_dir, self._policy_adapter_name)
+        for fname in ("adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"):
+            src = os.path.join(policy_subdir, fname)
+            dst = os.path.join(output_dir, fname)
+            if os.path.exists(src):
+                shutil.copyfile(src, dst)
+
+        # 3) Save tokenizer at the top level.
         if self.processing_class is not None:
             self.processing_class.save_pretrained(output_dir)
-        
-        # Also save a combined checkpoint for easy loading
-        combined_dir = f"{output_dir}/combined"
-        print(f"Saving combined model (SFT + policy) to: {combined_dir}")
-        model.save_pretrained(combined_dir, selected_adapters=[self._ref_adapter_name, self._policy_adapter_name])
-        
-        # Save adapter names mapping for later loading
-        import json
+
+        # 4) Save adapter-name metadata.
         adapter_info = {
             "ref_adapter_name": self._ref_adapter_name,
             "policy_adapter_name": self._policy_adapter_name,
-            "active_adapters": list(model.active_adapter) if isinstance(model.active_adapter, (list, tuple)) else [model.active_adapter],
+            "active_adapters": (
+                list(model.active_adapter)
+                if isinstance(model.active_adapter, (list, tuple))
+                else [model.active_adapter]
+            ),
         }
-        with open(f"{output_dir}/adapter_info.json", "w") as f:
+        with open(os.path.join(output_dir, "adapter_info.json"), "w") as f:
             json.dump(adapter_info, f, indent=2)
+
+        # 5) Backward-compat: on the **final** user-invoked save (not on each
+        #    periodic checkpoint), also emit the legacy ``combined/`` bundle
+        #    so existing consumers (e.g. ``evaluate_model.py``) still work.
+        if not _internal_call:
+            combined_dir = os.path.join(output_dir, "combined")
+            os.makedirs(combined_dir, exist_ok=True)
+            print(f"Saving combined model (SFT + policy) to: {combined_dir}")
+            model.save_pretrained(
+                combined_dir,
+                selected_adapters=[self._ref_adapter_name, self._policy_adapter_name],
+                safe_serialization=True,
+            )
 
     def _reward_output_to_scalars_and_components(
         self, output_reward_func: list, device: torch.device
@@ -1596,12 +1687,183 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 
         return prompt_ids, completion_ids, logprobs, extra_fields
 
-from pathlib import Path
-
-
 # ──────────────────────────────────────────────────────────────────────────
 # Utility: load a checkpoint saved by DualAdapterGRPOTrainer
 # ──────────────────────────────────────────────────────────────────────────
+
+def _resolve_dual_adapter_dirs(
+    checkpoint_dir: str | Path,
+) -> tuple[Path, Path, str] | None:
+    """Locate the reference/ and policy/ adapter directories inside a checkpoint.
+
+    Supports two layouts:
+
+    * **New** (produced by the current :meth:`DualAdapterGRPOTrainer.save_model`)
+      ::
+
+          checkpoint-N/reference/
+          checkpoint-N/policy/
+
+    * **Legacy** (produced by earlier versions that only wrote ``combined/``)
+      ::
+
+          checkpoint-N/combined/reference/
+          checkpoint-N/combined/policy/
+
+    Returns
+    -------
+    ``(ref_dir, policy_dir, layout)`` where ``layout`` is ``"new"`` or
+    ``"legacy"``, or *None* if no dual-adapter layout is found.
+    """
+    p = Path(checkpoint_dir)
+    candidates: list[tuple[Path, Path, str]] = [
+        (p / REFERENCE_ADAPTER_NAME, p / POLICY_ADAPTER_NAME, "new"),
+        (
+            p / "combined" / REFERENCE_ADAPTER_NAME,
+            p / "combined" / POLICY_ADAPTER_NAME,
+            "legacy",
+        ),
+    ]
+    for ref_dir, policy_dir, layout in candidates:
+        if (
+            (ref_dir / "adapter_config.json").exists()
+            and (policy_dir / "adapter_config.json").exists()
+        ):
+            return ref_dir, policy_dir, layout
+    return None
+
+
+def is_dual_adapter_checkpoint(checkpoint_dir: str | Path) -> bool:
+    """Return *True* iff *checkpoint_dir* looks like a dual-adapter GRPO save.
+
+    Recognises both the current layout (``reference/`` + ``policy/`` at the top
+    level) and the legacy layout (``combined/reference/`` + ``combined/policy/``).
+    See :func:`_resolve_dual_adapter_dirs` for details.
+    """
+    return _resolve_dual_adapter_dirs(checkpoint_dir) is not None
+
+
+def load_dual_adapter_checkpoint(
+    checkpoint_dir: str | Path,
+    device_map: str | dict = "auto",
+):
+    """Load a GRPO checkpoint back as a training-ready dual-adapter model.
+
+    Intended for crash recovery (``--resume_from <grpo_ckpt> --resume_training_state``):
+    rebuilds a :class:`PeftModel` with both the frozen ``reference`` (SFT) adapter
+    and the trainable ``policy`` adapter named and configured exactly as they
+    were at save time, so :class:`DualAdapterGRPOTrainer.__init__` detects the
+    already-dual state and skips re-creating the policy.
+
+    Parameters
+    ----------
+    checkpoint_dir : str | Path
+        Directory produced by :meth:`DualAdapterGRPOTrainer.save_model`
+        (e.g. ``output_dir/checkpoint-20/``).  Must contain
+        ``reference/`` and ``policy/`` subdirectories — use
+        :func:`is_dual_adapter_checkpoint` to check first.
+    device_map : str | dict
+        Forwarded to :func:`model_utils.load_quantised_model`.
+
+    Returns
+    -------
+    (PeftModel, AutoTokenizer)
+        Model has both adapters loaded; active adapter is ``policy``.
+    """
+    from transformers import AutoTokenizer
+    from peft import prepare_model_for_kbit_training
+    from model_utils import load_quantised_model
+
+    checkpoint_dir = Path(checkpoint_dir)
+    resolved = _resolve_dual_adapter_dirs(checkpoint_dir)
+    if resolved is None:
+        raise FileNotFoundError(
+            f"'{checkpoint_dir}' is not a dual-adapter checkpoint. "
+            f"Expected either top-level '{REFERENCE_ADAPTER_NAME}/' + "
+            f"'{POLICY_ADAPTER_NAME}/' subdirectories (new layout) or "
+            f"'combined/{REFERENCE_ADAPTER_NAME}/' + 'combined/{POLICY_ADAPTER_NAME}/' "
+            f"(legacy layout), each with adapter_config.json."
+        )
+    ref_dir, policy_dir, layout = resolved
+    print(
+        f"[load_dual_adapter_checkpoint] Detected '{layout}' dual-adapter layout "
+        f"(reference: {ref_dir}, policy: {policy_dir})"
+    )
+
+    # ------------------------------------------------------------------
+    # Migrate legacy layout: copy policy's adapter_config.json +
+    # adapter_model.safetensors to the TOP LEVEL of the checkpoint.  The
+    # HuggingFace Trainer's ``_load_from_checkpoint`` — invoked when
+    # ``trainer.train(resume_from_checkpoint=...)`` runs — looks for those
+    # two files at the root of the checkpoint directory.  Without them the
+    # Trainer would either fail or silently skip the adapter reload.
+    # One-shot, idempotent, safe to run every time.
+    # ------------------------------------------------------------------
+    is_distributed = (
+        torch.distributed.is_available() and torch.distributed.is_initialized()
+    )
+    is_main = not is_distributed or torch.distributed.get_rank() == 0
+    if is_main:
+        for fname in (
+            "adapter_config.json",
+            "adapter_model.safetensors",
+            "adapter_model.bin",
+        ):
+            src = policy_dir / fname
+            dst = checkpoint_dir / fname
+            if src.exists() and not dst.exists():
+                try:
+                    shutil.copyfile(src, dst)
+                    print(
+                        f"[load_dual_adapter_checkpoint] Copied {fname} to "
+                        f"top-level checkpoint dir (for HF Trainer compat)."
+                    )
+                except OSError as exc:
+                    print(
+                        f"[load_dual_adapter_checkpoint] Warning: could not "
+                        f"copy {fname} to top level: {exc}. HF Trainer may "
+                        f"fail to auto-reload the adapter — weights are still "
+                        f"correct because they were loaded manually above."
+                    )
+    if is_distributed:
+        torch.distributed.barrier()
+
+    with open(ref_dir / "adapter_config.json", "r") as f:
+        adapter_config = json.load(f)
+    base_model_name = adapter_config.get("base_model_name_or_path")
+    if not base_model_name:
+        raise ValueError(
+            f"base_model_name_or_path missing from {ref_dir / 'adapter_config.json'}"
+        )
+
+    print(f"[load_dual_adapter_checkpoint] Base model: {base_model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    if not tokenizer.eos_token:
+        tokenizer.add_special_tokens({"eos_token": "</s>"})
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    base_model = load_quantised_model(base_model_name, device_map=device_map)
+    base_model = prepare_model_for_kbit_training(
+        base_model, use_gradient_checkpointing=True,
+    )
+
+    print(f"[load_dual_adapter_checkpoint] Loading frozen reference adapter from: {ref_dir}")
+    model = PeftModel.from_pretrained(
+        base_model,
+        ref_dir.as_posix(),
+        adapter_name=REFERENCE_ADAPTER_NAME,
+        is_trainable=False,
+    )
+    print(f"[load_dual_adapter_checkpoint] Loading trainable policy adapter from: {policy_dir}")
+    model.load_adapter(
+        policy_dir.as_posix(),
+        adapter_name=POLICY_ADAPTER_NAME,
+        is_trainable=True,
+    )
+    model.set_adapter(POLICY_ADAPTER_NAME)
+    return model, tokenizer
+
 
 def load_dual_adapter_model(
     adapter: Path,

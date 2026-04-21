@@ -544,7 +544,11 @@ def train_with_grpo(
     # trl.GRPOTrainer (and its vllm dependency) during SFT-only runs.
     from trl import GRPOConfig
     from tool_calling_grpo_trainer import ToolCallingGRPOTrainer
-    from dual_adapter_grpo_trainer import DualAdapterGRPOTrainer
+    from dual_adapter_grpo_trainer import (
+        DualAdapterGRPOTrainer,
+        is_dual_adapter_checkpoint,
+        load_dual_adapter_checkpoint,
+    )
 
     # Determine device_map: per-GPU for DDP, "auto" otherwise
     device_map = _get_device_map(use_ddp)
@@ -561,25 +565,43 @@ def train_with_grpo(
 
     # Load model and tokenizer
     if resume_from:
-        print(f"Resuming GRPO training from SFT checkpoint: {resume_from}")
-        if use_unsloth:
-            model, tokenizer = load_unsloth_model_from_adapter(resume_from, max_seq_length=max_model_len, fast_inference=True, device_map=device_map)
-        else:
-            model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
-
-        if use_dual_adapter:
-            print("Using dual-adapter mode (DualAdapterGRPOTrainer)")
-            print("  - SFT adapter will be kept isolated (no merging)")
-            print("  - Reference model: SFT adapter only")
-            print("  - Policy model: new policy adapter")
+        # GRPO → GRPO resume: the checkpoint already contains BOTH the frozen
+        # SFT reference adapter AND the trained policy adapter.  Detect that
+        # layout and reload both so the DualAdapterGRPOTrainer can pick up
+        # where it left off without re-initialising the policy from the
+        # reference (which would discard all GRPO progress).
+        is_grpo_ckpt = use_dual_adapter and is_dual_adapter_checkpoint(resume_from)
+        if is_grpo_ckpt:
+            print(f"Resuming GRPO training from dual-adapter checkpoint: {resume_from}")
+            print("  - Reference (frozen SFT) adapter: loaded from reference/")
+            print("  - Policy (trainable) adapter: loaded from policy/")
+            if use_unsloth:
+                print("  - Note: unsloth is not used when reloading dual-adapter checkpoints")
+            model, tokenizer = load_dual_adapter_checkpoint(resume_from, device_map=device_map)
             peft_config_for_trainer = None
-            policy_lora_config = lora_config
-        else:
-            print("Using standard mode (GRPOTrainer with merge_and_unload)")
-            print("  - WARNING: SFT adapter will be merged into base weights")
-            print("  - This may cause precision loss with 4-bit quantization")
-            peft_config_for_trainer = lora_config
+            # Signal to DualAdapterGRPOTrainer: adapters are already set up.
             policy_lora_config = None
+        else:
+            # Transition SFT → GRPO: only a single (SFT) adapter is on disk.
+            print(f"Resuming GRPO training from SFT checkpoint: {resume_from}")
+            if use_unsloth:
+                model, tokenizer = load_unsloth_model_from_adapter(resume_from, max_seq_length=max_model_len, fast_inference=True, device_map=device_map)
+            else:
+                model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
+
+            if use_dual_adapter:
+                print("Using dual-adapter mode (DualAdapterGRPOTrainer)")
+                print("  - SFT adapter will be kept isolated (no merging)")
+                print("  - Reference model: SFT adapter only")
+                print("  - Policy model: new policy adapter")
+                peft_config_for_trainer = None
+                policy_lora_config = lora_config
+            else:
+                print("Using standard mode (GRPOTrainer with merge_and_unload)")
+                print("  - WARNING: SFT adapter will be merged into base weights")
+                print("  - This may cause precision loss with 4-bit quantization")
+                peft_config_for_trainer = lora_config
+                policy_lora_config = None
     else:
         if use_unsloth:
             model, tokenizer = load_unsloth_model(model_name)
@@ -652,7 +674,7 @@ def train_with_grpo(
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=2e-6,
+        learning_rate=2e-5,
         max_steps=max_steps,
         logging_steps=1,
         save_steps=10,
@@ -660,6 +682,9 @@ def train_with_grpo(
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to=report_to,
+        lr_scheduler_type="cosine",
+        lr_scheduler_kwargs={'num_cycles': 0.4},
+        warmup_steps=10,
         # GRPO-specific options
         loss_type="dapo", # "grpo", "dr_grpo", "dapo", "bnpo", "cispo", default is "dapo"
         num_generations=max(num_generations, 2),
