@@ -676,7 +676,7 @@ def train_with_grpo(
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=2e-5,
         max_steps=max_steps,
-        logging_steps=1,
+        logging_steps=5,
         save_steps=10,
         bf16=True,
         gradient_checkpointing=True,
@@ -694,6 +694,17 @@ def train_with_grpo(
         vllm_mode=vllm_mode,
         vllm_server_base_url=vllm_server_url,
         importance_sampling_level="sequence", # "token" or "sequence" : sequence provides more stable training and better alignment with sequence-level rewards
+        # Whether to compute importance sampling ratios at the `"token"` or `"sequence"` level.
+        # `"token"`: keeps raw per-token log-probability ratios. 
+        # `"sequence"`: averages them across valid tokens into a single ratio per sequence — generally more stable (see GSPO paper).
+        scale_rewards=False, 
+        # - `True` or `"group"` (default): rewards are scaled by the standard deviation within each group, ensuring unit variance within a group.
+        # - `"batch"`: rewards are scaled by the standard deviation across the entire batch
+        # - `False` or `"none"`: no scaling is applied. The [Dr. GRPO paper] recommends not scaling rewards, as scaling by the standard deviation introduces a question-level difficulty bias.
+        # Logging options
+        log_completions=True,
+        num_completions_to_print=10,
+        log_unique_prompts=True,
     )
 
     shared_callbacks = [
