@@ -1019,6 +1019,19 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     tool_call = tool_calls[i]
                     tool_name = tool_call.get("name")
                     tool_args = tool_call.get("arguments", {})
+                    if isinstance(tool_args, str):
+                        try:
+                            tool_args = json.loads(tool_args)
+                        except json.JSONDecodeError:
+                            tool_args = None
+                    if not isinstance(tool_args, dict):
+                        tool_failure_count += 1
+                        result = f"Tool execution failed: invalid 'arguments' (expected object, got {type(tool_call.get('arguments')).__name__})"
+                        tool_message = {"role": "tool", "name": tool_name, "content": str(result)}
+                        prompt_completion_tools[i].append(tool_message)
+                        if isinstance(completions[idx], list):
+                            completions[idx].append(tool_message)
+                        continue
                     tool_args["netlist"] = ToolHelper.get_netlist(prompts[idx][1]["content"])
 
                     if tool_name in self.tool_functions:
