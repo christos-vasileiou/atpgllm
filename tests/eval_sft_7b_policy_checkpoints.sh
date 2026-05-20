@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Evaluate policy LoRA checkpoints under sft_7b_exper2 with pass@k (vLLM, TP=4).
+# Evaluate policy LoRA checkpoints under sft_7b_exper2 with pass@k (vLLM, TP auto).
 #
 # Usage:
 #   ./eval_sft_7b_policy_checkpoints.sh
@@ -7,7 +7,7 @@
 #
 # Optional:
 #   DRY_RUN=1  — print commands only
-#   CUDA_VISIBLE_DEVICES=0,1,2,3  — must expose 4 GPUs for tp_size=4 (default: unset, use all visible)
+#   CUDA_VISIBLE_DEVICES=0,1,2,3  — tp_size = number of listed devices; if unset, all GPUs from nvidia-smi -L
 #   EVAL_PROMPT_BATCH_SIZE=8     — fused prompt batch for evaluate_model.py (default: 8)
 #   GENERATION_MICRO_BATCH_SIZE=8 — HF backend only; passed through for consistency (default: 8)
 #   GPU_MEMORY_UTILIZATION=0.55  — vLLM fraction of VRAM to reserve (default: 0.55; raise if GPUs are idle)
@@ -24,6 +24,22 @@ DRY_RUN="${DRY_RUN:-0}"
 EVAL_PROMPT_BATCH_SIZE="${EVAL_PROMPT_BATCH_SIZE:-16}"
 GENERATION_MICRO_BATCH_SIZE="${GENERATION_MICRO_BATCH_SIZE:-16}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
+
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  IFS=',' read -ra _TP_CUDA_DEVS <<< "$CUDA_VISIBLE_DEVICES"
+  TP_SIZE="${#_TP_CUDA_DEVS[@]}"
+else
+  if ! command -v nvidia-smi &>/dev/null; then
+    echo "error: CUDA_VISIBLE_DEVICES unset and nvidia-smi not in PATH; set CUDA_VISIBLE_DEVICES or install drivers" >&2
+    exit 1
+  fi
+  TP_SIZE=$(nvidia-smi -L 2>/dev/null | wc -l)
+  TP_SIZE="${TP_SIZE//[[:space:]]/}"
+fi
+if [[ -z "$TP_SIZE" || "$TP_SIZE" -lt 1 ]]; then
+  echo "error: could not determine GPU count for tp_size (got: ${TP_SIZE:-empty})" >&2
+  exit 1
+fi
 
 if [[ ! -f "$EVAL_SCRIPT" ]]; then
   echo "error: evaluate_model.py not found at $EVAL_SCRIPT" >&2
@@ -48,7 +64,7 @@ fi
 echo "Experiment root: $EXP_ROOT"
 echo "Checkpoints: ${CHECKPOINTS[*]}"
 echo "Output dir:    $EVAL_RESULTS_DIR"
-echo "tp_size:       4 (use 4 visible GPUs)"
+echo "tp_size:       $TP_SIZE  (from CUDA_VISIBLE_DEVICES if set, else nvidia-smi -L)"
 echo "prompt_batch:  $EVAL_PROMPT_BATCH_SIZE  (EVAL_PROMPT_BATCH_SIZE)"
 echo "gpu_mem_util:  $GPU_MEMORY_UTILIZATION  (GPU_MEMORY_UTILIZATION)"
 echo ""
@@ -65,7 +81,7 @@ for name in "${CHECKPOINTS[@]}"; do
     python "$EVAL_SCRIPT"
     --adapter "$policy"
     --backend vllm
-    --tp_size 4
+    --tp_size "$TP_SIZE"
     --gpu_memory_utilization "$GPU_MEMORY_UTILIZATION"
     --n 16
     --k 1 2 4 8 16

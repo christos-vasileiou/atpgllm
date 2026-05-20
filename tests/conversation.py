@@ -210,6 +210,81 @@ class ConversationExample:
     messages: List[Dict[str, str]]  # list of {"role": ..., "content": ...}
 
     @staticmethod
+    def _prepare_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Derive placeholders and formatted system/user strings (mutates *record*)."""
+        fault = record.get('fault', '')
+        if fault:
+            fault_match = FAULT_PATTERN.match(fault)
+            if fault_match:
+                fault_value = int(fault_match.group(2))
+                fault_net = fault_match.group(3).strip()
+
+                record['fault_net'] = fault_net
+                record['fault_model_short'] = f"SA{fault_value}"
+                record['fault_model_long'] = f"stuck-at-{fault_value}"
+                record['excitation_value'] = str(1 - fault_value)
+
+        expected_output_dict = json.loads(record.get('expected_output', '{}'))
+        record['primary_observation_nets'] = compact_signal_tokens(
+            list(expected_output_dict.keys())
+        )
+
+        input_vector_dict = json.loads(record.get('input_vector', '{}'))
+        record['input_vector_json'] = ", ".join(
+            f"{net}: {value}" for net, value in input_vector_dict.items()
+        )
+        record['expected_output_json'] = ", ".join(
+            f"{net}: {value}" for net, value in expected_output_dict.items()
+        )
+        record['input_vector'] = compact_binary_assignment_dict(input_vector_dict)
+        record['expected_output'] = compact_binary_assignment_dict(expected_output_dict)
+
+        record['propagation_gates'] = compact_signal_list(
+            record.get('fault_propagation_gates', '')
+        )
+
+        backtrack_tokens = _parse_csv_tokens(record.get('backtrack_nets', ''))
+        input_keys = set(input_vector_dict.keys())
+        controlling_tokens = [
+            tok for tok in backtrack_tokens if tok in input_keys
+        ]
+        record['primary_controlling_nets'] = compact_signal_tokens(
+            controlling_tokens
+        )
+        record['non_controlling_nets'] = compact_signal_tokens(
+            backtrack_tokens
+        )
+
+        system_content = record.get("system_content", "")
+        user_content = record.get("user_content", "")
+
+        convert_netlist_to_json_payload(record)
+
+        system_content = system_content.format(**record)
+        user_content = user_content.format(**record)
+
+        return {
+            "system_content": system_content,
+            "user_content": user_content,
+            "input_vector_dict": input_vector_dict,
+            "expected_output_dict": expected_output_dict,
+            "fault": fault,
+        }
+
+    @staticmethod
+    def prompt_messages_from_record(
+        record: Dict[str, Any], use_tools: bool = False,
+    ) -> List[Dict[str, str]]:
+        """System + user messages only (for prompt-length checks without full SFT format)."""
+        prep = ConversationExample._prepare_record(record)
+        messages: List[Dict[str, str]] = []
+        if prep["system_content"]:
+            messages.append({"role": "system", "content": prep["system_content"]})
+        if prep["user_content"]:
+            messages.append({"role": "user", "content": prep["user_content"]})
+        return messages
+
+    @staticmethod
     def from_record(record: Dict[str, Any], use_tools: bool = False) -> "ConversationExample":
         """
         Create a ConversationExample from a dataset record.  This method
@@ -251,76 +326,16 @@ class ConversationExample:
         13. non_controlling_nets <- from 'backtrack_nets' (sensitizing inputs)
         14. snapshot            <- from 'snapshot'
         """
-        
-        # =================================================================
-        # Parse fault string to derive fault-related placeholders
-        # Fault format: "sa0 net_name" or "sa1 net_name"
-        # =================================================================
-        fault = record.get('fault', '')
-        if fault:
-            fault_match = FAULT_PATTERN.match(fault)
-            if fault_match:
-                fault_value = int(fault_match.group(2))  # 0 or 1
-                fault_net = fault_match.group(3).strip()  # net name
+        prep = ConversationExample._prepare_record(record)
+        system_content = prep["system_content"]
+        user_content = prep["user_content"]
+        input_vector_dict = prep["input_vector_dict"]
+        expected_output_dict = prep["expected_output_dict"]
+        fault = prep["fault"]
 
-                record['fault_net'] = fault_net
-                record['fault_model_short'] = f"SA{fault_value}"  # "SA0" or "SA1"
-                record['fault_model_long'] = f"stuck-at-{fault_value}"  # "stuck-at-0" or "stuck-at-1"
-                # To excite a SA0 fault, drive the net to 1 (opposite of stuck value)
-                # To excite a SA1 fault, drive the net to 0 (opposite of stuck value)
-                record['excitation_value'] = str(1 - fault_value)
-
-        # =================================================================
-        # Parse JSON fields and derive additional placeholders
-        # =================================================================
-        # Parse expected_output to get primary_observation_nets (output net names)
-        expected_output_dict = json.loads(record.get('expected_output', '{}'))
-        record['primary_observation_nets'] = compact_signal_tokens(
-            list(expected_output_dict.keys())
-        )
-
-        # Format vectors as "net: value, net: value, ..."
-        input_vector_dict = json.loads(record.get('input_vector', '{}'))
-        record['input_vector_json'] = ", ".join(f"{net}: {value}" for net, value in input_vector_dict.items())
-        record['expected_output_json'] = ", ".join(f"{net}: {value}" for net, value in expected_output_dict.items())
-        record['input_vector'] = compact_binary_assignment_dict(input_vector_dict)
-        record['expected_output'] = compact_binary_assignment_dict(expected_output_dict)
-
-        # =================================================================
-        # Map stored field names to template placeholder names
-        # =================================================================
-        # propagation_gates: gates whose outputs are on the fault propagation path
-        record['propagation_gates'] = compact_signal_list(
-            record.get('fault_propagation_gates', '')
-        )
-
-        # primary_controlling_nets & non_controlling_nets: sensitizing inputs
-        # Both map to backtrack_nets (the inputs that control fault propagation)
-        backtrack_tokens = _parse_csv_tokens(record.get('backtrack_nets', ''))
-        input_keys = set(input_vector_dict.keys())
-        controlling_tokens = [
-            tok for tok in backtrack_tokens if tok in input_keys
-        ]
-        record['primary_controlling_nets'] = compact_signal_tokens(
-            controlling_tokens
-        )
-        record['non_controlling_nets'] = compact_signal_tokens(
-            backtrack_tokens
-        )
-
-        # Extract the raw fields
-        system_content = record.get("system_content", "")
-        user_content = record.get("user_content", "")
         reasoning_content = record.get("reasoning_content", "")
         answer_content = record.get("answer_content", "")
         snapshot = record.get("snapshot", "")
-
-        # Convert the netlist to a json payload including the doc_id and the netlist content
-        convert_netlist_to_json_payload(record)
-
-        # Format the system, user and answer content with the record
-        system_content = system_content.format(**record)
-        user_content = user_content.format(**record)
 
         # Lazy replacement of the placeholders
         answer_content = answer_content.replace('input_vector', 'input_vector_json')

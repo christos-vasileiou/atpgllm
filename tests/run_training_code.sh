@@ -8,7 +8,7 @@
 #SBATCH --mem=128G
 #SBATCH --partition=h100
 #SBATCH --gres=gpu:4
-#SBATCH --reservation=vasileoiou
+#SBATCH --reservation=vasileiou
 
 # Export the exact path of the Slurm log so Python can find it
 export SLURM_LOG_FILE="jobs/training_${SLURM_JOB_ID}.out"
@@ -93,6 +93,16 @@ fi
 # Default METHOD to 'sft' if not specified
 METHOD=${METHOD:-sft}
 
+# When DRY_RUN=True, print the commands that would be executed and skip
+# launching the vLLM server and the training process.
+DRY_RUN=${DRY_RUN:-False}
+if [ "$DRY_RUN" == "True" ]; then
+    echo "=============================================="
+    echo "DRY RUN MODE (DRY_RUN=True)"
+    echo "Commands will be printed but NOT executed."
+    echo "=============================================="
+fi
+
 # MODEL is required for SFT, optional for GRPO (which can resume from checkpoint)
 if [ -z "$MODEL" ] && [ "$METHOD" != "grpo" ]; then
     echo "ERROR: MODEL environment variable is not set!"
@@ -101,7 +111,7 @@ if [ -z "$MODEL" ] && [ "$METHOD" != "grpo" ]; then
 fi
 if [ "$METHOD" == "sft" ]; then
     MODEL=${MODEL:-Qwen/Qwen2.5-7B-Instruct}
-    TRAIN_DATASET=${TRAIN_DATASET:-chrivasileiou/asap7-language-of-test}
+    TRAIN_DATASET=${TRAIN_DATASET:-chrivasileiou/asap7-language-of-test-v2}
     OUTPUT_DIR=${OUTPUT_DIR:-sft_finetuned_model}
     RESUME_FROM=${RESUME_FROM:-}
     RESUME_TRAINING_STATE=${RESUME_TRAINING_STATE:-False}
@@ -110,26 +120,18 @@ if [ "$METHOD" == "sft" ]; then
     MAX_STEPS=${MAX_STEPS:-50}
     REPORT_TO=${REPORT_TO:-wandb}
     USE_DUAL_ADAPTER=${USE_DUAL_ADAPTER:-False}
-    # SFT does not need a vLLM engine during the training loop itself.
-    # The SFT stopping callback *can* use vLLM for faster validation,
-    # but on MIG instances (~12 GB) there is not enough VRAM to host
-    # both the training model and a vLLM engine (KV cache = 0 GB).
-    # Default to False; override with USE_VLLM=True for large GPUs.
-    # When USE_VLLM=True, start a persistent vLLM server on a spare GPU
-    # *before* launching training with dynamic LoRA loading enabled:
-    #   VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
-    #       CUDA_VISIBLE_DEVICES=<gpu> vllm serve <model> \
-    #       --enable-lora --max-lora-rank 64 --port 8000
     USE_VLLM=${USE_VLLM:-False}
     VLLM_MODE=${VLLM_MODE:-server}
     PORT=${PORT:-8002}
     MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
     MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
-    USE_UNSLOTH=${USE_UNSLOTH:-$(python -c "import unsloth" 2>/dev/null && echo True || echo False)}
-    USE_DDP=${USE_DDP:-True}
+    SKIP_BUFFER_SIZE=${SKIP_BUFFER_SIZE:-0}
+    ASSISTANT_ONLY_LOSS=${ASSISTANT_ONLY_LOSS:-True}
+    USE_UNSLOTH=${USE_UNSLOTH:-False}
+    USE_DDP=${USE_DDP:-False}
 elif [ "$METHOD" == "grpo" ]; then
     MODEL=${MODEL:-}
-    TRAIN_DATASET=${TRAIN_DATASET:-chrivasileiou/asap7-language-of-test}
+    TRAIN_DATASET=${TRAIN_DATASET:-chrivasileiou/asap7-language-of-test-v2}
     OUTPUT_DIR=${OUTPUT_DIR:-grpo_finetuned_model}
     RESUME_FROM=${RESUME_FROM:-sft_finetuned_model/checkpoint-150}
     RESUME_TRAINING_STATE=${RESUME_TRAINING_STATE:-False}
@@ -153,8 +155,8 @@ elif [ "$METHOD" == "grpo" ]; then
 fi
 
 # LoRA hyper-parameters (read by training_code.py via environment / argparse defaults)
-LORA_RANK=${LORA_RANK:-8}
-LORA_ALPHA=${LORA_ALPHA:-16}
+LORA_RANK=${LORA_RANK:-256}
+LORA_ALPHA=${LORA_ALPHA:-512}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-}
 export LORA_RANK LORA_ALPHA LORA_TARGET_MODULES
 
@@ -306,6 +308,15 @@ build_cmd_args() {
         CMD_ARGS+=(--use_unsloth)
     fi
 
+    # SFT only: assistant-only loss (mask system/user/tool-response tokens)
+    if [ "$METHOD" == "sft" ]; then
+        if [ -n "$ASSISTANT_ONLY_LOSS" ] && [ "$ASSISTANT_ONLY_LOSS" == "False" ]; then
+            CMD_ARGS+=(--no-assistant_only_loss)
+        else
+            CMD_ARGS+=(--assistant_only_loss)
+        fi
+    fi
+
     # Add --resume_from only if it's set and not "None"
     if [ -n "$RESUME_FROM" ] && [ "$RESUME_FROM" != "None" ]; then
         CMD_ARGS+=(--resume_from "$RESUME_FROM")
@@ -321,13 +332,13 @@ build_cmd_args() {
     CMD_ARGS+=(
         --max_model_len "$MAX_MODEL_LEN"
         --max_prompt_length "$MAX_PROMPT_LENGTH"
+        --skip_buffer_size "${SKIP_BUFFER_SIZE:-0}"
     )
 
     # Add GRPO-specific arguments only for GRPO method
     if [ "$METHOD" == "grpo" ]; then
         CMD_ARGS+=(
             --buffer_size "$BUFFER_SIZE"
-            --skip_buffer_size "${SKIP_BUFFER_SIZE:-0}"
             --num_generations "$NUM_GENERATIONS"
             --steps_per_generation "$STEPS_PER_GENERATION"
             --max_completion_length "$MAX_COMPLETION_LENGTH"
@@ -362,10 +373,13 @@ build_cmd_args() {
     echo "LORA_RANK: $LORA_RANK"
     echo "LORA_ALPHA: $LORA_ALPHA"
     echo "LORA_TARGET_MODULES: ${LORA_TARGET_MODULES:-'(default: q/k/v/o_proj + gate/up/down_proj)'}"
+    echo "SKIP_BUFFER_SIZE: ${SKIP_BUFFER_SIZE:-0}"
+    if [ "$METHOD" == "sft" ]; then
+        echo "ASSISTANT_ONLY_LOSS: ${ASSISTANT_ONLY_LOSS:-True}"
+    fi
     if [ "$METHOD" == "grpo" ]; then
         echo "--- GRPO-specific ---"
         echo "BUFFER_SIZE: $BUFFER_SIZE"
-        echo "SKIP_BUFFER_SIZE: ${SKIP_BUFFER_SIZE:-0}"
         echo "NUM_GENERATIONS: $NUM_GENERATIONS"
         echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION"
         echo "MAX_COMPLETION_LENGTH: $MAX_COMPLETION_LENGTH"
@@ -448,39 +462,43 @@ if [ "$USE_VLLM" == "True" ] && [ "$VLLM_MODE" == "server" ]; then
         echo "MAX_COMPLETION_LENGTH: $MAX_COMPLETION_LENGTH"
         echo "=============================================="
         echo "Running: CUDA_VISIBLE_DEVICES=$VLLM_GPU trl vllm-serve --model $MODEL --port $PORT --gpu_memory_utilization $VLLM_GPU_MEM_UTIL --data-parallel-size $DATA_PARALLEL_SIZE --tensor-parallel-size $TENSOR_PARALLEL_SIZE --max-model-len $VLLM_MAX_MODEL_LEN &"
-        CUDA_VISIBLE_DEVICES=$VLLM_GPU \
-        trl vllm-serve \
-            --model $MODEL \
-            --port $PORT \
-            --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
-            --data-parallel-size "$DATA_PARALLEL_SIZE" \
-            --tensor-parallel-size $TENSOR_PARALLEL_SIZE \
-            --max-model-len "$VLLM_MAX_MODEL_LEN" \
-            --enable_prefix_caching True &
-        VLLM_PID=$!
-        echo "Waiting for TRL vLLM server to become ready (PID: $VLLM_PID)..."
+        if [ "$DRY_RUN" != "True" ]; then
+            CUDA_VISIBLE_DEVICES=$VLLM_GPU \
+            trl vllm-serve \
+                --model $MODEL \
+                --port $PORT \
+                --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
+                --data-parallel-size "$DATA_PARALLEL_SIZE" \
+                --tensor-parallel-size $TENSOR_PARALLEL_SIZE \
+                --max-model-len "$VLLM_MAX_MODEL_LEN" \
+                --enable_prefix_caching True &
+            VLLM_PID=$!
+            echo "Waiting for TRL vLLM server to become ready (PID: $VLLM_PID)..."
+        fi
         COUNT_VLLM_GPUS=$(echo "$VLLM_GPU" | tr ',' '\n' | wc -l)
         NUM_TRAIN_GPUS=$((${#GPU_ARRAY[@]} - $COUNT_VLLM_GPUS))
         TRAINING_GPUS=("${GPU_ARRAY[@]:0:$NUM_TRAIN_GPUS}")
         export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${TRAINING_GPUS[*]}")"
     fi
 
-    _vllm_timeout=1800
-    _vllm_elapsed=0
-    while ! curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; do
-        if ! kill -0 "$VLLM_PID" 2>/dev/null; then
-            echo "ERROR: TRL vLLM server process died unexpectedly."
-            exit 1
-        fi
-        if [ "$_vllm_elapsed" -ge "$_vllm_timeout" ]; then
-            echo "ERROR: TRL vLLM server did not become ready within ${_vllm_timeout}s."
-            kill "$VLLM_PID" 2>/dev/null || true
-            exit 1
-        fi
-        sleep 2
-        _vllm_elapsed=$((_vllm_elapsed + 2))
-    done
-    echo "$METHOD vLLM server is ready on port $PORT (took ~${_vllm_elapsed}s)."
+    if [ "$DRY_RUN" != "True" ]; then
+        _vllm_timeout=1800
+        _vllm_elapsed=0
+        while ! curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; do
+            if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+                echo "ERROR: TRL vLLM server process died unexpectedly."
+                exit 1
+            fi
+            if [ "$_vllm_elapsed" -ge "$_vllm_timeout" ]; then
+                echo "ERROR: TRL vLLM server did not become ready within ${_vllm_timeout}s."
+                kill "$VLLM_PID" 2>/dev/null || true
+                exit 1
+            fi
+            sleep 2
+            _vllm_elapsed=$((_vllm_elapsed + 2))
+        done
+        echo "$METHOD vLLM server is ready on port $PORT (took ~${_vllm_elapsed}s)."
+    fi
     echo "=============================================="
     echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES, TRAINING_GPUS: ${#TRAINING_GPUS[@]}, VLLM_GPU: $VLLM_GPU"
 fi
@@ -496,19 +514,27 @@ fi
 if [ "$USE_DDP" == "True" ]; then
     echo "Command: accelerate launch --multi_gpu --num_processes $NUM_GPUS --mixed_precision bf16 training_code.py ${CMD_ARGS[*]}"
     echo ""
-    accelerate launch \
-        --multi_gpu \
-        --num_processes $NUM_GPUS \
-        --mixed_precision bf16 \
-        training_code.py "${CMD_ARGS[@]}"
+    if [ "$DRY_RUN" != "True" ]; then
+        accelerate launch \
+            --multi_gpu \
+            --num_processes $NUM_GPUS \
+            --mixed_precision bf16 \
+            training_code.py "${CMD_ARGS[@]}"
+    fi
 else
     echo "Command: python training_code.py ${CMD_ARGS[*]}"
     echo ""
-    python training_code.py "${CMD_ARGS[@]}"
+    if [ "$DRY_RUN" != "True" ]; then
+        python training_code.py "${CMD_ARGS[@]}"
+    fi
 fi
 
 # Capture exit code
 EXIT_CODE=$?
+if [ "$DRY_RUN" == "True" ]; then
+    echo "DRY RUN: skipped training execution."
+    EXIT_CODE=0
+fi
 
 echo ""
 echo "=============================================="

@@ -544,6 +544,73 @@ def smart_sync_model_config(model, tokenizer):
 
 
 # =====================================================================
+# Chat template patching for assistant-only loss
+# =====================================================================
+
+def patch_qwen_chat_template_for_assistant_mask(tokenizer) -> bool:
+    """Inject ``{% generation %}`` markers into a Qwen2/2.5/3 chat template.
+
+    The stock Qwen2/2.5/3 ``chat_template`` does not wrap assistant blocks in
+    ``{% generation %} ... {% endgeneration %}``, which means
+    ``tokenizer.apply_chat_template(..., return_assistant_tokens_mask=True)``
+    returns an all-zero mask and ``SFTConfig(assistant_only_loss=True)`` is
+    unusable.  This helper patches the template in-place so that:
+
+    * user / system / tool turns are *not* in the generation block (loss = -100);
+    * the assistant role header ``<|im_start|>assistant\\n`` is *not* in the
+      block (it matches what ``add_generation_prompt=True`` emits at inference);
+    * everything the assistant actually emits — natural-language content,
+      ``<tool_call>{...}</tool_call>`` JSON, and the closing ``<|im_end|>``
+      newline — *is* in the block (loss is computed there).
+
+    Returns ``True`` if a patch was applied, ``False`` if the template already
+    had generation markers (no-op).  Raises ``RuntimeError`` if the template
+    structure doesn't match the known Qwen layout so the caller fails loudly
+    instead of silently training on every token.
+    """
+    tpl = tokenizer.chat_template or ""
+    if "{% generation %}" in tpl or "{%- generation %}" in tpl:
+        return False
+
+    new = tpl.replace(
+        '{%- if (message.role == "user") or (message.role == "system" and not loop.first) or (message.role == "assistant" and not message.tool_calls) %}\n'
+        "        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}",
+        '{%- if (message.role == "user") or (message.role == "system" and not loop.first) %}\n'
+        "        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}\n"
+        '    {%- elif message.role == "assistant" and not message.tool_calls %}\n'
+        "        {{- '<|im_start|>' + message.role + '\\n' }}\n"
+        "        {%- generation %}\n"
+        "        {{- message.content + '<|im_end|>' + '\\n' }}\n"
+        "        {%- endgeneration %}",
+    ).replace(
+        '{%- elif message.role == "assistant" %}\n'
+        "        {{- '<|im_start|>' + message.role }}\n"
+        "        {%- if message.content %}\n"
+        "            {{- '\\n' + message.content }}\n"
+        "        {%- endif %}",
+        '{%- elif message.role == "assistant" %}\n'
+        "        {{- '<|im_start|>' + message.role + '\\n' }}\n"
+        "        {%- generation %}\n"
+        "        {%- if message.content %}\n"
+        "            {{- message.content }}\n"
+        "        {%- endif %}",
+    ).replace(
+        "        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}",
+        "        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n        {%- endgeneration %}\n    {%- elif message.role == \"tool\" %}",
+    )
+
+    if new == tpl or new.count("{%- generation %}") != 2 or new.count("{%- endgeneration %}") != 2:
+        raise RuntimeError(
+            "patch_qwen_chat_template_for_assistant_mask: could not locate the "
+            "expected Qwen2/2.5/3 template patterns. Inspect "
+            "tokenizer.chat_template; the upstream template may have changed."
+        )
+
+    tokenizer.chat_template = new
+    return True
+
+
+# =====================================================================
 # Standard adapter loading (no unsloth)
 # =====================================================================
 
@@ -576,10 +643,14 @@ def load_model_from_adapter(
         The model with loaded LoRA adapters and the tokenizer.
     """
     adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
-    if not os.path.exists(adapter_config_path):
-        adapter_config_path = os.path.join(adapter_path, "combined", "policy", "adapter_config.json")
+    try:
         if not os.path.exists(adapter_config_path):
-            raise FileNotFoundError(f"Adapter config file not found: {adapter_config_path}")
+            adapter_config_path = os.path.join(adapter_path, "combined", "policy", "adapter_config.json")
+            if not os.path.exists(adapter_config_path):
+                raise FileNotFoundError(f"Adapter config file not found: {adapter_config_path}")
+    except FileNotFoundError:
+        print(f"Adapter config file not found: {adapter_config_path}")
+        return None, None
 
     with open(adapter_config_path, 'r') as f:
         adapter_config = json.load(f)
@@ -609,6 +680,21 @@ def load_model_from_adapter(
     base_model = prepare_model_for_kbit_training(
         base_model, use_gradient_checkpointing=True,
     )
+
+    # Sanitize adapter_config.json: strip keys that are not valid PEFT/LoRA
+    # parameters.  Older checkpoints may contain 'max_model_length' injected
+    # by ContextLengthHistogramCallback, which causes PeftModel.from_pretrained
+    # to crash with "LoraConfig.__init__() got an unexpected keyword argument".
+    _NON_PEFT_KEYS = {"max_model_length", "max_position_embeddings"}
+    _adapter_cfg_path = os.path.join(adapter_path, "adapter_config.json")
+    if os.path.exists(_adapter_cfg_path):
+        with open(_adapter_cfg_path, "r") as _f:
+            _cfg = json.load(_f)
+        _removed = {k: _cfg.pop(k) for k in _NON_PEFT_KEYS if k in _cfg}
+        if _removed:
+            with open(_adapter_cfg_path, "w") as _f:
+                json.dump(_cfg, _f, indent=2)
+            print(f"[load_model_from_adapter] Removed non-PEFT keys from adapter_config.json: {list(_removed.keys())}")
 
     print(f"Loading LoRA adapter from: {adapter_path}")
     model = PeftModel.from_pretrained(base_model, adapter_path, is_trainable=True)

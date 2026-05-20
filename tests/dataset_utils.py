@@ -11,31 +11,33 @@ GRPO training pipelines.
   **independent**: the stream pointer advances past ``skip_buffer_size``
   valid rows first, then up to ``buffer_size`` rows are collected for the
   buffer (skips do not count toward ``buffer_size``).
+* :func:`skip_streaming_dataset` — lazy skip on an already-formatted
+  stream (tests / legacy). Streaming SFT should pass ``skip_buffer_size``
+  into :func:`format_dataset_for_training` for the fast fused path.
+* :func:`filter_streaming_dataset_by_prompt_length` — drop SFT ``messages``
+  rows whose system+user prompt exceeds ``max_prompt_length`` tokens.
 * :func:`format_dataset_for_training` — convert raw records into the
   chat-prompt format expected by ``SFTTrainer`` or ``GRPOTrainer``.
 """
 
 from __future__ import annotations
 
+import copy
+import itertools
+import os
+import re
 import sys
-from typing import Optional, Literal
+import concurrent.futures
+from collections import deque
+from typing import Iterator, Literal, Optional
 
+import matplotlib.pyplot as plt
 from datasets import Dataset, IterableDataset
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from conversation import ConversationExample
 from tools import TOOLS
-import sys
-import itertools
-import concurrent.futures
-from typing import Optional, Literal
-from datasets import Dataset, IterableDataset
-from transformers import AutoTokenizer
-from tqdm.auto import tqdm
-
-import re
-import matplotlib.pyplot as plt
 
 # =====================================================================
 # Training mode enumeration
@@ -47,6 +49,286 @@ class TrainingMode:
     GRPO = "grpo"
 
 
+# Gate-count filter (matches format_dataset_for_training).
+_GATE_INGREDIENT = (
+    r"(?m)^(?!\s*(?:module|endmodule|input|output|inout|wire|wand|wor|tri|tri0|tri1|"
+    r"trireg|reg|logic|assign|parameter|localparam|specify|endspecify|genvar|generate|"
+    r"endgenerate|always|always_ff|always_comb|always_latch|initial|begin|end|if|else|"
+    r"case|endcase|for|while|repeat|forever)\b)\s*"
+    r"[^\s(]+\s+(?:\\\S+|[A-Za-z_][A-Za-z0-9_$]*)\s*\("
+)
+_GATE_REGEX = re.compile(_GATE_INGREDIENT)
+
+
+def _default_skip_num_workers() -> int:
+    n = os.cpu_count() or 8
+    return max(1, min(16, n))
+
+
+def _gate_filter_passes(record: dict) -> bool:
+    gates_cnt = len(_GATE_REGEX.findall(record["netlist"]))
+    return gates_cnt not in (1, 5, 84)
+
+
+def _format_sft_messages_record(record: dict, use_tools: bool) -> dict:
+    convo = ConversationExample.from_record(record, use_tools=use_tools)
+    out: dict = {"messages": convo.messages}
+    if use_tools:
+        out["tools"] = TOOLS
+    return out
+
+
+def _format_sft_messages_batch(records: list[dict], use_tools: bool) -> list[dict]:
+    formatted = []
+    for raw in records:
+        rec = copy.deepcopy(raw)
+        formatted.append(_format_sft_messages_record(rec, use_tools))
+    return formatted
+
+
+def _classify_sft_messages_batch(
+    batch: list[dict],
+    tokenizer: AutoTokenizer,
+    use_tools: bool,
+    max_prompt_length: Optional[int],
+) -> list[str]:
+    """Per-row status in stream order: ``gate``, ``length``, or ``ok``."""
+    statuses: list[str] = ["gate"] * len(batch)
+    tools = TOOLS if use_tools else None
+    candidates: list[tuple[int, list[dict]]] = []
+
+    for i, raw in enumerate(batch):
+        if not _gate_filter_passes(raw):
+            continue
+        rec = copy.deepcopy(raw)
+        try:
+            prompt_messages = ConversationExample.prompt_messages_from_record(
+                rec, use_tools=use_tools,
+            )
+        except Exception:
+            statuses[i] = "length"
+            continue
+        if not prompt_messages:
+            statuses[i] = "length"
+            continue
+        candidates.append((i, prompt_messages))
+
+    if not candidates or max_prompt_length is None:
+        for idx, _ in candidates:
+            statuses[idx] = "ok"
+        return statuses
+
+    prompt_texts = [
+        tokenizer.apply_chat_template(
+            msgs,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        for _, msgs in candidates
+    ]
+    encodings = tokenizer(
+        prompt_texts,
+        add_special_tokens=False,
+        truncation=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
+    )
+    for (idx, _), token_ids in zip(candidates, encodings["input_ids"]):
+        if len(token_ids) < max_prompt_length:
+            statuses[idx] = "ok"
+        else:
+            statuses[idx] = "length"
+    return statuses
+
+
+def _classify_sft_messages_batch_worker(
+    batch: list[dict],
+    tokenizer: AutoTokenizer,
+    use_tools: bool,
+    max_prompt_length: Optional[int],
+) -> list[str]:
+    return _classify_sft_messages_batch(batch, tokenizer, use_tools, max_prompt_length)
+
+
+def _sft_messages_stream(
+    raw_iter: Iterator[dict],
+    tokenizer: AutoTokenizer,
+    use_tools: bool,
+    max_prompt_length: Optional[int],
+    skip_count: int,
+    batch_size: int,
+    num_workers: int,
+) -> Iterator[dict]:
+    """Fused gate filter, prompt-length filter, optional skip, and SFT formatting."""
+    skip_count = int(skip_count)
+    batch_size = max(1, int(batch_size))
+    num_workers = max(1, int(num_workers))
+
+    skipped_valid = 0
+    skip_done = skip_count == 0
+    stats = {"raw": 0, "gate": 0, "length": 0, "skipped": 0, "yielded": 0}
+
+    skip_pbar = (
+        tqdm(
+            total=skip_count,
+            desc="[SFT] Skipping training examples",
+            unit="ex",
+            file=sys.stdout,
+        )
+        if skip_count > 0
+        else None
+    )
+
+    def format_records(records: list[dict]) -> list[dict]:
+        # Full SFT format stays on the main process to avoid pool deadlocks
+        # (classify jobs already occupy worker_pool during pipelined skip).
+        return _format_sft_messages_batch(records, use_tools)
+
+    def consume_classified(batch: list[dict], statuses: list[str]) -> Iterator[dict]:
+        nonlocal skipped_valid, skip_done
+        if not batch:
+            return
+        stats["raw"] += len(batch)
+        to_format: list[dict] = []
+        for raw, status in zip(batch, statuses):
+            if status == "gate":
+                stats["gate"] += 1
+                continue
+            if status == "length":
+                stats["length"] += 1
+                continue
+            if not skip_done:
+                skipped_valid += 1
+                stats["skipped"] += 1
+                if skip_pbar is not None:
+                    skip_pbar.update(1)
+                if skipped_valid >= skip_count:
+                    skip_done = True
+                    if skip_pbar is not None:
+                        skip_pbar.close()
+                    print(
+                        f"[SFT] Skip complete: {skipped_valid} training example(s) "
+                        f"(scanned {stats['raw']} raw row(s), "
+                        f"dropped gate={stats['gate']} length={stats['length']})."
+                    )
+                continue
+            to_format.append(raw)
+
+        if not to_format:
+            return
+
+        for ex in format_records(to_format):
+            stats["yielded"] += 1
+            yield ex
+
+    pending: deque = deque()
+    worker_pool: concurrent.futures.ProcessPoolExecutor | None = None
+    if num_workers > 1:
+        worker_pool = concurrent.futures.ProcessPoolExecutor(max_workers=num_workers)
+
+    def classify_batch(batch: list[dict]) -> list[str]:
+        if worker_pool is not None:
+            return worker_pool.submit(
+                _classify_sft_messages_batch_worker,
+                batch,
+                tokenizer,
+                use_tools,
+                max_prompt_length,
+            ).result()
+        return _classify_sft_messages_batch(
+            batch, tokenizer, use_tools, max_prompt_length,
+        )
+
+    try:
+        batch: list[dict] = []
+        for raw in raw_iter:
+            batch.append(raw)
+            if len(batch) < batch_size:
+                continue
+            if worker_pool is not None:
+                pending.append((batch, worker_pool.submit(
+                    _classify_sft_messages_batch_worker,
+                    batch,
+                    tokenizer,
+                    use_tools,
+                    max_prompt_length,
+                )))
+                if len(pending) > num_workers:
+                    b, fut = pending.popleft()
+                    yield from consume_classified(b, fut.result())
+            else:
+                yield from consume_classified(batch, classify_batch(batch))
+            batch = []
+
+        if batch:
+            if worker_pool is not None:
+                pending.append((batch, worker_pool.submit(
+                    _classify_sft_messages_batch_worker,
+                    batch,
+                    tokenizer,
+                    use_tools,
+                    max_prompt_length,
+                )))
+            else:
+                yield from consume_classified(batch, classify_batch(batch))
+
+        while pending:
+            b, fut = pending.popleft()
+            yield from consume_classified(b, fut.result())
+    finally:
+        if worker_pool is not None:
+            worker_pool.shutdown(wait=True)
+        if skip_pbar is not None:
+            skip_pbar.close()
+
+    if skip_count > 0 and skipped_valid < skip_count:
+        print(
+            f"WARNING: stream ended after skipping {skipped_valid} valid example(s); "
+            f"requested skip_count={skip_count}."
+        )
+
+
+def _streaming_sft_messages_dataset(
+    raw_dataset: IterableDataset,
+    tokenizer: AutoTokenizer,
+    use_tools: bool,
+    max_prompt_length: Optional[int],
+    skip_buffer_size: int,
+    skip_batch_size: int,
+    skip_num_workers: int,
+) -> IterableDataset:
+    """IterableDataset with fused filter/format/skip for streaming SFT ``messages``."""
+    skip_buffer_size = int(skip_buffer_size)
+    skip_batch_size = max(1, int(skip_batch_size))
+    skip_num_workers = max(1, int(skip_num_workers))
+
+    if skip_buffer_size > 0:
+        print(
+            f"[SFT] Fast stream pipeline: skip first {skip_buffer_size} training example(s) "
+            f"(batch_size={skip_batch_size}, num_workers={skip_num_workers}, "
+            "system+user-only checks during skip)."
+        )
+    elif max_prompt_length is not None:
+        print(
+            f"[SFT] Fast stream pipeline: batched prompt filter "
+            f"(batch_size={skip_batch_size}, num_workers={skip_num_workers})."
+        )
+
+    def _generator():
+        yield from _sft_messages_stream(
+            iter(raw_dataset),
+            tokenizer=tokenizer,
+            use_tools=use_tools,
+            max_prompt_length=max_prompt_length,
+            skip_count=skip_buffer_size,
+            batch_size=skip_batch_size,
+            num_workers=skip_num_workers,
+        )
+
+    return IterableDataset.from_generator(_generator)
+
+
 # =====================================================================
 # Dataset helpers
 # =====================================================================
@@ -54,22 +336,22 @@ class TrainingMode:
 def process_batch(batch: list, tokenizer: AutoTokenizer, unique_by: str, max_prompt_length: int) -> list:
     """Helper function to tokenize and filter a batch of examples."""
     texts = [ex[unique_by] for ex in batch]
-    
-    # Batched tokenization: This drops the GIL and multi-threads natively in Rust
+
     encodings = tokenizer(
-        texts, 
-        add_special_tokens=False,     # We only need the length, not special tokens
-        truncation=False,             # We want to measure the true length
-        return_attention_mask=False,  # Saves memory/compute
-        return_token_type_ids=False   # Saves memory/compute
+        texts,
+        add_special_tokens=False,
+        truncation=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
     )
-    
+
     valid_examples = []
     for ex, length in zip(batch, map(len, encodings["input_ids"])):
         if length < max_prompt_length:
             valid_examples.append(ex)
-            
+
     return valid_examples
+
 
 def buffer_streaming_dataset(
     streaming_dataset: IterableDataset,
@@ -235,7 +517,115 @@ def buffer_streaming_dataset(
     )
     return dataset
 
-def format_dataset_for_training(dataset, tokenizer: AutoTokenizer, training_mode: str):
+
+def skip_streaming_dataset(
+    dataset: IterableDataset,
+    skip_count: int = 0,
+) -> IterableDataset:
+    """Advance past the first ``skip_count`` examples in a streaming dataset.
+
+    Each skipped row is one example the trainer would otherwise consume
+    (after formatting and any upstream filters such as prompt-length).
+    Use when resuming SFT on the
+    same stream so training does not revisit samples from a prior run.
+
+    For SFT ``messages`` training, prefer passing ``skip_buffer_size`` into
+    :func:`format_dataset_for_training` (fast fused skip). This helper remains
+    for already-formatted iterables and tests.
+
+    Parameters
+    ----------
+    dataset : IterableDataset
+        Formatted training stream (e.g. output of
+        :func:`format_dataset_for_training`).
+    skip_count : int, default 0
+        Number of leading examples to drop. ``0`` returns ``dataset`` unchanged.
+    """
+    try:
+        skip_count = int(skip_count)
+    except (TypeError, ValueError) as e:
+        raise ValueError("skip_count must be an integer") from e
+    if skip_count < 0:
+        raise ValueError("skip_count must be >= 0")
+    if skip_count == 0:
+        return dataset
+    if not isinstance(dataset, IterableDataset):
+        raise TypeError(
+            f"skip_streaming_dataset requires an IterableDataset, got {type(dataset)!r}"
+        )
+    print(
+        f"[SFT] Warning: lazy .skip({skip_count}) on a formatted stream is slow. "
+        "Pass skip_buffer_size into format_dataset_for_training for the fast path."
+    )
+    return dataset.skip(skip_count)
+
+
+def extract_prompt_messages(messages: list[dict]) -> list[dict]:
+    """Return system + user turns only (exclude assistant / tool)."""
+    return [m for m in messages if m.get("role") not in ("assistant", "tool")]
+
+
+def count_prompt_tokens(
+    tokenizer: AutoTokenizer,
+    messages: list[dict],
+    *,
+    tools=None,
+    add_generation_prompt: bool = True,
+) -> int:
+    """Token length of the system+user prompt, aligned with GRPO prompt sizing."""
+    prompt_messages = extract_prompt_messages(messages)
+    prompt_text = tokenizer.apply_chat_template(
+        prompt_messages,
+        tools=tools,
+        add_generation_prompt=add_generation_prompt,
+        tokenize=False,
+    )
+    return len(tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
+
+
+def filter_streaming_dataset_by_prompt_length(
+    dataset: IterableDataset,
+    tokenizer: AutoTokenizer,
+    max_prompt_length: int,
+) -> IterableDataset:
+    """Drop ``messages`` examples whose system+user prompt is too long.
+
+    Keeps rows with ``count_prompt_tokens(...) < max_prompt_length`` (same
+    strict comparison as :func:`buffer_streaming_dataset` / GRPO).
+    """
+    try:
+        max_prompt_length = int(max_prompt_length)
+    except (TypeError, ValueError) as e:
+        raise ValueError("max_prompt_length must be an integer") from e
+    if max_prompt_length <= 0:
+        raise ValueError("max_prompt_length must be > 0")
+    if not isinstance(dataset, IterableDataset):
+        raise TypeError(
+            "filter_streaming_dataset_by_prompt_length requires an IterableDataset, "
+            f"got {type(dataset)!r}"
+        )
+
+    def passes(example: dict) -> bool:
+        tools = example.get("tools")
+        return count_prompt_tokens(tokenizer, example["messages"], tools=tools) < max_prompt_length
+
+    print(
+        f"[SFT] Filtering stream: keep examples with system+user prompt "
+        f"< {max_prompt_length} tokens (assistant / tool excluded)."
+    )
+    return dataset.filter(passes)
+
+
+def format_dataset_for_training(
+    dataset,
+    tokenizer: AutoTokenizer,
+    training_mode: str,
+    sft_format: Literal["messages", "text"] = "messages",
+    max_prompt_length: Optional[int] = None,
+    skip_buffer_size: int = 0,
+    skip_batch_size: int = 128,
+    skip_num_workers: Optional[int] = None,
+):
     """
     Convert a dataset of records into a format accepted by SFTTrainer or
     GRPOTrainer.
@@ -259,41 +649,118 @@ def format_dataset_for_training(dataset, tokenizer: AutoTokenizer, training_mode
         The tokenizer whose chat template will be applied.
     training_mode : str
         ``TrainingMode.SFT`` or ``TrainingMode.GRPO``.
+    sft_format : {"messages", "text"}
+        Only used when ``training_mode == TrainingMode.SFT``:
+
+        * ``"messages"`` (default) — emit a *conversational* dataset with
+          ``messages`` (and ``tools`` when applicable). Required for
+          ``SFTConfig(assistant_only_loss=True)``: SFTTrainer applies the
+          chat template internally and produces ``assistant_masks`` so that
+          loss is computed only on assistant tokens.
+        * ``"text"`` — emit a pre-rendered ``text`` field. Legacy
+          language-modeling format; loss is computed on every non-pad token
+          (system / user / tool responses included). Use only when reverting
+          to the old behavior for ablation.
+    max_prompt_length : int, optional
+        SFT ``messages`` only. After formatting, drop examples whose
+        system+user chat-template token length is ``>= max_prompt_length``.
+        Matches GRPO prompt sizing (see :func:`count_prompt_tokens`). Ignored
+        for ``sft_format="text"`` — see module docstring on the text path.
+    skip_buffer_size : int, default 0
+        Streaming SFT ``messages`` only. Skip this many training examples
+        (post gate filter and prompt-length filter) before yielding. Uses a
+        batched multiprocessing pipeline when ``skip_buffer_size > 0`` or when
+        ``max_prompt_length`` is set on a streaming dataset.
+    skip_batch_size : int, default 128
+        Raw rows per batch for the fast streaming SFT pipeline.
+    skip_num_workers : int, optional
+        Worker processes for batch classify/format. Default: ``min(16, cpu_count)``.
 
     Returns
     -------
     Dataset or IterableDataset
-        A dataset ready for ``SFTTrainer`` or ``GRPOTrainer``.  For SFT
-        the field is ``text``; for GRPO the field is ``prompt``.  Returns
-        the same type as the input dataset.
+        A dataset ready for ``SFTTrainer`` or ``GRPOTrainer``. For GRPO the
+        field is ``prompt``; for SFT it is ``messages`` or ``text`` per
+        ``sft_format``. Same iterable/eager type as the input dataset.
     """
-    import os
     is_streaming = isinstance(dataset, IterableDataset)
-
-    # Matches Verilog gate/module instantiations: <cell_type> <instance_name> ( ... )
-    # - instance_name may be a normal identifier or an escaped identifier (starts with '\')
-    # - escaped identifiers can contain '/', '*', '[', ']', etc. up to the first whitespace
-    GATE_INGREDIENT = r"(?m)^(?!\s*(?:module|endmodule|input|output|inout|wire|wand|wor|tri|tri0|tri1|trireg|reg|logic|assign|parameter|localparam|specify|endspecify|genvar|generate|endgenerate|always|always_ff|always_comb|always_latch|initial|begin|end|if|else|case|endcase|for|while|repeat|forever)\b)\s*" \
-                  r"[^\s(]+\s+(?:\\\S+|[A-Za-z_][A-Za-z0-9_$]*)\s*\("
-    regex_instances = re.compile(GATE_INGREDIENT)
-    def filter_fn(record):
-        gates_cnt = len(regex_instances.findall(record['netlist']))
-        return gates_cnt not in (1, 5, 84)
-    dataset = dataset.filter(filter_fn)
 
     use_tools = hasattr(tokenizer, 'chat_template') and tokenizer.chat_template and ('tools' in tokenizer.chat_template or 'tool' in tokenizer.chat_template)
 
-    if training_mode == TrainingMode.SFT:
-        def format_fn(record):
-            convo = ConversationExample.from_record(record, use_tools=use_tools)
-            prompt = tokenizer.apply_chat_template(
-                convo.messages, tokenize=False, tools=TOOLS if use_tools else None,
-            )
-            return {"text": prompt}
+    if skip_num_workers is None:
+        skip_num_workers = _default_skip_num_workers()
 
-        return dataset.map(format_fn)
+    if training_mode == TrainingMode.SFT:
+        if sft_format == "messages":
+            use_fast_stream = is_streaming and (
+                skip_buffer_size > 0 or max_prompt_length is not None
+            )
+            if use_fast_stream:
+                return _streaming_sft_messages_dataset(
+                    dataset,
+                    tokenizer,
+                    use_tools,
+                    max_prompt_length,
+                    skip_buffer_size=skip_buffer_size,
+                    skip_batch_size=skip_batch_size,
+                    skip_num_workers=skip_num_workers,
+                )
+
+            def filter_fn(record):
+                return _gate_filter_passes(record)
+
+            dataset = dataset.filter(filter_fn)
+
+            def format_fn(record):
+                convo = ConversationExample.from_record(record, use_tools=use_tools)
+                out = {"messages": convo.messages}
+                if use_tools:
+                    out["tools"] = TOOLS
+                return out
+
+            mapped = dataset.map(format_fn)
+            if max_prompt_length is not None:
+                mapped = filter_streaming_dataset_by_prompt_length(
+                    mapped, tokenizer, max_prompt_length,
+                )
+            if skip_buffer_size > 0:
+                mapped = skip_streaming_dataset(mapped, skip_buffer_size)
+            return mapped
+
+        elif sft_format == "text":
+            if max_prompt_length is not None:
+                print(
+                    "[SFT] max_prompt_length is not applied for sft_format='text'. "
+                    "Use sft_format='messages' (assistant_only_loss=True) or pre-filter "
+                    "the dataset."
+                )
+
+            def filter_fn(record):
+                return _gate_filter_passes(record)
+
+            dataset = dataset.filter(filter_fn)
+
+            def format_fn(record):
+                convo = ConversationExample.from_record(record, use_tools=use_tools)
+                prompt = tokenizer.apply_chat_template(
+                    convo.messages, tokenize=False,
+                    tools=TOOLS if use_tools else None,
+                )
+                return {"text": prompt}
+
+            return dataset.map(format_fn)
+
+        else:
+            raise ValueError(
+                f"Unknown sft_format: {sft_format!r}. Expected 'messages' or 'text'."
+            )
 
     elif training_mode == TrainingMode.GRPO:
+        def filter_fn(record):
+            return _gate_filter_passes(record)
+
+        dataset = dataset.filter(filter_fn)
+
         def format_fn(record):
             convo = ConversationExample.from_record(record, use_tools=use_tools)
             prompt_messages = [

@@ -163,7 +163,12 @@ import wandb
 # continue to work.
 # =====================================================================
 from conversation import ConversationExample                                # noqa: F401
-from dataset_utils import TrainingMode, buffer_streaming_dataset, format_dataset_for_training  # noqa: F401
+from dataset_utils import (  # noqa: F401
+    TrainingMode,
+    buffer_streaming_dataset,
+    filter_streaming_dataset_by_prompt_length,
+    format_dataset_for_training,
+)
 from model_utils import (                                                   # noqa: F401
     load_quantised_model,
     get_lora_config,
@@ -173,6 +178,7 @@ from model_utils import (                                                   # no
     load_unsloth_model_from_adapter,
     smart_sync_model_config,
     load_model_from_adapter,
+    patch_qwen_chat_template_for_assistant_mask,
     _require_unsloth,
 )
 
@@ -219,6 +225,9 @@ def train_with_sft(
     output_dir: str,
     resume_from: str = None,
     resume_training_state: bool = False,
+    skip_buffer_size: int = 0,
+    skip_batch_size: int = 128,
+    skip_num_workers: int | None = None,
     per_device_train_batch_size: int = 1,
     gradient_accumulation_steps: int = 1,
     max_steps: int = -1,
@@ -230,6 +239,7 @@ def train_with_sft(
     lora_rank: int = 8,
     lora_alpha: int = 16,
     lora_target_modules: list[str] | None = None,
+    assistant_only_loss: bool = True,
     **kwargs,
 ) -> None:
     """
@@ -280,6 +290,18 @@ def train_with_sft(
 
         Without ``--resume_training_state``, ``--resume_from`` loads
         only the adapter weights and starts a fresh training run.
+    skip_buffer_size : int
+        Skip this many training examples from the start of the streaming
+        dataset (stream order, after gate filter, chat formatting, and
+        ``max_prompt_length`` filtering when using ``messages`` format).
+        Use with ``--resume_from`` when restarting SFT on
+        the same dataset so already-seen samples are not trained again.
+        Independent of ``--resume_training_state`` (which restores step
+        counters but does not advance the data stream).
+    skip_batch_size : int
+        Raw rows per batch for the fast streaming skip/filter pipeline.
+    skip_num_workers : int, optional
+        Parallel workers for skip/filter/format batches (default: min(16, CPUs)).
     use_vllm : bool
         If *True*, validation generation in the stopping callback uses
         a **persistent vLLM server** for faster batch inference.  Start
@@ -297,7 +319,11 @@ def train_with_sft(
         Number of examples to buffer from the test split for the
         stopping callback validation (default 30).
     max_model_len : int
-        Maximum model length for filtering dataset (default 16384).
+        Maximum sequence length passed to ``SFTConfig(max_length=...)``.
+    max_prompt_length : int
+        For ``messages`` format (``assistant_only_loss=True``): drop
+        examples whose system+user chat-template length is ``>=`` this
+        value. Not applied in legacy ``text`` format.
     use_unsloth : bool
         If *True*, use unsloth's ``FastLanguageModel`` for model loading
         and LoRA injection.
@@ -371,13 +397,54 @@ def train_with_sft(
     # Synchronize the model's config with the tokenizer's special token IDs
     model = smart_sync_model_config(model, tokenizer)
 
+    # ------------------------------------------------------------------
+    # Loss-mode selection: assistant-only (new, recommended) vs legacy LM.
+    # ------------------------------------------------------------------
+    if assistant_only_loss:
+        # Patch the tokenizer's chat template so SFTTrainer can produce
+        # assistant_masks. For Qwen2/2.5/3 the stock template lacks
+        # {% generation %} markers; this injects them around the two assistant
+        # rendering paths. No-op for templates that already mark assistant
+        # blocks (e.g. Llama-3.1+ Instruct).
+        if patch_qwen_chat_template_for_assistant_mask(tokenizer):
+            print("[SFT] Patched tokenizer chat_template with {% generation %} "
+                  "markers for assistant_only_loss=True.")
+        sft_format = "messages"
+        print("[SFT] Loss mode: assistant-only (system / user / tool-response "
+              "tokens are masked out).")
+    else:
+        sft_format = "text"
+        print("[SFT] Loss mode: legacy language modeling (loss over ALL "
+              "non-pad tokens, incl. system / user / tool-response).")
+
     # Load dataset (streaming for memory efficiency)
     data = load_dataset(dataset_path, split="train", streaming=True)
 
-    # Format dataset into chat prompts
-    train_dataset = format_dataset_for_training(data, tokenizer, TrainingMode.SFT)
+    # Format dataset into the chosen SFT layout
+    train_dataset = format_dataset_for_training(
+        data,
+        tokenizer,
+        TrainingMode.SFT,
+        sft_format=sft_format,
+        max_prompt_length=max_prompt_length if sft_format == "messages" else None,
+        skip_buffer_size=skip_buffer_size if sft_format == "messages" else 0,
+        skip_batch_size=skip_batch_size,
+        skip_num_workers=skip_num_workers,
+    )
 
-    training_args = SFTConfig(
+    if resume_training_state and skip_buffer_size:
+        print(
+            "[SFT] Warning: --resume_training_state restores trainer step/checkpoint "
+            "state; non-zero --skip_buffer_size also skips a dataset prefix. "
+            "Combine only if intentional."
+        )
+
+    # ------------------------------------------------------------------
+    # Build SFTConfig kwargs.  The base set is shared by both loss modes;
+    # the loss-specific keys are injected below so the two paths are
+    # explicit and easy to diff.
+    # ------------------------------------------------------------------
+    sft_kwargs: dict = dict(
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -394,16 +461,27 @@ def train_with_sft(
         gradient_checkpointing_kwargs={"use_reentrant": False} if use_ddp else None,
         bf16=True,
         report_to=report_to,
-        dataset_text_field="text",
         max_length=max_model_len,
         # Enable token counting so ThroughputMetricsCallback can compute tokens/sec
         include_num_input_tokens_seen=True,
+    )
+    if assistant_only_loss:
+        # SFTTrainer detects the conversational layout from the "messages"
+        # column and applies the chat template internally with
+        # return_assistant_tokens_mask=True.
+        sft_kwargs["assistant_only_loss"] = True
+    else:
+        # Legacy: pre-rendered "text" column, full LM loss over the chat.
+        sft_kwargs["dataset_text_field"] = "text"
+
+    if use_ddp:
         # DDP with IterableDataset: each process must fetch its own batch
-        # independently.  The default dispatch_batches=True tries to
+        # independently. The default dispatch_batches=True tries to
         # concatenate batches from all workers on the main process, which
         # fails when sequences have different lengths.
-        **({"accelerator_config": {"dispatch_batches": False}} if use_ddp else {}),
-    )
+        sft_kwargs["accelerator_config"] = {"dispatch_batches": False}
+
+    training_args = SFTConfig(**sft_kwargs)
 
     shared_callbacks = [
         ThroughputMetricsCallback(),
@@ -757,24 +835,27 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "output_dir",
     "resume_from",
     "resume_training_state",
+    "skip_buffer_size",
+    "skip_batch_size",
+    "skip_num_workers",
     "per_device_train_batch_size",
     "gradient_accumulation_steps",
     "max_steps",
     "report_to",
     "max_model_len",
+    "max_prompt_length",
     "use_unsloth",
     "use_ddp",
     "lora_rank",
     "lora_alpha",
     "lora_target_modules",
+    "assistant_only_loss",
 })
 _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "buffer_size",
-    "skip_buffer_size",
     "num_generations",
     "steps_per_generation",
     "max_completion_length",
-    "max_prompt_length",
     "use_dual_adapter",
     "use_vllm",
     "vllm_mode",
@@ -826,9 +907,25 @@ def main() -> None:
         "--skip_buffer_size",
         type=int,
         default=_env("SKIP_BUFFER_SIZE", 0),
-        help="GRPO only: advance past this many valid samples in stream order (pre-shuffle), "
-             "then start filling up to --buffer_size rows — the two limits are independent. "
+        help="Skip this many training examples from the start of the stream (after "
+             "formatting). SFT: skips formatted rows in stream order. GRPO: skips "
+             "valid buffered rows (dedupe/length filters) before collecting "
+             "--buffer_size rows — the two GRPO limits are independent. "
              "Env: SKIP_BUFFER_SIZE (default: 0)",
+    )
+    parser.add_argument(
+        "--skip_batch_size",
+        type=int,
+        default=_env("SKIP_BATCH_SIZE", 256),
+        help="SFT streaming: raw rows per batch for fast skip/filter/format. "
+             "Env: SKIP_BATCH_SIZE (default: 128)",
+    )
+    parser.add_argument(
+        "--skip_num_workers",
+        type=int,
+        default=_env("SKIP_NUM_WORKERS", None),
+        help="SFT streaming: parallel workers for skip/filter batches "
+             "(default: min(16, CPU count)). Env: SKIP_NUM_WORKERS",
     )
     parser.add_argument("--max_steps", type=int, default=_env('MAX_STEPS', 1),
                         help="Maximum number of training steps")
@@ -854,7 +951,9 @@ def main() -> None:
     parser.add_argument("--max_completion_length", type=int, default=_env('MAX_COMPLETION_LENGTH', 4096),
                         help="Maximum completion length")
     parser.add_argument("--max_prompt_length", type=int, default=_env('MAX_PROMPT_LENGTH', 4096),
-                        help="Maximum prompt length")
+                        help="Max system+user prompt tokens (chat template). SFT messages: "
+                             "drop longer examples. GRPO: drop during buffering. "
+                             "Ignored for SFT legacy text format.")
     parser.add_argument("--use_dual_adapter", action="store_true", default=_env('USE_DUAL_ADAPTER', '1').lower() in ('1', 'true', 'yes'),
                         help="Use dual-adapter mode (keeps SFT adapter isolated, avoids merge). Default: True")
     parser.add_argument("--use_unsloth", action="store_true", default=_env('USE_UNSLOTH', '0').lower() in ('1', 'true', 'yes'),
@@ -880,6 +979,18 @@ def main() -> None:
         default=_env("LORA_TARGET_MODULES", "") or "",
         help="Comma-separated module names (e.g. q_proj,v_proj). Empty = default attention+MLP set. Env: LORA_TARGET_MODULES",
     )
+    parser.add_argument(
+        "--assistant_only_loss",
+        action=argparse.BooleanOptionalAction,
+        default=_env("ASSISTANT_ONLY_LOSS", "1").lower() in ("1", "true", "yes"),
+        help="SFT only. If set (default), compute loss only on assistant tokens "
+             "(content + tool-call JSON); system / user / tool-response tokens are "
+             "masked out. The dataset is emitted as `messages` + `tools` and the "
+             "Qwen2/2.5/3 chat template is patched in-place to add {%% generation %%} "
+             "markers required by TRL. Use --no-assistant_only_loss to revert to the "
+             "legacy behavior (pre-rendered `text` field, language-modeling loss over "
+             "every non-pad token). Env: ASSISTANT_ONLY_LOSS (1/0).",
+    )
     args = parser.parse_args()
 
     _ltm = (args.lora_target_modules or "").strip()
@@ -888,7 +999,11 @@ def main() -> None:
     )
 
     # Validate integer arguments
-    for field in ('buffer_size', 'skip_buffer_size', 'per_device_train_batch_size',
+    if args.skip_num_workers is not None:
+        args.skip_num_workers = int(args.skip_num_workers)
+
+    for field in ('buffer_size', 'skip_buffer_size', 'skip_batch_size',
+                  'per_device_train_batch_size',
                   'gradient_accumulation_steps', 'max_steps',
                   'num_generations', 'steps_per_generation',
                   'max_model_len', 'max_completion_length', 'max_prompt_length',

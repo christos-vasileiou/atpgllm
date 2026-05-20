@@ -1,5 +1,6 @@
 from transformers.utils import get_json_schema
 import json
+import os
 from typing import Dict
 from pathlib import Path
 import sys
@@ -11,6 +12,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'data_preprocessing
 
 from fault_sim import OptimizedNetlist, fast_fault_sim
 from reward_function_factory import RewardFunctionFactory
+
+
+def _resolve_sim_config_path() -> Path:
+    """Config next to this module (stable regardless of cwd). Override with SIM_CONFIG."""
+    override = os.environ.get("SIM_CONFIG")
+    if not override:
+        return Path(__file__).resolve().parent / "sim_config.json"
+    p = Path(override).expanduser()
+    if p.is_absolute():
+        return p
+    return Path(__file__).resolve().parent / p
 
 
 # =============================================================================
@@ -37,15 +49,13 @@ TOOLS = [FAULT_SIMULATION_TOOL]
 
 
 async def fault_simulation_tool_handler(input_vector: str | Dict[str, int], output_vector: str | Dict[str, int], fault: str, doc_id: str, netlist: str) -> str:
-    if isinstance(input_vector, str):
-        with open('sim_config.json', 'r') as f:
+    try:
+        with _resolve_sim_config_path().open("r", encoding="utf-8") as f:
             gate_func = json.load(f)
-    else:
-        try:
-            with open('sim_config.json', 'r') as f:
-                gate_func = json.load(f)
-        except:
-            return {"error": "I cannot find the dictionary of the gate functions."}
+    except (OSError, json.JSONDecodeError):
+        if isinstance(input_vector, str):
+            raise
+        return {"error": "I cannot find the dictionary of the gate functions."}
     optimized_netlist = OptimizedNetlist(netlist, gate_func=gate_func, decl_re=RewardFunctionFactory.DECL_RE, name_re=RewardFunctionFactory.NAME_RE)
     snapshot = fast_fault_sim(input_vector, output_vector, fault, optimized_netlist, gate_func, return_rewards=False)
     if "error" in snapshot.columns:
