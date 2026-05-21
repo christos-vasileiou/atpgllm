@@ -755,7 +755,7 @@ def train_with_grpo(
         learning_rate=2e-5,
         max_steps=max_steps,
         logging_steps=5,
-        save_steps=10,
+        save_steps=5,
         bf16=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -765,7 +765,7 @@ def train_with_grpo(
         warmup_steps=10,
         # GRPO-specific options
         loss_type="dapo", # "grpo", "dr_grpo", "dapo", "bnpo", "cispo", default is "dapo"
-        mask_truncated_completions=True,
+        mask_truncated_completions=False,
         num_generations=max(num_generations, 2),
         steps_per_generation=steps_per_generation,
         max_completion_length=max_completion_length,
