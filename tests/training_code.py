@@ -765,6 +765,7 @@ def train_with_grpo(
         warmup_steps=10,
         # GRPO-specific options
         loss_type="dapo", # "grpo", "dr_grpo", "dapo", "bnpo", "cispo", default is "dapo"
+        mask_truncated_completions=True,
         num_generations=max(num_generations, 2),
         steps_per_generation=steps_per_generation,
         max_completion_length=max_completion_length,
@@ -782,7 +783,7 @@ def train_with_grpo(
         # Logging options
         log_completions=True,
         num_completions_to_print=10,
-        log_unique_prompts=True,
+        log_unique_prompts=False,
     )
 
     shared_callbacks = [
