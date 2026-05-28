@@ -8,7 +8,6 @@
 #SBATCH --mem=128G
 #SBATCH --partition=h100
 #SBATCH --gres=gpu:4
-#SBATCH --reservation=vasileiou
 
 # Export the exact path of the Slurm log so Python can find it
 export SLURM_LOG_FILE="jobs/training_${SLURM_JOB_ID}.out"
@@ -153,6 +152,13 @@ elif [ "$METHOD" == "grpo" ]; then
     MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-6144}
     SKIP_BUFFER_SIZE=${SKIP_BUFFER_SIZE:-0}
 fi
+
+# Auto-derive --skip_buffer_size from --resume_from on resumed runs.
+# Default ON: when RESUME_FROM is set, --resume_training_state is NOT, and
+# SKIP_BUFFER_SIZE is left at 0, training_code.py will read
+# cumulative_skip_buffer_size from <resume_from>/training_state_summary.json
+# and use it. Set AUTO_SKIP_FROM_RESUME=False to disable.
+AUTO_SKIP_FROM_RESUME=${AUTO_SKIP_FROM_RESUME:-True}
 
 # LoRA hyper-parameters (read by training_code.py via environment / argparse defaults)
 LORA_RANK=${LORA_RANK:-256}
@@ -335,6 +341,12 @@ build_cmd_args() {
         --skip_buffer_size "${SKIP_BUFFER_SIZE:-0}"
     )
 
+    # Disable the auto-skip-from-resume helper only when explicitly requested.
+    # Python defaults to ON, so we just send the negation when needed.
+    if [ "$AUTO_SKIP_FROM_RESUME" == "False" ]; then
+        CMD_ARGS+=(--no-auto_skip_from_resume)
+    fi
+
     # Add GRPO-specific arguments only for GRPO method
     if [ "$METHOD" == "grpo" ]; then
         CMD_ARGS+=(
@@ -374,6 +386,7 @@ build_cmd_args() {
     echo "LORA_ALPHA: $LORA_ALPHA"
     echo "LORA_TARGET_MODULES: ${LORA_TARGET_MODULES:-'(default: q/k/v/o_proj + gate/up/down_proj)'}"
     echo "SKIP_BUFFER_SIZE: ${SKIP_BUFFER_SIZE:-0}"
+    echo "AUTO_SKIP_FROM_RESUME: $AUTO_SKIP_FROM_RESUME"
     if [ "$METHOD" == "sft" ]; then
         echo "ASSISTANT_ONLY_LOSS: ${ASSISTANT_ONLY_LOSS:-True}"
     fi

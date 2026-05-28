@@ -151,7 +151,8 @@ from callbacks import (
     ThroughputMetricsCallback,
     ContextLengthHistogramCallback,
     TrainingStateCheckpointCallback,
-    SFTStoppingCallback,
+    read_cumulative_skip_from_checkpoint,
+    read_launch_skip_from_checkpoint,
     validate_training_state_checkpoint,
 )
 from git_utils import get_git_info
@@ -486,7 +487,10 @@ def train_with_sft(
     shared_callbacks = [
         ThroughputMetricsCallback(),
         ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
-        TrainingStateCheckpointCallback(),
+        TrainingStateCheckpointCallback(
+            method="sft",
+            launch_skip_buffer_size=skip_buffer_size,
+        ),
     ]
 
     trainer = SFTTrainer(
@@ -755,7 +759,7 @@ def train_with_grpo(
         learning_rate=2e-5,
         max_steps=max_steps,
         logging_steps=5,
-        save_steps=5,
+        save_steps=10,
         bf16=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -765,7 +769,6 @@ def train_with_grpo(
         warmup_steps=10,
         # GRPO-specific options
         loss_type="dapo", # "grpo", "dr_grpo", "dapo", "bnpo", "cispo", default is "dapo"
-        mask_truncated_completions=False,
         num_generations=max(num_generations, 2),
         steps_per_generation=steps_per_generation,
         max_completion_length=max_completion_length,
@@ -783,13 +786,17 @@ def train_with_grpo(
         # Logging options
         log_completions=True,
         num_completions_to_print=10,
-        log_unique_prompts=False,
+        log_unique_prompts=True,
     )
 
     shared_callbacks = [
         ThroughputMetricsCallback(),
         ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
-        TrainingStateCheckpointCallback(),
+        TrainingStateCheckpointCallback(
+            method="grpo",
+            launch_skip_buffer_size=skip_buffer_size,
+            buffer_size=buffer_size,
+        ),
     ]
 
     if use_dual_adapter:
@@ -837,6 +844,7 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "resume_from",
     "resume_training_state",
     "skip_buffer_size",
+    "auto_skip_from_resume",
     "skip_batch_size",
     "skip_num_workers",
     "per_device_train_batch_size",
@@ -913,6 +921,19 @@ def main() -> None:
              "valid buffered rows (dedupe/length filters) before collecting "
              "--buffer_size rows — the two GRPO limits are independent. "
              "Env: SKIP_BUFFER_SIZE (default: 0)",
+    )
+    parser.add_argument(
+        "--auto_skip_from_resume",
+        action=argparse.BooleanOptionalAction,
+        default=_env("AUTO_SKIP_FROM_RESUME", "1").lower() in ("1", "true", "yes"),
+        help="Default ON. When --resume_from is set and --skip_buffer_size is left "
+             "at 0, auto-load it from the checkpoint's training_state_summary.json: "
+             "(a) without --resume_training_state -> use cumulative_skip_buffer_size "
+             "(fresh run on new data, advances past everything the previous run consumed); "
+             "(b) with --resume_training_state -> use launch_skip_buffer_size (crash "
+             "recovery, matches the stream offset the optimizer was trained against). "
+             "An explicit non-zero --skip_buffer_size always wins. Disable with "
+             "--no-auto_skip_from_resume. Env: AUTO_SKIP_FROM_RESUME (1/0).",
     )
     parser.add_argument(
         "--skip_batch_size",
@@ -1017,10 +1038,68 @@ def main() -> None:
     if args.skip_buffer_size < 0:
         parser.error("skip_buffer_size must be >= 0")
 
+    # ------------------------------------------------------------------
+    # Auto-derive --skip_buffer_size from a resumed checkpoint.
+    #
+    # Triggered when:
+    #   * --auto_skip_from_resume is on (default), AND
+    #   * --resume_from points at a checkpoint, AND
+    #   * --skip_buffer_size was left at the default 0 (any non-zero
+    #     value is treated as an explicit override and respected).
+    #
+    # Which field we read depends on --resume_training_state:
+    #   * off (fresh run on new data) -> cumulative_skip_buffer_size
+    #     (advance past everything consumed by the previous run).
+    #   * on  (crash recovery)        -> launch_skip_buffer_size
+    #     (same stream offset the checkpoint optimizer was trained on,
+    #     so HF Trainer's built-in step-resume skip lands on the right rows).
+    # ------------------------------------------------------------------
+    if (
+        args.auto_skip_from_resume
+        and args.resume_from
+        and args.skip_buffer_size == 0
+    ):
+        if args.resume_training_state:
+            derive_kind = "launch_skip_buffer_size"
+            derived = read_launch_skip_from_checkpoint(args.resume_from)
+            mode_label = "crash recovery, matches checkpoint optimizer state"
+        else:
+            derive_kind = "cumulative_skip_buffer_size"
+            derived = read_cumulative_skip_from_checkpoint(args.resume_from)
+            mode_label = "fresh run on new data, advances past consumed rows"
+
+        if derived is not None:
+            print(
+                f"[auto_skip_from_resume] Derived --skip_buffer_size {derived} "
+                f"({derive_kind}; {mode_label}) from "
+                f"{args.resume_from}/training_state_summary.json. "
+                f"Override with --skip_buffer_size <N> or disable with "
+                f"--no-auto_skip_from_resume."
+            )
+            args.skip_buffer_size = derived
+        else:
+            print(
+                f"[auto_skip_from_resume] No {derive_kind} found in "
+                f"{args.resume_from}/training_state_summary.json — keeping "
+                f"--skip_buffer_size 0. (Expected for checkpoints saved before "
+                f"this feature was added; pass --skip_buffer_size <N> manually "
+                f"or disable with --no-auto_skip_from_resume.)"
+            )
+    elif (
+        args.auto_skip_from_resume
+        and args.resume_from
+        and args.skip_buffer_size != 0
+    ):
+        print(
+            f"[auto_skip_from_resume] Explicit --skip_buffer_size "
+            f"{args.skip_buffer_size} provided; not auto-deriving."
+        )
+
     # Convert args to dict and fix parameter naming
     args_dict = vars(args)
     args_dict['dataset_path'] = args_dict.pop('dataset')
     method = args_dict.pop('method')
+    # auto_skip_from_resume is a launch-time concern; train_with_* absorb it via **kwargs.
 
     # name wandb run according to the output directory and lora rank and alpha
     wandb_name = f"r{args_dict.get('lora_rank', 8)}-alpha{args_dict.get('lora_alpha', 16)}" 

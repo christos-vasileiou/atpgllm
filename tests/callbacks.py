@@ -393,7 +393,96 @@ class TrainingStateCheckpointCallback(TrainerCallback):
     ``--resume_training_state`` also restores the optimizer, LR
     schedule, global step, epoch counter, and RNG seeds so training
     continues exactly where it left off.
+
+    Stream-position bookkeeping
+    ---------------------------
+    The summary JSON additionally records the cumulative
+    ``skip_buffer_size`` that should be passed to the **next** training
+    job that resumes from this checkpoint as a fresh run on new data
+    (i.e. without ``--resume_training_state``). This removes the need
+    to compute the next stream offset by hand:
+
+    * **SFT** — ``cumulative_skip_buffer_size = launch_skip_buffer_size
+      + global_step * effective_batch_size`` where
+      ``effective_batch_size = per_device_train_batch_size * world_size
+      * gradient_accumulation_steps``. The Trainer consumes one
+      post-filter row per logical micro-batch slot, so this matches the
+      number of valid rows the streaming pipeline yielded.
+    * **GRPO** — ``cumulative_skip_buffer_size = launch_skip_buffer_size
+      + buffer_size``. The buffer is populated once at startup with the
+      next ``buffer_size`` valid rows from the stream; we treat the
+      whole buffer as "consumed" regardless of how many ``max_steps``
+      were actually reached, so the next run picks up from beyond the
+      buffered slice.
+
+    Parameters
+    ----------
+    method : str, optional
+        ``"sft"`` or ``"grpo"``. Selects the cumulative skip formula.
+        When ``None`` the SFT formula is used (back-compatible default).
+    launch_skip_buffer_size : int
+        The ``skip_buffer_size`` value that was passed to this run
+        (after any ``--auto_skip_from_resume`` resolution). Used as the
+        offset added to ``consumed_in_run``.
+    buffer_size : int, optional
+        GRPO only. The ``buffer_size`` that ``buffer_streaming_dataset``
+        was asked to fill. Required when ``method="grpo"``.
     """
+
+    def __init__(
+        self,
+        method: Optional[str] = None,
+        launch_skip_buffer_size: int = 0,
+        buffer_size: Optional[int] = None,
+    ):
+        self.method = method.lower() if isinstance(method, str) else None
+        try:
+            self.launch_skip_buffer_size = max(0, int(launch_skip_buffer_size or 0))
+        except (TypeError, ValueError):
+            self.launch_skip_buffer_size = 0
+        if buffer_size is None:
+            self.buffer_size: Optional[int] = None
+        else:
+            try:
+                self.buffer_size = max(0, int(buffer_size))
+            except (TypeError, ValueError):
+                self.buffer_size = None
+
+    def _compute_skip_state(self, args, state) -> dict:
+        """Return cumulative_skip_buffer_size + supporting metadata for the summary."""
+        try:
+            world_size = int(getattr(args, "world_size", 1) or 1)
+        except (TypeError, ValueError):
+            world_size = 1
+        try:
+            per_device = int(getattr(args, "per_device_train_batch_size", 1) or 1)
+        except (TypeError, ValueError):
+            per_device = 1
+        try:
+            grad_acc = int(getattr(args, "gradient_accumulation_steps", 1) or 1)
+        except (TypeError, ValueError):
+            grad_acc = 1
+        effective_batch_size = max(1, per_device) * max(1, world_size) * max(1, grad_acc)
+
+        if self.method == "grpo" and self.buffer_size is not None:
+            consumed = int(self.buffer_size)
+        else:
+            consumed = int(state.global_step) * effective_batch_size
+        cumulative = self.launch_skip_buffer_size + consumed
+
+        skip_state: dict = {
+            "method": self.method,
+            "launch_skip_buffer_size": self.launch_skip_buffer_size,
+            "effective_batch_size": effective_batch_size,
+            "per_device_train_batch_size": per_device,
+            "gradient_accumulation_steps": grad_acc,
+            "world_size": world_size,
+            "consumed_in_run": consumed,
+            "cumulative_skip_buffer_size": cumulative,
+        }
+        if self.method == "grpo":
+            skip_state["buffer_size"] = self.buffer_size
+        return skip_state
 
     def on_save(self, args, state, control, **kwargs):
         is_distributed = (
@@ -441,6 +530,15 @@ class TrainingStateCheckpointCallback(TrainerCallback):
         status = "RESUMABLE" if resumable else "INCOMPLETE"
         lr_str = f"{current_lr:.2e}" if current_lr is not None else "N/A"
 
+        # -- Compute cumulative stream offset for next fresh-run --------
+        try:
+            skip_state = self._compute_skip_state(args, state)
+        except Exception as exc:
+            logger.warning(
+                "Could not compute cumulative_skip_buffer_size: %s", exc
+            )
+            skip_state = {}
+
         print(
             f"[TrainingStateCheckpoint] Step {state.global_step} | "
             f"Epoch {state.epoch:.4f} | LR {lr_str} | {status}"
@@ -461,9 +559,16 @@ class TrainingStateCheckpointCallback(TrainerCallback):
             )
         else:
             print(
-                f"  Resume with: --resume_from {checkpoint_dir} "
+                f"  Resume (crash recovery): --resume_from {checkpoint_dir} "
                 f"--resume_training_state"
             )
+            cumulative = skip_state.get("cumulative_skip_buffer_size")
+            if cumulative is not None:
+                print(
+                    f"  Resume (fresh run on new data): --resume_from "
+                    f"{checkpoint_dir} --skip_buffer_size {cumulative} "
+                    f"(or rely on --auto_skip_from_resume, default ON)"
+                )
 
         # -- Write machine-readable summary ----------------------------
         summary = {
@@ -483,6 +588,7 @@ class TrainingStateCheckpointCallback(TrainerCallback):
                 "scheduler": has_scheduler,
                 "rng_states": rng_files,
             },
+            **skip_state,
         }
         summary_path = os.path.join(
             checkpoint_dir, "training_state_summary.json"
@@ -494,6 +600,58 @@ class TrainingStateCheckpointCallback(TrainerCallback):
             logger.warning(
                 "Could not write training state summary: %s", exc
             )
+
+
+def _read_skip_summary_int(checkpoint_dir: str, key: str) -> Optional[int]:
+    """Internal: read a non-negative integer field from ``training_state_summary.json``.
+
+    Returns ``None`` (and does not raise) when the summary file is
+    missing, malformed, or predates this feature.
+    """
+    summary_path = os.path.join(checkpoint_dir, "training_state_summary.json")
+    if not os.path.exists(summary_path):
+        return None
+    try:
+        with open(summary_path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read %s for %s: %s", summary_path, key, exc)
+        return None
+    val = data.get(key)
+    if val is None:
+        return None
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return None
+
+
+def read_cumulative_skip_from_checkpoint(checkpoint_dir: str) -> Optional[int]:
+    """Return ``cumulative_skip_buffer_size`` from a checkpoint summary, or ``None``.
+
+    Used by ``--auto_skip_from_resume`` for **fresh-on-new-data** resumes
+    (i.e. without ``--resume_training_state``) — the next run skips past
+    every valid row the previous run consumed, so training never revisits
+    samples already covered.
+
+    Returns ``None`` for legacy checkpoints without the new field; callers
+    should fall back to the user-supplied value or 0.
+    """
+    return _read_skip_summary_int(checkpoint_dir, "cumulative_skip_buffer_size")
+
+
+def read_launch_skip_from_checkpoint(checkpoint_dir: str) -> Optional[int]:
+    """Return ``launch_skip_buffer_size`` from a checkpoint summary, or ``None``.
+
+    Used by ``--auto_skip_from_resume`` for **crash-recovery** resumes
+    (i.e. with ``--resume_training_state``) — the next run uses the same
+    stream offset that the checkpoint's optimizer state was trained
+    against, so HF Trainer's built-in step-resume skip lands on the same
+    rows the original run consumed past ``global_step``.
+
+    Returns ``None`` for legacy checkpoints without the new field.
+    """
+    return _read_skip_summary_int(checkpoint_dir, "launch_skip_buffer_size")
 
 
 def validate_training_state_checkpoint(checkpoint_dir: str) -> None:
