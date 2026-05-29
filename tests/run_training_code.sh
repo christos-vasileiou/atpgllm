@@ -126,7 +126,6 @@ if [ "$METHOD" == "sft" ]; then
     MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
     SKIP_BUFFER_SIZE=${SKIP_BUFFER_SIZE:-0}
     ASSISTANT_ONLY_LOSS=${ASSISTANT_ONLY_LOSS:-True}
-    USE_UNSLOTH=${USE_UNSLOTH:-False}
     USE_DDP=${USE_DDP:-False}
 elif [ "$METHOD" == "grpo" ]; then
     MODEL=${MODEL:-}
@@ -145,7 +144,6 @@ elif [ "$METHOD" == "grpo" ]; then
     USE_VLLM=${USE_VLLM:-False}
     VLLM_MODE=${VLLM_MODE:-server}
     PORT=${PORT:-8002}
-    USE_UNSLOTH=${USE_UNSLOTH:-False}
     USE_DDP=${USE_DDP:-False}
     MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
     MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
@@ -309,11 +307,6 @@ build_cmd_args() {
         CMD_ARGS+=("--use_ddp")                
     fi
 
-    # Handle unsloth activation
-    if [ -n "$USE_UNSLOTH" ] && [ "$USE_UNSLOTH" == "True" ]; then
-        CMD_ARGS+=(--use_unsloth)
-    fi
-
     # SFT only: assistant-only loss (mask system/user/tool-response tokens)
     if [ "$METHOD" == "sft" ]; then
         if [ -n "$ASSISTANT_ONLY_LOSS" ] && [ "$ASSISTANT_ONLY_LOSS" == "False" ]; then
@@ -380,7 +373,6 @@ build_cmd_args() {
     echo "PORT: $PORT (http://localhost:$PORT, otherwise no vLLM server needed)"
     echo "*VLLM_GPU: ${VLLM_GPU:-(auto)} (set when vLLM server mode is used)"
     echo "USE_DUAL_ADAPTER: $USE_DUAL_ADAPTER"
-    echo "USE_UNSLOTH: $USE_UNSLOTH"
     echo "USE_DDP: $USE_DDP"
     echo "LORA_RANK: $LORA_RANK"
     echo "LORA_ALPHA: $LORA_ALPHA"

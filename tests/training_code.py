@@ -174,13 +174,9 @@ from model_utils import (                                                   # no
     load_quantised_model,
     get_lora_config,
     prepare_lora_model,
-    load_unsloth_model,
-    prepare_unsloth_lora_model,
-    load_unsloth_model_from_adapter,
     smart_sync_model_config,
     load_model_from_adapter,
     patch_qwen_chat_template_for_assistant_mask,
-    _require_unsloth,
 )
 
 
@@ -235,7 +231,6 @@ def train_with_sft(
     report_to: str = "wandb",
     max_model_len: int = 16384,
     max_prompt_length: int = 4096,
-    use_unsloth: bool = False,
     use_ddp: bool = False,
     lora_rank: int = 8,
     lora_alpha: int = 16,
@@ -325,9 +320,6 @@ def train_with_sft(
         For ``messages`` format (``assistant_only_loss=True``): drop
         examples whose system+user chat-template length is ``>=`` this
         value. Not applied in legacy ``text`` format.
-    use_unsloth : bool
-        If *True*, use unsloth's ``FastLanguageModel`` for model loading
-        and LoRA injection.
     use_ddp : bool
         If *True*, use Distributed Data Parallel (DDP) mode.  Each
         ``accelerate`` / ``torchrun`` process loads the full model on its
@@ -342,7 +334,6 @@ def train_with_sft(
         comes from the checkpoint).
     """
     lora_config = get_lora_config(
-        use_unsloth=use_unsloth,
         r=lora_rank,
         lora_alpha=lora_alpha,
         target_modules=lora_target_modules,
@@ -365,11 +356,6 @@ def train_with_sft(
         resume_checkpoint = resume_from
         print(f"[Resume] Will restore full training state from: {resume_from}")
 
-    # Validate unsloth availability early
-    if use_unsloth:
-        _require_unsloth()
-        print("[Unsloth] Enabled – using FastLanguageModel for optimised training")
-
     # Determine device_map: per-GPU for DDP, "auto" otherwise
     device_map = _get_device_map(use_ddp)
     if use_ddp:
@@ -378,22 +364,15 @@ def train_with_sft(
     # Load model and tokenizer — either from saved adapter or fresh
     if resume_from:
         print(f"Resuming training from: {resume_from}")
-        if use_unsloth:
-            model, tokenizer = load_unsloth_model_from_adapter(resume_from, max_seq_length=max_model_len, fast_inference=True, device_map=device_map)
-        else:
-            model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
+        model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
     else:
-        if use_unsloth:
-            model, tokenizer = load_unsloth_model(model_name)
-            model = prepare_unsloth_lora_model(model, lora_config)
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            if not tokenizer.eos_token:
-                tokenizer.add_special_tokens({"eos_token": "</s>"})
-            if not tokenizer.pad_token:
-                tokenizer.pad_token = tokenizer.eos_token
-            base_model = load_quantised_model(model_name, device_map=device_map)
-            model = prepare_lora_model(base_model, lora_config)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if not tokenizer.eos_token:
+            tokenizer.add_special_tokens({"eos_token": "</s>"})
+        if not tokenizer.pad_token:
+            tokenizer.pad_token = tokenizer.eos_token
+        base_model = load_quantised_model(model_name, device_map=device_map)
+        model = prepare_lora_model(base_model, lora_config)
 
     # Synchronize the model's config with the tokenizer's special token IDs
     model = smart_sync_model_config(model, tokenizer)
@@ -525,7 +504,6 @@ def train_with_grpo(
     max_completion_length: int = 4096,
     max_prompt_length: int = 4096,
     use_dual_adapter: bool = True,
-    use_unsloth: bool = False,
     use_ddp: bool = False,
     lora_rank: int = 8,
     lora_alpha: int = 16,
@@ -595,8 +573,6 @@ def train_with_grpo(
     use_dual_adapter : bool
         If *True* (default), uses ``DualAdapterGRPOTrainer`` which keeps
         the SFT adapter isolated and avoids ``merge_and_unload``.
-    use_unsloth : bool
-        If *True*, use unsloth's ``FastLanguageModel`` for model loading.
     use_ddp : bool
         If *True*, use Distributed Data Parallel (DDP) mode.  See
         :func:`train_with_sft` for details.
@@ -617,11 +593,6 @@ def train_with_grpo(
         resume_checkpoint = resume_from
         print(f"[Resume] Will restore full training state from: {resume_from}")
 
-    # Validate unsloth availability early
-    if use_unsloth:
-        _require_unsloth()
-        print("[Unsloth] Enabled – using FastLanguageModel for optimised GRPO training")
-
     # Lazy-import GRPO trainers and GRPOConfig to avoid pulling in
     # trl.GRPOTrainer (and its vllm dependency) during SFT-only runs.
     from trl import GRPOConfig
@@ -639,7 +610,6 @@ def train_with_grpo(
 
     # Define LoRA config — needed for both fresh start and resume
     lora_config = get_lora_config(
-        use_unsloth=use_unsloth,
         r=lora_rank,
         lora_alpha=lora_alpha,
         target_modules=lora_target_modules,
@@ -657,8 +627,6 @@ def train_with_grpo(
             print(f"Resuming GRPO training from dual-adapter checkpoint: {resume_from}")
             print("  - Reference (frozen SFT) adapter: loaded from reference/")
             print("  - Policy (trainable) adapter: loaded from policy/")
-            if use_unsloth:
-                print("  - Note: unsloth is not used when reloading dual-adapter checkpoints")
             model, tokenizer = load_dual_adapter_checkpoint(resume_from, device_map=device_map)
             peft_config_for_trainer = None
             # Signal to DualAdapterGRPOTrainer: adapters are already set up.
@@ -666,10 +634,7 @@ def train_with_grpo(
         else:
             # Transition SFT → GRPO: only a single (SFT) adapter is on disk.
             print(f"Resuming GRPO training from SFT checkpoint: {resume_from}")
-            if use_unsloth:
-                model, tokenizer = load_unsloth_model_from_adapter(resume_from, max_seq_length=max_model_len, fast_inference=True, device_map=device_map)
-            else:
-                model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
+            model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
 
             if use_dual_adapter:
                 print("Using dual-adapter mode (DualAdapterGRPOTrainer)")
@@ -685,18 +650,13 @@ def train_with_grpo(
                 peft_config_for_trainer = lora_config
                 policy_lora_config = None
     else:
-        if use_unsloth:
-            model, tokenizer = load_unsloth_model(model_name)
-            model = prepare_unsloth_lora_model(model, lora_config)
-            peft_config_for_trainer = None
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            if not tokenizer.eos_token:
-                tokenizer.add_special_tokens({"eos_token": "</s>"})
-            if not tokenizer.pad_token:
-                tokenizer.pad_token = tokenizer.eos_token
-            model = load_quantised_model(model_name, device_map=device_map)
-            peft_config_for_trainer = lora_config
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if not tokenizer.eos_token:
+            tokenizer.add_special_tokens({"eos_token": "</s>"})
+        if not tokenizer.pad_token:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = load_quantised_model(model_name, device_map=device_map)
+        peft_config_for_trainer = lora_config
 
         if use_dual_adapter:
             print("Note: Dual-adapter mode requires --resume_from with an SFT checkpoint")
@@ -853,7 +813,6 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "report_to",
     "max_model_len",
     "max_prompt_length",
-    "use_unsloth",
     "use_ddp",
     "lora_rank",
     "lora_alpha",
@@ -978,11 +937,8 @@ def main() -> None:
                              "Ignored for SFT legacy text format.")
     parser.add_argument("--use_dual_adapter", action="store_true", default=_env('USE_DUAL_ADAPTER', '1').lower() in ('1', 'true', 'yes'),
                         help="Use dual-adapter mode (keeps SFT adapter isolated, avoids merge). Default: True")
-    parser.add_argument("--use_unsloth", action="store_true", default=_env('USE_UNSLOTH', '0').lower() in ('1', 'true', 'yes'),
-                        help="Use unsloth's FastLanguageModel for optimised training "
-                             "(2x faster, 80%% less VRAM). Requires: pip install unsloth")
     parser.add_argument("--use_ddp", action="store_true", default=_env('USE_DDP', '0').lower() in ('1', 'true', 'yes'),
-                        help="Use Distributed Data Parallelization. It's recommended for SFT + unsloth training.")
+                        help="Use Distributed Data Parallelization. It's recommended for SFT training.")
     parser.add_argument(
         "--lora_rank",
         type=int,

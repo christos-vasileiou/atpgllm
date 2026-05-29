@@ -32,6 +32,8 @@ from transformers import Trainer
 from transformers.trainer_pt_utils import get_parameter_names
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
+from typing_extensions import deprecated
+
 # NOTE: unsloth's side-effect import (which monkey-patches transformers,
 # peft and trl) is handled by the *entry-point* script (training_code.py)
 # ONLY when ``--use_unsloth`` is present.  Importing unsloth here
@@ -101,19 +103,25 @@ def load_quantised_model(model_name: str, device_map: str | dict = "auto") -> Au
         model across all visible GPUs.  A dict like ``{"": "cuda:0"}``
         pins to a single device (used in DDP mode).
     """
+    from transformers.utils import is_flash_attn_3_available, is_flash_attn_2_available
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=quant_config,
-        device_map=device_map,
-        trust_remote_code=True,
-        # attn_implementation="flash_attention_2",
-    )
+    pretrained_kwargs = {
+        "quantization_config": quant_config,
+        "device_map": device_map,
+        "trust_remote_code": True,
+    }
+    if is_flash_attn_3_available():
+        pretrained_kwargs["attn_implementation"] = "flash_attention_3"
+    elif is_flash_attn_2_available():
+        pretrained_kwargs["attn_implementation"] = "flash_attention_2"
+    else:
+        pretrained_kwargs["attn_implementation"] = "sdpa"
+    model = AutoModelForCausalLM.from_pretrained(model_name, **pretrained_kwargs)
     return model
 
 
@@ -254,7 +262,6 @@ _DEFAULT_LORA_TARGET_MODULES = (
 
 
 def get_lora_config(
-    use_unsloth: bool = False,
     r: int | None = None,
     lora_alpha: int | None = None,
     target_modules: list[str] | None = None,
@@ -279,7 +286,7 @@ def get_lora_config(
         r=_r,
         lora_alpha=_alpha,
         target_modules=_targets,
-        lora_dropout=0 if use_unsloth else 0.05,
+        lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -316,6 +323,8 @@ def prepare_lora_model(
 # UNSLOTH MODEL LOADING HELPERS
 # =====================================================================
 
+
+@deprecated("Use load_quantised_model instead")
 def load_unsloth_model(
     model_name: str,
     max_seq_length: int = 8192,
@@ -371,6 +380,7 @@ def load_unsloth_model(
     return model, tokenizer
 
 
+@deprecated("Use prepare_lora_model instead")
 def prepare_unsloth_lora_model(
     model,
     lora_config: LoraConfig | None = None,
@@ -436,6 +446,7 @@ def prepare_unsloth_lora_model(
     return model
 
 
+@deprecated("Use load_model_from_adapter instead")
 def load_unsloth_model_from_adapter(
     adapter_path: str,
     max_seq_length: int = 8192,
