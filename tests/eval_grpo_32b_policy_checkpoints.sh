@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Evaluate policy LoRA checkpoints under sft_7b_exper2 with pass@k (vLLM, TP auto).
+# Evaluate policy LoRA checkpoints under grpo_32b_exper{2,3} with pass@k (vLLM, TP auto).
 #
 # Usage:
-#   ./eval_sft_7b_policy_checkpoints.sh
-#   EXP_ROOT=/path/to/sft_7b_exper2 EVAL_RESULTS_DIR=/path/to/results ./eval_sft_7b_policy_checkpoints.sh
+#   ./eval_grpo_32b_policy_checkpoints.sh
+#   POLICY_FOLDER=grpo_32b_exper3 ./eval_grpo_32b_policy_checkpoints.sh
+#   EXP_ROOT=/path/to/grpo_32b_exper3 EVAL_RESULTS_DIR=/path/to/results ./eval_grpo_32b_policy_checkpoints.sh
 #
 # Optional:
 #   DRY_RUN=1  — print commands only
@@ -12,21 +13,21 @@
 #   GENERATION_MICRO_BATCH_SIZE=8 — HF backend only; passed through for consistency (default: 8)
 #   GPU_MEMORY_UTILIZATION=0.55  — vLLM fraction of VRAM to reserve (default: 0.55; raise if GPUs are idle)
 #   SAMPLING_METHOD=random       — random | best_of_n | mcts | evolutionary (see sampling_strategies.py)
-#   NUM_SAMPLES=16               — --n completions / search budget per problem (max k must be <= n)
+#   NUM_SAMPLES=100              — --n completions / search budget per problem (default 100 for 32B; max k <= n)
 #   PASS_AT_K="1 2 4 8 16"       — space-separated pass@k values
 #   TEMPERATURE=0.7  TOP_P=0.95  MAX_NEW_TOKENS=16384  MAX_EVAL_SAMPLES=512
 #   THRESHOLD_MODE=fault_detected — fault_detected | positive_reward | full_accuracy
-#   WANDB_RUN_NAME / --wandb_run_name — optional; default name is derived from --adapter (experiment + checkpoint)
+#   WANDB_RUN_NAME / --wandb_run_name — optional; default name is derived from --adapter (e.g. …_checkpoint-N_policy)
 #
 # Examples:
-#   SAMPLING_METHOD=best_of_n NUM_SAMPLES=32 ./eval_sft_7b_policy_checkpoints.sh
-#   SAMPLING_METHOD=mcts NUM_SAMPLES=16 EVAL_RESULTS_DIR=./eval_results_sft_7b_mcts ./eval_sft_7b_policy_checkpoints.sh
+#   SAMPLING_METHOD=evolutionary NUM_SAMPLES=24 ./eval_grpo_32b_policy_checkpoints.sh
+#   SAMPLING_METHOD=random NUM_SAMPLES=100 PASS_AT_K="1 5 10" ./eval_grpo_32b_policy_checkpoints.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EVAL_SCRIPT="${SCRIPT_DIR}/evaluate_model.py"
-POLICY_FOLDER="${POLICY_FOLDER:-sft_7b_exper2}"
+POLICY_FOLDER="${POLICY_FOLDER:-grpo_32b_exper2}"
 EXP_ROOT="${EXP_ROOT:-${SCRIPT_DIR}/${POLICY_FOLDER}}"
 EVAL_RESULTS_DIR="${EVAL_RESULTS_DIR:-${SCRIPT_DIR}/eval_results_${POLICY_FOLDER}_policy}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -106,10 +107,24 @@ for k in "${K_VALUES[@]}"; do
 done
 echo ""
 
+# New layout: checkpoint-N/policy; legacy: checkpoint-N/combined/policy
+# (see dual_adapter_grpo_trainer._resolve_dual_adapter_dirs).
+resolve_grpo_policy_adapter() {
+  local ckpt_dir="$1"
+  local candidate
+  for candidate in "${ckpt_dir}/policy" "${ckpt_dir}/combined/policy"; do
+    if [[ -f "${candidate}/adapter_config.json" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 for name in "${CHECKPOINTS[@]}"; do
-  policy="${EXP_ROOT}/${name}"
-  if [[ ! -d "$policy" ]]; then
-    echo "skip: no policy adapter at $policy" >&2
+  ckpt_dir="${EXP_ROOT}/${name}"
+  if ! policy="$(resolve_grpo_policy_adapter "$ckpt_dir")"; then
+    echo "skip: no policy adapter under $ckpt_dir (checked policy/ and combined/policy)" >&2
     continue
   fi
   out_json="${EVAL_RESULTS_DIR}/${name}_passatk_${SAMPLING_METHOD}_n${NUM_SAMPLES}_t${TEMPERATURE}_topp${TOP_P}_b${EVAL_PROMPT_BATCH_SIZE}.json"

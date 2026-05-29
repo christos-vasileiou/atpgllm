@@ -68,6 +68,14 @@ from dataset_utils import buffer_streaming_dataset
 from reward_function_factory import RewardFunctionFactory
 from tools import TOOLS, FAULT_SIMULATION_TOOL, fault_simulation_tool, fault_simulation_tool_handler, ToolHelper
 from revert_template import revert_chat_template
+from sampling_strategies import (
+    Verifier,
+    list_available_strategies,
+    make_hf_generator,
+    make_strategy,
+    make_vllm_generator,
+    run_strategy_batch,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -619,7 +627,7 @@ def format_eval_prompt(record: Dict[str, Any], tokenizer: AutoTokenizer) -> str:
         The formatted prompt string.
     """
     use_tools = 'tools' in tokenizer.chat_template or 'tool' in tokenizer.chat_template
-    convo = ConversationExample.from_record(_eval_record_as_dict(record), use_tools=use_tools)
+    convo = ConversationExample.from_record(record, use_tools=use_tools)
     
     # Keep only system and user messages for the prompt
     prompt_messages = [
@@ -669,7 +677,7 @@ def evaluate_completions(
         Per-completion reward dictionaries with component scores.
     """
     from atpgllm.llm.reward_funcs import test_generation_reward
-    from fault_sim import fast_fault_sim
+    from fault_sim import resolve_fault_sim_runner
     
     # Build kwargs
     netlists = []
@@ -692,9 +700,10 @@ def evaluate_completions(
         "detected_faults_fn": RewardFunctionFactory.detected_faults_fn,
         "eval_mode": True,
         "lib_gate_funcs": reward_factory.gate_funcs,
-        "fault_sim": fast_fault_sim,
+        "fault_sim": resolve_fault_sim_runner(),
         "netlists": netlists,
         "fault": faults,
+        "module_name": [_eval_record_as_dict(r).get("module_name", "") for r in records],
     }
     
     try:
@@ -732,16 +741,26 @@ def is_completion_correct(reward: Dict[str, float], threshold_mode: str = "fault
     bool
         True if the completion passes the threshold.
     """
+    def _get_acc(key: str) -> float:
+        """Read an _acc field with fallback to its _logonly variant.
+
+        ``test_generation_grpo_reward`` currently emits only ``..._logonly``
+        keys for accuracy metrics (they're informational, not part of the
+        GRPO loss). Keep reading the bare ``..._acc`` first so any future
+        refactor that re-introduces them stays compatible.
+        """
+        return float(reward.get(key, reward.get(f"{key}_logonly", 0)))
+
     if threshold_mode == "fault_detected":
-        return reward.get('fault_detected_by_pred_input_vector_acc', 0) == 1
+        return _get_acc("fault_detected_by_pred_input_vector_acc") == 1
     elif threshold_mode == "positive_reward":
         return sum(reward.values()) > 0
     elif threshold_mode == "full_accuracy":
         return (
-            reward.get('fault_detected_by_pred_input_vector_acc', 0) == 1 and
-            reward.get('input_vector_acc', 0) == 1 and
-            reward.get('expected_output_acc', 0) == 1 and
-            reward.get('detected_faults_acc', 0) == 1
+            _get_acc("fault_detected_by_pred_input_vector_acc") == 1 and
+            _get_acc("input_vector_acc") == 1 and
+            _get_acc("expected_output_acc") == 1 and
+            _get_acc("detected_faults_acc") == 1
         )
     else:
         raise ValueError(f"Unknown threshold mode: {threshold_mode}")
@@ -751,7 +770,7 @@ def wandb_run_name_from_adapter(adapter: Path) -> str:
     """
     Build a short Weights & Biases run *name* from the adapter path so runs are
     identifiable by experiment folder and checkpoint (e.g. SFT adapter dir vs
-    GRPO ``.../checkpoint-N/combined/policy``).
+    GRPO ``.../checkpoint-N/policy`` or ``.../checkpoint-N/combined/policy``).
     """
     try:
         p = adapter.resolve()
@@ -761,10 +780,24 @@ def wandb_run_name_from_adapter(adapter: Path) -> str:
     parts = p.parts
     tokens: Tuple[str, ...]
 
-    if len(parts) >= 3 and parts[-1] == "policy" and parts[-2] == "combined":
-        ckpt_token = parts[-3]
-        exp_token = parts[-4] if len(parts) >= 4 else ""
-        tokens = (exp_token, ckpt_token, "policy") if exp_token else (ckpt_token, "policy")
+    if len(parts) >= 2 and parts[-1] == "policy":
+        if parts[-2] == "combined" and len(parts) >= 3:
+            ckpt_token = parts[-3]
+            exp_token = parts[-4] if len(parts) >= 4 else ""
+        elif parts[-2].startswith("checkpoint-"):
+            ckpt_token = parts[-2]
+            exp_token = parts[-3] if len(parts) >= 3 else ""
+        else:
+            ckpt_token = ""
+            exp_token = ""
+        if ckpt_token:
+            tokens = (
+                (exp_token, ckpt_token, "policy")
+                if exp_token
+                else (ckpt_token, "policy")
+            )
+        else:
+            tokens = (p.parent.name, p.name) if p.parent.name else (p.name,)
     elif p.name.startswith("checkpoint-"):
         exp = p.parent.name
         tokens = (exp, p.name) if exp else (p.name,)
@@ -789,7 +822,8 @@ def evaluate(
     k_values: List[int] = None,
     temperature: float = 0.6,
     top_p: float = 0.95,
-    max_new_tokens: int = 4096*4,
+    max_new_tokens: int = 16384,
+    max_prompt_length: int = 4096,
     max_eval_samples: int = -1,
     max_tool_rounds: int = 1,
     threshold_mode: str = "fault_detected",
@@ -804,6 +838,7 @@ def evaluate(
     eval_prompt_batch_size: int = 8,
     generation_micro_batch_size: int = 8,
     wandb_run_name: Optional[str] = None,
+    sampling_method: str = "random",
 ) -> Dict[str, Any]:
     """
     Main evaluation function.
@@ -952,7 +987,7 @@ def evaluate(
     eval_dataset = load_dataset(dataset_path, split="test", streaming=True)
     
     # Buffer the streaming dataset
-    eval_records = buffer_streaming_dataset(eval_dataset, buffer_size=max_eval_samples, shuffle=False, unique_by="netlist", tokenizer=tokenizer, max_prompt_length=max_new_tokens//4)
+    eval_records = buffer_streaming_dataset(eval_dataset, buffer_size=max_eval_samples, shuffle=False, unique_by="netlist", tokenizer=tokenizer, max_prompt_length=max_prompt_length)
     
     print(f"Loaded {len(eval_records)} eval samples from '{dataset_path}' (eval split)")
     
@@ -1013,7 +1048,25 @@ def evaluate(
     all_rewards = []  # Detailed rewards per problem per completion
     
     eval_start_time = time.time()
-    
+
+    # =========================================================================
+    # 4.5. Build the search strategy (non-random methods bypass tool calls)
+    # =========================================================================
+    strategy = None
+    if sampling_method != "random":
+        verifier = Verifier(reward_factory)
+        if backend == "vllm":
+            generator = make_vllm_generator(
+                model, tokenizer, lora_request, generation_config,
+            )
+        else:
+            generator = make_hf_generator(
+                model, tokenizer, generation_config,
+                micro_batch_size=generation_micro_batch_size,
+            )
+        strategy = make_strategy(sampling_method, generator, verifier, budget=n)
+        print(f"Sampling strategy: {sampling_method} (budget per problem: {n})")
+
     n_records = len(eval_records)
     batch_starts = list(range(0, n_records, max(1, eval_prompt_batch_size)))
     
@@ -1035,7 +1088,7 @@ def evaluate(
         
         for slot, (idx, record) in enumerate(zip(global_indices, chunk)):
             try:
-                prompt_text = format_eval_prompt(record, tokenizer)
+                prompt_text = format_eval_prompt(record.copy(), tokenizer)
                 ok_prompts.append(prompt_text)
                 ok_records.append(record)
                 ok_slot.append(slot)
@@ -1056,64 +1109,76 @@ def evaluate(
         
         if ok_prompts:
             gen_t0 = time.time()
-            if backend == "vllm":
-                flat_completions = generate_batch_n_completions_vllm(
-                    llm=model,
-                    tokenizer=tokenizer,
-                    prompt_texts=ok_prompts,
+            if strategy is not None:
+                # Non-random search: strategy owns both generation and scoring.
+                flat_completions, rewards_flat, _ = run_strategy_batch(
+                    strategy=strategy,
+                    prompts=ok_prompts,
+                    records=ok_records,
                     n=n,
-                    sampling_params=generation_config,
-                    lora_request=lora_request,
-                    max_tool_rounds=max_tool_rounds,
                 )
+                gen_dt = time.time() - gen_t0
+                prompts_rep = [p for p in ok_prompts for _ in range(n)]
+                records_rep = [r for r in ok_records for _ in range(n)]
             else:
-                flat_completions = generate_batch_n_completions_hf(
-                    model=model,
-                    tokenizer=tokenizer,
-                    prompt_texts=ok_prompts,
-                    n=n,
-                    generation_config=generation_config,
-                    max_tool_rounds=max_tool_rounds,
-                    micro_batch_size=generation_micro_batch_size,
-                )
-            gen_dt = time.time() - gen_t0
-            
-            expected_flat = len(ok_prompts) * n
-            if len(flat_completions) != expected_flat:
-                print(
-                    f"Warning: expected {expected_flat} completions "
-                    f"({len(ok_prompts)} prompts × n={n}), got {len(flat_completions)}; "
-                    "padding or truncating to match."
-                )
-                if len(flat_completions) < expected_flat:
-                    flat_completions = flat_completions + [""] * (
-                        expected_flat - len(flat_completions)
+                if backend == "vllm":
+                    flat_completions = generate_batch_n_completions_vllm(
+                        llm=model,
+                        tokenizer=tokenizer,
+                        prompt_texts=ok_prompts,
+                        n=n,
+                        sampling_params=generation_config,
+                        lora_request=lora_request,
+                        max_tool_rounds=max_tool_rounds,
                     )
                 else:
-                    flat_completions = flat_completions[:expected_flat]
+                    flat_completions = generate_batch_n_completions_hf(
+                        model=model,
+                        tokenizer=tokenizer,
+                        prompt_texts=ok_prompts,
+                        n=n,
+                        generation_config=generation_config,
+                        max_tool_rounds=max_tool_rounds,
+                        micro_batch_size=generation_micro_batch_size,
+                    )
+                gen_dt = time.time() - gen_t0
 
-            prompts_rep = [p for p in ok_prompts for _ in range(n)]
-            records_rep = [r for r in ok_records for _ in range(n)]
-            try:
-                rewards_flat = evaluate_completions(
-                    reward_factory=reward_factory,
-                    prompts=prompts_rep,
-                    completions=flat_completions,
-                    records=records_rep,
-                )
-            except Exception as e:
-                print(f"Warning: Batch reward computation failed: {e}")
-                import traceback
-                traceback.print_exc()
-                zero_r = {
-                    'format': 0, 'pred_simulation': 0, 'fault_simulation': 0,
-                    'input_vector': 0, 'expected_output': 0, 'detected_faults': 0,
-                    'fault_detect_inpvector': 0, 'pred_vs_fault_sim_acc': 0,
-                    'fault_detected_by_pred_input_vector_acc': 0,
-                    'expected_output_acc': 0, 'input_vector_acc': 0,
-                    'detected_faults_acc': 0,
-                }
-                rewards_flat = [zero_r] * (len(ok_prompts) * n)
+                expected_flat = len(ok_prompts) * n
+                if len(flat_completions) != expected_flat:
+                    print(
+                        f"Warning: expected {expected_flat} completions "
+                        f"({len(ok_prompts)} prompts × n={n}), got {len(flat_completions)}; "
+                        "padding or truncating to match."
+                    )
+                    if len(flat_completions) < expected_flat:
+                        flat_completions = flat_completions + [""] * (
+                            expected_flat - len(flat_completions)
+                        )
+                    else:
+                        flat_completions = flat_completions[:expected_flat]
+
+                prompts_rep = [p for p in ok_prompts for _ in range(n)]
+                records_rep = [r for r in ok_records for _ in range(n)]
+                try:
+                    rewards_flat = evaluate_completions(
+                        reward_factory=reward_factory,
+                        prompts=prompts_rep,
+                        completions=flat_completions,
+                        records=records_rep,
+                    )
+                except Exception as e:
+                    print(f"Warning: Batch reward computation failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    zero_r = {
+                        'format': 0, 'pred_simulation': 0, 'fault_simulation': 0,
+                        'input_vector': 0, 'expected_output': 0, 'detected_faults': 0,
+                        'fault_detect_inpvector': 0, 'pred_vs_fault_sim_acc': 0,
+                        'fault_detected_by_pred_input_vector_acc': 0,
+                        'expected_output_acc': 0, 'input_vector_acc': 0,
+                        'detected_faults_acc': 0,
+                    }
+                    rewards_flat = [zero_r] * (len(ok_prompts) * n)
 
             n_reward = len(rewards_flat)
             if n_reward != len(prompts_rep):
@@ -1312,6 +1377,7 @@ def evaluate(
             "qlora": qlora,
             "eval_prompt_batch_size": eval_prompt_batch_size,
             "generation_micro_batch_size": generation_micro_batch_size,
+            "sampling_method": sampling_method,
         },
     }
     
@@ -2412,6 +2478,18 @@ Examples:
         help="Transformers backend: max parallel sequences per generate() call "
              "when expanding to batch_size * n paths (default: 8).",
     )
+    parser.add_argument(
+        "--sampling_method",
+        type=str,
+        default=_env("SAMPLING_METHOD", "random"),
+        choices=["random"] + list_available_strategies(),
+        help=(
+            "Inference-time search strategy. 'random' (default) uses the "
+            "existing tool-calling pipeline. Other strategies bypass model "
+            "tool calls and use the external fault simulator as the "
+            "verifier / oracle (see sampling_strategies.py)."
+        ),
+    )
 
     # SFT Stopping Criteria Arguments
     sft_group = parser.add_argument_group(
@@ -2491,6 +2569,10 @@ Examples:
     )
 
     args = parser.parse_args()
+    if not args.config_path.startswith("/"):
+        args.config_path = Path(__file__).resolve().parent / args.config_path
+    else:
+        args.config_path = Path(args.config_path)
 
     if args.sft_stop:
         evaluate_sft_stop(
@@ -2528,6 +2610,7 @@ Examples:
             temperature=args.temperature,
             top_p=args.top_p,
             max_new_tokens=args.max_new_tokens,
+            max_prompt_length=args.max_prompt_length,
             max_eval_samples=args.max_eval_samples,
             max_tool_rounds=args.max_tool_rounds,
             threshold_mode=args.threshold_mode,
@@ -2542,6 +2625,7 @@ Examples:
             eval_prompt_batch_size=args.eval_prompt_batch_size,
             generation_micro_batch_size=args.generation_micro_batch_size,
             wandb_run_name=args.wandb_run_name or None,
+            sampling_method=args.sampling_method,
         )
 
 if __name__ == "__main__":
