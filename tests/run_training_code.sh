@@ -75,22 +75,46 @@ start_time=$(date +%s)
 # echo ""
 
 # =============================================================================
-# Validate Required Environment Variables
+# Load Run Configuration
 # =============================================================================
-if [ -z "$MODEL" ]; then
-    echo "ERROR: MODEL environment variable is not set!"
-    echo "Usage: MODEL=<model_name> TRAIN_DATASET=<dataset_path> METHOD=<sft|grpo> sbatch run_test_training_code.sh"
+# All run configuration lives in a shell config file passed as the FIRST
+# positional argument (it is sourced here, NOT exported at submit time):
+#   sbatch run_training_code.sh configs/grpo.conf
+#   ./run_training_code.sh      configs/sft.conf
+CONFIG_FILE="${1:-}"
+if [ -z "$CONFIG_FILE" ]; then
+    echo "ERROR: no configuration file provided."
+    echo "Usage: sbatch run_training_code.sh <config_file>   (e.g. configs/sft.conf, configs/grpo.conf)"
+    echo "   or: ./run_training_code.sh <config_file>"
     exit 1
 fi
+# Allow a path relative to this script's directory when it is not found in CWD.
+if [ ! -f "$CONFIG_FILE" ]; then
+    _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [ -f "$_script_dir/$CONFIG_FILE" ] && CONFIG_FILE="$_script_dir/$CONFIG_FILE"
+fi
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: configuration file not found: $CONFIG_FILE"
+    exit 1
+fi
+echo "Loading configuration from: $CONFIG_FILE"
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+# =============================================================================
+# Validate Required Configuration
+# =============================================================================
+METHOD=${METHOD:-sft}
 
 if [ -z "$TRAIN_DATASET" ]; then
-    echo "ERROR: TRAIN_DATASET environment variable is not set!"
-    echo "Usage: MODEL=<model_name> TRAIN_DATASET=<dataset_path> METHOD=<sft|grpo> sbatch run_test_training_code.sh"
+    echo "ERROR: TRAIN_DATASET is not set in $CONFIG_FILE"
     exit 1
 fi
-
-# Default METHOD to 'sft' if not specified
-METHOD=${METHOD:-sft}
+# MODEL is required for SFT, optional for GRPO (which can resume from checkpoint).
+if [ -z "$MODEL" ] && [ "$METHOD" != "grpo" ]; then
+    echo "ERROR: MODEL is not set in $CONFIG_FILE (required for METHOD=$METHOD)"
+    exit 1
+fi
 
 # When DRY_RUN=True, print the commands that would be executed and skip
 # launching the vLLM server and the training process.
@@ -102,67 +126,16 @@ if [ "$DRY_RUN" == "True" ]; then
     echo "=============================================="
 fi
 
-# MODEL is required for SFT, optional for GRPO (which can resume from checkpoint)
-if [ -z "$MODEL" ] && [ "$METHOD" != "grpo" ]; then
-    echo "ERROR: MODEL environment variable is not set!"
-    echo "Usage: MODEL=<model_name> TRAIN_DATASET=<dataset_path> METHOD=<sft|grpo> sbatch run_test_training_code.sh"
-    exit 1
-fi
-if [ "$METHOD" == "sft" ]; then
-    MODEL=${MODEL:-Qwen/Qwen2.5-7B-Instruct}
-    TRAIN_DATASET=${TRAIN_DATASET:-chrivasileiou/asap7-language-of-test-v2}
-    OUTPUT_DIR=${OUTPUT_DIR:-sft_finetuned_model}
-    RESUME_FROM=${RESUME_FROM:-}
-    RESUME_TRAINING_STATE=${RESUME_TRAINING_STATE:-False}
-    PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-2}
-    GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
-    MAX_STEPS=${MAX_STEPS:-50}
-    REPORT_TO=${REPORT_TO:-wandb}
-    USE_DUAL_ADAPTER=${USE_DUAL_ADAPTER:-False}
-    USE_VLLM=${USE_VLLM:-False}
-    VLLM_MODE=${VLLM_MODE:-server}
-    PORT=${PORT:-8002}
-    MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
-    MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
-    SKIP_BUFFER_SIZE=${SKIP_BUFFER_SIZE:-0}
-    ASSISTANT_ONLY_LOSS=${ASSISTANT_ONLY_LOSS:-True}
-    USE_DDP=${USE_DDP:-False}
-elif [ "$METHOD" == "grpo" ]; then
-    MODEL=${MODEL:-}
-    TRAIN_DATASET=${TRAIN_DATASET:-chrivasileiou/asap7-language-of-test-v2}
-    OUTPUT_DIR=${OUTPUT_DIR:-grpo_finetuned_model}
-    RESUME_FROM=${RESUME_FROM:-sft_finetuned_model/checkpoint-150}
-    RESUME_TRAINING_STATE=${RESUME_TRAINING_STATE:-False}
-    BUFFER_SIZE=${BUFFER_SIZE:-10000}
-    PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-2}
-    GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
-    MAX_STEPS=${MAX_STEPS:-50}
-    REPORT_TO=${REPORT_TO:-wandb}
-    NUM_GENERATIONS=${NUM_GENERATIONS:-8}
-    STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-4}
-    USE_DUAL_ADAPTER=${USE_DUAL_ADAPTER:-True}
-    USE_VLLM=${USE_VLLM:-False}
-    VLLM_MODE=${VLLM_MODE:-server}
-    PORT=${PORT:-8002}
-    USE_DDP=${USE_DDP:-False}
-    MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
-    MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-    MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-6144}
-    SKIP_BUFFER_SIZE=${SKIP_BUFFER_SIZE:-0}
-fi
+# AUTO_SKIP_FROM_RESUME (set in the config file): when RESUME_FROM is set,
+# --resume_training_state is NOT, and SKIP_BUFFER_SIZE is left at 0,
+# training_code.py reads cumulative_skip_buffer_size from
+# <resume_from>/training_state_summary.json. Set AUTO_SKIP_FROM_RESUME=False
+# in the config to disable.
 
-# Auto-derive --skip_buffer_size from --resume_from on resumed runs.
-# Default ON: when RESUME_FROM is set, --resume_training_state is NOT, and
-# SKIP_BUFFER_SIZE is left at 0, training_code.py will read
-# cumulative_skip_buffer_size from <resume_from>/training_state_summary.json
-# and use it. Set AUTO_SKIP_FROM_RESUME=False to disable.
-AUTO_SKIP_FROM_RESUME=${AUTO_SKIP_FROM_RESUME:-True}
-
-# LoRA hyper-parameters (read by training_code.py via environment / argparse defaults)
-LORA_RANK=${LORA_RANK:-256}
-LORA_ALPHA=${LORA_ALPHA:-512}
-LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-}
-export LORA_RANK LORA_ALPHA LORA_TARGET_MODULES
+# These knobs reach Python ONLY through the environment (no CLI flag exists),
+# so the launcher exports the values sourced from the config file to the child.
+export LORA_RANK LORA_ALPHA LORA_TARGET_MODULES QWEN_MOE TUNE_MOE_ROUTER MOE_MAX_MEMORY_GIB
+[ -n "$WANDB_PROJECT" ] && export WANDB_PROJECT
 
 # =============================================================================
 # GPU Configuration and Setup
@@ -307,6 +280,10 @@ build_cmd_args() {
         CMD_ARGS+=("--use_ddp")                
     fi
 
+    if [ "$QWEN_MOE" == "True" ]; then
+        CMD_ARGS+=(--qwen_moe)
+    fi
+
     # SFT only: assistant-only loss (mask system/user/tool-response tokens)
     if [ "$METHOD" == "sft" ]; then
         if [ -n "$ASSISTANT_ONLY_LOSS" ] && [ "$ASSISTANT_ONLY_LOSS" == "False" ]; then
@@ -377,6 +354,9 @@ build_cmd_args() {
     echo "LORA_RANK: $LORA_RANK"
     echo "LORA_ALPHA: $LORA_ALPHA"
     echo "LORA_TARGET_MODULES: ${LORA_TARGET_MODULES:-'(default: q/k/v/o_proj + gate/up/down_proj)'}"
+    echo "QWEN_MOE: $QWEN_MOE"
+    echo "TUNE_MOE_ROUTER: $TUNE_MOE_ROUTER"
+    echo "MOE_MAX_MEMORY_GIB: ${MOE_MAX_MEMORY_GIB:-'(auto 95% per GPU)'}"
     echo "SKIP_BUFFER_SIZE: ${SKIP_BUFFER_SIZE:-0}"
     echo "AUTO_SKIP_FROM_RESUME: $AUTO_SKIP_FROM_RESUME"
     if [ "$METHOD" == "sft" ]; then
