@@ -170,6 +170,7 @@ pics
 *version*
 tests/sft_finetuned_model/
 tests/grpo_finetuned_model/
+tests/grpo_finetuned_models/
 tests/tmp_dir/
 tests/jobs/
 tests/logs/

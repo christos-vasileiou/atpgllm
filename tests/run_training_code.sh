@@ -23,6 +23,9 @@ elif [ -f "/proj/trela/christos/myenv/bin/activate" ]; then
 fi
 echo "Python Path: $(which python)"
 
+# Reduce CUDA fragmentation on long 8k-seq LoRA runs (especially DDP resume).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 start_time=$(date +%s)
 # =============================================================================
 # Debugging Information
@@ -77,29 +80,105 @@ start_time=$(date +%s)
 # =============================================================================
 # Load Run Configuration
 # =============================================================================
-# All run configuration lives in a shell config file passed as the FIRST
-# positional argument (it is sourced here, NOT exported at submit time):
-#   sbatch run_training_code.sh configs/grpo.conf
-#   ./run_training_code.sh      configs/sft.conf
-CONFIG_FILE="${1:-}"
+# Config is passed as the FIRST positional argument and sourced here (not via
+# submit-time env exports). For SLURM, prefer submit_training_code.sh so the
+# config is frozen when you queue the job, not when it eventually starts:
+#   ./submit_training_code.sh configs/grpo.conf
+# Direct / interactive:
+#   ./run_training_code.sh configs/sft.conf
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_LAUNCH_CONFIG_DIR="$_SCRIPT_DIR/jobs/launch_configs"
+mkdir -p "$_LAUNCH_CONFIG_DIR" "$_LAUNCH_CONFIG_DIR/snapshots"
+
+CONFIG_ARG="${1:-}"
+CONFIG_FILE="$CONFIG_ARG"
 if [ -z "$CONFIG_FILE" ]; then
     echo "ERROR: no configuration file provided."
-    echo "Usage: sbatch run_training_code.sh <config_file>   (e.g. configs/sft.conf, configs/grpo.conf)"
+    echo "Usage: sbatch run_training_code.sh <config_file>"
     echo "   or: ./run_training_code.sh <config_file>"
+    echo "SLURM (freeze at submit): ./submit_training_code.sh <config_file>"
     exit 1
 fi
-# Allow a path relative to this script's directory when it is not found in CWD.
 if [ ! -f "$CONFIG_FILE" ]; then
-    _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    [ -f "$_script_dir/$CONFIG_FILE" ] && CONFIG_FILE="$_script_dir/$CONFIG_FILE"
+    [ -f "$_SCRIPT_DIR/$CONFIG_ARG" ] && CONFIG_FILE="$_SCRIPT_DIR/$CONFIG_ARG"
 fi
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "ERROR: configuration file not found: $CONFIG_FILE"
+    echo "ERROR: configuration file not found: $CONFIG_ARG"
     exit 1
 fi
+
+LAUNCH_CONFIG_ORIGINAL="$CONFIG_FILE"
+LAUNCH_CONFIG_FROZEN_BY=""
+LAUNCH_CONFIG_FROZEN_AT=""
+case "$CONFIG_FILE" in
+    */jobs/launch_configs/submit_*)
+        LAUNCH_CONFIG_FROZEN_BY="submit"
+        if [ -f "${CONFIG_FILE}.meta" ]; then
+            # shellcheck source=/dev/null
+            source "${CONFIG_FILE}.meta"
+            LAUNCH_CONFIG_ORIGINAL="${launch_config_original:-$LAUNCH_CONFIG_ORIGINAL}"
+            LAUNCH_CONFIG_FROZEN_AT="${launch_config_frozen_at:-$LAUNCH_CONFIG_FROZEN_AT}"
+        fi
+        ;;
+    */jobs/launch_configs/*)
+        LAUNCH_CONFIG_FROZEN_BY="frozen_copy"
+        ;;
+    *)
+        _stamp="$(date +%Y%m%d_%H%M%S)"
+        if [ -n "${SLURM_JOB_ID:-}" ]; then
+            _frozen="$_LAUNCH_CONFIG_DIR/job_${SLURM_JOB_ID}_$(basename "$CONFIG_FILE")"
+            LAUNCH_CONFIG_FROZEN_BY="job_start"
+        else
+            _frozen="$_LAUNCH_CONFIG_DIR/run_${_stamp}_$(basename "$CONFIG_FILE")"
+            LAUNCH_CONFIG_FROZEN_BY="direct"
+        fi
+        cp "$CONFIG_FILE" "$_frozen"
+        LAUNCH_CONFIG_FROZEN_AT="$(date -Iseconds 2>/dev/null || date)"
+        CONFIG_FILE="$_frozen"
+        echo "NOTE: config frozen at run start ($_frozen). For SLURM submit-time freeze use submit_training_code.sh"
+        ;;
+esac
+
 echo "Loading configuration from: $CONFIG_FILE"
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
+
+# Snapshot sourced values for Weights & Biases (exact launcher state at run time).
+write_launch_config_snapshot() {
+    local _snap_stamp _snap_path _key _val
+    local _launch_keys=(
+        METHOD MODEL TRAIN_DATASET OUTPUT_DIR
+        RESUME_FROM RESUME_TRAINING_STATE AUTO_SKIP_FROM_RESUME SKIP_BUFFER_SIZE
+        PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS MAX_STEPS REPORT_TO
+        MAX_MODEL_LEN MAX_PROMPT_LENGTH MAX_COMPLETION_LENGTH
+        ASSISTANT_ONLY_LOSS BUFFER_SIZE NUM_GENERATIONS STEPS_PER_GENERATION
+        NETLIST_DIVERSITY_STRATEGY
+        USE_DUAL_ADAPTER USE_DDP USE_VLLM VLLM_MODE PORT
+        TENSOR_PARALLEL_SIZE DATA_PARALLEL_SIZE VLLM_GPU_MEM_UTIL
+        LORA_RANK LORA_ALPHA LORA_TARGET_MODULES QWEN_MOE TUNE_MOE_ROUTER MOE_MAX_MEMORY_GIB
+        WANDB_PROJECT DRY_RUN
+    )
+    _snap_stamp="$(date +%Y%m%d_%H%M%S)"
+    _snap_path="$_LAUNCH_CONFIG_DIR/snapshots/launch_${SLURM_JOB_ID:-local}_${_snap_stamp}.env"
+    {
+        echo "# launch_config_snapshot v1"
+        echo "# launch_config_file=$CONFIG_FILE"
+        echo "# launch_config_original=$LAUNCH_CONFIG_ORIGINAL"
+        echo "# launch_config_frozen_by=${LAUNCH_CONFIG_FROZEN_BY:-unknown}"
+        echo "# launch_config_frozen_at=${LAUNCH_CONFIG_FROZEN_AT:-}"
+        echo "# launch_config_snapshotted_at=$(date -Iseconds 2>/dev/null || date)"
+        echo "# slurm_job_id=${SLURM_JOB_ID:-}"
+        echo "# hostname=$(hostname)"
+        for _key in "${_launch_keys[@]}"; do
+            _val="${!_key-}"
+            printf '%s=%s\n' "$_key" "$_val"
+        done
+    } > "$_snap_path"
+    export LAUNCH_CONFIG_SNAPSHOT="$_snap_path"
+    export LAUNCH_CONFIG_FROZEN_FILE="$CONFIG_FILE"
+    echo "Launch config snapshot for W&B: $_snap_path"
+}
+write_launch_config_snapshot
 
 # =============================================================================
 # Validate Required Configuration
@@ -325,6 +404,10 @@ build_cmd_args() {
             --steps_per_generation "$STEPS_PER_GENERATION"
             --max_completion_length "$MAX_COMPLETION_LENGTH"
         )
+        # Buffer ordering strategy for netlist diversity per effective batch.
+        if [ -n "$NETLIST_DIVERSITY_STRATEGY" ]; then
+            CMD_ARGS+=(--netlist_diversity_strategy "$NETLIST_DIVERSITY_STRATEGY")
+        fi
         # This condition checks whether the variable USE_DUAL_ADAPTER is set (not empty) and its value is exactly "True".
         if [ -n "$USE_DUAL_ADAPTER" ] && [ "$USE_DUAL_ADAPTER" == "True" ]; then
             CMD_ARGS+=(--use_dual_adapter)
@@ -368,6 +451,7 @@ build_cmd_args() {
         echo "NUM_GENERATIONS: $NUM_GENERATIONS"
         echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION"
         echo "MAX_COMPLETION_LENGTH: $MAX_COMPLETION_LENGTH"
+        echo "NETLIST_DIVERSITY_STRATEGY: ${NETLIST_DIVERSITY_STRATEGY:-even_spacing}"
     fi
     echo "=============================================="
     echo "CMD_ARGS: ${CMD_ARGS[*]}"

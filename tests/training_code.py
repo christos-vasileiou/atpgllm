@@ -151,6 +151,7 @@ from callbacks import (
     ThroughputMetricsCallback,
     ContextLengthHistogramCallback,
     TrainingStateCheckpointCallback,
+    patch_trainer_cpu_optimizer_resume,
     read_cumulative_skip_from_checkpoint,
     read_launch_skip_from_checkpoint,
     validate_training_state_checkpoint,
@@ -173,11 +174,29 @@ from dataset_utils import (  # noqa: F401
 from model_utils import (                                                   # noqa: F401
     load_quantised_model,
     get_lora_config,
+    get_qwen_moe_lora_config,
     prepare_lora_model,
     smart_sync_model_config,
     load_model_from_adapter,
     patch_qwen_chat_template_for_assistant_mask,
 )
+
+
+def _resolve_lora_config(
+    lora_rank: int,
+    lora_alpha: int,
+    lora_target_modules: list[str] | None,
+    qwen_moe: bool,
+) -> "LoraConfig":
+    if lora_target_modules is not None:
+        return get_lora_config(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+        )
+    if qwen_moe:
+        return get_qwen_moe_lora_config(r=lora_rank, lora_alpha=lora_alpha)
+    return get_lora_config(r=lora_rank, lora_alpha=lora_alpha)
 
 
 # =====================================================================
@@ -235,6 +254,7 @@ def train_with_sft(
     lora_rank: int = 8,
     lora_alpha: int = 16,
     lora_target_modules: list[str] | None = None,
+    qwen_moe: bool = False,
     assistant_only_loss: bool = True,
     **kwargs,
 ) -> None:
@@ -333,10 +353,8 @@ def train_with_sft(
         Ignored when ``resume_from`` loads an existing adapter (architecture
         comes from the checkpoint).
     """
-    lora_config = get_lora_config(
-        r=lora_rank,
-        lora_alpha=lora_alpha,
-        target_modules=lora_target_modules,
+    lora_config = _resolve_lora_config(
+        lora_rank, lora_alpha, lora_target_modules, qwen_moe,
     )
 
     # Lazy-import SFTTrainer and SFTConfig
@@ -479,6 +497,8 @@ def train_with_sft(
         args=training_args,
         callbacks=shared_callbacks,
     )
+    if resume_checkpoint:
+        patch_trainer_cpu_optimizer_resume(trainer)
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(output_dir)
 
@@ -508,6 +528,8 @@ def train_with_grpo(
     lora_rank: int = 8,
     lora_alpha: int = 16,
     lora_target_modules: list[str] | None = None,
+    qwen_moe: bool = False,
+    netlist_diversity_strategy: str = "even_spacing",
     **kwargs,
 ) -> None:
     """
@@ -609,10 +631,8 @@ def train_with_grpo(
         print(f"[DDP] Enabled – loading model with device_map={device_map}")
 
     # Define LoRA config — needed for both fresh start and resume
-    lora_config = get_lora_config(
-        r=lora_rank,
-        lora_alpha=lora_alpha,
-        target_modules=lora_target_modules,
+    lora_config = _resolve_lora_config(
+        lora_rank, lora_alpha, lora_target_modules, qwen_moe,
     )
 
     # Load model and tokenizer
@@ -691,6 +711,13 @@ def train_with_grpo(
         tokenizer=tokenizer,
         max_prompt_length=max_prompt_length,
         skip_buffer_size=skip_buffer_size,
+        # Spread each netlist's faults across the epoch so every effective batch
+        # sees as many distinct netlists as possible (mitigates reward hacking /
+        # policy collapse from netlist-homogeneous batches). Requires
+        # shuffle_dataset=False below so the sampler preserves this order.
+        # Strategy is selectable via --netlist_diversity_strategy.
+        maximize_diversity_by="netlist",
+        diversity_strategy=netlist_diversity_strategy,
     )
 
     # =========================================================================
@@ -716,7 +743,7 @@ def train_with_grpo(
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=2e-5,
+        learning_rate=5e-6,
         max_steps=max_steps,
         logging_steps=5,
         save_steps=10,
@@ -727,6 +754,11 @@ def train_with_grpo(
         lr_scheduler_type="cosine",
         lr_scheduler_kwargs={'num_cycles': 0.4},
         warmup_steps=10,
+        # --- Step 2: prevent entropy / diversity collapse -------------------
+        beta=0.03,                # KL to the FIXED SFT reference (was 0.0 = no anchor). Range 0.01–0.05; this is the single most important change.
+        temperature=1.0,          # keep rollout exploration high (was implicitly 1.0)
+        top_entropy_quantile=0.8, # only update the top-80% highest-entropy tokens (was 1.0), so confident tokens stop being driven to ~0 entropy
+        # leave sync_ref_model=False (default): you WANT a fixed SFT anchor, not one that drifts toward the (collapsing) policy.
         # GRPO-specific options
         loss_type="dapo", # "grpo", "dr_grpo", "dapo", "bnpo", "cispo", default is "dapo"
         num_generations=max(num_generations, 2),
@@ -740,6 +772,11 @@ def train_with_grpo(
         # `"token"`: keeps raw per-token log-probability ratios. 
         # `"sequence"`: averages them across valid tokens into a single ratio per sequence — generally more stable (see GSPO paper).
         scale_rewards=False, 
+        # Preserve the netlist-diversity-maximising order produced by
+        # buffer_streaming_dataset(maximize_diversity_by="netlist"): the
+        # RepeatSampler only keeps dataset order when shuffle_dataset is False
+        # (otherwise it re-randomises and destroys the per-batch diversity).
+        shuffle_dataset=False,
         # - `True` or `"group"` (default): rewards are scaled by the standard deviation within each group, ensuring unit variance within a group.
         # - `"batch"`: rewards are scaled by the standard deviation across the entire batch
         # - `False` or `"none"`: no scaling is applied. The [Dr. GRPO paper] recommends not scaling rewards, as scaling by the standard deviation introduces a question-level difficulty bias.
@@ -784,6 +821,8 @@ def train_with_grpo(
             callbacks=shared_callbacks,
         )
 
+    if resume_checkpoint:
+        patch_trainer_cpu_optimizer_resume(trainer)
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(output_dir)
 
@@ -817,11 +856,13 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "lora_rank",
     "lora_alpha",
     "lora_target_modules",
+    "qwen_moe",
     "assistant_only_loss",
 })
 _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "buffer_size",
     "num_generations",
+    "netlist_diversity_strategy",
     "steps_per_generation",
     "max_completion_length",
     "use_dual_adapter",
@@ -831,12 +872,41 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
 })
 
 
-def _wandb_run_config(method: str, args_dict: dict, git_info: dict) -> dict:
+def _load_launch_config_snapshot(path: str | None) -> dict[str, str]:
+    """Parse launcher snapshot (KEY=value lines + # metadata comments)."""
+    if not path or not os.path.isfile(path):
+        return {}
+    out: dict[str, str] = {}
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                meta = line.lstrip("#").strip()
+                if "=" in meta:
+                    key, _, val = meta.partition("=")
+                    out[f"_{key.strip()}"] = val.strip()
+                continue
+            key, sep, val = line.partition("=")
+            if sep:
+                out[key.strip()] = val
+    return out
+
+
+def _wandb_run_config(
+    method: str,
+    args_dict: dict,
+    git_info: dict,
+    launch_config: dict[str, str] | None = None,
+) -> dict:
     """Subset of CLI args that actually tune the active training path (SFT vs GRPO)."""
     keys = _WANDB_CONFIG_KEYS_SFT | (
         _WANDB_CONFIG_KEYS_GRPO_ONLY if method == "grpo" else frozenset()
     )
     body = {k: args_dict[k] for k in sorted(keys) if k in args_dict}
+    if launch_config:
+        body["launch_config"] = launch_config
     return {"method": method, **body, **git_info}
 
 
@@ -925,6 +995,17 @@ def main() -> None:
                         help="VLLM mode")
     parser.add_argument("--num_generations", type=int, default=_env('NUM_GENERATIONS', 8),
                         help="Number of generations per prompt to sample.")
+    parser.add_argument(
+        "--netlist_diversity_strategy",
+        type=str,
+        default=_env("NETLIST_DIVERSITY_STRATEGY", "even_spacing"),
+        choices=["random", "round_robin", "even_spacing"],
+        help="GRPO: buffer ordering that controls netlist diversity per effective "
+             "batch (env: NETLIST_DIVERSITY_STRATEGY). 'even_spacing' (default, "
+             "recommended) spreads each netlist's faults uniformly across the epoch; "
+             "'round_robin' cycles netlist groups (clusters a dominant netlist's "
+             "tail); 'random' = plain shuffle baseline.",
+    )
     parser.add_argument("--steps_per_generation", type=int, default=_env('STEPS_PER_GENERATION', 2),
                         help="Steps per generation")
     parser.add_argument("--max_model_len", type=int, default=_env('MAX_MODEL_LEN', 8192),
@@ -956,6 +1037,13 @@ def main() -> None:
         type=str,
         default=_env("LORA_TARGET_MODULES", "") or "",
         help="Comma-separated module names (e.g. q_proj,v_proj). Empty = default attention+MLP set. Env: LORA_TARGET_MODULES",
+    )
+    parser.add_argument(
+        "--qwen_moe",
+        action=argparse.BooleanOptionalAction,
+        default=_env("QWEN_MOE", "0").lower() in ("1", "true", "yes"),
+        help="Use Qwen-style MoE LoRA targets (attention + expert MLP; optional "
+             "router via TUNE_MOE_ROUTER=1). Env: QWEN_MOE",
     )
     parser.add_argument(
         "--assistant_only_loss",
@@ -1064,8 +1152,10 @@ def main() -> None:
     else:
         wandb_name = f"{method}-{args_dict.get('output_dir', 'run')}-{wandb_name}" 
 
-    # 1. Wandb config: only hyperparameters that apply to the chosen method (plus git metadata)
-    run_config = _wandb_run_config(method, args_dict, get_git_info())
+    # 1. Wandb config: CLI hyperparameters + git metadata + launcher config snapshot
+    launch_snapshot_path = os.environ.get("LAUNCH_CONFIG_SNAPSHOT")
+    launch_config = _load_launch_config_snapshot(launch_snapshot_path)
+    run_config = _wandb_run_config(method, args_dict, get_git_info(), launch_config)
 
     # 2. Initialize wandb explicitly to capture everything from this point forward
     wandb.init(
@@ -1074,6 +1164,12 @@ def main() -> None:
         name=wandb_name,
         settings=wandb.Settings(console="wrap") # Forces capture of Python stdout/stderr
     )
+
+    if launch_snapshot_path and os.path.isfile(launch_snapshot_path):
+        wandb.save(os.path.abspath(launch_snapshot_path), base_path=os.getcwd())
+    frozen_conf = os.environ.get("LAUNCH_CONFIG_FROZEN_FILE")
+    if frozen_conf and os.path.isfile(frozen_conf):
+        wandb.save(os.path.abspath(frozen_conf), base_path=os.getcwd())
 
     # 3. Tell wandb to live-stream the Slurm bash log file to the cloud
     slurm_log = os.environ.get("SLURM_LOG_FILE")

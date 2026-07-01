@@ -88,7 +88,68 @@ def _require_unsloth() -> None:
 # Standard (BitsAndBytes + PEFT) model loading
 # =====================================================================
 
-def load_quantised_model(model_name: str, device_map: str | dict = "auto") -> AutoModelForCausalLM:
+def infer_per_gpu_max_memory(gib: float | None = None) -> dict[int, str] | None:
+    """
+    Build a ``max_memory`` dict for ``from_pretrained(device_map="auto")``.
+
+    Respects ``MOE_MAX_MEMORY_GIB`` (per-GPU cap) when set; otherwise uses
+    ``gib`` or ~95 % of each device’s total VRAM.
+    """
+    if not torch.cuda.is_available():
+        return None
+    n = torch.cuda.device_count()
+    if n <= 1:
+        return None
+    env_gib = os.environ.get("MOE_MAX_MEMORY_GIB")
+    if env_gib:
+        cap = float(env_gib)
+    elif gib is not None:
+        cap = gib
+    else:
+        cap = None
+    out: dict[int, str] = {}
+    for i in range(n):
+        if cap is not None:
+            out[i] = f"{cap:.0f}GiB"
+        else:
+            total = torch.cuda.get_device_properties(i).total_memory
+            out[i] = f"{int(total * 0.95 / (1024 ** 3))}GiB"
+    return out
+
+
+def get_qwen_moe_lora_config(
+    r: int | None = None,
+    lora_alpha: int | None = None,
+    target_modules: list[str] | None = None,
+    tune_router: bool | None = None,
+) -> LoraConfig:
+    """
+    LoRA config for Qwen-style MoE (Qwen1.5-MoE, Qwen3-MoE, etc.).
+
+    Targets attention projections and per-expert ``gate_proj`` / ``up_proj`` /
+    ``down_proj``.  Optionally includes the routing ``gate`` when
+    ``tune_router`` or env ``TUNE_MOE_ROUTER=1``.
+    """
+    if tune_router is None:
+        tune_router = os.environ.get("TUNE_MOE_ROUTER", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    if target_modules is None:
+        targets = list(_QWEN_MOE_LORA_TARGET_MODULES)
+        if tune_router:
+            targets = list(_QWEN_MOE_ROUTER_MODULE) + targets
+    else:
+        targets = list(target_modules)
+    return get_lora_config(r=r, lora_alpha=lora_alpha, target_modules=targets)
+
+
+def load_quantised_model(
+    model_name: str,
+    device_map: str | dict = "auto",
+    max_memory: dict | None = None,
+) -> AutoModelForCausalLM:
     """
     Load a base causal language model in 4-bit quantised form using
     ``BitsAndBytesConfig``.  Gradient checkpointing is enabled to save
@@ -121,6 +182,10 @@ def load_quantised_model(model_name: str, device_map: str | dict = "auto") -> Au
         pretrained_kwargs["attn_implementation"] = "flash_attention_2"
     else:
         pretrained_kwargs["attn_implementation"] = "sdpa"
+    if max_memory is None and device_map == "auto":
+        max_memory = infer_per_gpu_max_memory()
+    if max_memory is not None:
+        pretrained_kwargs["max_memory"] = max_memory
     model = AutoModelForCausalLM.from_pretrained(model_name, **pretrained_kwargs)
     return model
 
@@ -259,6 +324,12 @@ _DEFAULT_LORA_TARGET_MODULES = (
     "up_proj",
     "down_proj",
 )
+
+# Attention + expert MLP (Qwen1.5-MoE, Qwen3-MoE, Mixtral-style checkpoints).
+_QWEN_MOE_LORA_TARGET_MODULES = _DEFAULT_LORA_TARGET_MODULES
+
+# Optional router tuning (set TUNE_MOE_ROUTER=1 in the launch env).
+_QWEN_MOE_ROUTER_MODULE = ("gate",)
 
 
 def get_lora_config(
@@ -712,3 +783,134 @@ def load_model_from_adapter(
     model.print_trainable_parameters()
 
     return model, tokenizer
+
+
+# =====================================================================
+# QLoRA-faithful export for evaluation serving
+# =====================================================================
+
+def export_qlora_merged_bf16(
+    adapter_path: str,
+    output_dir: str,
+    device_map: str | dict | None = None,
+) -> str:
+    """
+    Materialise the exact bf16 weights that GRPO training pushed to its vLLM
+    server (see ``DualAdapterGRPOTrainer._move_model_to_vllm``):
+
+        ``W' = dequantize_4bit(W_nf4) + B·A·scaling``
+
+    for every LoRA-targeted linear layer.  Embeddings, norms, biases and
+    ``lm_head`` keep the clean Hub values — training never quantised them.
+
+    Serving the *Hub* bf16 checkpoint with the LoRA mounted dynamically is
+    NOT equivalent: the adapter was trained against the NF4-quantised base,
+    so evaluation must reproduce the dequantised base, not the clean one.
+
+    Requires a CUDA device (bitsandbytes dequantisation) and roughly
+    2x model-size CPU RAM.  Writes a standard HF model directory (weights +
+    config + tokenizer) that vLLM / transformers can serve directly without
+    ``enable_lora``.
+
+    Parameters
+    ----------
+    adapter_path : str
+        Directory with ``adapter_config.json`` + ``adapter_model.safetensors``
+        (e.g. ``grpo_7b_exper1/checkpoint-10/policy``).
+    output_dir : str
+        Destination directory for the merged bf16 model.
+    device_map : str | dict, optional
+        Placement for the temporary 4-bit load (default: ``cuda:0``).
+
+    Returns
+    -------
+    str
+        *output_dir*, for chaining.
+    """
+    import gc
+    import bitsandbytes as bnb
+
+    with open(os.path.join(adapter_path, "adapter_config.json")) as f:
+        base_model_name = json.load(f)["base_model_name_or_path"]
+
+    if device_map is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "export_qlora_merged_bf16 requires a CUDA device for "
+                "bitsandbytes 4-bit dequantisation."
+            )
+        device_map = {"": "cuda:0"}
+
+    print(f"[export_qlora_merged_bf16] Loading 4-bit base: {base_model_name}")
+    base_model = load_quantised_model(base_model_name, device_map=device_map)
+    print(f"[export_qlora_merged_bf16] Loading adapter: {adapter_path}")
+    model = PeftModel.from_pretrained(base_model, adapter_path)
+    model.eval()
+
+    merged_sd: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        # LoRA-wrapped linears: dequantise base + fold active adapter deltas.
+        for name, module in model.named_modules():
+            if hasattr(module, "lora_A") and hasattr(module, "base_layer"):
+                base_layer = module.base_layer
+                if hasattr(base_layer.weight, "quant_state"):
+                    w = bnb.functional.dequantize_4bit(
+                        base_layer.weight.data, base_layer.weight.quant_state
+                    ).to(torch.bfloat16)
+                else:
+                    w = base_layer.weight.data.clone().to(torch.bfloat16)
+                for adapter_name in module.active_adapters:
+                    if adapter_name in module.lora_A:
+                        lora_A = module.lora_A[adapter_name].weight.to(w.device, torch.bfloat16)
+                        lora_B = module.lora_B[adapter_name].weight.to(w.device, torch.bfloat16)
+                        w += (lora_B @ lora_A) * module.scaling[adapter_name]
+                hf_name = name.replace("base_model.model.", "") + ".weight"
+                merged_sd[hf_name] = w.cpu()
+        # Quantised linears WITHOUT LoRA (none with the default target set,
+        # but kept for safety): dequantise only.
+        for name, module in model.named_modules():
+            if isinstance(module, bnb.nn.Linear4bit):
+                hf_name = (
+                    name.replace("base_model.model.", "").replace(".base_layer", "")
+                    + ".weight"
+                )
+                if hf_name not in merged_sd:
+                    merged_sd[hf_name] = (
+                        bnb.functional.dequantize_4bit(
+                            module.weight.data, module.weight.quant_state
+                        )
+                        .to(torch.bfloat16)
+                        .cpu()
+                    )
+
+    del model, base_model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    print(f"[export_qlora_merged_bf16] Writing merged bf16 model to: {output_dir}")
+    clean_model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        dtype=torch.bfloat16,
+        device_map="cpu",
+        trust_remote_code=True,
+    )
+    missing, unexpected = clean_model.load_state_dict(merged_sd, strict=False)
+    # ``missing`` is expected: embeddings / norms / biases / lm_head keep the
+    # clean Hub values.  ``unexpected`` means our name mapping broke.
+    if unexpected:
+        raise RuntimeError(
+            f"export_qlora_merged_bf16: {len(unexpected)} unexpected keys "
+            f"(name-mapping mismatch), e.g. {unexpected[:3]}"
+        )
+    n_replaced = len(merged_sd)
+    print(
+        f"[export_qlora_merged_bf16] Replaced {n_replaced} linear weights; "
+        f"{len(missing)} params kept from the clean base."
+    )
+    clean_model.save_pretrained(output_dir, safe_serialization=True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    tokenizer.save_pretrained(output_dir)
+
+    del clean_model, merged_sd
+    gc.collect()
+    return output_dir

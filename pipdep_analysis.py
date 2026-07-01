@@ -4,11 +4,7 @@ from toposort import toposort_flatten
 
 # Define packages that must be installed first
 PRIORITY_PACKAGES = {
-    'torch': '2.2.1',
-    'numpy': '1.26.4',
-    'setuptools': '50.3.2',
-    'wheel': '0.45.1',
-    'pip': '25.0.1'
+    'torch': '2.5.1',
 }
 
 def get_dependency_graph():

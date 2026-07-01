@@ -119,7 +119,7 @@ def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], f
 
   # inject the fault value
   bad_machine.update({faulty_net: int(faulty_value)})
-
+  netlist_dict = {}
   # Simulation: Propagate input vector. 
   # If fault is given, force the value to the specified net (Bad Machine Simulation)
   # If no fault is given, propagate the value normally (Good Machine Simulation)
@@ -131,16 +131,18 @@ def fault_sim(input_vector: Union[str, dict], output_vector: Union[str, dict], f
     # get ingredients using the regex pattern
     ingredients = gate_ingredients.findall(line)[0]
     # gather ingredients
-    circuit.append(ingredients)
+    # circuit.append(ingredients)
     # get ingredients from circuit
     gate_type, instance, output, *inputs = ingredients
+    circuit.append({'gate_type': gate_type, 'instance': instance, 'output': output, 'inputs': inputs})
     inputs = inputs[0].split(', ')
     if fault_path[-1] in inputs:
       fault_path.append(output)
-
     good_machine[output] = gate_func[gate_type[:2]]([good_machine[i] for i in inputs])
     if output not in bad_machine.keys():
       bad_machine[output] = gate_func[gate_type[:2]]([bad_machine[i] for i in inputs])
+    # I am parsing a verilog netlist. I want to store to an efficient data format each gate's inputs and outputs 
+    netlist_dict[instance] = {'inputs': inputs, 'output': output} 
   simulation = pd.concat([pd.Series(good_machine), pd.Series(bad_machine)], axis=1)
   simulation[2] = simulation.index.isin(_inputs)
   simulation[3] = simulation.index.isin(_outputs)

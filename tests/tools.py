@@ -10,7 +10,7 @@ import ast
 # Add the parent directory of atpgllm to sys.path to allow importing from data_preprocessing
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'data_preprocessing'))
 
-from fault_sim import OptimizedNetlist, fast_fault_sim
+from fault_sim import OptimizedNetlist, resolve_fault_sim_runner
 from reward_function_factory import RewardFunctionFactory
 
 
@@ -57,7 +57,16 @@ async def fault_simulation_tool_handler(input_vector: str | Dict[str, int], outp
             raise
         return {"error": "I cannot find the dictionary of the gate functions."}
     optimized_netlist = OptimizedNetlist(netlist, gate_func=gate_func, decl_re=RewardFunctionFactory.DECL_RE, name_re=RewardFunctionFactory.NAME_RE)
-    snapshot = fast_fault_sim(input_vector, output_vector, fault, optimized_netlist, gate_func, return_rewards=False)
+    fault_sim_runner = resolve_fault_sim_runner()
+    snapshot = fault_sim_runner(
+        input_vector,
+        output_vector,
+        fault,
+        optimized_netlist,
+        gate_func,
+        module_name=doc_id,
+        return_rewards=False,
+    )
     if "error" in snapshot.columns:
         return snapshot.loc[0, "error"]
     return snapshot[['Good Machine', 'Bad Machine']].to_json()

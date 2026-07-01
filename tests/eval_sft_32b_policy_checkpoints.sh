@@ -12,15 +12,27 @@
 #   GENERATION_MICRO_BATCH_SIZE=8 — HF backend only; passed through for consistency (default: 8)
 #   GPU_MEMORY_UTILIZATION=0.55  — vLLM fraction of VRAM to reserve (default: 0.55; raise if GPUs are idle)
 #   SAMPLING_METHOD=random       — random | best_of_n | mcts | evolutionary (see sampling_strategies.py)
-#   NUM_SAMPLES=16               — --n completions / search budget per problem (max k must be <= n)
+#   NUM_COMPLETIONS=16           — --num_completions: completions per problem for pass@k, the
+#                                  pass@k pool (max k must be <= it). Alias: NUM_SAMPLES.
+#   SEARCH_BUDGET=50             — --budget: per-completion search width for mcts/evolutionary
+#                                  only (default: 50; orthogonal to NUM_COMPLETIONS)
+#   BEST_OF_N_WIDTH=4            — --n: per-completion i.i.d. samples for best_of_n only
+#                                  (default: 4; the best is kept; orthogonal to NUM_COMPLETIONS)
 #   PASS_AT_K="1 2 4 8 16"       — space-separated pass@k values
 #   TEMPERATURE=0.7  TOP_P=0.95  MAX_NEW_TOKENS=16384  MAX_EVAL_SAMPLES=512
 #   THRESHOLD_MODE=fault_detected — fault_detected | positive_reward | full_accuracy
+#   MAX_PROMPT_LENGTH=4096       — max prompt token length for eval buffering (default: 4096)
+#   EVAL_DATASET=chrivasileiou/asap7-language-of-test-v2 — test split source; must match
+#                                  TRAIN_DATASET in configs/sft.conf
+#   MERGE_DEQUANT=1              — serve the QLoRA-faithful merged bf16 export via
+#                                  --merge_dequant (adapter trained on NF4 base); 0 = clean
+#                                  bf16 base + dynamic LoRA (NOT faithful to training).
+#                                  Note: ~65 GB disk per 32B checkpoint export.
 #   WANDB_RUN_NAME / --wandb_run_name — optional; default name is derived from --adapter (experiment + checkpoint)
 #
 # Examples:
-#   SAMPLING_METHOD=evolutionary NUM_SAMPLES=24 ./eval_sft_32b_policy_checkpoints.sh
-#   SAMPLING_METHOD=random NUM_SAMPLES=32 PASS_AT_K="1 5 10 16" ./eval_sft_32b_policy_checkpoints.sh
+#   SAMPLING_METHOD=evolutionary NUM_COMPLETIONS=24 SEARCH_BUDGET=48 ./eval_sft_32b_policy_checkpoints.sh
+#   SAMPLING_METHOD=random NUM_COMPLETIONS=32 PASS_AT_K="1 5 10 16" ./eval_sft_32b_policy_checkpoints.sh
 
 set -euo pipefail
 
@@ -34,13 +46,19 @@ EVAL_PROMPT_BATCH_SIZE="${EVAL_PROMPT_BATCH_SIZE:-16}"
 GENERATION_MICRO_BATCH_SIZE="${GENERATION_MICRO_BATCH_SIZE:-16}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 SAMPLING_METHOD="${SAMPLING_METHOD:-random}"
-NUM_SAMPLES="${NUM_SAMPLES:-50}"
+# pass@k pool: completions per problem (max k must be <= it).
+# NUM_SAMPLES is kept as a backward-compatible alias for NUM_COMPLETIONS.
+NUM_COMPLETIONS="${NUM_COMPLETIONS:-${NUM_SAMPLES:-50}}"
 PASS_AT_K="${PASS_AT_K:-1 2 4 8 16}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.95}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16384}"
 MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-512}"
 THRESHOLD_MODE="${THRESHOLD_MODE:-fault_detected}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
+# Must match TRAIN_DATASET in configs/sft.conf (test split of the same database).
+EVAL_DATASET="${EVAL_DATASET:-chrivasileiou/asap7-language-of-test-v2}"
+MERGE_DEQUANT="${MERGE_DEQUANT:-1}"
 read -ra K_VALUES <<< "$PASS_AT_K"
 
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -70,8 +88,9 @@ fi
 
 mkdir -p "$EVAL_RESULTS_DIR"
 
+# Exclude cached *_merged_bf16 exports produced by --merge_dequant.
 mapfile -t CHECKPOINTS < <(
-  find "$EXP_ROOT" -maxdepth 1 -mindepth 1 -type d -name 'checkpoint-*' -printf '%f\n' | sort -V
+  find "$EXP_ROOT" -maxdepth 1 -mindepth 1 -type d -name 'checkpoint-*' ! -name '*_merged_bf16' -printf '%f\n' | sort -V
 )
 
 if [[ ${#CHECKPOINTS[@]} -eq 0 ]]; then
@@ -85,10 +104,18 @@ echo "Output dir:    $EVAL_RESULTS_DIR"
 echo "tp_size:       $TP_SIZE  (from CUDA_VISIBLE_DEVICES if set, else nvidia-smi -L)"
 echo "prompt_batch:  $EVAL_PROMPT_BATCH_SIZE  (EVAL_PROMPT_BATCH_SIZE)"
 echo "gpu_mem_util:  $GPU_MEMORY_UTILIZATION  (GPU_MEMORY_UTILIZATION)"
-echo "sampling:      $SAMPLING_METHOD  (SAMPLING_METHOD)"
-echo "num_samples:   $NUM_SAMPLES  (NUM_SAMPLES / --n)"
+echo "sampling:        $SAMPLING_METHOD  (SAMPLING_METHOD)"
+echo "num_completions: $NUM_COMPLETIONS  (NUM_COMPLETIONS / --num_completions)"
+if [[ "$SAMPLING_METHOD" == "mcts" || "$SAMPLING_METHOD" == "evolutionary" ]]; then
+  echo "search_budget:   ${SEARCH_BUDGET:-50}  (SEARCH_BUDGET / --budget)"
+fi
+if [[ "$SAMPLING_METHOD" == "best_of_n" ]]; then
+  echo "best_of_n_width: ${BEST_OF_N_WIDTH:-4}  (BEST_OF_N_WIDTH / --n)"
+fi
 echo "pass@k:        ${K_VALUES[*]}  (PASS_AT_K)"
 echo "temperature:   $TEMPERATURE  top_p: $TOP_P"
+echo "dataset:       $EVAL_DATASET  (EVAL_DATASET)"
+echo "merge_dequant: $MERGE_DEQUANT  (MERGE_DEQUANT; 1 = QLoRA-faithful merged bf16 serving)"
 echo ""
 
 case "$SAMPLING_METHOD" in
@@ -98,9 +125,33 @@ case "$SAMPLING_METHOD" in
     exit 1
     ;;
 esac
+if [[ -n "${SEARCH_BUDGET:-}" ]] && [[ "$SAMPLING_METHOD" != "mcts" && "$SAMPLING_METHOD" != "evolutionary" ]]; then
+  echo "error: SEARCH_BUDGET applies only to mcts/evolutionary (got SAMPLING_METHOD=$SAMPLING_METHOD)" >&2
+  exit 1
+fi
+if [[ -n "${BEST_OF_N_WIDTH:-}" ]] && [[ "$SAMPLING_METHOD" != "best_of_n" ]]; then
+  echo "error: BEST_OF_N_WIDTH applies only to best_of_n (got SAMPLING_METHOD=$SAMPLING_METHOD)" >&2
+  exit 1
+fi
+case "$SAMPLING_METHOD" in
+  mcts|evolutionary)
+    SEARCH_BUDGET="${SEARCH_BUDGET:-50}"
+    if [[ "$SEARCH_BUDGET" -lt 1 ]]; then
+      echo "error: SEARCH_BUDGET ($SEARCH_BUDGET) must be >= 1" >&2
+      exit 1
+    fi
+    ;;
+  best_of_n)
+    BEST_OF_N_WIDTH="${BEST_OF_N_WIDTH:-4}"
+    if [[ "$BEST_OF_N_WIDTH" -lt 1 ]]; then
+      echo "error: BEST_OF_N_WIDTH ($BEST_OF_N_WIDTH) must be >= 1" >&2
+      exit 1
+    fi
+    ;;
+esac
 for k in "${K_VALUES[@]}"; do
-  if [[ "$k" -gt "$NUM_SAMPLES" ]]; then
-    echo "error: pass@${k} requires NUM_SAMPLES >= ${k} (got NUM_SAMPLES=$NUM_SAMPLES)" >&2
+  if [[ "$k" -gt "$NUM_COMPLETIONS" ]]; then
+    echo "error: pass@${k} requires NUM_COMPLETIONS >= ${k} (got NUM_COMPLETIONS=$NUM_COMPLETIONS)" >&2
     exit 1
   fi
 done
@@ -108,20 +159,27 @@ echo ""
 
 for name in "${CHECKPOINTS[@]}"; do
   policy="${EXP_ROOT}/${name}"
-  if [[ ! -d "$policy" ]]; then
-    echo "skip: no policy adapter at $policy" >&2
+  if [[ ! -f "${policy}/adapter_config.json" ]]; then
+    echo "skip: no adapter_config.json at $policy" >&2
     continue
   fi
-  out_json="${EVAL_RESULTS_DIR}/${name}_passatk_${SAMPLING_METHOD}_n${NUM_SAMPLES}_t${TEMPERATURE}_topp${TOP_P}_b${EVAL_PROMPT_BATCH_SIZE}.json"
-  out_stdout="${EVAL_RESULTS_DIR}/${name}_${SAMPLING_METHOD}_n${NUM_SAMPLES}_stdout.log"
+  _out_tag="nc${NUM_COMPLETIONS}"
+  if [[ "$SAMPLING_METHOD" == "mcts" || "$SAMPLING_METHOD" == "evolutionary" ]]; then
+    _out_tag="${_out_tag}_sb${SEARCH_BUDGET}"
+  elif [[ "$SAMPLING_METHOD" == "best_of_n" ]]; then
+    _out_tag="${_out_tag}_bon${BEST_OF_N_WIDTH}"
+  fi
+  out_json="${EVAL_RESULTS_DIR}/${name}_passatk_${SAMPLING_METHOD}_${_out_tag}_t${TEMPERATURE}_topp${TOP_P}_b${EVAL_PROMPT_BATCH_SIZE}.json"
+  out_stdout="${EVAL_RESULTS_DIR}/${name}_${SAMPLING_METHOD}_${_out_tag}_stdout.log"
   cmd=(
     python "$EVAL_SCRIPT"
     --adapter "$policy"
+    --dataset "$EVAL_DATASET"
     --backend vllm
     --tp_size "$TP_SIZE"
     --gpu_memory_utilization "$GPU_MEMORY_UTILIZATION"
     --sampling_method "$SAMPLING_METHOD"
-    --n "$NUM_SAMPLES"
+    --num_completions "$NUM_COMPLETIONS"
     --k "${K_VALUES[@]}"
     --temperature "$TEMPERATURE"
     --top_p "$TOP_P"
@@ -130,9 +188,18 @@ for name in "${CHECKPOINTS[@]}"; do
     --threshold_mode "$THRESHOLD_MODE"
     --eval_prompt_batch_size "$EVAL_PROMPT_BATCH_SIZE"
     --generation_micro_batch_size "$GENERATION_MICRO_BATCH_SIZE"
+    --max_prompt_length "$MAX_PROMPT_LENGTH"
     --report_to wandb
     --output_file "$out_json"
   )
+  if [[ "$SAMPLING_METHOD" == "mcts" || "$SAMPLING_METHOD" == "evolutionary" ]]; then
+    cmd+=( --budget "$SEARCH_BUDGET" )
+  elif [[ "$SAMPLING_METHOD" == "best_of_n" ]]; then
+    cmd+=( --n "$BEST_OF_N_WIDTH" )
+  fi
+  if [[ "$MERGE_DEQUANT" == "1" ]]; then
+    cmd+=( --merge_dequant )
+  fi
   echo "=== ${name} ==="
   if [[ "$DRY_RUN" == "1" ]]; then
     printf '%q ' "${cmd[@]}"

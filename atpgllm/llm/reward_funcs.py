@@ -342,10 +342,14 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
   perfect_pi = float(kwargs.get("reward_perfect_pi_bonus", 1.0))
   perfect_mention = float(kwargs.get("reward_perfect_mention_bonus", 1.0))
   format_weight = float(kwargs.get("reward_format_weight", 0.12))
+  # Shaping credit earned when the fault is NOT actually detected is
+  # attenuated to this fraction, so the true binary detection dominates the scalar.
+  undetected_scale = float(kwargs.get("reward_undetected_shaping_scale", 0.2))
 
   rewards: List[Dict[str, float]] = []
+  module_names = kwargs.get("module_name") or []
 
-  for prompt, completion, netlist in zip(prompts, completions, netlists):
+  for idx, (prompt, completion, netlist) in enumerate(zip(prompts, completions, netlists)):
     # Keys are non-overlapping so sum(...) is a well-defined total (GRPO / logging).
     out: Dict[str, float] = {
       "format": 0.0,
@@ -402,6 +406,8 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
       rewards.append(out)
       continue
 
+    mod_name = module_names[idx] if idx < len(module_names) else None
+
     try:
       result = fault_sim_runner(
         pred_input,
@@ -409,6 +415,7 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
         f"{fault} {net}",
         netlist,
         gate_func,
+        module_name=mod_name,
         return_rewards=True,
       )
       fault_simulation, _fault_sim_rewards = result
@@ -423,7 +430,10 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
       rewards.append(out)
       continue
 
-    detected = _fault_detected_at_pos(fault_simulation)
+    if _fault_sim_rewards.get("tetramax_available"):
+      detected = bool(_fault_sim_rewards.get("tetramax_detected"))
+    else:
+      detected = _fault_detected_at_pos(fault_simulation)
     site_ok = _fault_site_activated(fault_simulation, net, stuck_at)
     po_score, _ = _po_prediction_score(fault_simulation, pred_output)
     pi_score, _ = _pi_assignment_score(fault_simulation, pred_input)
@@ -431,16 +441,19 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
     tool_bonus = _tool_response_po_consistency_bonus(completion, fault_simulation)
     mention = _mentions_target_fault(pred_faults, fault, net) if pred_faults else 0.0
 
-    out["fault_detect_inpvector"] = (
-        w_detect * float(detected) 
-        + w_site * site_ok
-    )
-    out["fault_detected_by_pred_input_vector_acc_logonly"] = float(detected)
+    detected_f = float(detected)
+    site_ok_f = float(site_ok)
+    # When the fault is genuinely detected, pay full shaping; otherwise damp it so
+    # "looks-right-but-doesn't-detect" completions can't out-score real detections.
+    shaping = 1.0 if detected else undetected_scale
 
-    out["expected_output"] = w_po * po_score + (perfect_po if po_score >= 0.999 else 0.0)
-    out["input_vector"] = w_pi * pi_score + (perfect_pi if pi_score >= 0.999 else 0.0)
+    out["fault_detect_inpvector"] = w_detect * detected_f + w_site * site_ok_f * shaping
+    out["fault_detected_by_pred_input_vector_acc_logonly"] = 1. if detected and site_ok else 0.
+
+    out["expected_output"] = (w_po * po_score + (perfect_po if po_score >= 0.999 else 0.0)) * shaping
+    out["input_vector"] = (w_pi * pi_score + (perfect_pi if pi_score >= 0.999 else 0.0)) * shaping
     out["fault_simulation"] = w_tool_json * tool_bonus
-    out["detected_faults"] = w_fault_mention * mention + (perfect_mention if mention >= 0.99 else 0.0)
+    out["detected_faults"] = (w_fault_mention * mention + (perfect_mention if mention >= 0.99 else 0.0)) * shaping
     out["expected_output_acc_logonly"] = 1.0 if po_score >= 0.999 else 0.0
     out["input_vector_acc_logonly"] = 1.0 if pi_score >= 0.999 else 0.0
     out["detected_faults_acc_logonly"] = 1.0 if mention >= 0.99 else 0.0

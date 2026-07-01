@@ -1,10 +1,7 @@
 
 from .utils import *
 from .llm import *
-try:
-    from .graph import *
-except ImportError:
-    pass  # torch_geometric not installed — graph features unavailable
+from .graph import *
 import json
 
 models_causal = {
@@ -20,7 +17,6 @@ models_causal = {
   'llama-3': "meta-llama/Meta-Llama-3-8B-Instruct",
   'llama-3.1': "meta-llama/Llama-3.1-8B-Instruct",
   'llama-3.2': "meta-llama/Llama-3.2-3B-Instruct",
-  'llama-3.3': "meta-llama/Llama-3.3-70B-Instruct",
   'test-model': "chrivasileiou/TestModel",
   'test-model-lora': "chrivasileiou/TestModelLora",
   'test-model-v2': "chrivasileiou/TestModel-2",

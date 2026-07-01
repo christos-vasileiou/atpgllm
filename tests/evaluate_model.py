@@ -7,14 +7,18 @@ Evaluation script for dual-adapter models (SFT + GRPO) using pass@k metrics.
 This module evaluates a model trained through SFT → GRPO by:
 1. Loading the dual-adapter model via HF PEFT or vLLM natively.
 2. Loading the eval split of `chrivasileiou/asap7-language-of-test`
-3. For batches of prompts, generating N completions each (with tool-calling support)
+3. For batches of prompts, generating num_completions completions each, where
+   each completion is one independent application of the chosen sampling
+   strategy (with tool-calling support).
 4. Executing tool calls (fault simulation) when the model requests them
 5. Computing rewards via RewardFunctionFactory
 6. Calculating pass@k metrics (pass@1, pass@5, pass@10, etc.)
 
 The pass@k metric (from the Codex paper, Chen et al. 2021) estimates:
     pass@k = E[1 - C(n-c, k) / C(n, k)]
-where n = total completions per problem, c = correct completions.
+where n = num_completions (completions per problem), c = correct completions.
+The estimator is unbiased only when the num_completions completions are i.i.d.,
+which is why every strategy returns one completion per independent application.
 
 Usage:
     python evaluate_model.py \
@@ -22,14 +26,14 @@ Usage:
         --tp_size 2 \
         --adapter ./finetuned_model/combined/policy/ \
         --dataset chrivasileiou/asap7-language-of-test \
-        --n 10 --k 1 5 10 \
+        --num_completions 10 --k 1 5 10 \
         --temperature 0.6
 
 Environment Variables:
     ADAPTER_CHECKPOINT: Path to SFT/GRPO adapter checkpoint
     WANDB_RUN_NAME: Optional override for the Weights & Biases run display name
     EVAL_DATASET: Dataset identifier (default: chrivasileiou/asap7-language-of-test)
-    NUM_SAMPLES: Number of completions per prompt (default: 10)
+    NUM_COMPLETIONS: Completions per prompt for pass@k (default: 10)
     MAX_EVAL_SAMPLES: Maximum number of eval samples (default: -1 for all)
     EVAL_PROMPT_BATCH_SIZE: Prompts per fused generation batch (default: 8)
     GENERATION_MICRO_BATCH_SIZE: HF generate micro-batch (default: 8)
@@ -361,7 +365,7 @@ def generate_batch_n_completions_vllm(
 ) -> List[str]:
     """
     For B prompts, generate n independent completions each (B * n total paths).
-
+    
     Each round batches all active paths in one ``llm.generate`` call so vLLM can
     schedule work across prompts, not just across samples of a single prompt.
     """
@@ -374,31 +378,31 @@ def generate_batch_n_completions_vllm(
         for p in prompt_texts
         for _ in range(n)
     ]
-
+    
     for _round in range(max_tool_rounds + 1):
         active_indices = [i for i, state in enumerate(states) if not state["done"]]
         if not active_indices:
             break
-
+        
         active_inputs = [states[i]["current_input"] for i in active_indices]
-
+        
         outputs = llm.generate(
             active_inputs,
             sampling_params=sampling_params,
             lora_request=lora_request,
             use_tqdm=False,
         )
-
+        
         if len(outputs) != len(active_inputs):
             raise RuntimeError(
                 f"vLLM returned {len(outputs)} outputs for {len(active_inputs)} "
                 "requests; refusing to continue with misaligned tool-round state."
             )
-
+        
         for i, output in zip(active_indices, outputs):
             completion_text = output.outputs[0].text
             states[i]["full_completion"] += completion_text
-
+            
             if _round < max_tool_rounds:
                 tool_call = parse_tool_call(completion_text)
                 if tool_call is not None:
@@ -412,7 +416,7 @@ def generate_batch_n_completions_vllm(
                             }
                         )
                         tool_result = execute_tool_call(tool_call)
-
+                        
                         messages = revert_chat_template(
                             states[i]["current_input"], tokenizer=tokenizer
                         )
@@ -422,7 +426,7 @@ def generate_batch_n_completions_vllm(
                             "name": tool_call.get("name", "fault_simulation_tool"),
                             "content": tool_result,
                         })
-
+                        
                         states[i]["current_input"] = tokenizer.apply_chat_template(
                             messages,
                             tokenize=False,
@@ -442,7 +446,7 @@ def generate_batch_n_completions_vllm(
                     states[i]["done"] = True
             else:
                 states[i]["done"] = True
-
+    
     return [state["full_completion"] for state in states]
 
 
@@ -811,14 +815,105 @@ def wandb_run_name_from_adapter(adapter: Path) -> str:
     return base or "atpg_eval"
 
 
+def should_disable_custom_all_reduce(tp_size: int) -> bool:
+    """
+    Decide whether vLLM's custom all-reduce kernel must be disabled for TP>1.
+
+    On NVLink-less nodes (e.g. A100-PCIE) the kernel's GPU P2P transfers can
+    silently corrupt tensors, producing garbage completions at TP>1 while
+    TP=1 is fine.  On NVLink topologies (H100/H200 SXM) it is safe and
+    faster, so we keep it.  Detection is per-node via NVML NVLink state;
+    on any detection failure we disable the kernel (correctness over speed —
+    the NCCL fallback is always correct).
+    """
+    if tp_size <= 1:
+        return False
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            for link in range(18):  # NVML max NVLink links per GPU
+                try:
+                    if pynvml.nvmlDeviceGetNvLinkState(handle, link) == pynvml.NVML_FEATURE_ENABLED:
+                        print("[vllm] NVLink detected: keeping custom all-reduce enabled.")
+                        return False
+                except pynvml.NVMLError:
+                    break
+            print("[vllm] No NVLink (PCIe-only topology): disabling custom all-reduce.")
+            return True
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        print(f"[vllm] NVLink detection failed ({e}): disabling custom all-reduce.")
+        return True
+
+
+def _merged_export_complete(merged_dir: Path) -> bool:
+    """True if *merged_dir* holds a complete HF model export (config present
+    and every shard listed in the safetensors index on disk)."""
+    if not (merged_dir / "config.json").exists():
+        return False
+    index_path = merged_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        return all((merged_dir / fn).exists() for fn in set(weight_map.values()))
+    return (merged_dir / "model.safetensors").exists()
+
+
+def resolve_merged_bf16_dir(adapter: Path) -> Path:
+    """
+    Return the cached QLoRA-faithful merged bf16 export for *adapter*,
+    creating it via ``model_utils.export_qlora_merged_bf16`` if missing.
+
+    The export materialises ``dequantize_4bit(W_nf4) + B·A·scaling`` — the
+    exact weights GRPO training pushed to its vLLM server — so vLLM can serve
+    it as a plain bf16 model without ``enable_lora``.  Cached as a sibling
+    directory ``<adapter>_merged_bf16/`` (e.g. ``checkpoint-30/policy_merged_bf16/``).
+
+    The export runs in a subprocess: dequantisation needs a CUDA context that
+    would otherwise stay resident in this process and starve vLLM's GPU
+    memory reservation (`del` + ``empty_cache()`` cannot release the context).
+    """
+    merged_dir = adapter.parent / f"{adapter.name}_merged_bf16"
+    if _merged_export_complete(merged_dir):
+        print(f"[merge_dequant] Reusing cached merged bf16 export: {merged_dir}")
+        return merged_dir
+
+    import subprocess
+
+    print(f"[merge_dequant] No complete cached export found, building: {merged_dir}")
+    tests_dir = str(Path(__file__).resolve().parent)
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {tests_dir!r}); "
+        "from model_utils import export_qlora_merged_bf16; "
+        f"export_qlora_merged_bf16({str(adapter)!r}, {str(merged_dir)!r})"
+    )
+    result = subprocess.run([sys.executable, "-c", code])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"merged bf16 export subprocess failed (exit {result.returncode}) "
+            f"for adapter: {adapter}"
+        )
+    if not _merged_export_complete(merged_dir):
+        raise RuntimeError(
+            f"merged bf16 export finished but {merged_dir} is incomplete "
+            "(missing config.json or weight shards)"
+        )
+    return merged_dir
+
+
 # =============================================================================
 # MAIN EVALUATION PIPELINE
 # =============================================================================
 
 def evaluate(
     adapter: Path,
-    dataset_path: str = "chrivasileiou/asap7-language-of-test",
-    n: int = 10,
+    dataset_path: str = "chrivasileiou/asap7-language-of-test-v2",
+    num_completions: int = 10,
     k_values: List[int] = None,
     temperature: float = 0.6,
     top_p: float = 0.95,
@@ -839,6 +934,9 @@ def evaluate(
     generation_micro_batch_size: int = 8,
     wandb_run_name: Optional[str] = None,
     sampling_method: str = "random",
+    merge_dequant: bool = False,
+    budget: Optional[int] = None,
+    best_of_n_width: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Main evaluation function.
@@ -849,8 +947,10 @@ def evaluate(
         Path to SFT/GRPO adapter checkpoint.
     dataset_path : str
         HuggingFace dataset identifier.
-    n : int
-        Number of completions per prompt (for pass@k estimation).
+    num_completions : int
+        Completions per problem for pass@k estimation (the pass@k pool, N).
+        Each completion is one independent application of the sampling
+        strategy.
     k_values : List[int]
         List of k values to compute pass@k for.
     temperature : float
@@ -875,12 +975,24 @@ def evaluate(
         Path to save detailed results as JSON.
     eval_prompt_batch_size : int
         How many dataset prompts to run through generation together. Each batch
-        issues one fused multi-path generation of ``batch_size * n`` sequences
+        issues one fused multi-path generation of ``batch_size * num_completions`` sequences
         per tool round (vLLM), improving GPU utilization vs one prompt at a time.
     generation_micro_batch_size : int
         Transformers backend only: cap on parallel sequences per ``generate`` call.
     wandb_run_name : str, optional
         Weights & Biases run display name. If omitted, derived from *adapter*.
+    merge_dequant : bool
+        vLLM backend only: export the QLoRA-faithful merged bf16 model
+        (``dequantize_4bit(W_nf4) + B·A·scaling``, exactly what GRPO training
+        pushed to its vLLM server) and serve it without dynamic LoRA.  The
+        export is cached next to the adapter as ``<adapter>_merged_bf16/``.
+    budget : int, optional
+        Per-completion search width (B) for ``mcts`` / ``evolutionary`` only:
+        scored rollouts (mcts) or completions evaluated (evolutionary) per
+        independent search. Orthogonal to ``num_completions``.
+    best_of_n_width : int, optional
+        Per-completion width (B) for ``best_of_n`` only: i.i.d. samples drawn
+        per completion, of which the best is kept (``1`` = i.i.d. baseline).
 
     Returns
     -------
@@ -892,8 +1004,45 @@ def evaluate(
     
     # Validate k values
     for k in k_values:
-        if k > n:
-            raise ValueError(f"k={k} > n={n}. Cannot compute pass@{k} with only {n} samples per prompt.")
+        if k > num_completions:
+            raise ValueError(
+                f"k={k} > num_completions={num_completions}. Cannot compute "
+                f"pass@{k} with only {num_completions} completions per problem."
+            )
+
+    # ``budget`` (mcts/evolutionary) and ``best_of_n_width`` (best_of_n) are the
+    # same concept — the per-completion search width (B) — under different flag
+    # names; ``random`` takes neither. Normalize to a single ``width``.
+    if sampling_method in ("mcts", "evolutionary"):
+        if budget is None:
+            raise ValueError(
+                f"--budget is required when --sampling_method={sampling_method}"
+            )
+        if budget < 1:
+            raise ValueError(f"--budget must be >= 1 (got {budget})")
+        if best_of_n_width is not None:
+            raise ValueError(
+                "--n applies to best_of_n only; use --budget for "
+                f"{sampling_method}"
+            )
+        width = budget
+    elif sampling_method == "best_of_n":
+        if best_of_n_width is None:
+            raise ValueError("--n is required when --sampling_method=best_of_n")
+        if best_of_n_width < 1:
+            raise ValueError(f"--n must be >= 1 (got {best_of_n_width})")
+        if budget is not None:
+            raise ValueError(
+                "--budget applies to mcts/evolutionary only; use --n for "
+                "best_of_n"
+            )
+        width = best_of_n_width
+    else:  # random
+        if budget is not None or best_of_n_width is not None:
+            raise ValueError(
+                "--budget / --n do not apply to the random sampling method"
+            )
+        width = None
     
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -918,24 +1067,33 @@ def evaluate(
     if backend == "vllm":
         from vllm import LLM, SamplingParams
         from vllm.lora.request import LoRARequest
-        
-        quant_kwargs = {}
-        if qlora:
-            # Activates handling for bitsandbytes quantized base models natively.
-            quant_kwargs["quantization"] = "bitsandbytes"
-            quant_kwargs["load_format"] = "bitsandbytes"
+        if merge_dequant:
+            # QLoRA-faithful serving: the adapter was trained against the
+            # NF4-quantised base, so serve dequant(W_nf4) + B·A·s as plain
+            # bf16 weights instead of mounting the LoRA on the clean Hub base.
+            merged_dir = resolve_merged_bf16_dir(adapter)
+            vllm_model_path = str(merged_dir)
+            lora_kwargs = {}
+        else:
+            vllm_model_path = base_model_name
+            lora_kwargs = {
+                "enable_lora": True,
+                "max_lora_rank": adapter_config.get("r", 8),
+            }
+            if qlora:
+                # Activates handling for bitsandbytes quantized base models natively.
+                lora_kwargs["quantization"] = "bitsandbytes"
+                lora_kwargs["load_format"] = "bitsandbytes"
 
-        # Initialize vLLM with unmerged dynamic LoRA
         try:
             model = LLM(
-                model=base_model_name,
+                model=vllm_model_path,
                 tensor_parallel_size=tp_size,
                 gpu_memory_utilization=gpu_memory_utilization,
                 dtype="bfloat16",
-                enable_lora=True,
-                max_lora_rank=adapter_config.get("r", 8),
                 trust_remote_code=True,
-                **quant_kwargs
+                disable_custom_all_reduce=should_disable_custom_all_reduce(tp_size),
+                **lora_kwargs
             )
         except (RuntimeError, ValueError) as e:
             em = str(e).lower()
@@ -947,7 +1105,7 @@ def evaluate(
                     "from other processes."
                 ) from e
             raise
-        lora_request = LoRARequest("active_adapter", 1, str(adapter))
+        lora_request = None if merge_dequant else LoRARequest("active_adapter", 1, str(adapter))
         
         # In vLLM, n=1 here because the generation_vllm function manually submits 'n' active prompts
         generation_config = SamplingParams(
@@ -959,10 +1117,19 @@ def evaluate(
         )
         
         print(f"vLLM Engine initialized on {tp_size} GPUs.")
-        print(f"Base Model: {base_model_name}")
-        print(f"Adapter dynamically mounted from: {adapter.as_posix()}")
+        if merge_dequant:
+            print(f"Serving QLoRA-faithful merged bf16 model: {vllm_model_path}")
+        else:
+            print(f"Base Model: {base_model_name}")
+            print(f"Adapter dynamically mounted from: {adapter.as_posix()}")
 
     else:
+        if merge_dequant:
+            print(
+                "[merge_dequant] Note: flag ignored for the transformers backend — "
+                "load_dual_adapter_model already loads the NF4-quantised base, "
+                "which is QLoRA-faithful by construction."
+            )
         # Standard HF PEFT
         model = load_dual_adapter_model(adapter=adapter)
         model.eval()
@@ -1016,7 +1183,9 @@ def evaluate(
                 config={
                     "adapter": str(adapter),
                     "dataset": dataset_path,
-                    "n": n,
+                    "num_completions": num_completions,
+                    "sampling_method": sampling_method,
+                    "width": width,
                     "k_values": k_values,
                     "temperature": temperature,
                     "top_p": top_p,
@@ -1037,8 +1206,8 @@ def evaluate(
     # =========================================================================
     print("\n" + "=" * 70)
     print(
-        f"EVALUATING: n={n}, k={k_values}, temperature={temperature}, "
-        f"prompt_batch_size={eval_prompt_batch_size}"
+        f"EVALUATING: num_completions={num_completions}, k={k_values}, "
+        f"temperature={temperature}, prompt_batch_size={eval_prompt_batch_size}"
     )
     print(f"Threshold mode: {threshold_mode}")
     print("=" * 70)
@@ -1048,9 +1217,12 @@ def evaluate(
     all_rewards = []  # Detailed rewards per problem per completion
     
     eval_start_time = time.time()
-
     # =========================================================================
-    # 4.5. Build the search strategy (non-random methods bypass tool calls)
+    # 4.5. Build the search strategy.
+    # When max_tool_rounds >= 1, the search runs the same fault-simulation tool
+    # loop as the random path (the model can call the tool mid-generation);
+    # otherwise tool calls are disabled and the simulator is used only as the
+    # external verifier / oracle.
     # =========================================================================
     strategy = None
     if sampling_method != "random":
@@ -1064,8 +1236,39 @@ def evaluate(
                 model, tokenizer, generation_config,
                 micro_batch_size=generation_micro_batch_size,
             )
-        strategy = make_strategy(sampling_method, generator, verifier, budget=n)
-        print(f"Sampling strategy: {sampling_method} (budget per problem: {n})")
+        strategy_kwargs = {}
+        if sampling_method == "mcts":
+            strategy_kwargs["branching"] = 3
+            strategy_kwargs["chunk_tokens"] = 256
+            strategy_kwargs["rollout_max_tokens"] = None
+            strategy_kwargs["ucb_c"] = 1.4
+            strategy_kwargs["chunk_temperature"] = 0.9
+            strategy_kwargs["rollout_temperature"] = 0.7
+        elif sampling_method == "evolutionary":
+            strategy_kwargs["population_size"] = 6
+            strategy_kwargs["elite_fraction"] = 0.5
+            strategy_kwargs["mutation_temperature"] = 1.0
+            strategy_kwargs["crossover_temperature"] = 0.7
+            strategy_kwargs["crossover_max_tokens"] = 2048
+        
+        use_tools = max_tool_rounds >= 1
+        strategy = make_strategy(
+            sampling_method,
+            generator,
+            verifier,
+            num_completions=num_completions,
+            width=width,
+            use_tools=use_tools,
+            max_tool_rounds=max_tool_rounds,
+            **strategy_kwargs,
+        )
+        width_label = "best_of_n_width" if sampling_method == "best_of_n" else "search_budget"
+        print(
+            f"Sampling strategy: {sampling_method} "
+            f"(num_completions={num_completions}, {width_label}={width}, "
+            f"tool_calling={'on' if use_tools else 'off'}, "
+            f"max_tool_rounds={max_tool_rounds})"
+        )
 
     n_records = len(eval_records)
     batch_starts = list(range(0, n_records, max(1, eval_prompt_batch_size)))
@@ -1104,7 +1307,7 @@ def evaluate(
                     "module_name": mod_s,
                     "error": f"prompt_format_error: {e}",
                     "num_correct": 0,
-                    "n": n,
+                    "num_completions": num_completions,
                 }
         
         if ok_prompts:
@@ -1115,18 +1318,18 @@ def evaluate(
                     strategy=strategy,
                     prompts=ok_prompts,
                     records=ok_records,
-                    n=n,
+                    num_completions=num_completions,
                 )
                 gen_dt = time.time() - gen_t0
-                prompts_rep = [p for p in ok_prompts for _ in range(n)]
-                records_rep = [r for r in ok_records for _ in range(n)]
+                prompts_rep = [p for p in ok_prompts for _ in range(num_completions)]
+                records_rep = [r for r in ok_records for _ in range(num_completions)]
             else:
                 if backend == "vllm":
                     flat_completions = generate_batch_n_completions_vllm(
                         llm=model,
                         tokenizer=tokenizer,
                         prompt_texts=ok_prompts,
-                        n=n,
+                        n=num_completions,
                         sampling_params=generation_config,
                         lora_request=lora_request,
                         max_tool_rounds=max_tool_rounds,
@@ -1136,19 +1339,19 @@ def evaluate(
                         model=model,
                         tokenizer=tokenizer,
                         prompt_texts=ok_prompts,
-                        n=n,
+                        n=num_completions,
                         generation_config=generation_config,
                         max_tool_rounds=max_tool_rounds,
                         micro_batch_size=generation_micro_batch_size,
                     )
                 gen_dt = time.time() - gen_t0
 
-                expected_flat = len(ok_prompts) * n
+                expected_flat = len(ok_prompts) * num_completions
                 if len(flat_completions) != expected_flat:
                     print(
                         f"Warning: expected {expected_flat} completions "
-                        f"({len(ok_prompts)} prompts × n={n}), got {len(flat_completions)}; "
-                        "padding or truncating to match."
+                        f"({len(ok_prompts)} prompts × num_completions={num_completions}), "
+                        f"got {len(flat_completions)}; padding or truncating to match."
                     )
                     if len(flat_completions) < expected_flat:
                         flat_completions = flat_completions + [""] * (
@@ -1157,8 +1360,8 @@ def evaluate(
                     else:
                         flat_completions = flat_completions[:expected_flat]
 
-                prompts_rep = [p for p in ok_prompts for _ in range(n)]
-                records_rep = [r for r in ok_records for _ in range(n)]
+                prompts_rep = [p for p in ok_prompts for _ in range(num_completions)]
+                records_rep = [r for r in ok_records for _ in range(num_completions)]
                 try:
                     rewards_flat = evaluate_completions(
                         reward_factory=reward_factory,
@@ -1178,8 +1381,8 @@ def evaluate(
                         'expected_output_acc': 0, 'input_vector_acc': 0,
                         'detected_faults_acc': 0,
                     }
-                    rewards_flat = [zero_r] * (len(ok_prompts) * n)
-
+                    rewards_flat = [zero_r] * (len(ok_prompts) * num_completions)
+            
             n_reward = len(rewards_flat)
             if n_reward != len(prompts_rep):
                 print(
@@ -1204,7 +1407,7 @@ def evaluate(
             per_problem_time = gen_dt / max(len(ok_prompts), 1)
             
             for j, slot in enumerate(ok_slot):
-                problem_rewards = rewards_flat[j * n : (j + 1) * n]
+                problem_rewards = rewards_flat[j * num_completions : (j + 1) * num_completions]
                 num_correct = sum(
                     1
                     for r in problem_rewards
@@ -1221,13 +1424,13 @@ def evaluate(
                     "fault": record.get("fault", ""),
                     "module_name": record.get("module_name", ""),
                     "num_correct": num_correct,
-                    "n": n,
+                    "num_completions": num_completions,
                     "time_seconds": chunk_time_seconds[slot],
                     "rewards_summary": {
                         "mean_total_reward": np.mean(
                             [sum(r.values()) for r in problem_rewards]
                         ),
-                        "fault_detection_rate": num_correct / n,
+                        "fault_detection_rate": num_correct / num_completions,
                         "mean_format_reward": np.mean(
                             [r.get('format', 0) for r in problem_rewards]
                         ),
@@ -1250,7 +1453,7 @@ def evaluate(
                     "module_name": mod_s,
                     "error": "internal_error: incomplete batch slot",
                     "num_correct": 0,
-                    "n": n,
+                    "num_completions": num_completions,
                 }
             all_num_correct.append(chunk_num_correct[slot])
             all_rewards.append(chunk_rewards[slot])
@@ -1260,9 +1463,9 @@ def evaluate(
         if wandb_run and (last_idx + 1) % 10 == 0:
             running_pass_at_k = {}
             for k in k_values:
-                if k <= n:
+                if k <= num_completions:
                     pass_k = estimate_pass_at_k(
-                        np.array([n] * len(all_num_correct)),
+                        np.array([num_completions] * len(all_num_correct)),
                         np.array(all_num_correct),
                         k,
                     )
@@ -1299,12 +1502,12 @@ def evaluate(
     print("COMPUTING PASS@K METRICS")
     print("=" * 70)
     
-    num_samples_arr = np.array([n] * len(all_num_correct))
+    num_samples_arr = np.array([num_completions] * len(all_num_correct))
     num_correct_arr = np.array(all_num_correct)
     
     pass_at_k_results = {}
     for k in k_values:
-        if k <= n:
+        if k <= num_completions:
             pass_k = estimate_pass_at_k(num_samples_arr, num_correct_arr, k)
             mean_pass_k = np.mean(pass_k)
             pass_at_k_results[f"pass@{k}"] = float(mean_pass_k)
@@ -1321,7 +1524,9 @@ def evaluate(
         "num_errors": len(all_results) - len(valid_results),
         "total_eval_time_seconds": round(eval_time, 2),
         "avg_time_per_sample_seconds": round(eval_time / max(len(eval_records), 1), 2),
-        "n_completions_per_prompt": n,
+        "num_completions": num_completions,
+        "sampling_method": sampling_method,
+        "search_width": width,
         "temperature": temperature,
         "threshold_mode": threshold_mode,
     }
@@ -1363,7 +1568,8 @@ def evaluate(
         "config": {
             "adapter": str(adapter),
             "dataset": dataset_path,
-            "n": n,
+            "num_completions": num_completions,
+            "search_width": width,
             "k_values": k_values,
             "temperature": temperature,
             "top_p": top_p,
@@ -1409,7 +1615,7 @@ def evaluate(
     print("=" * 70)
     print(f"Dataset: {dataset_path} (eval split)")
     print(f"Samples: {len(eval_records)}")
-    print(f"Completions per sample: {n}")
+    print(f"Completions per sample: {num_completions}")
     print(f"Temperature: {temperature}")
     print(f"Threshold mode: {threshold_mode}")
     print()
@@ -1768,7 +1974,7 @@ def _sft_eval_generate_hf(
 
 def evaluate_sft_stop(
     adapter: Path,
-    dataset_path: str = "chrivasileiou/asap7-language-of-test",
+    dataset_path: str = "chrivasileiou/asap7-language-of-test-v2",
     eval_buffer_size: int = 30,
     format_threshold: float = 0.95,
     diversity_threshold: float = 0.30,
@@ -1899,6 +2105,7 @@ def evaluate_sft_stop(
             enable_lora=True,
             max_lora_rank=max_lora_rank,
             trust_remote_code=True,
+            disable_custom_all_reduce=should_disable_custom_all_reduce(tp_size),
             **quant_kwargs,
         )
         sampling_config = SamplingParams(
@@ -2310,22 +2517,26 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic evaluation with pass@1
-  python evaluate_model.py --adapter ./sft_finetuned_model/ --n 1 --k 1
+  # Basic evaluation with pass@1 (random i.i.d. baseline)
+  python evaluate_model.py --adapter ./sft_finetuned_model/ --num_completions 1 --k 1
 
-  # Full evaluation with pass@1,5,10
+  # Full evaluation with pass@1,5,10 (random i.i.d. baseline)
   python evaluate_model.py \\
       --adapter ./finetuned_model/combined/policy/ \\
       --backend vllm \\
-      --n 10 --k 1 5 10 \\
+      --num_completions 10 --k 1 5 10 \\
       --temperature 0.6 \\
       --output eval_results.json
 
-  # Quick evaluation on a subset
+  # best_of_n: each of 20 completions is the best of 3 i.i.d. samples
   python evaluate_model.py \\
-      --adapter ./finetuned_model/combined/reference/ \\
-      --backend transformers \\
-      --max_eval_samples 50 --n 5 --k 1 5
+      --adapter ./finetuned_model/combined/policy/ --backend vllm \\
+      --sampling_method best_of_n --num_completions 20 --n 3 --k 1 5 10
+
+  # mcts: each of 20 completions is one MCTS search of budget 3
+  python evaluate_model.py \\
+      --adapter ./finetuned_model/combined/policy/ --backend vllm \\
+      --sampling_method mcts --num_completions 20 --budget 3 --k 1 5 10
 
   # SFT stopping criteria evaluation (all checkpoints in a training dir)
   python evaluate_model.py \\
@@ -2358,10 +2569,18 @@ Examples:
         help="HuggingFace dataset identifier",
     )
     parser.add_argument(
-        "--n", 
-        type=int, 
-        default=int(_env("NUM_SAMPLES", "10")), 
-        help="Number of completions per prompt",
+        "--num_completions",
+        type=int,
+        default=int(_env("NUM_COMPLETIONS", _env("NUM_SAMPLES", "10"))),
+        help="Completions per problem for pass@k (the pass@k pool, N). Each "
+             "completion is one independent application of --sampling_method.",
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=None,
+        help="best_of_n only: i.i.d. samples drawn per completion, of which "
+             "the best is kept (the 'n' in best-of-n; per-completion width).",
     )
     parser.add_argument(
         "--k", 
@@ -2465,6 +2684,15 @@ Examples:
         help="Use if the base model is a BitsAndBytes quantized model (4-bit/8-bit)."
     )
     parser.add_argument(
+        "--merge_dequant",
+        action="store_true",
+        help="vLLM backend: serve the QLoRA-faithful merged bf16 model "
+             "(dequantize_4bit(W_nf4) + B*A*scaling, exactly what GRPO training "
+             "pushed to its vLLM server) instead of mounting the LoRA on the "
+             "clean bf16 Hub base. The export is built once and cached as "
+             "<adapter>_merged_bf16/ next to the adapter.",
+    )
+    parser.add_argument(
         "--eval_prompt_batch_size",
         type=int,
         default=int(_env("EVAL_PROMPT_BATCH_SIZE", "8")),
@@ -2476,7 +2704,7 @@ Examples:
         type=int,
         default=int(_env("GENERATION_MICRO_BATCH_SIZE", "8")),
         help="Transformers backend: max parallel sequences per generate() call "
-             "when expanding to batch_size * n paths (default: 8).",
+             "when expanding to batch_size * num_completions paths (default: 8).",
     )
     parser.add_argument(
         "--sampling_method",
@@ -2489,6 +2717,20 @@ Examples:
             "tool calls and use the external fault simulator as the "
             "verifier / oracle (see sampling_strategies.py)."
         ),
+    )
+    parser.add_argument(
+        "--budget",
+        type=int,
+        default=int(_env("SEARCH_BUDGET")) if _env("SEARCH_BUDGET") else None,
+        help="mcts/evolutionary only: per-completion search width (B). Scored "
+             "rollouts (mcts) or completions evaluated (evolutionary) per "
+             "independent search. Orthogonal to --num_completions.",
+    )
+    parser.add_argument(
+        "--max_prompt_length",
+        type=int,
+        default=4096,
+        help="Max prompt token length for eval buffering (default: 4096).",
     )
 
     # SFT Stopping Criteria Arguments
@@ -2542,12 +2784,6 @@ Examples:
         default=30,
         help="Number of eval prompts to buffer from the test split "
              "(default: 30).",
-    )
-    sft_group.add_argument(
-        "--max_prompt_length",
-        type=int,
-        default=4096,
-        help="Max prompt token length for eval buffering (default: 4096).",
     )
     sft_group.add_argument(
         "--generation_batch_size",
@@ -2605,7 +2841,7 @@ Examples:
         evaluate(
             adapter=Path(args.adapter),
             dataset_path=args.dataset,
-            n=args.n,
+            num_completions=args.num_completions,
             k_values=args.k,
             temperature=args.temperature,
             top_p=args.top_p,
@@ -2626,6 +2862,9 @@ Examples:
             generation_micro_batch_size=args.generation_micro_batch_size,
             wandb_run_name=args.wandb_run_name or None,
             sampling_method=args.sampling_method,
+            merge_dequant=args.merge_dequant,
+            budget=args.budget,
+            best_of_n_width=args.n,
         )
 
 if __name__ == "__main__":

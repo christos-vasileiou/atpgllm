@@ -11,7 +11,7 @@ import hashlib
 # Add the parent directory of atpgllm to sys.path to allow importing from data_preprocessing
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'data_preprocessing'))
 
-from fault_sim import OptimizedNetlist, fast_fault_sim
+from fault_sim import OptimizedNetlist, resolve_fault_sim_runner
 from atpgllm.llm.reward_funcs import (
     extract_json_tool_response_and_convert_to_df,
     extract_markdown_table,
@@ -321,7 +321,7 @@ class RewardFunctionFactory:
                 "tool_response_fn": self.tool_response_fn,
                 "eval_mode": False,
                 "lib_gate_funcs": gate_funcs,
-                "fault_sim": fast_fault_sim,  # Pass the fast_fault_sim function
+                "fault_sim": resolve_fault_sim_runner(),
             }
             
             _ = kwargs.pop('system_content', None)
@@ -346,7 +346,6 @@ class RewardFunctionFactory:
             
             # Run the reward calculation
             try:
-                
                 # ret_rewards = test_generation_reward(prompts, completions, **reward_kwargs)
                 ret_rewards = test_generation_grpo_reward(prompts, completions, **reward_kwargs)
                 if not return_component_dicts:

@@ -54,7 +54,7 @@ from typing import List, Union, Callable, Dict, Any
 from trl.trainer.utils import print_rich_table
 import random
 
-DEBUG = False
+DEBUG = True
 
 def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool = True):
   # Retrieve optimizer from hyperparameters dict
@@ -160,7 +160,7 @@ def sft(dataloader, model, hps, desc:str = "SFT Training...", training_loop:bool
             # print(tabulate(x.iloc[-logging_steps:], headers='keys', tablefmt='psql', showindex=False))
             logging_step=0
           logging_step+=1
-      if DEBUG and i>1000:
+      if DEBUG and i>400:
         break
       
       if is_main_process():
@@ -224,7 +224,7 @@ def prepare_reward_kwargs(hps, reward_funcs):
     if reward_func.__name__ == "cot_reward":
       reward_kwargs.append({"model": sentence_transformer, "cot_block_re": cot_block_re, "thought_pattern_re": thought_pattern_re, "fault_re": fault_re})
     elif reward_func.__name__ == "test_generation_reward":
-      reward_kwargs.append({"fault_re": lambda x: fault_re.findall(x), "simulation_re": lambda x: simulation_re.findall(x), "input_vector_re": lambda x: input_vector_re.findall(x), "expected_output_re": lambda x: expected_output_re.findall(x), "detected_faults_re": lambda x: detected_faults_re.findall(x)})
+      reward_kwargs.append({"fault_re": fault_re, "simulation_re": simulation_re, "input_vector_re": input_vector_re, "expected_output_re": expected_output_re, "detected_faults_re": detected_faults_re})
   return reward_kwargs
 
 def smart_round(value, sig_figs=3):
@@ -414,7 +414,7 @@ def compute_loss(model, data_iterator, reward_funcs, reward_kwargss, hps, step):
     # Print a sample of the prompt, completion, and reward
     if step % hps.gradient_accumulation_steps == 0:
       print_prompt_completions_sample(prompts, completions, rewards_per_func.sum(dim=1).clone().cpu(), step)
-    
+
     # Gather rewards and compute advantages
     rewards_per_func = gather(rewards_per_func)
     rewards = rewards_per_func.sum(dim=1)
@@ -1286,9 +1286,9 @@ def fine_tuning(dataloader, validation_loader, model, hps, training_loop=True):
     # 2. Train adapter (LoRA weights) as well
     sft(dataloader, model, hps, desc="SFT Lora Training...", training_loop=training_loop) 
     # Apply inference on some random samples of validation set
-    if not DEBUG:
-      infer(wrapped_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
-      save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="Model trained with LoRA")
+    # if not DEBUG:
+    # infer(wrapped_model=model, dataloader=validation_loader, tokenizer=hps.tokenizer, model_max_length=hps.model_max_length, epoch=1, file_path=hps.file_path, parallel=hps.parallel, new_file=True)
+    save_model(model, hps.save_in_repo, push_to_hub=True, save_embedding_layers=True, hps=hps, commit_message="Model trained with LoRA")
 
   # Configure which parts of the model to train in step 3
   train_layers(model, train_embeddings=False, train_head=False, train_lora=True, train_base_model=False)
@@ -1415,7 +1415,7 @@ def main():
   model = load_tokenizer(model, hps)
   
   # Load dataset
-  dataset = load_raw_dataset(hps.data_file, test_size=.09)
+  dataset = load_raw_dataset(hps.data_file, test_size=.1)
   
   # Prepare objects for training and validation methods (optimizer, scheduler, dataloader, etc...)
   model, training_loader, validation_loader, testing_loader = prepare_objects_for_training(model, dataset, hps)

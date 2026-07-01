@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import itertools
 import os
+import random
 import re
 import sys
 import concurrent.futures
@@ -353,6 +354,113 @@ def process_batch(batch: list, tokenizer: AutoTokenizer, unique_by: str, max_pro
     return valid_examples
 
 
+def _example_field_key(example: dict, field: str) -> str:
+    """Diversity key for an example.
+
+    The GRPO ``netlist`` field is a ``{"doc_id": ..., "netlist": ...}`` payload
+    (see :func:`conversation.convert_netlist_to_json_payload`), so prefer its
+    ``doc_id``; otherwise stringify the field value.
+    """
+    val = example.get(field)
+    if isinstance(val, dict):
+        return str(val.get("doc_id") or val.get("id") or val.get("netlist") or val)
+    return str(val)
+
+
+DiversityStrategy = Literal["random", "round_robin", "even_spacing"]
+
+
+def _grouped_shuffled(examples: list, field: str, seed: int) -> list:
+    """Group examples by ``field`` key, shuffle within each group (seeded), and
+    return the groups as a list of item-lists ordered largest-first (with the
+    key as a deterministic tie-break)."""
+    rng = random.Random(seed)
+    groups: dict = {}
+    for ex in examples:
+        groups.setdefault(_example_field_key(ex, field), []).append(ex)
+    ordered_keys = sorted(groups.keys(), key=lambda k: (-len(groups[k]), k))
+    group_lists: list = []
+    for k in ordered_keys:
+        items = groups[k]
+        rng.shuffle(items)  # randomise fault order within a netlist (seeded)
+        group_lists.append(items)
+    return group_lists
+
+
+def _round_robin_interleave(group_lists: list) -> list:
+    """One item per group in rotation (largest groups first). Maximises early
+    diversity but a dominant group's tail clusters once smaller groups exhaust."""
+    queues: deque = deque(deque(g) for g in group_lists)
+    result: list = []
+    while queues:
+        q = queues.popleft()
+        result.append(q.popleft())
+        if q:
+            queues.append(q)
+    return result
+
+
+def _even_spacing_interleave(group_lists: list) -> list:
+    """Assign each item an evenly spaced fractional position ``(rank+0.5)/n`` in
+    ``[0, 1)`` and sort globally, so every group's items are spread uniformly
+    across the whole sequence. Keeps per-window diversity uniformly high (best
+    average *and* minimum)."""
+    decorated: list = []
+    for gi, items in enumerate(group_lists):
+        n = len(items)
+        for rank, ex in enumerate(items):
+            decorated.append(((rank + 0.5) / n, gi, ex))
+    decorated.sort(key=lambda t: (t[0], t[1]))
+    return [ex for _, _, ex in decorated]
+
+
+def interleave_for_field_diversity(
+    examples: list,
+    field: str,
+    strategy: DiversityStrategy = "even_spacing",
+    seed: int = 42,
+) -> list:
+    """Deterministically reorder ``examples`` to control ``field`` diversity in
+    every contiguous window. Pure function of ``(examples, field, strategy, seed)``.
+
+    Strategies
+    ----------
+    ``"random"``
+        Seeded global shuffle. Baseline; diversity per window is left to chance
+        (≈ what you get today). No structural guarantee.
+    ``"round_robin"``
+        Cycle through netlist groups one item at a time (largest first). Early
+        windows are maximally diverse, but once small groups run out a dominant
+        netlist's remaining faults cluster at the tail → low-diversity windows
+        there. Good only when group sizes are similar.
+    ``"even_spacing"`` (default, recommended)
+        Spread every netlist's faults uniformly across the epoch (fractional
+        positions). Any window of length ``W`` then holds ~``W * group_size / N``
+        of each netlist — as many distinct netlists as the class balance allows —
+        consistently from start to end. Best average and minimum diversity.
+
+    For GRPO this prevents effective batches dominated by 1–3 netlists' worth of
+    faults, which otherwise make proxy/reward hacking and policy collapse easier.
+    """
+    if not examples:
+        return examples
+
+    if strategy == "random":
+        result = list(examples)
+        random.Random(seed).shuffle(result)
+        return result
+
+    group_lists = _grouped_shuffled(examples, field, seed)
+    if strategy == "round_robin":
+        return _round_robin_interleave(group_lists)
+    if strategy == "even_spacing":
+        return _even_spacing_interleave(group_lists)
+    raise ValueError(
+        f"Unknown diversity strategy {strategy!r}; "
+        "choose 'random', 'round_robin', or 'even_spacing'."
+    )
+
+
 def buffer_streaming_dataset(
     streaming_dataset: IterableDataset,
     buffer_size: int = 10000,
@@ -364,6 +472,8 @@ def buffer_streaming_dataset(
     batch_size: int = 1000,
     num_workers: int = 4,
     skip_buffer_size: int = 0,
+    maximize_diversity_by: Optional[Literal["netlist", "module_name"]] = None,
+    diversity_strategy: DiversityStrategy = "even_spacing",
 ) -> Dataset:
     """Materialise a streaming iterable into a :class:`datasets.Dataset`.
 
@@ -387,6 +497,17 @@ def buffer_streaming_dataset(
         buffer. Use when resuming GRPO on the same stream to avoid retraining on
         prompts already covered in a prior run. Order follows the streaming
         iterator **before** ``shuffle``.
+    maximize_diversity_by : {"netlist", "module_name"}, optional
+        When set, deterministically reorder the buffered examples (via
+        :func:`interleave_for_field_diversity`) so consecutive samples cycle
+        through different values of this field — maximising netlist diversity
+        within each effective batch. Replaces the random ``shuffle`` (the
+        interleave already randomises within-group order using ``seed``). Pair
+        with ``GRPOConfig(shuffle_dataset=False)`` so the trainer's sampler
+        preserves this order.
+    diversity_strategy : {"random", "round_robin", "even_spacing"}, default "even_spacing"
+        Reordering algorithm used when ``maximize_diversity_by`` is set. See
+        :func:`interleave_for_field_diversity` for the trade-offs.
     """
     try:
         skip_buffer_size = int(skip_buffer_size)
@@ -500,10 +621,20 @@ def buffer_streaming_dataset(
             "max_prompt_length, or empty stream). Check dataset path and filters."
         )
 
-    dataset = Dataset.from_list(examples)
-
-    if shuffle:
-        dataset = dataset.shuffle(seed=seed)
+    if maximize_diversity_by is not None:
+        examples = interleave_for_field_diversity(
+            examples, maximize_diversity_by, strategy=diversity_strategy, seed=seed
+        )
+        dataset = Dataset.from_list(examples)
+        print(
+            f"Reordered buffer for '{maximize_diversity_by}' diversity per window "
+            f"(strategy='{diversity_strategy}', seed={seed}); random shuffle skipped. "
+            "Set GRPOConfig(shuffle_dataset=False) to preserve this order."
+        )
+    else:
+        dataset = Dataset.from_list(examples)
+        if shuffle:
+            dataset = dataset.shuffle(seed=seed)
 
     if skip_buffer_size > 0 and buffer_size > 0 and len(dataset) < buffer_size:
         print(

@@ -689,6 +689,55 @@ def validate_training_state_checkpoint(checkpoint_dir: str) -> None:
         )
 
 
+def patch_trainer_cpu_optimizer_resume(trainer) -> None:
+    """Load optimizer/scheduler checkpoints on CPU when resuming with DDP.
+
+    HuggingFace ``Trainer._load_optimizer_and_scheduler`` places optimizer
+    state directly on each GPU when ``world_size > 1``.  For large LoRA runs
+    (e.g. rank 256 on A100 40GB) the checkpoint ``optimizer.pt`` alone can be
+    ~5 GiB per rank, leaving no headroom for the first backward pass.
+
+    ``paged_adamw_32bit`` keeps optimizer state on CPU during training; this
+    patch restores that layout on resume.  DeepSpeed / FSDP paths are unchanged.
+    """
+    from transformers.trainer import (
+        OPTIMIZER_NAME,
+        SCHEDULER_NAME,
+        check_torch_load_is_safe,
+    )
+
+    original = trainer._load_optimizer_and_scheduler
+
+    def _load_optimizer_and_scheduler_cpu(checkpoint):
+        if checkpoint is None:
+            return
+        if (
+            trainer.is_deepspeed_enabled
+            or trainer.is_fsdp_enabled
+        ):
+            return original(checkpoint)
+
+        optim_file = os.path.join(checkpoint, OPTIMIZER_NAME)
+        sched_file = os.path.join(checkpoint, SCHEDULER_NAME)
+        if not (os.path.isfile(optim_file) and os.path.isfile(sched_file)):
+            return original(checkpoint)
+
+        check_torch_load_is_safe()
+        trainer.optimizer.load_state_dict(
+            torch.load(optim_file, map_location="cpu", weights_only=True)
+        )
+        check_torch_load_is_safe()
+        trainer.lr_scheduler.load_state_dict(
+            torch.load(sched_file, map_location="cpu", weights_only=True)
+        )
+        print(
+            "[Resume] Loaded optimizer and scheduler state on CPU "
+            "(DDP resume OOM workaround for paged_adamw_32bit)."
+        )
+
+    trainer._load_optimizer_and_scheduler = _load_optimizer_and_scheduler_cpu
+
+
 # =====================================================================
 # SFTStoppingCallback
 # =====================================================================

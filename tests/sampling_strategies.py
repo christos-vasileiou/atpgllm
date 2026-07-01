@@ -4,16 +4,28 @@ sampling_strategies.py
 
 Pluggable inference-time search strategies for ``evaluate_model.py``.
 
-Each strategy explores the model's output space under a fixed call budget
-(``--n``) and stops as soon as the **external fault simulator** confirms the
-target fault is detected (or the model emits EOS / the budget is exhausted).
+``evaluate_model.py`` passes two orthogonal knobs:
 
-Implemented (Phase 1):
+  * ``--num_completions`` (N) — completions per problem; this *is* the pass@k
+    pool.  Every strategy returns exactly N completions per problem, each one
+    produced by a single independent application of the strategy, so the N
+    outputs are i.i.d. draws from the (search-augmented) policy and the pass@k
+    estimator stays valid.
+  * the per-completion search width (B) — how much search backs *each* of the
+    N completions: ``--n`` for ``best_of_n``, ``--budget`` for ``mcts`` /
+    ``evolutionary``.  Total work per problem is ``N * (cost of one width-B
+    application)``.
 
-  * ``best_of_n``    — Independent N samples with diversified temperature.
-  * ``mcts``         — UCT search over partial completions; rollouts run to
-                       EOS and the simulator-derived reward is backpropagated.
-  * ``evolutionary`` — Genetic search; crossover splices ``INPUT_VECTOR``
+Implemented:
+
+  * ``best_of_n``    — each completion is the best of ``B`` i.i.d. samples
+                       (drawn at the eval temperature; ``B == 1`` reduces to
+                       the plain i.i.d. baseline).
+  * ``mcts``         — each completion is the best of one UCT search of ``B``
+                       rollouts; rollouts run to EOS and the simulator-derived
+                       reward is backpropagated.
+  * ``evolutionary`` — each completion is the best of one genetic search of
+                       ``B`` evaluations; crossover splices ``INPUT_VECTOR``
                        between parents, mutation regenerates the suffix.
 
 All three bypass model-issued tool calls during search and use the
@@ -56,6 +68,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data_preprocessing
 
 from fault_sim import resolve_fault_sim_runner
 from reward_function_factory import RewardFunctionFactory
+from tools import TOOLS, ToolHelper
+from revert_template import get_generation_prompt_suffix, revert_chat_template
 
 
 # Module-local regexes (decoupled from the factory so partial completions
@@ -106,8 +120,37 @@ def reward_is_detected(reward: Dict[str, float]) -> bool:
 # Generator abstraction
 # =============================================================================
 
+def _load_tool_helpers():
+    """
+    Lazily import the tool-call parser / executor from ``evaluate_model``.
+
+    Lazy (call-time) to avoid an import cycle: ``evaluate_model`` imports this
+    module at top level, so importing it back here at top level would deadlock
+    the import machinery. By call time both modules are fully loaded.
+    """
+    from evaluate_model import (
+        ensure_tool_call_arguments_dict,
+        execute_tool_call,
+        parse_tool_call,
+    )
+
+    return parse_tool_call, ensure_tool_call_arguments_dict, execute_tool_call
+
+
+# Marks the boundary of a *resolved* tool exchange in the readable completion.
+# Text after the final occurrence is the still-open assistant turn (where a new
+# tool call may appear and must be executed).
+_TOOL_RESPONSE_CLOSE = "</tool_response>"
+
+
 class Generator(ABC):
-    """Abstract generator. ``generate`` returns ``[[c_1..c_n] per prompt]``."""
+    """
+    Abstract generator. ``generate`` returns ``[[c_1..c_n] per prompt]``.
+
+    Concrete subclasses must set ``self.tokenizer`` (used by
+    :meth:`generate_with_tools` to revert / re-apply the chat template across
+    tool rounds).
+    """
 
     @abstractmethod
     def generate(
@@ -119,6 +162,143 @@ class Generator(ABC):
         top_p: Optional[float] = None,
     ) -> List[List[str]]:
         ...
+
+    # -------------------------------------------------------------------------
+    # Tool-aware generation (shared by all strategies)
+    # -------------------------------------------------------------------------
+
+    def _base_messages(self, prompt: str) -> List[Dict[str, Any]]:
+        """
+        System + user messages for *prompt* (a fully templated generation
+        prompt). The trailing ``add_generation_prompt`` suffix is stripped so
+        the revert parser doesn't emit a spurious empty assistant turn.
+        """
+        suffix = get_generation_prompt_suffix(tokenizer=self.tokenizer)
+        clean = prompt[: -len(suffix)] if suffix and prompt.endswith(suffix) else prompt
+        try:
+            msgs = revert_chat_template(clean, tokenizer=self.tokenizer)
+        except ValueError:
+            return []
+        # Keep only the context turns; any assistant content here would be the
+        # (empty) open turn we just stripped.
+        return [m for m in msgs if m.get("role") in ("system", "user", "tool")]
+
+    @staticmethod
+    def _open_turn_text(prefix: str) -> str:
+        """Portion of *prefix* belonging to the still-open assistant turn."""
+        if _TOOL_RESPONSE_CLOSE in prefix:
+            return prefix.rsplit(_TOOL_RESPONSE_CLOSE, 1)[1]
+        return prefix
+
+    def generate_with_tools(
+        self,
+        prompts: List[str],
+        n: int = 1,
+        prefixes: Optional[List[str]] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_tool_rounds: int = 1,
+    ) -> List[List[str]]:
+        """
+        Multi-round tool-aware generation, batched in lockstep across all
+        active paths (mirrors ``generate_batch_n_completions_vllm`` but uses
+        :meth:`generate` as the per-round primitive so it works for any
+        backend).
+
+        Each ``(prompt, prefix)`` pair expands to *n* independent paths. The
+        returned **readable** completion for a path is
+        ``prefix + model_text + <tool_response>…</tool_response> + …`` — the
+        same format the reward parser consumes. Generation continues from a
+        properly re-templated conversation after every tool call, so the model
+        always sees the in-distribution tool format (not the readable markers).
+
+        Constraint: a non-empty *prefix* must lie within the first assistant
+        turn (it may contain an unexecuted ``<tool_call>`` but no already
+        *resolved* ``<tool_response>``). All strategy call sites honour this.
+        """
+        parse_tool_call, ensure_args, execute_tool_call = _load_tool_helpers()
+
+        if prefixes is None:
+            prefixes = [""] * len(prompts)
+        if len(prefixes) != len(prompts):
+            raise ValueError("prefixes must align with prompts")
+
+        base_messages_cache = [self._base_messages(p) for p in prompts]
+
+        states: List[Dict[str, Any]] = []
+        for p_idx, (prompt, prefix) in enumerate(zip(prompts, prefixes)):
+            for _ in range(n):
+                states.append({
+                    "prompt": prompt,
+                    "p_idx": p_idx,
+                    "current_input": prompt + prefix,
+                    "readable": prefix,
+                    "assistant_acc": self._open_turn_text(prefix),
+                    "done": False,
+                })
+
+        for _round in range(max_tool_rounds + 1):
+            active = [i for i, s in enumerate(states) if not s["done"]]
+            if not active:
+                break
+            
+            inputs = [states[i]["current_input"] for i in active]
+            outputs = self.generate(
+                inputs, n=1, max_tokens=max_tokens,
+                temperature=temperature, top_p=top_p,
+            )
+            
+            for i, out_list in zip(active, outputs):
+                s = states[i]
+                text = out_list[0] if out_list else ""
+                s["readable"] += text
+                s["assistant_acc"] += text
+                
+                if _round >= max_tool_rounds:
+                    s["done"] = True
+                    continue
+                
+                tool_call = parse_tool_call(s["assistant_acc"])
+                if tool_call is None:
+                    s["done"] = True
+                    continue
+                
+                try:
+                    ensure_args(tool_call)
+                    tool_call["arguments"].update(
+                        {"netlist": ToolHelper.get_netlist(s["prompt"])}
+                    )
+                    tool_result = execute_tool_call(tool_call)
+                    messages = list(base_messages_cache[s["p_idx"]])
+                    messages.append(
+                        {"role": "assistant", "content": s["assistant_acc"]}
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "name": tool_call.get("name", "fault_simulation_tool"),
+                        "content": tool_result,
+                    })
+                    s["current_input"] = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        tools=TOOLS,
+                        add_generation_prompt=True,
+                    )
+                    s["readable"] += (
+                        f"\n<tool_response>\n{tool_result}\n</tool_response>\n"
+                    )
+                    s["assistant_acc"] = ""
+                except Exception as e:
+                    s["readable"] += (
+                        f"\n<tool_response>\nTool round failed: {e}\n</tool_response>\n"
+                    )
+                    s["done"] = True
+
+        grouped: List[List[str]] = [[] for _ in prompts]
+        for s in states:
+            grouped[s["p_idx"]].append(s["readable"])
+        return grouped
 
 
 class VLLMGenerator(Generator):
@@ -134,11 +314,16 @@ class VLLMGenerator(Generator):
         self._base = base_sampling_params
 
     def _params(self, n, max_tokens, temperature, top_p):
+        # Coerce to built-in scalars: vLLM's msgpack encoder rejects numpy
+        # types (e.g. a numpy.float64 temperature from np.linspace).
+        temp = self._base.temperature if temperature is None else temperature
+        tp = self._base.top_p if top_p is None else top_p
+        mt = self._base.max_tokens if max_tokens is None else max_tokens
         return self._SamplingParams(
-            n=n,
-            temperature=self._base.temperature if temperature is None else temperature,
-            top_p=self._base.top_p if top_p is None else top_p,
-            max_tokens=self._base.max_tokens if max_tokens is None else max_tokens,
+            n=int(n),
+            temperature=float(temp),
+            top_p=float(tp),
+            max_tokens=int(mt),
             stop_token_ids=list(self._base.stop_token_ids or []),
         )
 
@@ -172,13 +357,13 @@ class HFGenerator(Generator):
         from transformers import GenerationConfig
 
         cfg = GenerationConfig(
-            max_new_tokens=(
+            max_new_tokens=int(
                 self._base.max_new_tokens if max_tokens is None else max_tokens
             ),
-            temperature=(
+            temperature=float(
                 self._base.temperature if temperature is None else temperature
             ),
-            top_p=self._base.top_p if top_p is None else top_p,
+            top_p=float(self._base.top_p if top_p is None else top_p),
             do_sample=True,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
@@ -302,10 +487,51 @@ class SamplingStrategy(ABC):
 
     name: str = "abstract"
 
-    def __init__(self, generator: Generator, verifier: Verifier, budget: int, **_):
+    def __init__(
+        self,
+        generator: Generator,
+        verifier: Verifier,
+        num_completions: int = 1,
+        use_tools: bool = False,
+        max_tool_rounds: int = 1,
+        **_,
+    ):
         self.gen = generator
         self.verifier = verifier
-        self.budget = budget
+        # ``num_completions`` (N) is the pass@k pool size. Every strategy
+        # returns exactly N completions per problem, each from one independent
+        # application of the strategy (see module docstring).
+        self.num_completions = num_completions
+        self.use_tools = use_tools
+        self.max_tool_rounds = max_tool_rounds
+
+    def _generate(
+        self,
+        prompts: List[str],
+        n: int = 1,
+        prefixes: Optional[List[str]] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> List[List[str]]:
+        """
+        Route generation through the tool-aware loop (when ``use_tools``) or the
+        plain primitive. With plain generation, any *prefixes* are prepended to
+        the returned text so callers get the same readable shape either way.
+        """
+        if self.use_tools:
+            return self.gen.generate_with_tools(
+                prompts, n=n, prefixes=prefixes,
+                max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+                max_tool_rounds=self.max_tool_rounds,
+            )
+        out = self.gen.generate(
+            prompts, n=n, max_tokens=max_tokens,
+            temperature=temperature, top_p=top_p,
+        )
+        if prefixes is not None:
+            out = [[prefixes[i] + t for t in sub] for i, sub in enumerate(out)]
+        return out
 
     @abstractmethod
     def sample_batch(
@@ -322,12 +548,13 @@ class SamplingStrategy(ABC):
 
 class BestOfNStrategy(SamplingStrategy):
     """
-    Independent N samples per prompt across a small temperature grid (more
-    diverse than a single fixed T). All N are scored; results are returned
-    in generation order so the caller can still compute ``pass@k`` over the
-    full set. Early stop is not possible inside a single vLLM call, but
-    the strategy reports ``detected_any`` so downstream code can short-
-    circuit further work on detected problems if desired.
+    Best-of-``width`` selection, repeated ``num_completions`` times per problem.
+
+    Each of the N pass@k slots is one independent draw of ``width`` (B) i.i.d.
+    samples at the eval temperature, keeping the single best by verifier
+    ``detected`` then ``scalar``. ``B == 1`` degenerates to the plain i.i.d.
+    baseline. All ``N * B`` samples are drawn in one batched generation per
+    problem and grouped into N blocks of B.
     """
 
     name = "best_of_n"
@@ -336,50 +563,49 @@ class BestOfNStrategy(SamplingStrategy):
         self,
         generator: Generator,
         verifier: Verifier,
-        budget: int,
-        temperatures: Optional[List[float]] = None,
+        num_completions: int,
+        width: int,
         **kwargs,
     ):
-        super().__init__(generator, verifier, budget)
-        self.temperatures = list(temperatures) if temperatures else [0.4, 0.7, 1.0]
+        super().__init__(
+            generator, verifier, num_completions=num_completions, **kwargs
+        )
+        self.width = width
 
     def sample_batch(self, prompts, records):
-        per_temp = max(1, self.budget // len(self.temperatures))
-        # gathered[i] is the list of completions accumulated for prompt i.
-        gathered: List[List[str]] = [[] for _ in prompts]
-        for t in self.temperatures:
-            batch = self.gen.generate(prompts, n=per_temp, temperature=t)
-            for i, cs in enumerate(batch):
-                gathered[i].extend(cs)
+        total = self.num_completions * self.width
+        # One batched draw of N*B i.i.d. samples per prompt at the eval
+        # temperature (no temperature grid: the pool must be i.i.d.).
+        batch = self._generate(prompts, n=total)
 
-        # Normalize to exactly ``budget`` completions per prompt: pad with
-        # extra samples at the lowest temperature if a temperature grid
-        # didn't divide evenly.
-        deficits = [self.budget - len(cs) for cs in gathered]
-        if any(d > 0 for d in deficits):
-            top_up_idx = [i for i, d in enumerate(deficits) if d > 0]
-            top_up_prompts = [prompts[i] for i in top_up_idx]
-            top_up_n = max(deficits[i] for i in top_up_idx)
-            extra = self.gen.generate(
-                top_up_prompts, n=top_up_n, temperature=self.temperatures[0],
-            )
-            for slot, i in enumerate(top_up_idx):
-                gathered[i].extend(extra[slot][: deficits[i]])
-        for i in range(len(gathered)):
-            gathered[i] = gathered[i][: self.budget]
-
-        # Verify all in one batched call per problem.
         results: List[SamplingResult] = []
-        for prompt, record, cs in zip(prompts, records, gathered):
+        for prompt, record, samples in zip(prompts, records, batch):
+            # Pad defensively so grouping always yields N blocks of exactly B.
+            if len(samples) < total:
+                samples = list(samples) + [""] * (total - len(samples))
             scores = self.verifier.score_many(
-                [prompt] * len(cs), cs, [record] * len(cs),
+                [prompt] * len(samples), samples, [record] * len(samples),
             )
+            best_completions: List[str] = []
+            best_scores: List[CompletionScore] = []
+            for g in range(self.num_completions):
+                block = list(
+                    zip(
+                        samples[g * self.width : (g + 1) * self.width],
+                        scores[g * self.width : (g + 1) * self.width],
+                    )
+                )
+                best_c, best_s = max(
+                    block, key=lambda cs: (cs[1].detected, cs[1].scalar),
+                )
+                best_completions.append(best_c)
+                best_scores.append(best_s)
             results.append(
                 SamplingResult(
-                    completions=cs,
-                    scores=scores,
-                    detected_any=any(s.detected for s in scores),
-                    generator_calls=len(cs),
+                    completions=best_completions,
+                    scores=best_scores,
+                    detected_any=any(s.detected for s in best_scores),
+                    generator_calls=len(samples),
                 )
             )
         return results
@@ -415,8 +641,10 @@ class MCTSStrategy(SamplingStrategy):
          a value in ``[0, 1]`` (1.0 if detected; otherwise a sigmoid of the
          scalar verifier reward) up to the root.
 
-    Budget: ``iterations = budget // 2`` (each iter costs ≈ 2 generator
-    calls: one expansion + one rollout).
+    Width: each search runs up to ``budget`` (B) scored rollouts (one per
+    iteration; each iteration costs ≈ 2 generator calls: one expansion + one
+    rollout) and returns its single best completion. The strategy runs
+    ``num_completions`` (N) such independent searches per problem.
     """
 
     name = "mcts"
@@ -425,6 +653,7 @@ class MCTSStrategy(SamplingStrategy):
         self,
         generator: Generator,
         verifier: Verifier,
+        num_completions: int,
         budget: int,
         branching: int = 3,
         chunk_tokens: int = 256,
@@ -434,7 +663,10 @@ class MCTSStrategy(SamplingStrategy):
         rollout_temperature: float = 0.7,
         **kwargs,
     ):
-        super().__init__(generator, verifier, budget)
+        super().__init__(
+            generator, verifier, num_completions=num_completions, **kwargs
+        )
+        self.budget = budget
         self.branching = branching
         self.chunk_tokens = chunk_tokens
         self.rollout_max_tokens = rollout_max_tokens
@@ -458,6 +690,9 @@ class MCTSStrategy(SamplingStrategy):
     def _expand(self, prompt: str, node: _MCTSNode) -> None:
         if node.terminal or node.children:
             return
+        # Expansion is intentionally plain: chunks are partial assistant text,
+        # so tool calls are not executed here. A ``<tool_call>`` landing inside
+        # a chunk is resolved later by the tool-aware rollout from that node.
         continuations = self.gen.generate(
             [prompt + node.prefix],
             n=self.branching,
@@ -468,13 +703,15 @@ class MCTSStrategy(SamplingStrategy):
             node.children.append(_MCTSNode(prefix=node.prefix + c, parent=node))
 
     def _rollout(self, prompt: str, leaf: _MCTSNode) -> str:
-        completion_tail = self.gen.generate(
-            [prompt + leaf.prefix],
+        # Tool-aware when use_tools: any tool call in (prefix + rollout tail)
+        # is executed and the simulator output fed back before continuing.
+        return self._generate(
+            [prompt],
             n=1,
+            prefixes=[leaf.prefix],
             max_tokens=self.rollout_max_tokens,
             temperature=self.rollout_temperature,
         )[0][0]
-        return leaf.prefix + completion_tail
 
     @staticmethod
     def _backprop(leaf: _MCTSNode, value: float) -> None:
@@ -491,14 +728,15 @@ class MCTSStrategy(SamplingStrategy):
         # Squash scalar reward to (0, 1); positive scalars → > 0.5.
         return 1.0 / (1.0 + math.exp(-0.1 * score.scalar))
 
-    def _run_single(self, prompt: str, record: Dict[str, Any]) -> SamplingResult:
+    def _search_once(
+        self, prompt: str, record: Dict[str, Any],
+    ) -> Tuple[str, CompletionScore, int]:
+        """One UCT search of ``budget`` rollouts; returns its single best."""
         root = _MCTSNode(prefix="")
-        completions: List[str] = []
-        scores: List[CompletionScore] = []
+        best: Optional[Tuple[str, CompletionScore]] = None
         calls = 0
-        iterations = max(1, self.budget // 2)
 
-        for _ in range(iterations):
+        for _ in range(self.budget):
             leaf = self._select(root)
             self._expand(prompt, leaf)
             calls += 1
@@ -514,11 +752,28 @@ class MCTSStrategy(SamplingStrategy):
             score = self.verifier.score(prompt, full_completion, record)
             target.terminal = True
             self._backprop(target, self._value_from_score(score))
-            completions.append(full_completion)
-            scores.append(score)
+            if best is None or (score.detected, score.scalar) > (
+                best[1].detected, best[1].scalar
+            ):
+                best = (full_completion, score)
             if score.detected:
                 break
 
+        if best is None:
+            best = ("", CompletionScore(detected=False, scalar=0.0))
+        return best[0], best[1], calls
+
+    def _run_single(self, prompt: str, record: Dict[str, Any]) -> SamplingResult:
+        # ``num_completions`` independent searches; each contributes its single
+        # best completion, giving an i.i.d. pass@k pool of size N per problem.
+        completions: List[str] = []
+        scores: List[CompletionScore] = []
+        calls = 0
+        for _ in range(self.num_completions):
+            c, s, cc = self._search_once(prompt, record)
+            completions.append(c)
+            scores.append(s)
+            calls += cc
         return SamplingResult(
             completions=completions,
             scores=scores,
@@ -549,7 +804,15 @@ class EvolutionaryStrategy(SamplingStrategy):
          * **mutation**: cut the parent at a random position and resample
            the suffix with a higher temperature.
 
-    Stops early when any child detects the fault.
+    Width: each search evaluates up to ``budget`` (B) completions and returns
+    its single best; stops early when any child detects the fault. The strategy
+    runs ``num_completions`` (N) such independent searches per problem.
+
+    Tool calling: when ``use_tools`` is set, seeding and child continuations
+    run through the tool-aware loop. Seeds (no prefix) get full multi-round
+    tool support. Child prefixes are cut from the parent's *first* assistant
+    segment (before any resolved ``<tool_response>``) so a tool call in the
+    regenerated tail is re-templated against the correct system+user context.
     """
 
     name = "evolutionary"
@@ -558,6 +821,7 @@ class EvolutionaryStrategy(SamplingStrategy):
         self,
         generator: Generator,
         verifier: Verifier,
+        num_completions: int,
         budget: int,
         population_size: int = 6,
         elite_fraction: float = 0.5,
@@ -567,13 +831,22 @@ class EvolutionaryStrategy(SamplingStrategy):
         seed_temperatures: Optional[List[float]] = None,
         **kwargs,
     ):
-        super().__init__(generator, verifier, budget)
+        super().__init__(
+            generator, verifier, num_completions=num_completions, **kwargs
+        )
+        self.budget = budget
         self.population_size = population_size
         self.elite_count = max(1, int(round(population_size * elite_fraction)))
         self.mutation_temperature = mutation_temperature
         self.crossover_temperature = crossover_temperature
         self.crossover_max_tokens = crossover_max_tokens
         self.seed_temperatures = list(seed_temperatures) if seed_temperatures else [0.5, 0.8, 1.0]
+
+    @staticmethod
+    def _first_segment(text: str) -> str:
+        """Parent text up to (not including) the first resolved tool response."""
+        marker = "\n<tool_response>"
+        return text.split(marker, 1)[0] if marker in text else text
 
     @staticmethod
     def _splice_input_vector(donor: str, host: str) -> Optional[str]:
@@ -589,11 +862,12 @@ class EvolutionaryStrategy(SamplingStrategy):
         prompt: str,
         record: Dict[str, Any],
     ) -> Tuple[List[str], List[CompletionScore], int]:
-        per_temp = max(1, self.population_size // len(self.seed_temperatures))
+        seed_count = min(self.population_size, self.budget)
+        per_temp = max(1, seed_count // len(self.seed_temperatures))
         completions: List[str] = []
         for t in self.seed_temperatures:
-            completions.extend(self.gen.generate([prompt], n=per_temp, temperature=t)[0])
-        completions = completions[: self.population_size]
+            completions.extend(self._generate([prompt], n=per_temp, temperature=t)[0])
+        completions = completions[:seed_count]
         scores = self.verifier.score_many(
             [prompt] * len(completions), completions, [record] * len(completions),
         )
@@ -624,11 +898,14 @@ class EvolutionaryStrategy(SamplingStrategy):
                         max_tokens.append(self.crossover_max_tokens)
                         continue
             parent = random.choice(elites)
+            # Mutate within the first assistant segment so the regenerated tail
+            # re-templates cleanly if it issues a tool call (see class docstring).
+            seg = self._first_segment(parent)
             # Avoid degenerate empty / huge cuts.
-            min_cut = max(1, len(parent) // 4)
-            max_cut = max(min_cut + 1, 3 * len(parent) // 4)
+            min_cut = max(1, len(seg) // 4)
+            max_cut = max(min_cut + 1, 3 * len(seg) // 4)
             cut = random.randint(min_cut, max_cut)
-            prefixes.append(parent[:cut])
+            prefixes.append(seg[:cut])
             kinds.append("m")
             max_tokens.append(None)
 
@@ -649,30 +926,28 @@ class EvolutionaryStrategy(SamplingStrategy):
         )
         # Temperature: use crossover_temperature if any crossover, else mutation_temperature.
         temp = self.crossover_temperature if "c" in kinds else self.mutation_temperature
-        batch_prompts = [prompt + pre for pre in prefixes]
-        batch_outputs = self.gen.generate(
-            batch_prompts, n=1, max_tokens=unified_max, temperature=temp,
+        # ``_generate`` already prepends each prefix (and appends any tool
+        # responses), so each output is the full readable child completion.
+        batch_outputs = self._generate(
+            [prompt] * len(prefixes),
+            n=1,
+            prefixes=prefixes,
+            max_tokens=unified_max,
+            temperature=temp,
         )
-        children: List[str] = []
-        for pre, out_list in zip(prefixes, batch_outputs):
-            tail = out_list[0] if out_list else ""
-            children.append(pre + tail)
-        return children
+        return [out_list[0] if out_list else "" for out_list in batch_outputs]
 
-    def _run_single(self, prompt: str, record: Dict[str, Any]) -> SamplingResult:
+    def _search_once(
+        self, prompt: str, record: Dict[str, Any],
+    ) -> Tuple[str, CompletionScore, int]:
+        """One genetic search (≤ ``budget`` evals); returns its single best."""
         population, scores, calls = self._seed_population(prompt, record)
         all_completions: List[str] = list(population)
         all_scores: List[CompletionScore] = list(scores)
 
-        if any(s.detected for s in all_scores):
-            return SamplingResult(
-                completions=all_completions,
-                scores=all_scores,
-                detected_any=True,
-                generator_calls=calls,
-            )
-
-        while calls < self.budget:
+        while not any(s.detected for s in all_scores) and (
+            len(all_completions) < self.budget
+        ):
             ranked = sorted(
                 zip(all_completions, all_scores),
                 key=lambda cs: cs[1].scalar,
@@ -680,7 +955,7 @@ class EvolutionaryStrategy(SamplingStrategy):
             )
             elites = [c for c, _ in ranked[: self.elite_count]]
 
-            remaining = self.budget - calls
+            remaining = self.budget - len(all_completions)
             k = min(self.population_size, remaining)
             if k <= 0:
                 break
@@ -694,13 +969,30 @@ class EvolutionaryStrategy(SamplingStrategy):
             )
             all_completions.extend(new_completions)
             all_scores.extend(new_scores)
-            if any(s.detected for s in new_scores):
-                break
 
+        if not all_completions:
+            return "", CompletionScore(detected=False, scalar=0.0), calls
+        best_c, best_s = max(
+            zip(all_completions, all_scores),
+            key=lambda cs: (cs[1].detected, cs[1].scalar),
+        )
+        return best_c, best_s, calls
+
+    def _run_single(self, prompt: str, record: Dict[str, Any]) -> SamplingResult:
+        # ``num_completions`` independent searches; each contributes its single
+        # best completion, giving an i.i.d. pass@k pool of size N per problem.
+        completions: List[str] = []
+        scores: List[CompletionScore] = []
+        calls = 0
+        for _ in range(self.num_completions):
+            c, s, cc = self._search_once(prompt, record)
+            completions.append(c)
+            scores.append(s)
+            calls += cc
         return SamplingResult(
-            completions=all_completions,
-            scores=all_scores,
-            detected_any=any(s.detected for s in all_scores),
+            completions=completions,
+            scores=scores,
+            detected_any=any(s.detected for s in scores),
             generator_calls=calls,
         )
 
@@ -728,32 +1020,71 @@ def make_strategy(
     name: str,
     generator: Generator,
     verifier: Verifier,
-    budget: int,
+    *,
+    num_completions: int,
+    width: Optional[int] = None,
+    use_tools: bool = False,
+    max_tool_rounds: int = 1,
     **kwargs,
 ) -> SamplingStrategy:
+    """
+    Build a strategy by name.
+
+    ``num_completions`` (N) is the pass@k pool size for every strategy: the
+    strategy returns exactly N completions per problem, each from one
+    independent application of the strategy.
+
+    ``width`` (B) is the per-completion search width and is required for all
+    registered strategies:
+      * ``best_of_n``    — i.i.d. samples drawn per completion (best is kept);
+      * ``mcts``         — scored rollouts per search;
+      * ``evolutionary`` — completions evaluated per search.
+
+    ``use_tools`` enables the in-search fault-simulation tool loop (the model
+    can call ``fault_simulation_tool`` mid-generation, exactly like the random
+    eval path); ``max_tool_rounds`` caps how many tool calls each path may make.
+    Extra ``kwargs`` are strategy-specific knobs (branching, population_size, …).
+    """
     if name not in STRATEGY_REGISTRY:
         raise ValueError(
             f"Unknown sampling strategy '{name}'. "
             f"Available: {list_available_strategies()}."
         )
-    return STRATEGY_REGISTRY[name](generator, verifier, budget, **kwargs)
+    if width is None:
+        raise ValueError(f"make_strategy({name}) requires width=...")
+    common = dict(
+        num_completions=num_completions,
+        use_tools=use_tools,
+        max_tool_rounds=max_tool_rounds,
+        **kwargs,
+    )
+    if name == "best_of_n":
+        return BestOfNStrategy(generator, verifier, width=width, **common)
+    if name in ("mcts", "evolutionary"):
+        cls = STRATEGY_REGISTRY[name]
+        return cls(generator, verifier, budget=width, **common)
+    raise ValueError(f"Unhandled strategy: {name}")
 
 
-def normalize_to_n(
-    result: SamplingResult, n: int,
+def select_for_pass_at_k(
+    result: SamplingResult, num_completions: int,
 ) -> Tuple[List[str], List[Dict[str, float]]]:
     """
-    Pad / truncate a ``SamplingResult`` so the caller can plug it into the
-    existing ``pass@k`` pipeline which assumes exactly ``n`` completions
-    per problem.
+    Normalize a ``SamplingResult`` to exactly ``num_completions`` completions.
 
-    Padding is empty strings + zero-reward dicts so the pad slots can
-    never appear "correct".
+    Strategies already return exactly N independent completions, so this is a
+    defensive normalizer only: it truncates / pads *in order* and never
+    reorders by score (reordering would bias the i.i.d. pass@k pool). Pad slots
+    are empty strings with zero-reward dicts so they can never count as
+    correct.
     """
-    completions = list(result.completions[:n])
-    components: List[Dict[str, float]] = [s.components for s in result.scores[:n]]
-    if len(completions) < n:
-        pad = n - len(completions)
+    completions = list(result.completions)
+    components: List[Dict[str, float]] = [s.components for s in result.scores]
+    if len(completions) > num_completions:
+        completions = completions[:num_completions]
+        components = components[:num_completions]
+    elif len(completions) < num_completions:
+        pad = num_completions - len(completions)
         completions.extend([""] * pad)
         components.extend([{} for _ in range(pad)])
     return completions, components
@@ -763,12 +1094,12 @@ def run_strategy_batch(
     strategy: SamplingStrategy,
     prompts: List[str],
     records: List[Dict[str, Any]],
-    n: int,
+    num_completions: int,
 ) -> Tuple[List[str], List[Dict[str, float]], List[SamplingResult]]:
     """
     Execute *strategy* on a batch and return three aligned views:
 
-    * ``flat_completions``  — length ``len(prompts) * n`` (padded / truncated)
+    * ``flat_completions``  — length ``len(prompts) * num_completions``
     * ``flat_rewards``      — same length; the verifier's component dicts
     * ``raw_results``       — the per-problem ``SamplingResult`` objects for
                               callers that want search-cost diagnostics.
@@ -777,7 +1108,7 @@ def run_strategy_batch(
     flat_completions: List[str] = []
     flat_rewards: List[Dict[str, float]] = []
     for res in raw_results:
-        comps, rewards = normalize_to_n(res, n)
+        comps, rewards = select_for_pass_at_k(res, num_completions)
         flat_completions.extend(comps)
         flat_rewards.extend(rewards)
     return flat_completions, flat_rewards, raw_results
