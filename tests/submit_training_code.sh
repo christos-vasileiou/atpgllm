@@ -57,5 +57,36 @@ echo "  original: $CONFIG_FILE"
 echo "  frozen:   $FROZEN"
 echo "  meta:     ${FROZEN}.meta"
 
+# ---------------------------------------------------------------------------
+# Build sbatch resource overrides from the (frozen) config.
+#
+# #SBATCH directives inside run_training_code.sh are static, so the topology
+# (partition, node count, GPUs/node, CPUs, memory) is driven here instead:
+# sbatch CLI flags take precedence over #SBATCH lines. This is what makes the
+# SAME launcher work for single-node (4xH100: PARTITION=h100, NUM_NODES=1,
+# GPUS_PER_NODE=4) and multi-node (H200: NUM_NODES=2/3, GPUS_PER_NODE=2).
+# ---------------------------------------------------------------------------
+# shellcheck source=/dev/null
+source "$FROZEN"
+PARTITION="${PARTITION:-h200}"
+NUM_NODES="${NUM_NODES:-1}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
+CPUS_PER_TASK="${CPUS_PER_TASK:-32}"
+MEM="${MEM:-128G}"
+JOB_NAME="$(basename "${OUTPUT_DIR:-${METHOD:-train}}")"
+
+SBATCH_FLAGS=(
+    --partition="$PARTITION"
+    --nodes="$NUM_NODES"
+    --ntasks-per-node=1
+    --gres=gpu:"$GPUS_PER_NODE"
+    --cpus-per-task="$CPUS_PER_TASK"
+    --mem="$MEM"
+    --job-name="$JOB_NAME"
+)
+
+echo "sbatch resource overrides (from config):"
+echo "  ${SBATCH_FLAGS[*]}"
+
 cd "$SCRIPT_DIR"
-exec sbatch run_training_code.sh "$FROZEN"
+exec sbatch "${SBATCH_FLAGS[@]}" run_training_code.sh "$FROZEN"
