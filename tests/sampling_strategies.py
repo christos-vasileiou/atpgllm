@@ -21,9 +21,11 @@ Implemented:
   * ``best_of_n``    — each completion is the best of ``B`` i.i.d. samples
                        (drawn at the eval temperature; ``B == 1`` reduces to
                        the plain i.i.d. baseline).
-  * ``mcts``         — each completion is the best of one UCT search of ``B``
-                       rollouts; rollouts run to EOS and the simulator-derived
-                       reward is backpropagated.
+  * ``mcts``         — each completion is the best of one PUCT search of ``B``
+                       rollouts (AlphaZero / Silver 2017 selection rule, the
+                       same pUCT variant the DeepMind MT decoder uses); rollouts
+                       run to EOS and the simulator-derived reward is
+                       backpropagated.
   * ``evolutionary`` — each completion is the best of one genetic search of
                        ``B`` evaluations; crossover splices ``INPUT_VECTOR``
                        between parents, mutation regenerates the suffix.
@@ -50,6 +52,21 @@ Design choices
   process-reward model in this repo; faking one would amount to
   format-heuristics, which the verifier already covers via the
   ``RewardFunctionFactory`` reward components.
+* The tree search uses **PUCT**, not vanilla UCT. UCT's exploration bonus
+  ``c*sqrt(ln N / n)`` is prior-free: it weights every continuation by visit
+  count alone, which is calibrated for small, roughly-uniform action sets
+  (board games with ``Q in [0, 1]``). Language-model completion has a huge,
+  extremely non-uniform action set, so the policy's own probabilities carry
+  most of the signal about which continuations are worth expanding. PUCT
+  (Rosin 2011; Silver 2017; used by AlphaZero, MuZero, and the DeepMind MT
+  decoder of Leblond et al. 2021) multiplies the exploration term by the
+  policy prior ``P(s, a)`` and replaces ``ln N`` with ``sqrt(sum_b N(s,b))``
+  over ``1 + N(s,a)``, so unexpanded children are ranked by prior instead of
+  by an infinite first-play-urgency bonus. Here ``P(s, a)`` is the base LM's
+  own (length-normalised, temperature-``tau``) probability of each sampled
+  chunk — the exact analogue of AlphaZero's policy head. We also apply the
+  MuZero/MT-paper adaptive min-max rescaling of ``Q`` so the search is
+  invariant to the (unknown) scale of the verifier reward.
 """
 
 from __future__ import annotations
@@ -162,6 +179,31 @@ class Generator(ABC):
         top_p: Optional[float] = None,
     ) -> List[List[str]]:
         ...
+
+    def generate_with_scores(
+        self,
+        prompts: List[str],
+        n: int = 1,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> List[List[Tuple[str, Optional[float]]]]:
+        """
+        Like :meth:`generate`, but pairs every sample with a scalar policy
+        score: the model's **mean per-token log-probability** of that sample
+        under its prompt. PUCT expansion turns these into the prior ``P(s, a)``
+        over the sampled children (see :class:`MCTSStrategy`).
+
+        The base implementation has no access to log-probs and returns ``None``
+        scores; callers must treat ``None`` as "no policy signal" and fall back
+        to a uniform prior. Backends that can expose log-probs (e.g. vLLM)
+        override this.
+        """
+        grouped = self.generate(
+            prompts, n=n, max_tokens=max_tokens,
+            temperature=temperature, top_p=top_p,
+        )
+        return [[(t, None) for t in sub] for sub in grouped]
 
     # -------------------------------------------------------------------------
     # Tool-aware generation (shared by all strategies)
@@ -313,7 +355,7 @@ class VLLMGenerator(Generator):
         self.lora_request = lora_request
         self._base = base_sampling_params
 
-    def _params(self, n, max_tokens, temperature, top_p):
+    def _params(self, n, max_tokens, temperature, top_p, logprobs=None):
         # Coerce to built-in scalars: vLLM's msgpack encoder rejects numpy
         # types (e.g. a numpy.float64 temperature from np.linspace).
         temp = self._base.temperature if temperature is None else temperature
@@ -325,6 +367,7 @@ class VLLMGenerator(Generator):
             top_p=float(tp),
             max_tokens=int(mt),
             stop_token_ids=list(self._base.stop_token_ids or []),
+            logprobs=logprobs,
         )
 
     def generate(self, prompts, n=1, max_tokens=None, temperature=None, top_p=None):
@@ -336,6 +379,33 @@ class VLLMGenerator(Generator):
             use_tqdm=False,
         )
         return [[sub.text for sub in o.outputs] for o in outputs]
+
+    def generate_with_scores(
+        self, prompts, n=1, max_tokens=None, temperature=None, top_p=None,
+    ):
+        # ``logprobs=0`` asks vLLM to score only the sampled tokens (no extra
+        # top-k), which is enough to populate ``cumulative_logprob``; we
+        # length-normalise it into a mean per-token log-probability so chunks
+        # of slightly different length stay comparable when softmaxed into a
+        # prior. Any missing field degrades gracefully to a ``None`` score
+        # (→ uniform prior downstream).
+        sp = self._params(n, max_tokens, temperature, top_p, logprobs=0)
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params=sp,
+            lora_request=self.lora_request,
+            use_tqdm=False,
+        )
+        grouped: List[List[Tuple[str, Optional[float]]]] = []
+        for o in outputs:
+            row: List[Tuple[str, Optional[float]]] = []
+            for sub in o.outputs:
+                clp = getattr(sub, "cumulative_logprob", None)
+                n_tok = len(getattr(sub, "token_ids", None) or [])
+                avg_lp = (clp / n_tok) if (clp is not None and n_tok > 0) else None
+                row.append((sub.text, avg_lp))
+            grouped.append(row)
+        return grouped
 
 
 class HFGenerator(Generator):
@@ -620,9 +690,11 @@ class _MCTSNode:
     prefix: str  # text appended to the prompt to reach this node
     parent: Optional["_MCTSNode"] = None
     children: List["_MCTSNode"] = field(default_factory=list)
-    visits: int = 0
-    total_value: float = 0.0
-    terminal: bool = False
+    visits: int = 0            # N(s, a): times this edge/node was traversed
+    total_value: float = 0.0   # sum of backed-up values → Q(s, a) = mean
+    prior: float = 1.0         # P(s, a): policy prob of the chunk reaching here
+    terminal: bool = False     # no usable expansion (EOS) → never re-expanded
+    value_cache: Optional[float] = None  # rollout value, reused if re-selected
 
     @property
     def mean_value(self) -> float:
@@ -631,20 +703,33 @@ class _MCTSNode:
 
 class MCTSStrategy(SamplingStrategy):
     """
-    UCT search over partial completions.
+    PUCT search over partial completions (MCTS with rollout evaluation).
+
+    Selection uses the AlphaZero / Silver (2017) pUCT rule — the same variant
+    the DeepMind MT decoder (Leblond et al. 2021) adopts for autoregressive
+    language decoding — rather than vanilla UCT::
+
+        a* = argmax_a [ Q(s, a) + c_puct * P(s, a) * sqrt(sum_b N(s,b)) / (1 + N(s,a)) ]
+
+    where ``P(s, a)`` is the base LM's own probability of the chunk that
+    reaches child ``a`` (length-normalised mean per-token prob, then softmaxed
+    with temperature ``prior_temperature`` over the sampled siblings), and
+    ``Q(s, a)`` is the child's mean rollout value, rescaled online to ``[0, 1]``
+    with the tree's running min/max (the MuZero / MT-paper adaptive value
+    scale) so selection is invariant to the verifier reward's scale.
 
     Each iteration:
-      1. Select a leaf via UCT.
-      2. Expand: generate ``branching`` short chunks (``chunk_tokens``).
-      3. Rollout: pick one child, continue it to EOS.
-      4. Backprop: score the full completion via the simulator; propagate
-         a value in ``[0, 1]`` (1.0 if detected; otherwise a sigmoid of the
-         scalar verifier reward) up to the root.
+      1. Select a leaf by descending pUCT from the root.
+      2. Evaluate the leaf by a tool-aware rollout to EOS, scored by the
+         simulator; the value in ``[0, 1]`` (1.0 if detected, else a sigmoid
+         of the scalar reward) is backed up to the root.
+      3. Expand the leaf into ``branching`` chunks (``chunk_tokens``), each
+         carrying its policy prior, so later iterations can deepen it.
 
     Width: each search runs up to ``budget`` (B) scored rollouts (one per
-    iteration; each iteration costs ≈ 2 generator calls: one expansion + one
-    rollout) and returns its single best completion. The strategy runs
-    ``num_completions`` (N) such independent searches per problem.
+    iteration; ≈ 2 generator calls each — one rollout + one expansion) and
+    returns its single best completion. The strategy runs ``num_completions``
+    (N) such independent searches per problem.
     """
 
     name = "mcts"
@@ -658,7 +743,8 @@ class MCTSStrategy(SamplingStrategy):
         branching: int = 3,
         chunk_tokens: int = 256,
         rollout_max_tokens: Optional[int] = None,
-        ucb_c: float = 1.4,
+        c_puct: float = 1.25,
+        prior_temperature: float = 1.0,
         chunk_temperature: float = 0.9,
         rollout_temperature: float = 0.7,
         **kwargs,
@@ -670,48 +756,124 @@ class MCTSStrategy(SamplingStrategy):
         self.branching = branching
         self.chunk_tokens = chunk_tokens
         self.rollout_max_tokens = rollout_max_tokens
-        self.ucb_c = ucb_c
+        self.c_puct = c_puct
+        self.prior_temperature = max(1e-6, prior_temperature)
         self.chunk_temperature = chunk_temperature
         self.rollout_temperature = rollout_temperature
 
-    def _select(self, root: _MCTSNode) -> _MCTSNode:
-        node = root
-        while node.children and not node.terminal:
-            log_n = math.log(max(1, node.visits))
+    # -- prior over sampled children ------------------------------------------
 
-            def _ucb(child: _MCTSNode) -> float:
-                if child.visits == 0:
-                    return float("inf")
-                return child.mean_value + self.ucb_c * math.sqrt(log_n / child.visits)
+    @staticmethod
+    def _softmax(logits: List[float], temperature: float) -> List[float]:
+        scaled = [x / temperature for x in logits]
+        hi = max(scaled)
+        exps = [math.exp(x - hi) for x in scaled]  # shift for numerical safety
+        z = sum(exps)
+        return [e / z for e in exps]
 
-            node = max(node.children, key=_ucb)
-        return node
+    def _priors_from_logprobs(self, logps: List[Optional[float]]) -> List[float]:
+        """
+        Turn per-child mean log-probs into a prior P(s, ·). Falls back to a
+        uniform prior when the backend cannot supply log-probs (any ``None``),
+        which reduces pUCT to a visit-count polynomial rule but stays valid.
+        """
+        k = len(logps)
+        if k == 0:
+            return []
+        if any(lp is None for lp in logps):
+            return [1.0 / k] * k
+        return self._softmax([float(lp) for lp in logps], self.prior_temperature)
 
-    def _expand(self, prompt: str, node: _MCTSNode) -> None:
+    # -- selection ------------------------------------------------------------
+
+    def _puct_select_child(
+        self, node: _MCTSNode, min_q: float, max_q: float,
+    ) -> _MCTSNode:
+        # sum_b N(s, b); the +1 acts as a single virtual prior visit so the
+        # prior — not an arbitrary tie-break — decides the first descent out of
+        # a freshly expanded node (critical at the small budgets used here).
+        sqrt_total = math.sqrt(1 + sum(c.visits for c in node.children))
+        span = max_q - min_q
+
+        def _score(child: _MCTSNode) -> float:
+            if child.visits == 0:
+                q = 0.0  # first-play urgency: unexplored → pessimistic exploit
+            elif span > 0:
+                q = (child.mean_value - min_q) / span
+            else:
+                q = child.mean_value
+            u = self.c_puct * child.prior * sqrt_total / (1 + child.visits)
+            return q + u
+
+        return max(node.children, key=_score)
+
+    # -- expansion / rollout --------------------------------------------------
+
+    def _expand(self, prompt: str, node: _MCTSNode) -> int:
+        """
+        Give *node* up to ``branching`` children, each with its policy prior.
+        Returns the number of generator invocations spent (0 if already
+        expanded / terminal). Identical continuations are merged into one
+        child (they denote the same state), and a node that yields no usable
+        continuation is marked terminal so it is never re-expanded.
+        """
         if node.terminal or node.children:
-            return
-        # Expansion is intentionally plain: chunks are partial assistant text,
-        # so tool calls are not executed here. A ``<tool_call>`` landing inside
-        # a chunk is resolved later by the tool-aware rollout from that node.
-        continuations = self.gen.generate(
+            return 0
+        # Expansion is intentionally plain (no tool loop): chunks are partial
+        # assistant text, so a ``<tool_call>`` landing inside a chunk is
+        # resolved later by the tool-aware rollout from that node.
+        scored = self.gen.generate_with_scores(
             [prompt + node.prefix],
             n=self.branching,
             max_tokens=self.chunk_tokens,
             temperature=self.chunk_temperature,
         )[0]
-        for c in continuations:
-            node.children.append(_MCTSNode(prefix=node.prefix + c, parent=node))
+
+        # Merge duplicate chunks; drop empties (an immediate EOS is already
+        # represented by this node's own rollout).
+        rep_logp: Dict[str, Optional[float]] = {}
+        order: List[str] = []
+        for text, logp in scored:
+            if not text:
+                continue
+            if text not in rep_logp:
+                rep_logp[text] = logp
+                order.append(text)
+
+        if not order:
+            node.terminal = True
+            return 1
+
+        priors = self._priors_from_logprobs([rep_logp[t] for t in order])
+        for text, p in zip(order, priors):
+            node.children.append(
+                _MCTSNode(prefix=node.prefix + text, parent=node, prior=p)
+            )
+        return 1
 
     def _rollout(self, prompt: str, leaf: _MCTSNode) -> str:
-        # Tool-aware when use_tools: any tool call in (prefix + rollout tail)
-        # is executed and the simulator output fed back before continuing.
-        return self._generate(
-            [prompt],
+        if self.use_tools:
+            # Tool-aware: generate_with_tools feeds ``prompt + prefix`` to the
+            # model (conditioning on the tree path) and executes any tool call
+            # in the rollout tail before continuing.
+            return self._generate(
+                [prompt],
+                n=1,
+                prefixes=[leaf.prefix],
+                max_tokens=self.rollout_max_tokens,
+                temperature=self.rollout_temperature,
+            )[0][0]
+        # Plain path: condition the model on ``prompt + prefix`` (as ``_expand``
+        # does) so the rollout actually continues the selected node, then stitch
+        # the prefix back onto the readable completion. (The shared ``_generate``
+        # only prepends the prefix textually without conditioning on it.)
+        tail = self.gen.generate(
+            [prompt + leaf.prefix],
             n=1,
-            prefixes=[leaf.prefix],
             max_tokens=self.rollout_max_tokens,
             temperature=self.rollout_temperature,
         )[0][0]
+        return leaf.prefix + tail
 
     @staticmethod
     def _backprop(leaf: _MCTSNode, value: float) -> None:
@@ -731,33 +893,46 @@ class MCTSStrategy(SamplingStrategy):
     def _search_once(
         self, prompt: str, record: Dict[str, Any],
     ) -> Tuple[str, CompletionScore, int]:
-        """One UCT search of ``budget`` rollouts; returns its single best."""
+        """One pUCT search of ``budget`` rollouts; returns its single best."""
         root = _MCTSNode(prefix="")
         best: Optional[Tuple[str, CompletionScore]] = None
         calls = 0
+        # Adaptive value scale (MuZero / MT paper): running min/max of backed-up
+        # values, used to rescale Q into [0, 1] during selection.
+        min_q, max_q = math.inf, -math.inf
 
-        for _ in range(self.budget):
-            leaf = self._select(root)
-            self._expand(prompt, leaf)
-            calls += 1
-            if leaf.children:
-                # Prefer an unvisited child; fall back to random among siblings.
-                unvisited = [c for c in leaf.children if c.visits == 0]
-                target = unvisited[0] if unvisited else random.choice(leaf.children)
+        for it in range(self.budget):
+            # SELECT: descend pUCT to a node without children (a leaf).
+            node = root
+            while node.children:
+                node = self._puct_select_child(node, min_q, max_q)
+
+            # EVALUATE: rollout to EOS + verifier score. A terminal leaf that
+            # is re-selected reuses its cached value (no wasted generation).
+            if node.terminal and node.value_cache is not None:
+                value = node.value_cache
             else:
-                target = leaf
+                full_completion = self._rollout(prompt, node)
+                calls += 1
+                score = self.verifier.score(prompt, full_completion, record)
+                value = self._value_from_score(score)
+                node.value_cache = value
+                if best is None or (score.detected, score.scalar) > (
+                    best[1].detected, best[1].scalar
+                ):
+                    best = (full_completion, score)
+                if score.detected:
+                    self._backprop(node, value)
+                    break
 
-            full_completion = self._rollout(prompt, target)
-            calls += 1
-            score = self.verifier.score(prompt, full_completion, record)
-            target.terminal = True
-            self._backprop(target, self._value_from_score(score))
-            if best is None or (score.detected, score.scalar) > (
-                best[1].detected, best[1].scalar
-            ):
-                best = (full_completion, score)
-            if score.detected:
-                break
+            # BACKUP.
+            self._backprop(node, value)
+            min_q, max_q = min(min_q, value), max(max_q, value)
+
+            # EXPAND for future depth (skip on the final iteration — no budget
+            # left to exploit new children).
+            if it < self.budget - 1 and not node.terminal:
+                calls += self._expand(prompt, node)
 
         if best is None:
             best = ("", CompletionScore(detected=False, scalar=0.0))

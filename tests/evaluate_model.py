@@ -1241,7 +1241,11 @@ def evaluate(
             strategy_kwargs["branching"] = 3
             strategy_kwargs["chunk_tokens"] = 256
             strategy_kwargs["rollout_max_tokens"] = None
-            strategy_kwargs["ucb_c"] = 1.4
+            # PUCT (AlphaZero / Silver 2017) selection knobs: c_puct trades off
+            # exploration vs exploitation; prior_temperature (tau) sharpens or
+            # flattens the LM policy prior P(s, a) over sampled chunks.
+            strategy_kwargs["c_puct"] = 1.25
+            strategy_kwargs["prior_temperature"] = 1.0
             strategy_kwargs["chunk_temperature"] = 0.9
             strategy_kwargs["rollout_temperature"] = 0.7
         elif sampling_method == "evolutionary":
