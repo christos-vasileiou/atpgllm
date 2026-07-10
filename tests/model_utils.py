@@ -724,15 +724,30 @@ def load_model_from_adapter(
     tuple[AutoModelForCausalLM, AutoTokenizer]
         The model with loaded LoRA adapters and the tokenizer.
     """
-    adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
-    try:
-        if not os.path.exists(adapter_config_path):
-            adapter_config_path = os.path.join(adapter_path, "combined", "policy", "adapter_config.json")
-            if not os.path.exists(adapter_config_path):
-                raise FileNotFoundError(f"Adapter config file not found: {adapter_config_path}")
-    except FileNotFoundError:
-        print(f"Adapter config file not found: {adapter_config_path}")
-        return None, None
+    # Fail fast and loudly: a missing/incorrect path must not return
+    # ``(None, None)`` — that only defers the failure to a cryptic
+    # ``'NoneType' object has no attribute 'config'`` much later.
+    if not os.path.isdir(adapter_path):
+        raise FileNotFoundError(
+            f"load_model_from_adapter: adapter/checkpoint directory does not exist: "
+            f"{adapter_path!r} (resolved: {os.path.abspath(adapter_path)}, "
+            f"cwd: {os.getcwd()}). Check --resume_from / RESUME_FROM in your launch config."
+        )
+
+    # SFT checkpoints keep adapter_config.json at the top level; legacy
+    # dual-adapter bundles nest it under combined/policy/.
+    _candidates = [
+        os.path.join(adapter_path, "adapter_config.json"),
+        os.path.join(adapter_path, "combined", "policy", "adapter_config.json"),
+    ]
+    adapter_config_path = next((p for p in _candidates if os.path.exists(p)), None)
+    if adapter_config_path is None:
+        raise FileNotFoundError(
+            "load_model_from_adapter: no adapter_config.json found under "
+            f"{adapter_path!r}. Looked in: "
+            + ", ".join(os.path.abspath(p) for p in _candidates)
+            + ". Ensure the path points at a PEFT/LoRA checkpoint directory."
+        )
 
     with open(adapter_config_path, 'r') as f:
         adapter_config = json.load(f)
