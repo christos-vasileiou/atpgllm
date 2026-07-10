@@ -85,6 +85,13 @@ SBATCH_FLAGS=(
     --job-name="$JOB_NAME"
 )
 
+RESERVATION="${RESERVATION:-}"
+if [ -n "$RESERVATION" ]; then
+    SBATCH_FLAGS+=(--reservation="$RESERVATION")
+else
+    echo "No reservation specified"
+fi
+
 echo "sbatch resource overrides (from config):"
 echo "  ${SBATCH_FLAGS[*]}"
 

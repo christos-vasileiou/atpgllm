@@ -1165,23 +1165,35 @@ def main() -> None:
         settings=wandb.Settings(console="wrap") # Forces capture of Python stdout/stderr
     )
 
-    if launch_snapshot_path and os.path.isfile(launch_snapshot_path):
-        wandb.save(os.path.abspath(launch_snapshot_path), base_path=os.getcwd())
-    frozen_conf = os.environ.get("LAUNCH_CONFIG_FROZEN_FILE")
-    if frozen_conf and os.path.isfile(frozen_conf):
-        wandb.save(os.path.abspath(frozen_conf), base_path=os.getcwd())
+    # W&B file uploads: resolve symlinks so the path shares os.getcwd()'s
+    # canonical namespace (getcwd() resolves symlinks, abspath() does not),
+    # fall back to the file's own dir when it lives outside the run cwd, and
+    # never let a logging convenience abort training.
+    def _wandb_save_file(path, policy=None):
+        if not path:
+            return
+        real_path = os.path.realpath(path)
+        if not os.path.isfile(real_path):
+            return
+        try:
+            cwd = os.path.realpath(os.getcwd())
+            base = cwd if os.path.commonpath([real_path, cwd]) == cwd \
+                else os.path.dirname(real_path)
+            if policy is None:
+                wandb.save(real_path, base_path=base)
+            else:
+                wandb.save(real_path, base_path=base, policy=policy)
+        except Exception as exc:
+            print(f"[wandb.save] skipped {real_path!r}: {exc}")
 
-    # 3. Tell wandb to live-stream the Slurm bash log file to the cloud
-    slurm_log = os.environ.get("SLURM_LOG_FILE")
-    if slurm_log and os.path.exists(slurm_log):
-        # policy="live" continuously uploads the file as Slurm writes to it
-        wandb.save(os.path.abspath(slurm_log), base_path=os.getcwd(), policy="live")
+    _wandb_save_file(launch_snapshot_path)
+    _wandb_save_file(os.environ.get("LAUNCH_CONFIG_FROZEN_FILE"))
+
+    # 3. Live-stream the Slurm bash log file to the cloud as Slurm writes it.
+    _wandb_save_file(os.environ.get("SLURM_LOG_FILE"), policy="live")
     
-    # 4. Tell wandb to live-stream the Slurm error file to the cloud
-    slurm_error = os.environ.get("SLURM_ERROR_FILE")
-    if slurm_error and os.path.exists(slurm_error):
-        # policy="live" continuously uploads the file as Slurm writes to it
-        wandb.save(os.path.abspath(slurm_error), base_path=os.getcwd(), policy="live")
+    # 4. Live-stream the Slurm error file to the cloud as Slurm writes it.
+    _wandb_save_file(os.environ.get("SLURM_ERROR_FILE"), policy="live")
     # -----------------------
 
     if method == "sft":

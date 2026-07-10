@@ -6,8 +6,8 @@
 #SBATCH --ntasks-per-node=1             # ONE launcher task per node (accelerate/srun spawn the ranks)
 #SBATCH --cpus-per-task=32              # CPUs per node task
 #SBATCH --mem=128G
-#SBATCH --partition=h200
-#SBATCH --gres=gpu:2
+#SBATCH --partition=h100
+#SBATCH --gres=gpu:4
 #
 # ---------------------------------------------------------------------------
 # The #SBATCH resource directives above are DEFAULTS for a direct
@@ -47,7 +47,14 @@ start_time=$(date +%s)
 #   ./submit_training_code.sh configs/grpo.conf
 # Direct / interactive:
 #   ./run_training_code.sh configs/sft.conf
-_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Under SLURM, ${BASH_SOURCE[0]} points at the copied batch script in
+# /var/spool/slurmd/<job>/ (not writable); use the submit dir (the repo) so
+# launch-config snapshots land alongside jobs/ instead of failing to write.
+if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+    _SCRIPT_DIR="$SLURM_SUBMIT_DIR"
+else
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 _LAUNCH_CONFIG_DIR="$_SCRIPT_DIR/jobs/launch_configs"
 mkdir -p "$_LAUNCH_CONFIG_DIR" "$_LAUNCH_CONFIG_DIR/snapshots"
 
