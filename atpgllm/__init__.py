@@ -1,10 +1,6 @@
 
 from .utils import *
 from .llm import *
-try:
-  from .graph import *
-except ImportError:
-  pass # torch_geometric not installed - graph features unavailable
 import json
 
 models_causal = {
