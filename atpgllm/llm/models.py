@@ -1,4 +1,5 @@
 from transformers import BertModel, AutoModel, AutoConfig
+from transformers import LlamaPreTrainedModel
 from atpgllm.utils import *
 import torch.nn as nn
 import torch.nn.functional as F
@@ -308,3 +309,45 @@ class MyModel(nn.Module):
       elif isinstance(module, nn.Embedding):
         nn.init.normal_(module.weight.data, mean=0, std=0.02)
 
+
+class ATPGModel(LlamaPreTrainedModel):
+  def __init__(self, hps:AttrDict = None):
+    super(ATPGModel, self).__init__(AutoConfig.from_pretrained(hps.model_name))
+    self.model = load_model(hps)
+    self.lm_head = self.model.lm_head
+    self.model = self.model.model
+    self.pat_head = nn.Linear(self.model.config.hidden_size, 2)
+  def forward(self, x):
+    x = self.model.model(x)
+    text = self.model.lm_head(x)
+    patterns = self.pat_head(x)
+    return (text, patterns)
+  
+
+from transformers import LlamaModel, LlamaPreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
+import torch.nn as nn
+
+class ATPGLlama(LlamaPreTrainedModel):
+  def __init__(self, hps, model):
+    super(ATPGLlama, self).__init__(AutoConfig.from_pretrained(hps.model_name))
+    self.config = AutoConfig.from_pretrained(hps.model_name)
+    model.resize_token_embeddings(len(hps.tokenizer)) # resize the embeddings of input embeddings by adding the new tokens (length of updated tokenizer) 
+    self.llama = model.model  # Initialize the Llama model.
+    self.lm_head = model.lm_head # Initialize
+    self.pat_head_map = torch.tensor(hps.tokenizer.convert_tokens_to_ids(set(hps.tokenizer.tokenize("0101\n1011"))), dtype=self.lm_head.weight.dtype)
+    self.pat_head = nn.Linear(self.config.hidden_size, self.pat_head_map.size(0), bias=False).to(self.lm_head.weight.dtype)  # Additional head for pattern generation.
+    # self.pat_head_map = torch.tensor([hps.tokenizer.convert_tokens_to_ids(patv.content) for patv in hps.added_new_tokens], dtype=self.lm_head.weight.dtype)
+  def forward(self, input_ids, attention_mask=None, labels=None):
+    # Forward pass through the base Llama model.
+    outputs = self.llama(input_ids=input_ids, attention_mask=attention_mask)
+    # The last hidden state from the base model.
+    last_hidden_state = outputs.last_hidden_state
+    # The original lm_head from the Llama model for text generation.
+    text_logits = self.lm_head(last_hidden_state)
+    # Forward pass through the additional pattern head.
+    pattern_logits = self.pat_head(last_hidden_state)  # Assuming we want the pattern based on the first token.
+
+    # calculate loss
+
+    return text_logits, pattern_logits

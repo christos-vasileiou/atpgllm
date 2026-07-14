@@ -151,7 +151,9 @@ from callbacks import (
     ThroughputMetricsCallback,
     ContextLengthHistogramCallback,
     TrainingStateCheckpointCallback,
-    SFTStoppingCallback,
+    patch_trainer_cpu_optimizer_resume,
+    read_cumulative_skip_from_checkpoint,
+    read_launch_skip_from_checkpoint,
     validate_training_state_checkpoint,
 )
 from git_utils import get_git_info
@@ -172,15 +174,29 @@ from dataset_utils import (  # noqa: F401
 from model_utils import (                                                   # noqa: F401
     load_quantised_model,
     get_lora_config,
+    get_qwen_moe_lora_config,
     prepare_lora_model,
-    load_unsloth_model,
-    prepare_unsloth_lora_model,
-    load_unsloth_model_from_adapter,
     smart_sync_model_config,
     load_model_from_adapter,
     patch_qwen_chat_template_for_assistant_mask,
-    _require_unsloth,
 )
+
+
+def _resolve_lora_config(
+    lora_rank: int,
+    lora_alpha: int,
+    lora_target_modules: list[str] | None,
+    qwen_moe: bool,
+) -> "LoraConfig":
+    if lora_target_modules is not None:
+        return get_lora_config(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+        )
+    if qwen_moe:
+        return get_qwen_moe_lora_config(r=lora_rank, lora_alpha=lora_alpha)
+    return get_lora_config(r=lora_rank, lora_alpha=lora_alpha)
 
 
 # =====================================================================
@@ -234,11 +250,11 @@ def train_with_sft(
     report_to: str = "wandb",
     max_model_len: int = 16384,
     max_prompt_length: int = 4096,
-    use_unsloth: bool = False,
     use_ddp: bool = False,
     lora_rank: int = 8,
     lora_alpha: int = 16,
     lora_target_modules: list[str] | None = None,
+    qwen_moe: bool = False,
     assistant_only_loss: bool = True,
     **kwargs,
 ) -> None:
@@ -324,9 +340,6 @@ def train_with_sft(
         For ``messages`` format (``assistant_only_loss=True``): drop
         examples whose system+user chat-template length is ``>=`` this
         value. Not applied in legacy ``text`` format.
-    use_unsloth : bool
-        If *True*, use unsloth's ``FastLanguageModel`` for model loading
-        and LoRA injection.
     use_ddp : bool
         If *True*, use Distributed Data Parallel (DDP) mode.  Each
         ``accelerate`` / ``torchrun`` process loads the full model on its
@@ -340,11 +353,8 @@ def train_with_sft(
         Ignored when ``resume_from`` loads an existing adapter (architecture
         comes from the checkpoint).
     """
-    lora_config = get_lora_config(
-        use_unsloth=use_unsloth,
-        r=lora_rank,
-        lora_alpha=lora_alpha,
-        target_modules=lora_target_modules,
+    lora_config = _resolve_lora_config(
+        lora_rank, lora_alpha, lora_target_modules, qwen_moe,
     )
 
     # Lazy-import SFTTrainer and SFTConfig
@@ -364,11 +374,6 @@ def train_with_sft(
         resume_checkpoint = resume_from
         print(f"[Resume] Will restore full training state from: {resume_from}")
 
-    # Validate unsloth availability early
-    if use_unsloth:
-        _require_unsloth()
-        print("[Unsloth] Enabled – using FastLanguageModel for optimised training")
-
     # Determine device_map: per-GPU for DDP, "auto" otherwise
     device_map = _get_device_map(use_ddp)
     if use_ddp:
@@ -377,22 +382,15 @@ def train_with_sft(
     # Load model and tokenizer — either from saved adapter or fresh
     if resume_from:
         print(f"Resuming training from: {resume_from}")
-        if use_unsloth:
-            model, tokenizer = load_unsloth_model_from_adapter(resume_from, max_seq_length=max_model_len, fast_inference=True, device_map=device_map)
-        else:
-            model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
+        model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
     else:
-        if use_unsloth:
-            model, tokenizer = load_unsloth_model(model_name)
-            model = prepare_unsloth_lora_model(model, lora_config)
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            if not tokenizer.eos_token:
-                tokenizer.add_special_tokens({"eos_token": "</s>"})
-            if not tokenizer.pad_token:
-                tokenizer.pad_token = tokenizer.eos_token
-            base_model = load_quantised_model(model_name, device_map=device_map)
-            model = prepare_lora_model(base_model, lora_config)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if not tokenizer.eos_token:
+            tokenizer.add_special_tokens({"eos_token": "</s>"})
+        if not tokenizer.pad_token:
+            tokenizer.pad_token = tokenizer.eos_token
+        base_model = load_quantised_model(model_name, device_map=device_map)
+        model = prepare_lora_model(base_model, lora_config)
 
     # Synchronize the model's config with the tokenizer's special token IDs
     model = smart_sync_model_config(model, tokenizer)
@@ -486,7 +484,10 @@ def train_with_sft(
     shared_callbacks = [
         ThroughputMetricsCallback(),
         ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
-        TrainingStateCheckpointCallback(),
+        TrainingStateCheckpointCallback(
+            method="sft",
+            launch_skip_buffer_size=skip_buffer_size,
+        ),
     ]
 
     trainer = SFTTrainer(
@@ -496,6 +497,8 @@ def train_with_sft(
         args=training_args,
         callbacks=shared_callbacks,
     )
+    if resume_checkpoint:
+        patch_trainer_cpu_optimizer_resume(trainer)
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(output_dir)
 
@@ -521,11 +524,12 @@ def train_with_grpo(
     max_completion_length: int = 4096,
     max_prompt_length: int = 4096,
     use_dual_adapter: bool = True,
-    use_unsloth: bool = False,
     use_ddp: bool = False,
     lora_rank: int = 8,
     lora_alpha: int = 16,
     lora_target_modules: list[str] | None = None,
+    qwen_moe: bool = False,
+    netlist_diversity_strategy: str = "even_spacing",
     **kwargs,
 ) -> None:
     """
@@ -591,8 +595,6 @@ def train_with_grpo(
     use_dual_adapter : bool
         If *True* (default), uses ``DualAdapterGRPOTrainer`` which keeps
         the SFT adapter isolated and avoids ``merge_and_unload``.
-    use_unsloth : bool
-        If *True*, use unsloth's ``FastLanguageModel`` for model loading.
     use_ddp : bool
         If *True*, use Distributed Data Parallel (DDP) mode.  See
         :func:`train_with_sft` for details.
@@ -613,11 +615,6 @@ def train_with_grpo(
         resume_checkpoint = resume_from
         print(f"[Resume] Will restore full training state from: {resume_from}")
 
-    # Validate unsloth availability early
-    if use_unsloth:
-        _require_unsloth()
-        print("[Unsloth] Enabled – using FastLanguageModel for optimised GRPO training")
-
     # Lazy-import GRPO trainers and GRPOConfig to avoid pulling in
     # trl.GRPOTrainer (and its vllm dependency) during SFT-only runs.
     from trl import GRPOConfig
@@ -626,6 +623,7 @@ def train_with_grpo(
         DualAdapterGRPOTrainer,
         is_dual_adapter_checkpoint,
         load_dual_adapter_checkpoint,
+        resolve_base_model_name_from_checkpoint,
     )
 
     # Determine device_map: per-GPU for DDP, "auto" otherwise
@@ -634,11 +632,8 @@ def train_with_grpo(
         print(f"[DDP] Enabled – loading model with device_map={device_map}")
 
     # Define LoRA config — needed for both fresh start and resume
-    lora_config = get_lora_config(
-        use_unsloth=use_unsloth,
-        r=lora_rank,
-        lora_alpha=lora_alpha,
-        target_modules=lora_target_modules,
+    lora_config = _resolve_lora_config(
+        lora_rank, lora_alpha, lora_target_modules, qwen_moe,
     )
 
     # Load model and tokenizer
@@ -648,13 +643,30 @@ def train_with_grpo(
         # layout and reload both so the DualAdapterGRPOTrainer can pick up
         # where it left off without re-initialising the policy from the
         # reference (which would discard all GRPO progress).
-        is_grpo_ckpt = use_dual_adapter and is_dual_adapter_checkpoint(resume_from)
+        is_grpo_ckpt = is_dual_adapter_checkpoint(resume_from)
+        if is_grpo_ckpt and not use_dual_adapter:
+            print(
+                "[GRPO] WARNING: resume_from is a dual-adapter checkpoint but "
+                "--use_dual_adapter was disabled. Forcing dual-adapter mode so "
+                "reference/ + policy/ weights are not silently dropped."
+            )
+            use_dual_adapter = True
         if is_grpo_ckpt:
             print(f"Resuming GRPO training from dual-adapter checkpoint: {resume_from}")
             print("  - Reference (frozen SFT) adapter: loaded from reference/")
             print("  - Policy (trainable) adapter: loaded from policy/")
-            if use_unsloth:
-                print("  - Note: unsloth is not used when reloading dual-adapter checkpoints")
+            if resume_training_state:
+                print("  - Trainer state: will restore optimizer / step / RNG")
+            else:
+                print(
+                    "  - Trainer state: fresh optimizer (adapter weights only). "
+                    "Pass --resume_training_state for crash recovery."
+                )
+            if not model_name:
+                derived = resolve_base_model_name_from_checkpoint(resume_from)
+                if derived:
+                    model_name = derived
+                    print(f"  - Derived base model_name for logging/vLLM: {model_name}")
             model, tokenizer = load_dual_adapter_checkpoint(resume_from, device_map=device_map)
             peft_config_for_trainer = None
             # Signal to DualAdapterGRPOTrainer: adapters are already set up.
@@ -662,10 +674,7 @@ def train_with_grpo(
         else:
             # Transition SFT → GRPO: only a single (SFT) adapter is on disk.
             print(f"Resuming GRPO training from SFT checkpoint: {resume_from}")
-            if use_unsloth:
-                model, tokenizer = load_unsloth_model_from_adapter(resume_from, max_seq_length=max_model_len, fast_inference=True, device_map=device_map)
-            else:
-                model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
+            model, tokenizer = load_model_from_adapter(resume_from, device_map=device_map)
 
             if use_dual_adapter:
                 print("Using dual-adapter mode (DualAdapterGRPOTrainer)")
@@ -681,18 +690,13 @@ def train_with_grpo(
                 peft_config_for_trainer = lora_config
                 policy_lora_config = None
     else:
-        if use_unsloth:
-            model, tokenizer = load_unsloth_model(model_name)
-            model = prepare_unsloth_lora_model(model, lora_config)
-            peft_config_for_trainer = None
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            if not tokenizer.eos_token:
-                tokenizer.add_special_tokens({"eos_token": "</s>"})
-            if not tokenizer.pad_token:
-                tokenizer.pad_token = tokenizer.eos_token
-            model = load_quantised_model(model_name, device_map=device_map)
-            peft_config_for_trainer = lora_config
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if not tokenizer.eos_token:
+            tokenizer.add_special_tokens({"eos_token": "</s>"})
+        if not tokenizer.pad_token:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = load_quantised_model(model_name, device_map=device_map)
+        peft_config_for_trainer = lora_config
 
         if use_dual_adapter:
             print("Note: Dual-adapter mode requires --resume_from with an SFT checkpoint")
@@ -727,6 +731,13 @@ def train_with_grpo(
         tokenizer=tokenizer,
         max_prompt_length=max_prompt_length,
         skip_buffer_size=skip_buffer_size,
+        # Spread each netlist's faults across the epoch so every effective batch
+        # sees as many distinct netlists as possible (mitigates reward hacking /
+        # policy collapse from netlist-homogeneous batches). Requires
+        # shuffle_dataset=False below so the sampler preserves this order.
+        # Strategy is selectable via --netlist_diversity_strategy.
+        maximize_diversity_by="netlist",
+        diversity_strategy=netlist_diversity_strategy,
     )
 
     # =========================================================================
@@ -752,10 +763,10 @@ def train_with_grpo(
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=2e-5,
+        learning_rate=5e-6,
         max_steps=max_steps,
         logging_steps=5,
-        save_steps=5,
+        save_steps=10,
         bf16=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -763,9 +774,13 @@ def train_with_grpo(
         lr_scheduler_type="cosine",
         lr_scheduler_kwargs={'num_cycles': 0.4},
         warmup_steps=10,
+        # --- Step 2: prevent entropy / diversity collapse -------------------
+        beta=0.03,                # KL to the FIXED SFT reference (was 0.0 = no anchor). Range 0.01–0.05; this is the single most important change.
+        temperature=1.0,          # keep rollout exploration high (was implicitly 1.0)
+        top_entropy_quantile=0.8, # only update the top-80% highest-entropy tokens (was 1.0), so confident tokens stop being driven to ~0 entropy
+        # leave sync_ref_model=False (default): you WANT a fixed SFT anchor, not one that drifts toward the (collapsing) policy.
         # GRPO-specific options
         loss_type="dapo", # "grpo", "dr_grpo", "dapo", "bnpo", "cispo", default is "dapo"
-        mask_truncated_completions=False,
         num_generations=max(num_generations, 2),
         steps_per_generation=steps_per_generation,
         max_completion_length=max_completion_length,
@@ -777,19 +792,29 @@ def train_with_grpo(
         # `"token"`: keeps raw per-token log-probability ratios. 
         # `"sequence"`: averages them across valid tokens into a single ratio per sequence — generally more stable (see GSPO paper).
         scale_rewards=False, 
+        # Preserve the netlist-diversity-maximising order produced by
+        # buffer_streaming_dataset(maximize_diversity_by="netlist"): the
+        # RepeatSampler only keeps dataset order when shuffle_dataset is False
+        # (otherwise it re-randomises and destroys the per-batch diversity).
+        shuffle_dataset=False,
         # - `True` or `"group"` (default): rewards are scaled by the standard deviation within each group, ensuring unit variance within a group.
         # - `"batch"`: rewards are scaled by the standard deviation across the entire batch
         # - `False` or `"none"`: no scaling is applied. The [Dr. GRPO paper] recommends not scaling rewards, as scaling by the standard deviation introduces a question-level difficulty bias.
         # Logging options
         log_completions=True,
         num_completions_to_print=10,
-        log_unique_prompts=False,
+        log_unique_prompts=True,
     )
 
     shared_callbacks = [
         ThroughputMetricsCallback(),
         ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
-        TrainingStateCheckpointCallback(),
+        TrainingStateCheckpointCallback(
+            method="grpo",
+            launch_skip_buffer_size=skip_buffer_size,
+            buffer_size=buffer_size,
+            num_generations=max(num_generations, 2),
+        ),
     ]
 
     if use_dual_adapter:
@@ -817,6 +842,8 @@ def train_with_grpo(
             callbacks=shared_callbacks,
         )
 
+    if resume_checkpoint:
+        patch_trainer_cpu_optimizer_resume(trainer)
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(output_dir)
 
@@ -837,6 +864,7 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "resume_from",
     "resume_training_state",
     "skip_buffer_size",
+    "auto_skip_from_resume",
     "skip_batch_size",
     "skip_num_workers",
     "per_device_train_batch_size",
@@ -845,16 +873,17 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "report_to",
     "max_model_len",
     "max_prompt_length",
-    "use_unsloth",
     "use_ddp",
     "lora_rank",
     "lora_alpha",
     "lora_target_modules",
+    "qwen_moe",
     "assistant_only_loss",
 })
 _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "buffer_size",
     "num_generations",
+    "netlist_diversity_strategy",
     "steps_per_generation",
     "max_completion_length",
     "use_dual_adapter",
@@ -864,12 +893,41 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
 })
 
 
-def _wandb_run_config(method: str, args_dict: dict, git_info: dict) -> dict:
+def _load_launch_config_snapshot(path: str | None) -> dict[str, str]:
+    """Parse launcher snapshot (KEY=value lines + # metadata comments)."""
+    if not path or not os.path.isfile(path):
+        return {}
+    out: dict[str, str] = {}
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                meta = line.lstrip("#").strip()
+                if "=" in meta:
+                    key, _, val = meta.partition("=")
+                    out[f"_{key.strip()}"] = val.strip()
+                continue
+            key, sep, val = line.partition("=")
+            if sep:
+                out[key.strip()] = val
+    return out
+
+
+def _wandb_run_config(
+    method: str,
+    args_dict: dict,
+    git_info: dict,
+    launch_config: dict[str, str] | None = None,
+) -> dict:
     """Subset of CLI args that actually tune the active training path (SFT vs GRPO)."""
     keys = _WANDB_CONFIG_KEYS_SFT | (
         _WANDB_CONFIG_KEYS_GRPO_ONLY if method == "grpo" else frozenset()
     )
     body = {k: args_dict[k] for k in sorted(keys) if k in args_dict}
+    if launch_config:
+        body["launch_config"] = launch_config
     return {"method": method, **body, **git_info}
 
 
@@ -915,6 +973,19 @@ def main() -> None:
              "Env: SKIP_BUFFER_SIZE (default: 0)",
     )
     parser.add_argument(
+        "--auto_skip_from_resume",
+        action=argparse.BooleanOptionalAction,
+        default=_env("AUTO_SKIP_FROM_RESUME", "1").lower() in ("1", "true", "yes"),
+        help="Default ON. When --resume_from is set and --skip_buffer_size is left "
+             "at 0, auto-load it from the checkpoint's training_state_summary.json: "
+             "(a) without --resume_training_state -> use cumulative_skip_buffer_size "
+             "(fresh run on new data, advances past everything the previous run consumed); "
+             "(b) with --resume_training_state -> use launch_skip_buffer_size (crash "
+             "recovery, matches the stream offset the optimizer was trained against). "
+             "An explicit non-zero --skip_buffer_size always wins. Disable with "
+             "--no-auto_skip_from_resume. Env: AUTO_SKIP_FROM_RESUME (1/0).",
+    )
+    parser.add_argument(
         "--skip_batch_size",
         type=int,
         default=_env("SKIP_BATCH_SIZE", 256),
@@ -945,6 +1016,17 @@ def main() -> None:
                         help="VLLM mode")
     parser.add_argument("--num_generations", type=int, default=_env('NUM_GENERATIONS', 8),
                         help="Number of generations per prompt to sample.")
+    parser.add_argument(
+        "--netlist_diversity_strategy",
+        type=str,
+        default=_env("NETLIST_DIVERSITY_STRATEGY", "even_spacing"),
+        choices=["random", "round_robin", "even_spacing"],
+        help="GRPO: buffer ordering that controls netlist diversity per effective "
+             "batch (env: NETLIST_DIVERSITY_STRATEGY). 'even_spacing' (default, "
+             "recommended) spreads each netlist's faults uniformly across the epoch; "
+             "'round_robin' cycles netlist groups (clusters a dominant netlist's "
+             "tail); 'random' = plain shuffle baseline.",
+    )
     parser.add_argument("--steps_per_generation", type=int, default=_env('STEPS_PER_GENERATION', 2),
                         help="Steps per generation")
     parser.add_argument("--max_model_len", type=int, default=_env('MAX_MODEL_LEN', 8192),
@@ -957,11 +1039,8 @@ def main() -> None:
                              "Ignored for SFT legacy text format.")
     parser.add_argument("--use_dual_adapter", action="store_true", default=_env('USE_DUAL_ADAPTER', '1').lower() in ('1', 'true', 'yes'),
                         help="Use dual-adapter mode (keeps SFT adapter isolated, avoids merge). Default: True")
-    parser.add_argument("--use_unsloth", action="store_true", default=_env('USE_UNSLOTH', '0').lower() in ('1', 'true', 'yes'),
-                        help="Use unsloth's FastLanguageModel for optimised training "
-                             "(2x faster, 80%% less VRAM). Requires: pip install unsloth")
     parser.add_argument("--use_ddp", action="store_true", default=_env('USE_DDP', '0').lower() in ('1', 'true', 'yes'),
-                        help="Use Distributed Data Parallelization. It's recommended for SFT + unsloth training.")
+                        help="Use Distributed Data Parallelization. It's recommended for SFT training.")
     parser.add_argument(
         "--lora_rank",
         type=int,
@@ -979,6 +1058,13 @@ def main() -> None:
         type=str,
         default=_env("LORA_TARGET_MODULES", "") or "",
         help="Comma-separated module names (e.g. q_proj,v_proj). Empty = default attention+MLP set. Env: LORA_TARGET_MODULES",
+    )
+    parser.add_argument(
+        "--qwen_moe",
+        action=argparse.BooleanOptionalAction,
+        default=_env("QWEN_MOE", "0").lower() in ("1", "true", "yes"),
+        help="Use Qwen-style MoE LoRA targets (attention + expert MLP; optional "
+             "router via TUNE_MOE_ROUTER=1). Env: QWEN_MOE",
     )
     parser.add_argument(
         "--assistant_only_loss",
@@ -1017,10 +1103,68 @@ def main() -> None:
     if args.skip_buffer_size < 0:
         parser.error("skip_buffer_size must be >= 0")
 
+    # ------------------------------------------------------------------
+    # Auto-derive --skip_buffer_size from a resumed checkpoint.
+    #
+    # Triggered when:
+    #   * --auto_skip_from_resume is on (default), AND
+    #   * --resume_from points at a checkpoint, AND
+    #   * --skip_buffer_size was left at the default 0 (any non-zero
+    #     value is treated as an explicit override and respected).
+    #
+    # Which field we read depends on --resume_training_state:
+    #   * off (fresh run on new data) -> cumulative_skip_buffer_size
+    #     (advance past everything consumed by the previous run).
+    #   * on  (crash recovery)        -> launch_skip_buffer_size
+    #     (same stream offset the checkpoint optimizer was trained on,
+    #     so HF Trainer's built-in step-resume skip lands on the right rows).
+    # ------------------------------------------------------------------
+    if (
+        args.auto_skip_from_resume
+        and args.resume_from
+        and args.skip_buffer_size == 0
+    ):
+        if args.resume_training_state:
+            derive_kind = "launch_skip_buffer_size"
+            derived = read_launch_skip_from_checkpoint(args.resume_from)
+            mode_label = "crash recovery, matches checkpoint optimizer state"
+        else:
+            derive_kind = "cumulative_skip_buffer_size"
+            derived = read_cumulative_skip_from_checkpoint(args.resume_from)
+            mode_label = "fresh run on new data, advances past consumed rows"
+
+        if derived is not None:
+            print(
+                f"[auto_skip_from_resume] Derived --skip_buffer_size {derived} "
+                f"({derive_kind}; {mode_label}) from "
+                f"{args.resume_from}/training_state_summary.json. "
+                f"Override with --skip_buffer_size <N> or disable with "
+                f"--no-auto_skip_from_resume."
+            )
+            args.skip_buffer_size = derived
+        else:
+            print(
+                f"[auto_skip_from_resume] No {derive_kind} found in "
+                f"{args.resume_from}/training_state_summary.json — keeping "
+                f"--skip_buffer_size 0. (Expected for checkpoints saved before "
+                f"this feature was added; pass --skip_buffer_size <N> manually "
+                f"or disable with --no-auto_skip_from_resume.)"
+            )
+    elif (
+        args.auto_skip_from_resume
+        and args.resume_from
+        and args.skip_buffer_size != 0
+    ):
+        print(
+            f"[auto_skip_from_resume] Explicit --skip_buffer_size "
+            f"{args.skip_buffer_size} provided; not auto-deriving."
+        )
+
     # Convert args to dict and fix parameter naming
     args_dict = vars(args)
     args_dict['dataset_path'] = args_dict.pop('dataset')
     method = args_dict.pop('method')
+    # auto_skip_from_resume is a launch-time concern; train_with_* absorb it via **kwargs.
 
     # name wandb run according to the output directory and lora rank and alpha
     wandb_name = f"r{args_dict.get('lora_rank', 8)}-alpha{args_dict.get('lora_alpha', 16)}" 
@@ -1029,8 +1173,10 @@ def main() -> None:
     else:
         wandb_name = f"{method}-{args_dict.get('output_dir', 'run')}-{wandb_name}" 
 
-    # 1. Wandb config: only hyperparameters that apply to the chosen method (plus git metadata)
-    run_config = _wandb_run_config(method, args_dict, get_git_info())
+    # 1. Wandb config: CLI hyperparameters + git metadata + launcher config snapshot
+    launch_snapshot_path = os.environ.get("LAUNCH_CONFIG_SNAPSHOT")
+    launch_config = _load_launch_config_snapshot(launch_snapshot_path)
+    run_config = _wandb_run_config(method, args_dict, get_git_info(), launch_config)
 
     # 2. Initialize wandb explicitly to capture everything from this point forward
     wandb.init(
@@ -1040,17 +1186,35 @@ def main() -> None:
         settings=wandb.Settings(console="wrap") # Forces capture of Python stdout/stderr
     )
 
-    # 3. Tell wandb to live-stream the Slurm bash log file to the cloud
-    slurm_log = os.environ.get("SLURM_LOG_FILE")
-    if slurm_log and os.path.exists(slurm_log):
-        # policy="live" continuously uploads the file as Slurm writes to it
-        wandb.save(os.path.abspath(slurm_log), base_path=os.getcwd(), policy="live")
+    # W&B file uploads: resolve symlinks so the path shares os.getcwd()'s
+    # canonical namespace (getcwd() resolves symlinks, abspath() does not),
+    # fall back to the file's own dir when it lives outside the run cwd, and
+    # never let a logging convenience abort training.
+    def _wandb_save_file(path, policy=None):
+        if not path:
+            return
+        real_path = os.path.realpath(path)
+        if not os.path.isfile(real_path):
+            return
+        try:
+            cwd = os.path.realpath(os.getcwd())
+            base = cwd if os.path.commonpath([real_path, cwd]) == cwd \
+                else os.path.dirname(real_path)
+            if policy is None:
+                wandb.save(real_path, base_path=base)
+            else:
+                wandb.save(real_path, base_path=base, policy=policy)
+        except Exception as exc:
+            print(f"[wandb.save] skipped {real_path!r}: {exc}")
+
+    _wandb_save_file(launch_snapshot_path)
+    _wandb_save_file(os.environ.get("LAUNCH_CONFIG_FROZEN_FILE"))
+
+    # 3. Live-stream the Slurm bash log file to the cloud as Slurm writes it.
+    _wandb_save_file(os.environ.get("SLURM_LOG_FILE"), policy="live")
     
-    # 4. Tell wandb to live-stream the Slurm error file to the cloud
-    slurm_error = os.environ.get("SLURM_ERROR_FILE")
-    if slurm_error and os.path.exists(slurm_error):
-        # policy="live" continuously uploads the file as Slurm writes to it
-        wandb.save(os.path.abspath(slurm_error), base_path=os.getcwd(), policy="live")
+    # 4. Live-stream the Slurm error file to the cloud as Slurm writes it.
+    _wandb_save_file(os.environ.get("SLURM_ERROR_FILE"), policy="live")
     # -----------------------
 
     if method == "sft":

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Evaluate policy LoRA checkpoints under sft_7b_exper2 with pass@k (vLLM, TP auto).
+# Evaluate policy LoRA checkpoints under sft_32b_exper1 with pass@k (vLLM, TP auto).
 #
 # Usage:
-#   ./eval_sft_7b_policy_checkpoints.sh
-#   EXP_ROOT=/path/to/sft_7b_exper2 EVAL_RESULTS_DIR=/path/to/results ./eval_sft_7b_policy_checkpoints.sh
+#   ./eval_sft_32b_policy_checkpoints.sh
+#   EXP_ROOT=/path/to/sft_32b_exper1 EVAL_RESULTS_DIR=/path/to/results ./eval_sft_32b_policy_checkpoints.sh
 #
 # Optional:
 #   DRY_RUN=1  — print commands only
@@ -26,18 +26,19 @@
 #                                  TRAIN_DATASET in configs/sft.conf
 #   MERGE_DEQUANT=1              — serve the QLoRA-faithful merged bf16 export via
 #                                  --merge_dequant (adapter trained on NF4 base); 0 = clean
-#                                  bf16 base + dynamic LoRA (NOT faithful to training)
+#                                  bf16 base + dynamic LoRA (NOT faithful to training).
+#                                  Note: ~65 GB disk per 32B checkpoint export.
 #   WANDB_RUN_NAME / --wandb_run_name — optional; default name is derived from --adapter (experiment + checkpoint)
 #
 # Examples:
-#   SAMPLING_METHOD=best_of_n NUM_COMPLETIONS=32 BEST_OF_N_WIDTH=4 ./eval_sft_7b_policy_checkpoints.sh
-#   SAMPLING_METHOD=mcts NUM_COMPLETIONS=16 SEARCH_BUDGET=50 EVAL_RESULTS_DIR=./eval_results_sft_7b_mcts ./eval_sft_7b_policy_checkpoints.sh
+#   SAMPLING_METHOD=evolutionary NUM_COMPLETIONS=24 SEARCH_BUDGET=48 ./eval_sft_32b_policy_checkpoints.sh
+#   SAMPLING_METHOD=random NUM_COMPLETIONS=32 PASS_AT_K="1 5 10 16" ./eval_sft_32b_policy_checkpoints.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EVAL_SCRIPT="${SCRIPT_DIR}/evaluate_model.py"
-POLICY_FOLDER="${POLICY_FOLDER:-sft_7b_exper2}"
+POLICY_FOLDER="${POLICY_FOLDER:-sft_32b_exper1}"
 EXP_ROOT="${EXP_ROOT:-${SCRIPT_DIR}/${POLICY_FOLDER}}"
 EVAL_RESULTS_DIR="${EVAL_RESULTS_DIR:-${SCRIPT_DIR}/eval_results_${POLICY_FOLDER}_policy}"
 DRY_RUN="${DRY_RUN:-0}"

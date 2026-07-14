@@ -393,7 +393,181 @@ class TrainingStateCheckpointCallback(TrainerCallback):
     ``--resume_training_state`` also restores the optimizer, LR
     schedule, global step, epoch counter, and RNG seeds so training
     continues exactly where it left off.
+
+    Stream-position bookkeeping
+    ---------------------------
+    The summary JSON additionally records the cumulative
+    ``skip_buffer_size`` that should be passed to the **next** training
+    job that resumes from this checkpoint as a fresh run on new data
+    (i.e. without ``--resume_training_state``). This removes the need
+    to compute the next stream offset by hand:
+
+    * **SFT** — ``cumulative_skip_buffer_size = launch_skip_buffer_size
+      + global_step * effective_batch_size`` where
+      ``effective_batch_size = per_device_train_batch_size * world_size
+      * gradient_accumulation_steps``. The Trainer consumes one
+      post-filter row per logical micro-batch slot, so this matches the
+      number of valid rows the streaming pipeline yielded.
+    * **GRPO** — ``cumulative_skip_buffer_size = launch_skip_buffer_size
+      + buffer_size``. The buffer is populated once at startup with the
+      next ``buffer_size`` valid rows from the stream; we treat the
+      whole buffer as "consumed" regardless of how many ``max_steps``
+      were actually reached, so the next run picks up from beyond the
+      buffered slice.
+
+    GRPO effective-batch metadata (matches TRL ``GRPOConfig`` /
+    ``DualAdapterGRPOTrainer``)
+    ----------------------------------------------------------------
+    TRL defines the *sequence* effective batch as::
+
+        effective_batch_sequences =
+            per_device_train_batch_size * world_size * gradient_accumulation_steps
+
+    and requires it to be divisible by ``num_generations``.  ``RepeatSampler``
+    then replicates each unique prompt ``num_generations`` times, so one
+    optimizer step touches this many *unique prompts*::
+
+        unique_prompts_per_step = effective_batch_sequences // num_generations
+
+    That is the same quantity stored as
+    ``DualAdapterGRPOTrainer._prompts_per_effective_batch``.  For GRPO the
+    summary's ``effective_batch_size`` field is this unique-prompt count
+    (not the raw sequence count).  ``prompts_seen_approx =
+    global_step * unique_prompts_per_step`` is also recorded for diagnostics;
+    it is **not** used for stream skip (the buffer was already fully drawn
+    from the stream at startup).
+
+    Parameters
+    ----------
+    method : str, optional
+        ``"sft"`` or ``"grpo"``. Selects the cumulative skip formula.
+        When ``None`` the SFT formula is used (back-compatible default).
+    launch_skip_buffer_size : int
+        The ``skip_buffer_size`` value that was passed to this run
+        (after any ``--auto_skip_from_resume`` resolution). Used as the
+        offset added to ``consumed_in_run``.
+    buffer_size : int, optional
+        GRPO only. The ``buffer_size`` that ``buffer_streaming_dataset``
+        was asked to fill. Required when ``method="grpo"``.
+    num_generations : int, optional
+        GRPO only. Completions per prompt (``GRPOConfig.num_generations``).
+        Used to convert TRL's sequence effective batch into unique prompts
+        per optimizer step. Falls back to ``args.num_generations`` when
+        omitted.
     """
+
+    def __init__(
+        self,
+        method: Optional[str] = None,
+        launch_skip_buffer_size: int = 0,
+        buffer_size: Optional[int] = None,
+        num_generations: Optional[int] = None,
+    ):
+        self.method = method.lower() if isinstance(method, str) else None
+        try:
+            self.launch_skip_buffer_size = max(0, int(launch_skip_buffer_size or 0))
+        except (TypeError, ValueError):
+            self.launch_skip_buffer_size = 0
+        if buffer_size is None:
+            self.buffer_size: Optional[int] = None
+        else:
+            try:
+                self.buffer_size = max(0, int(buffer_size))
+            except (TypeError, ValueError):
+                self.buffer_size = None
+        if num_generations is None:
+            self.num_generations: Optional[int] = None
+        else:
+            try:
+                self.num_generations = max(1, int(num_generations))
+            except (TypeError, ValueError):
+                self.num_generations = None
+
+    def _compute_skip_state(self, args, state) -> dict:
+        """Return cumulative_skip_buffer_size + supporting metadata for the summary."""
+        try:
+            world_size = int(getattr(args, "world_size", 1) or 1)
+        except (TypeError, ValueError):
+            world_size = 1
+        try:
+            per_device = int(getattr(args, "per_device_train_batch_size", 1) or 1)
+        except (TypeError, ValueError):
+            per_device = 1
+        try:
+            grad_acc = int(getattr(args, "gradient_accumulation_steps", 1) or 1)
+        except (TypeError, ValueError):
+            grad_acc = 1
+
+        # TRL GRPOConfig: "effective batch size" = sequences per optimizer step.
+        effective_batch_sequences = (
+            max(1, per_device) * max(1, world_size) * max(1, grad_acc)
+        )
+
+        num_generations = self.num_generations
+        if num_generations is None:
+            try:
+                num_generations = int(getattr(args, "num_generations", 0) or 0)
+            except (TypeError, ValueError):
+                num_generations = 0
+            if num_generations < 1:
+                num_generations = None
+
+        if self.method == "grpo":
+            # Unique prompts per optimizer step (RepeatSampler mini_repeat /
+            # DualAdapterGRPOTrainer._prompts_per_effective_batch).
+            g = max(1, int(num_generations or 1))
+            if effective_batch_sequences % g != 0:
+                logger.warning(
+                    "GRPO effective_batch_sequences (%s) is not divisible by "
+                    "num_generations (%s); unique_prompts_per_step uses floor division.",
+                    effective_batch_sequences, g,
+                )
+            unique_prompts_per_step = max(1, effective_batch_sequences // g)
+            # Summary "effective_batch_size" = unique prompts (what one step
+            # consumes from the buffered dataset), not raw sequences.
+            effective_batch_size = unique_prompts_per_step
+        else:
+            g = None
+            unique_prompts_per_step = None
+            effective_batch_size = effective_batch_sequences
+
+        if self.method == "grpo" and self.buffer_size is not None:
+            # Stream skip: whole buffer was drawn once at startup.
+            consumed = int(self.buffer_size)
+            prompts_seen_approx = int(state.global_step) * effective_batch_size
+        else:
+            consumed = int(state.global_step) * effective_batch_size
+            prompts_seen_approx = consumed
+        cumulative = self.launch_skip_buffer_size + consumed
+
+        skip_state: dict = {
+            "method": self.method,
+            "launch_skip_buffer_size": self.launch_skip_buffer_size,
+            "effective_batch_size": effective_batch_size,
+            "effective_batch_sequences": effective_batch_sequences,
+            "per_device_train_batch_size": per_device,
+            "gradient_accumulation_steps": grad_acc,
+            "world_size": world_size,
+            "consumed_in_run": consumed,
+            "cumulative_skip_buffer_size": cumulative,
+            "prompts_seen_approx": prompts_seen_approx,
+        }
+        if self.method == "grpo":
+            skip_state["buffer_size"] = self.buffer_size
+            skip_state["num_generations"] = g
+            skip_state["unique_prompts_per_step"] = unique_prompts_per_step
+            try:
+                steps_per_generation = int(
+                    getattr(args, "steps_per_generation", 0) or 0
+                )
+            except (TypeError, ValueError):
+                steps_per_generation = 0
+            if steps_per_generation > 0:
+                skip_state["steps_per_generation"] = steps_per_generation
+                skip_state["generation_batch_size"] = (
+                    max(1, per_device) * max(1, world_size) * steps_per_generation
+                )
+        return skip_state
 
     def on_save(self, args, state, control, **kwargs):
         is_distributed = (
@@ -441,10 +615,31 @@ class TrainingStateCheckpointCallback(TrainerCallback):
         status = "RESUMABLE" if resumable else "INCOMPLETE"
         lr_str = f"{current_lr:.2e}" if current_lr is not None else "N/A"
 
+        # -- Compute cumulative stream offset for next fresh-run --------
+        try:
+            skip_state = self._compute_skip_state(args, state)
+        except Exception as exc:
+            logger.warning(
+                "Could not compute cumulative_skip_buffer_size: %s", exc
+            )
+            skip_state = {}
+
         print(
             f"[TrainingStateCheckpoint] Step {state.global_step} | "
             f"Epoch {state.epoch:.4f} | LR {lr_str} | {status}"
         )
+        if self.method == "grpo" and skip_state:
+            uniq = skip_state.get("unique_prompts_per_step")
+            seqs = skip_state.get("effective_batch_sequences")
+            seen = skip_state.get("prompts_seen_approx")
+            if uniq is not None and seqs is not None:
+                print(
+                    f"  GRPO effective batch: {uniq} unique prompts/step "
+                    f"({seqs} sequences / {skip_state.get('num_generations')} gens); "
+                    f"prompts_seen_approx={seen} "
+                    f"(stream skip still uses buffer_size="
+                    f"{skip_state.get('buffer_size')})"
+                )
         if not resumable:
             missing = []
             if not has_trainer_state:
@@ -461,9 +656,16 @@ class TrainingStateCheckpointCallback(TrainerCallback):
             )
         else:
             print(
-                f"  Resume with: --resume_from {checkpoint_dir} "
+                f"  Resume (crash recovery): --resume_from {checkpoint_dir} "
                 f"--resume_training_state"
             )
+            cumulative = skip_state.get("cumulative_skip_buffer_size")
+            if cumulative is not None:
+                print(
+                    f"  Resume (fresh run on new data): --resume_from "
+                    f"{checkpoint_dir} --skip_buffer_size {cumulative} "
+                    f"(or rely on --auto_skip_from_resume, default ON)"
+                )
 
         # -- Write machine-readable summary ----------------------------
         summary = {
@@ -483,6 +685,7 @@ class TrainingStateCheckpointCallback(TrainerCallback):
                 "scheduler": has_scheduler,
                 "rng_states": rng_files,
             },
+            **skip_state,
         }
         summary_path = os.path.join(
             checkpoint_dir, "training_state_summary.json"
@@ -494,6 +697,58 @@ class TrainingStateCheckpointCallback(TrainerCallback):
             logger.warning(
                 "Could not write training state summary: %s", exc
             )
+
+
+def _read_skip_summary_int(checkpoint_dir: str, key: str) -> Optional[int]:
+    """Internal: read a non-negative integer field from ``training_state_summary.json``.
+
+    Returns ``None`` (and does not raise) when the summary file is
+    missing, malformed, or predates this feature.
+    """
+    summary_path = os.path.join(checkpoint_dir, "training_state_summary.json")
+    if not os.path.exists(summary_path):
+        return None
+    try:
+        with open(summary_path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read %s for %s: %s", summary_path, key, exc)
+        return None
+    val = data.get(key)
+    if val is None:
+        return None
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return None
+
+
+def read_cumulative_skip_from_checkpoint(checkpoint_dir: str) -> Optional[int]:
+    """Return ``cumulative_skip_buffer_size`` from a checkpoint summary, or ``None``.
+
+    Used by ``--auto_skip_from_resume`` for **fresh-on-new-data** resumes
+    (i.e. without ``--resume_training_state``) — the next run skips past
+    every valid row the previous run consumed, so training never revisits
+    samples already covered.
+
+    Returns ``None`` for legacy checkpoints without the new field; callers
+    should fall back to the user-supplied value or 0.
+    """
+    return _read_skip_summary_int(checkpoint_dir, "cumulative_skip_buffer_size")
+
+
+def read_launch_skip_from_checkpoint(checkpoint_dir: str) -> Optional[int]:
+    """Return ``launch_skip_buffer_size`` from a checkpoint summary, or ``None``.
+
+    Used by ``--auto_skip_from_resume`` for **crash-recovery** resumes
+    (i.e. with ``--resume_training_state``) — the next run uses the same
+    stream offset that the checkpoint's optimizer state was trained
+    against, so HF Trainer's built-in step-resume skip lands on the same
+    rows the original run consumed past ``global_step``.
+
+    Returns ``None`` for legacy checkpoints without the new field.
+    """
+    return _read_skip_summary_int(checkpoint_dir, "launch_skip_buffer_size")
 
 
 def validate_training_state_checkpoint(checkpoint_dir: str) -> None:
@@ -529,6 +784,55 @@ def validate_training_state_checkpoint(checkpoint_dir: str) -> None:
             "The LR schedule will restart from the beginning.",
             _SCHEDULER_FILE, checkpoint_dir,
         )
+
+
+def patch_trainer_cpu_optimizer_resume(trainer) -> None:
+    """Load optimizer/scheduler checkpoints on CPU when resuming with DDP.
+
+    HuggingFace ``Trainer._load_optimizer_and_scheduler`` places optimizer
+    state directly on each GPU when ``world_size > 1``.  For large LoRA runs
+    (e.g. rank 256 on A100 40GB) the checkpoint ``optimizer.pt`` alone can be
+    ~5 GiB per rank, leaving no headroom for the first backward pass.
+
+    ``paged_adamw_32bit`` keeps optimizer state on CPU during training; this
+    patch restores that layout on resume.  DeepSpeed / FSDP paths are unchanged.
+    """
+    from transformers.trainer import (
+        OPTIMIZER_NAME,
+        SCHEDULER_NAME,
+        check_torch_load_is_safe,
+    )
+
+    original = trainer._load_optimizer_and_scheduler
+
+    def _load_optimizer_and_scheduler_cpu(checkpoint):
+        if checkpoint is None:
+            return
+        if (
+            trainer.is_deepspeed_enabled
+            or trainer.is_fsdp_enabled
+        ):
+            return original(checkpoint)
+
+        optim_file = os.path.join(checkpoint, OPTIMIZER_NAME)
+        sched_file = os.path.join(checkpoint, SCHEDULER_NAME)
+        if not (os.path.isfile(optim_file) and os.path.isfile(sched_file)):
+            return original(checkpoint)
+
+        check_torch_load_is_safe()
+        trainer.optimizer.load_state_dict(
+            torch.load(optim_file, map_location="cpu", weights_only=True)
+        )
+        check_torch_load_is_safe()
+        trainer.lr_scheduler.load_state_dict(
+            torch.load(sched_file, map_location="cpu", weights_only=True)
+        )
+        print(
+            "[Resume] Loaded optimizer and scheduler state on CPU "
+            "(DDP resume OOM workaround for paged_adamw_32bit)."
+        )
+
+    trainer._load_optimizer_and_scheduler = _load_optimizer_and_scheduler_cpu
 
 
 # =====================================================================

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Evaluate policy LoRA checkpoints under sft_7b_exper2 with pass@k (vLLM, TP auto).
+# Evaluate policy LoRA checkpoints under grpo_32b_exper{2,3} with pass@k (vLLM, TP auto).
 #
 # Usage:
-#   ./eval_sft_7b_policy_checkpoints.sh
-#   EXP_ROOT=/path/to/sft_7b_exper2 EVAL_RESULTS_DIR=/path/to/results ./eval_sft_7b_policy_checkpoints.sh
+#   ./eval_grpo_32b_policy_checkpoints.sh
+#   POLICY_FOLDER=grpo_32b_exper3 ./eval_grpo_32b_policy_checkpoints.sh
+#   EXP_ROOT=/path/to/grpo_32b_exper3 EVAL_RESULTS_DIR=/path/to/results ./eval_grpo_32b_policy_checkpoints.sh
 #
 # Optional:
 #   DRY_RUN=1  — print commands only
@@ -12,7 +13,7 @@
 #   GENERATION_MICRO_BATCH_SIZE=8 — HF backend only; passed through for consistency (default: 8)
 #   GPU_MEMORY_UTILIZATION=0.55  — vLLM fraction of VRAM to reserve (default: 0.55; raise if GPUs are idle)
 #   SAMPLING_METHOD=random       — random | best_of_n | mcts | evolutionary (see sampling_strategies.py)
-#   NUM_COMPLETIONS=16           — --num_completions: completions per problem for pass@k, the
+#   NUM_COMPLETIONS=100          — --num_completions: completions per problem for pass@k, the
 #                                  pass@k pool (max k must be <= it). Alias: NUM_SAMPLES.
 #   SEARCH_BUDGET=50             — --budget: per-completion search width for mcts/evolutionary
 #                                  only (default: 50; orthogonal to NUM_COMPLETIONS)
@@ -23,21 +24,22 @@
 #   THRESHOLD_MODE=fault_detected — fault_detected | positive_reward | full_accuracy
 #   MAX_PROMPT_LENGTH=4096       — max prompt token length for eval buffering (default: 4096)
 #   EVAL_DATASET=chrivasileiou/asap7-language-of-test-v2 — test split source; must match
-#                                  TRAIN_DATASET in configs/sft.conf
+#                                  TRAIN_DATASET in configs/grpo.conf
 #   MERGE_DEQUANT=1              — serve the QLoRA-faithful merged bf16 export via
 #                                  --merge_dequant (adapter trained on NF4 base); 0 = clean
-#                                  bf16 base + dynamic LoRA (NOT faithful to training)
-#   WANDB_RUN_NAME / --wandb_run_name — optional; default name is derived from --adapter (experiment + checkpoint)
+#                                  bf16 base + dynamic LoRA (NOT faithful to training).
+#                                  Note: ~65 GB disk per 32B checkpoint export.
+#   WANDB_RUN_NAME / --wandb_run_name — optional; default name is derived from --adapter (e.g. …_checkpoint-N_policy)
 #
 # Examples:
-#   SAMPLING_METHOD=best_of_n NUM_COMPLETIONS=32 BEST_OF_N_WIDTH=4 ./eval_sft_7b_policy_checkpoints.sh
-#   SAMPLING_METHOD=mcts NUM_COMPLETIONS=16 SEARCH_BUDGET=50 EVAL_RESULTS_DIR=./eval_results_sft_7b_mcts ./eval_sft_7b_policy_checkpoints.sh
+#   SAMPLING_METHOD=evolutionary NUM_COMPLETIONS=24 SEARCH_BUDGET=48 ./eval_grpo_32b_policy_checkpoints.sh
+#   SAMPLING_METHOD=random NUM_COMPLETIONS=100 PASS_AT_K="1 5 10" ./eval_grpo_32b_policy_checkpoints.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EVAL_SCRIPT="${SCRIPT_DIR}/evaluate_model.py"
-POLICY_FOLDER="${POLICY_FOLDER:-sft_7b_exper2}"
+POLICY_FOLDER="${POLICY_FOLDER:-grpo_32b_exper2}"
 EXP_ROOT="${EXP_ROOT:-${SCRIPT_DIR}/${POLICY_FOLDER}}"
 EVAL_RESULTS_DIR="${EVAL_RESULTS_DIR:-${SCRIPT_DIR}/eval_results_${POLICY_FOLDER}_policy}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -55,7 +57,7 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16384}"
 MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-512}"
 THRESHOLD_MODE="${THRESHOLD_MODE:-fault_detected}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
-# Must match TRAIN_DATASET in configs/sft.conf (test split of the same database).
+# Must match TRAIN_DATASET in configs/grpo.conf (test split of the same database).
 EVAL_DATASET="${EVAL_DATASET:-chrivasileiou/asap7-language-of-test-v2}"
 MERGE_DEQUANT="${MERGE_DEQUANT:-1}"
 read -ra K_VALUES <<< "$PASS_AT_K"
@@ -87,9 +89,8 @@ fi
 
 mkdir -p "$EVAL_RESULTS_DIR"
 
-# Exclude cached *_merged_bf16 exports produced by --merge_dequant.
 mapfile -t CHECKPOINTS < <(
-  find "$EXP_ROOT" -maxdepth 1 -mindepth 1 -type d -name 'checkpoint-*' ! -name '*_merged_bf16' -printf '%f\n' | sort -V
+  find "$EXP_ROOT" -maxdepth 1 -mindepth 1 -type d -name 'checkpoint-*' -printf '%f\n' | sort -V
 )
 
 if [[ ${#CHECKPOINTS[@]} -eq 0 ]]; then
@@ -156,10 +157,24 @@ for k in "${K_VALUES[@]}"; do
 done
 echo ""
 
+# New layout: checkpoint-N/policy; legacy: checkpoint-N/combined/policy
+# (see dual_adapter_grpo_trainer._resolve_dual_adapter_dirs).
+resolve_grpo_policy_adapter() {
+  local ckpt_dir="$1"
+  local candidate
+  for candidate in "${ckpt_dir}/policy" "${ckpt_dir}/combined/policy"; do
+    if [[ -f "${candidate}/adapter_config.json" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 for name in "${CHECKPOINTS[@]}"; do
-  policy="${EXP_ROOT}/${name}"
-  if [[ ! -f "${policy}/adapter_config.json" ]]; then
-    echo "skip: no adapter_config.json at $policy" >&2
+  ckpt_dir="${EXP_ROOT}/${name}"
+  if ! policy="$(resolve_grpo_policy_adapter "$ckpt_dir")"; then
+    echo "skip: no policy adapter under $ckpt_dir (checked policy/ and combined/policy)" >&2
     continue
   fi
   _out_tag="nc${NUM_COMPLETIONS}"

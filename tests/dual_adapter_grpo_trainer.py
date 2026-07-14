@@ -49,6 +49,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -248,6 +249,18 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         # We use adapter switching for ref logps — no separate ref_model needed.
         self.ref_model = None
         self.print = False
+
+        # ── Netlist-diversity diagnostics state ──
+        # One optimizer step consumes this many *unique* prompts (the "effective
+        # batch"); netlist diversity is measured over rolling windows of this size.
+        world = getattr(self.accelerator, "num_processes", 1) or 1
+        self._prompts_per_effective_batch = max(
+            1,
+            (self.args.per_device_train_batch_size * world * self.args.gradient_accumulation_steps)
+            // max(1, int(getattr(self, "num_generations", 1) or 1)),
+        )
+        self._netlist_seen: set = set()
+        self._eff_batch_netlist_window: list = []
         
     def _update_adapter_weights(self, model: PeftModel, source_adapter_name: str, target_adapter_name: str, tau: float = 1.):
         """
@@ -282,25 +295,41 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             target_param.data.mul_(1 - tau).add_(source_param.data, alpha=tau)
     
     def _rename_adapter(self, model: PeftModel, old_name: str, new_name: str):
-        """Rename an adapter in the PeftModel."""
+        """Rename an adapter across *all* of PEFT's per-adapter containers.
+
+        PEFT scatters per-adapter state over several dicts on each LoRA layer:
+        ``lora_A``/``lora_B`` and embeddings (``adapter_layer_names``);
+        ``r``/``lora_alpha``/``scaling``/``lora_dropout`` (``other_param_names``);
+        plus ``use_dora``, ``lora_magnitude_vector`` and (newer PEFT)
+        ``lora_bias``. Renaming only a subset leaves stale keys under
+        ``old_name``; the missing one bites the first time ``new_name`` is
+        actually activated in a forward pass. In particular a missing
+        ``use_dora[new_name]`` raises ``KeyError: '<new_name>'`` inside the bnb
+        LoRA ``forward`` — which only happens once the reference adapter runs a
+        forward pass (i.e. ``beta > 0`` / a KL term), so the bug is dormant at
+        ``beta == 0``.
+        """
         if old_name not in model.peft_config:
             raise ValueError(f"Adapter '{old_name}' not found. Available: {list(model.peft_config.keys())}")
-        
-        # Copy config with new name
+
+        # Top-level config registry.
         model.peft_config[new_name] = model.peft_config.pop(old_name)
-        
-        # Rename in all LoRA layers
+
+        # Every per-adapter container on each LoRA layer. dict / nn.ModuleDict /
+        # nn.ParameterDict all support ``in``, ``pop`` and item assignment.
         for module in model.modules():
-            if isinstance(module, LoraLayer):
-                if old_name in module.lora_A:
-                    module.lora_A[new_name] = module.lora_A.pop(old_name)
-                if old_name in module.lora_B:
-                    module.lora_B[new_name] = module.lora_B.pop(old_name)
-                if hasattr(module, 'scaling') and old_name in module.scaling:
-                    module.scaling[new_name] = module.scaling.pop(old_name)
-                if old_name in module.lora_dropout:
-                    module.lora_dropout[new_name] = module.lora_dropout.pop(old_name)
-        
+            if not isinstance(module, LoraLayer):
+                continue
+            container_names = (
+                list(getattr(module, "adapter_layer_names", ()))
+                + list(getattr(module, "other_param_names", ()))
+                + ["use_dora", "lora_magnitude_vector", "lora_bias"]
+            )
+            for attr in container_names:
+                container = getattr(module, attr, None)
+                if container is not None and old_name in container:
+                    container[new_name] = container.pop(old_name)
+
         model.set_adapter(new_name)
     
     def _get_adapter_config(self, model: PeftModel, adapter_name: str) -> LoraConfig:
@@ -470,15 +499,74 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         model.disable_adapter = patched_disable_adapter
         return original_disable_adapter
     
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        """Reload Trainer state, then re-assert dual-adapter trainability.
+
+        HuggingFace ``Trainer._load_from_checkpoint`` reloads ``reference/`` and
+        ``policy/`` via ``PeftModel.load_adapter`` and then ``set_adapter``.
+        That can leave ``requires_grad`` / active-adapter flags inconsistent
+        with dual-adapter GRPO (frozen reference, trainable policy).  Re-apply
+        our setup after the stock reload so quantization + LoRA resume stays
+        correct under DDP and single-process runs.
+        """
+        super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        target = self.accelerator.unwrap_model(model if model is not None else self.model)
+        if isinstance(target, PeftModel):
+            missing = [
+                name for name in (self._ref_adapter_name, self._policy_adapter_name)
+                if name not in target.peft_config
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"Dual-adapter resume from '{resume_from_checkpoint}' is missing "
+                    f"adapter(s) {missing}. Available: {list(target.peft_config.keys())}. "
+                    f"Expected both '{self._ref_adapter_name}' and "
+                    f"'{self._policy_adapter_name}' (see DualAdapterGRPOTrainer.save_model)."
+                )
+            self._setup_adapter_training(target)
+            print(
+                "[DualAdapterGRPOTrainer] Re-applied dual-adapter trainability after "
+                f"checkpoint reload (active={target.active_adapter})."
+            )
+
     def train(self, *args, **kwargs):
         """Install the disable_adapter patch before training, restore after."""
         model = self.accelerator.unwrap_model(self.model)
         original_disable_adapter = self._patch_disable_adapter()
-        
+
+        resume_from = kwargs.get("resume_from_checkpoint")
+        if resume_from:
+            self._warn_if_world_size_mismatch(resume_from)
+
         try:
             return super().train(*args, **kwargs)
         finally:
             model.disable_adapter = original_disable_adapter
+
+    def _warn_if_world_size_mismatch(self, resume_from_checkpoint: str) -> None:
+        """HF RNG / optimizer shards are per-rank; world_size must match the save."""
+        summary_path = os.path.join(resume_from_checkpoint, "training_state_summary.json")
+        if not os.path.isfile(summary_path):
+            return
+        try:
+            with open(summary_path) as f:
+                summary = json.load(f)
+            saved = summary.get("world_size")
+            if saved is None:
+                return
+            current = int(getattr(self.accelerator, "num_processes", 1) or 1)
+            if int(saved) != current:
+                warnings.warn(
+                    f"Resuming dual-adapter GRPO from '{resume_from_checkpoint}' "
+                    f"saved with world_size={saved}, but this launch has "
+                    f"world_size={current}. Optimizer/RNG resume may fail or "
+                    f"diverge. Use the same train-GPU count as the original run "
+                    f"(e.g. grpo_h100_4gpu.conf → 3 train GPUs).",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            print(f"[DualAdapterGRPOTrainer] Could not check world_size for resume: {exc}")
 
     @profiling_decorator
     def _move_model_to_vllm(self):
@@ -692,6 +780,178 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             bucket.setdefault(sub, [])
             bucket[sub].append(float(means[j].item()))
 
+    def _log_group_sampling_diagnostics(
+        self,
+        scalars: torch.Tensor,
+        comp_mat: torch.Tensor | None,
+        comp_keys: list[str] | None,
+        reward_func_name: str,
+    ) -> None:
+        """
+        Phase-0 GRPO sampling diagnostic (inline; logged to W&B via ``self._metrics``).
+
+        Quantifies whether i.i.d. best-of-N group sampling is starving GRPO of
+        gradient. A group (the ``num_generations`` completions for one prompt) is
+        *degenerate* when all its completions receive the same training scalar, so
+        the within-group advantage is zero and the prompt contributes no gradient.
+
+        Logged per generation step under ``diagnostics/group_sampling/<reward>/``:
+          * ``degenerate_fraction``        — groups with zero scalar spread.
+          * ``all_fail_fraction``          — groups with 0 fault detections (hard regime).
+          * ``all_pass_fraction``          — groups where every sample detects (too easy).
+          * ``solved_fraction_pass_at_k``  — groups with >=1 detection (pass@k, k=G).
+          * ``pass_at_1``                  — per-sample detection rate.
+          * ``mean_detected_per_group``    — i.i.d. coverage count (0..G).
+          * ``scalar_std_mean`` / ``scalar_range_mean`` — within-group reward spread.
+          * ``rescuable_all_fail_fraction``— among all-fail groups, the share where a
+            *graded* reward component still differs across samples (Phase-2 headroom:
+            a dense sub-goal signal could rescue groups binary detection marks dead).
+
+        Computed on local rows only (no DDP collectives) to stay deadlock-free; on
+        multi-GPU the logged values reflect the main process's slice of groups.
+        """
+        if comp_mat is None or not comp_keys:
+            return
+        detect_key = "fault_detected_by_pred_input_vector_acc_logonly"
+        if detect_key not in comp_keys:
+            return  # only the test-generation reward carries fault detection
+        G = int(getattr(self, "num_generations", 0) or 0)
+        if G < 2:
+            return
+        metrics_root = getattr(self, "_metrics", None)
+        if metrics_root is None:
+            return
+
+        scal = scalars.detach().float()
+        comp = comp_mat.detach().float()
+        n = scal.shape[0]
+        if n == 0 or n % G != 0:
+            return  # only score when rows tile cleanly into complete groups
+
+        num_groups = n // G
+        key_idx = {k: j for j, k in enumerate(comp_keys)}
+
+        scal_g = torch.nan_to_num(scal, nan=0.0).reshape(num_groups, G)
+        detect_g = torch.nan_to_num(
+            comp[:, key_idx[detect_key]], nan=0.0
+        ).reshape(num_groups, G)
+        detect_bin = (detect_g >= 1.0).float()
+
+        scalar_std = scal_g.std(dim=1, unbiased=False)
+        scalar_range = scal_g.max(dim=1).values - scal_g.min(dim=1).values
+        degenerate = scalar_range <= 1e-8
+
+        detected_per_group = detect_bin.sum(dim=1)
+        all_fail = detected_per_group == 0
+        all_pass = detected_per_group == G
+        solved = detected_per_group >= 1
+
+        rescuable_frac = None
+        graded_cols = [
+            key_idx[k]
+            for k in ("fault_detect_inpvector", "input_vector", "expected_output")
+            if k in key_idx
+        ]
+        n_all_fail = int(all_fail.sum().item())
+        if graded_cols and n_all_fail > 0:
+            graded = torch.nan_to_num(comp[:, graded_cols], nan=0.0).reshape(
+                num_groups, G, len(graded_cols)
+            )
+            graded_range = graded.max(dim=1).values - graded.min(dim=1).values
+            graded_varies = (graded_range > 1e-8).any(dim=1)
+            rescuable_frac = float((graded_varies & all_fail).sum().item()) / n_all_fail
+
+        mode = "train" if self.model.training else "eval"
+        bucket = metrics_root.setdefault(mode, {})
+        prefix = f"diagnostics/group_sampling/{reward_func_name}"
+
+        def _append(name: str, value: float) -> None:
+            bucket.setdefault(f"{prefix}/{name}", []).append(float(value))
+
+        _append("degenerate_fraction", degenerate.float().mean().item())
+        _append("all_fail_fraction", all_fail.float().mean().item())
+        _append("all_pass_fraction", all_pass.float().mean().item())
+        _append("solved_fraction_pass_at_k", solved.float().mean().item())
+        _append("pass_at_1", detect_bin.mean().item())
+        _append("mean_detected_per_group", detected_per_group.mean().item())
+        _append("scalar_std_mean", scalar_std.mean().item())
+        _append("scalar_range_mean", scalar_range.mean().item())
+        if rescuable_frac is not None:
+            _append("rescuable_all_fail_fraction", rescuable_frac)
+
+    @staticmethod
+    def _netlist_identity(netlist_field) -> str:
+        """Stable per-netlist id.
+
+        Prefers the dataset ``doc_id`` carried in the formatted ``netlist``
+        payload (``{"doc_id": ..., "netlist": ...}``); falls back to a hash of
+        the raw netlist string so distinct structures never collide.
+        """
+        if isinstance(netlist_field, dict):
+            doc_id = netlist_field.get("doc_id") or netlist_field.get("id")
+            if doc_id:
+                return str(doc_id)
+            raw = netlist_field.get("netlist", "")
+            netlist_field = raw if isinstance(raw, str) else str(raw)
+        if not isinstance(netlist_field, str):
+            netlist_field = str(netlist_field)
+        return hashlib.sha256(netlist_field.encode("utf-8")).hexdigest()[:16]
+
+    def _log_netlist_diversity_diagnostics(self, inputs: list) -> None:
+        """Track netlist diversity per effective batch + cumulative coverage.
+
+        Motivation: if an effective batch is dominated by 1–3 netlists, GRPO
+        advantages are normalised over near-homogeneous structure, which makes
+        proxy/reward hacking and policy collapse far easier. These metrics make
+        that visible.
+
+        Logged under ``diagnostics/netlist_diversity/`` (train only, local rows):
+          * ``unique_in_generation_batch``      — distinct netlists in this gen batch.
+          * ``effective_batch_unique_count``    — distinct netlists over a rolling
+            window of ``prompts_per_effective_batch`` unique prompts (= one
+            optimizer step's worth of prompts).
+          * ``effective_batch_unique_fraction`` — same, normalised to ``[0, 1]``
+            (1.0 = every prompt in the step is a different netlist).
+          * ``cumulative_unique_seen``          — distinct netlists seen so far.
+
+        Computed on local rows only (no DDP collectives) to stay deadlock-free;
+        on multi-GPU the values reflect the main process's slice.
+        """
+        if not self.model.training or not inputs:
+            return
+        metrics_root = getattr(self, "_metrics", None)
+        if metrics_root is None:
+            return
+
+        G = max(1, int(getattr(self, "num_generations", 1) or 1))
+        ids = [self._netlist_identity(ex.get("netlist")) for ex in inputs]
+        # Collapse the G completions per prompt down to one id per unique prompt.
+        prompt_ids = ids[::G] if len(ids) % G == 0 else list(dict.fromkeys(ids))
+
+        bucket = metrics_root.setdefault("train", {})
+
+        def _append(name: str, value: float) -> None:
+            bucket.setdefault(f"diagnostics/netlist_diversity/{name}", []).append(float(value))
+
+        _append("unique_in_generation_batch", len(set(prompt_ids)))
+
+        # Cumulative coverage: overwrite with the exact current count (don't
+        # average it away over the logging window — mirrors num_tokens logging).
+        self._netlist_seen.update(prompt_ids)
+        bucket["diagnostics/netlist_diversity/cumulative_unique_seen"] = [
+            float(len(self._netlist_seen))
+        ]
+
+        # Rolling effective-batch window.
+        W = int(self._prompts_per_effective_batch)
+        self._eff_batch_netlist_window.extend(prompt_ids)
+        while len(self._eff_batch_netlist_window) >= W:
+            window = self._eff_batch_netlist_window[:W]
+            self._eff_batch_netlist_window = self._eff_batch_netlist_window[W:]
+            uniq = len(set(window))
+            _append("effective_batch_unique_count", uniq)
+            _append("effective_batch_unique_fraction", uniq / W)
+
     @profiling_decorator
     def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
         """
@@ -707,6 +967,9 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         """
         device = self.accelerator.device
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+
+        # Netlist-diversity diagnostics (independent of reward values).
+        self._log_netlist_diversity_diagnostics(inputs)
 
         # Build kwargs dict from all non-standard input columns for custom reward fns
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
@@ -754,6 +1017,9 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     rewards_per_func[:, i] = scalars
                     if comp_mat is not None and comp_keys is not None:
                         self._log_reward_component_means(comp_mat, comp_keys, reward_func_name)
+                        self._log_group_sampling_diagnostics(
+                            scalars, comp_mat, comp_keys, reward_func_name
+                        )
 
         if self.print:
             for prompt, completion in zip(prompts, completions):
@@ -785,8 +1051,12 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 )
                 rewards_per_func[:, idx] = scalars
                 if comp_mat is not None and comp_keys is not None:
+                    reward_func_name = idx_to_reward_name.get(idx, str(idx))
                     self._log_reward_component_means(
-                        comp_mat, comp_keys, idx_to_reward_name.get(idx, str(idx))
+                        comp_mat, comp_keys, reward_func_name
+                    )
+                    self._log_group_sampling_diagnostics(
+                        scalars, comp_mat, comp_keys, reward_func_name
                     )
 
         # Warn if every reward function returned None for any sample
@@ -1704,6 +1974,60 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 # Utility: load a checkpoint saved by DualAdapterGRPOTrainer
 # ──────────────────────────────────────────────────────────────────────────
 
+_NON_PEFT_ADAPTER_KEYS = frozenset({"max_model_length", "max_position_embeddings"})
+
+
+def _sanitize_adapter_config_file(adapter_config_path: Path) -> None:
+    """Strip non-PEFT keys that older callbacks may have injected into adapter_config.json."""
+    if not adapter_config_path.is_file():
+        return
+    try:
+        with open(adapter_config_path) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    removed = {k: cfg.pop(k) for k in _NON_PEFT_ADAPTER_KEYS if k in cfg}
+    if not removed:
+        return
+    try:
+        with open(adapter_config_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        print(
+            f"[load_dual_adapter_checkpoint] Removed non-PEFT keys from "
+            f"{adapter_config_path}: {list(removed.keys())}"
+        )
+    except OSError as exc:
+        print(
+            f"[load_dual_adapter_checkpoint] Warning: could not sanitize "
+            f"{adapter_config_path}: {exc}"
+        )
+
+
+def resolve_base_model_name_from_checkpoint(checkpoint_dir: str | Path) -> str | None:
+    """Return ``base_model_name_or_path`` from a dual-adapter or single-adapter checkpoint."""
+    resolved = _resolve_dual_adapter_dirs(checkpoint_dir)
+    candidates: list[Path] = []
+    if resolved is not None:
+        ref_dir, policy_dir, _ = resolved
+        candidates.extend(
+            [ref_dir / "adapter_config.json", policy_dir / "adapter_config.json"]
+        )
+    p = Path(checkpoint_dir)
+    candidates.append(p / "adapter_config.json")
+    for cfg_path in candidates:
+        if not cfg_path.is_file():
+            continue
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            name = cfg.get("base_model_name_or_path")
+            if name:
+                return name
+        except (OSError, json.JSONDecodeError):
+            continue
+    return None
+
+
 def _resolve_dual_adapter_dirs(
     checkpoint_dir: str | Path,
 ) -> tuple[Path, Path, str] | None:
@@ -1803,13 +2127,16 @@ def load_dual_adapter_checkpoint(
         f"(reference: {ref_dir}, policy: {policy_dir})"
     )
 
+    # Sanitize configs before PEFT reads them (same non-PEFT keys as
+    # model_utils.load_model_from_adapter).
+    _sanitize_adapter_config_file(ref_dir / "adapter_config.json")
+    _sanitize_adapter_config_file(policy_dir / "adapter_config.json")
+
     # ------------------------------------------------------------------
-    # Migrate legacy layout: copy policy's adapter_config.json +
-    # adapter_model.safetensors to the TOP LEVEL of the checkpoint.  The
-    # HuggingFace Trainer's ``_load_from_checkpoint`` — invoked when
-    # ``trainer.train(resume_from_checkpoint=...)`` runs — looks for those
-    # two files at the root of the checkpoint directory.  Without them the
-    # Trainer would either fail or silently skip the adapter reload.
+    # Ensure top-level policy adapter files exist for HF Trainer resume.
+    # ``Trainer._load_from_checkpoint`` prefers adapter *subdirs* when present
+    # (reference/ + policy/), but also needs a valid PEFT root for some paths
+    # and for tools that expect adapter_config.json at the checkpoint root.
     # One-shot, idempotent, safe to run every time.
     # ------------------------------------------------------------------
     is_distributed = (
@@ -1836,8 +2163,10 @@ def load_dual_adapter_checkpoint(
                         f"[load_dual_adapter_checkpoint] Warning: could not "
                         f"copy {fname} to top level: {exc}. HF Trainer may "
                         f"fail to auto-reload the adapter — weights are still "
-                        f"correct because they were loaded manually above."
+                        f"correct because they were loaded manually below."
                     )
+            elif src.exists() and dst.exists() and fname == "adapter_config.json":
+                _sanitize_adapter_config_file(dst)
     if is_distributed:
         torch.distributed.barrier()
 
@@ -1850,12 +2179,20 @@ def load_dual_adapter_checkpoint(
         )
 
     print(f"[load_dual_adapter_checkpoint] Base model: {base_model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    # Prefer tokenizer files saved with the checkpoint (chat template, etc.).
+    if (checkpoint_dir / "tokenizer_config.json").exists():
+        print(f"[load_dual_adapter_checkpoint] Loading tokenizer from: {checkpoint_dir}")
+        tokenizer = AutoTokenizer.from_pretrained(
+            checkpoint_dir.as_posix(), trust_remote_code=True
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
     if not tokenizer.eos_token:
         tokenizer.add_special_tokens({"eos_token": "</s>"})
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Always reload the 4-bit base + both adapters. Never merge_and_unload.
     base_model = load_quantised_model(base_model_name, device_map=device_map)
     base_model = prepare_model_for_kbit_training(
         base_model, use_gradient_checkpointing=True,
@@ -1874,7 +2211,27 @@ def load_dual_adapter_checkpoint(
         adapter_name=POLICY_ADAPTER_NAME,
         is_trainable=True,
     )
+    # set_adapter marks the active adapter trainable; then freeze reference.
     model.set_adapter(POLICY_ADAPTER_NAME)
+    for name, param in model.named_parameters():
+        if REFERENCE_ADAPTER_NAME in name and "lora" in name.lower():
+            param.requires_grad = False
+        elif POLICY_ADAPTER_NAME in name and "lora" in name.lower():
+            param.requires_grad = True
+
+    n_ref = sum(p.numel() for n, p in model.named_parameters() if REFERENCE_ADAPTER_NAME in n)
+    n_pol = sum(p.numel() for n, p in model.named_parameters() if POLICY_ADAPTER_NAME in n)
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f"[load_dual_adapter_checkpoint] Adapters ready "
+        f"(reference params={n_ref:,}, policy params={n_pol:,}, "
+        f"trainable={n_train:,}, active={model.active_adapter})"
+    )
+    if n_train <= 0:
+        raise RuntimeError(
+            "Dual-adapter resume loaded zero trainable parameters. "
+            "Policy adapter must be trainable for GRPO continuation."
+        )
     return model, tokenizer
 
 
