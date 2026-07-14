@@ -1,6 +1,10 @@
 
 from .utils import *
 from .llm import *
+try:
+  from .graph import *
+except ImportError:
+  pass  # torch_geometric (or graph deps) not installed — graph modality unavailable
 import json
 
 models_causal = {

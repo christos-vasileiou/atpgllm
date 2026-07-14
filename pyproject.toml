@@ -22,8 +22,24 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/christos-vasileiou/atpgllm"
 
-[tool.setuptools]
-packages = ["atpgllm"]
+[project.optional-dependencies]
+graph-track = [
+    "wandb>=0.16",
+    "plotly>=5.10",
+]
+graph-search = [
+    "optuna>=3.4",
+    "ax-platform>=0.4.3",
+    "wandb>=0.16",
+    "plotly>=5.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["atpgllm*"]
+
+[tool.setuptools.package-data]
+atpgllm = ["deepspeed_config.json"]
 
 [tool.setuptools.dynamic]
 dependencies = {file = "requirements.txt"}

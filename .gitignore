@@ -183,3 +183,7 @@ tests/small_sft_finetuned_models/
 ds_zero3.json
 sample_dataset.jsonl
 
+# Precomputed graph Stage-1 design descriptions (regenerate via
+# python -m atpgllm.graph.scripts.precompute_design_descriptions)
+tests/graph/data/design_descriptions.json
+
