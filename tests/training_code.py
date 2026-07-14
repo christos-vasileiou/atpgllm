@@ -623,6 +623,7 @@ def train_with_grpo(
         DualAdapterGRPOTrainer,
         is_dual_adapter_checkpoint,
         load_dual_adapter_checkpoint,
+        resolve_base_model_name_from_checkpoint,
     )
 
     # Determine device_map: per-GPU for DDP, "auto" otherwise
@@ -642,11 +643,30 @@ def train_with_grpo(
         # layout and reload both so the DualAdapterGRPOTrainer can pick up
         # where it left off without re-initialising the policy from the
         # reference (which would discard all GRPO progress).
-        is_grpo_ckpt = use_dual_adapter and is_dual_adapter_checkpoint(resume_from)
+        is_grpo_ckpt = is_dual_adapter_checkpoint(resume_from)
+        if is_grpo_ckpt and not use_dual_adapter:
+            print(
+                "[GRPO] WARNING: resume_from is a dual-adapter checkpoint but "
+                "--use_dual_adapter was disabled. Forcing dual-adapter mode so "
+                "reference/ + policy/ weights are not silently dropped."
+            )
+            use_dual_adapter = True
         if is_grpo_ckpt:
             print(f"Resuming GRPO training from dual-adapter checkpoint: {resume_from}")
             print("  - Reference (frozen SFT) adapter: loaded from reference/")
             print("  - Policy (trainable) adapter: loaded from policy/")
+            if resume_training_state:
+                print("  - Trainer state: will restore optimizer / step / RNG")
+            else:
+                print(
+                    "  - Trainer state: fresh optimizer (adapter weights only). "
+                    "Pass --resume_training_state for crash recovery."
+                )
+            if not model_name:
+                derived = resolve_base_model_name_from_checkpoint(resume_from)
+                if derived:
+                    model_name = derived
+                    print(f"  - Derived base model_name for logging/vLLM: {model_name}")
             model, tokenizer = load_dual_adapter_checkpoint(resume_from, device_map=device_map)
             peft_config_for_trainer = None
             # Signal to DualAdapterGRPOTrainer: adapters are already set up.
@@ -793,6 +813,7 @@ def train_with_grpo(
             method="grpo",
             launch_skip_buffer_size=skip_buffer_size,
             buffer_size=buffer_size,
+            num_generations=max(num_generations, 2),
         ),
     ]
 

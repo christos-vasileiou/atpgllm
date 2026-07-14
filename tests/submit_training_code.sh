@@ -61,7 +61,7 @@ echo "  meta:     ${FROZEN}.meta"
 # Build sbatch resource overrides from the (frozen) config.
 #
 # #SBATCH directives inside run_training_code.sh are static, so the topology
-# (partition, node count, GPUs/node, CPUs, memory) is driven here instead:
+# (partition, node count, GPUs/node, CPUs, memory, wall time) is driven here instead:
 # sbatch CLI flags take precedence over #SBATCH lines. This is what makes the
 # SAME launcher work for single-node (4xH100: PARTITION=h100, NUM_NODES=1,
 # GPUS_PER_NODE=4) and multi-node (H200: NUM_NODES=2/3, GPUS_PER_NODE=2).
@@ -73,6 +73,7 @@ NUM_NODES="${NUM_NODES:-1}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-32}"
 MEM="${MEM:-128G}"
+TIME_LIMIT="${TIME_LIMIT:-7-00:00:00}"
 JOB_NAME="$(basename "${OUTPUT_DIR:-${METHOD:-train}}")"
 
 SBATCH_FLAGS=(
@@ -82,6 +83,7 @@ SBATCH_FLAGS=(
     --gres=gpu:"$GPUS_PER_NODE"
     --cpus-per-task="$CPUS_PER_TASK"
     --mem="$MEM"
+    --time="$TIME_LIMIT"
     --job-name="$JOB_NAME"
 )
 

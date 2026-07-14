@@ -13,8 +13,8 @@
 # The #SBATCH resource directives above are DEFAULTS for a direct
 #   sbatch run_training_code.sh <config>
 # For multi-node runs prefer submit_training_code.sh: it reads PARTITION,
-# NUM_NODES, GPUS_PER_NODE, CPUS_PER_TASK and MEM from the config file and
-# passes them to sbatch as CLI overrides (which take precedence over the
+# NUM_NODES, GPUS_PER_NODE, CPUS_PER_TASK, MEM, and TIME_LIMIT from the config
+# file and passes them to sbatch as CLI overrides (which take precedence over the
 # #SBATCH lines here). That keeps this file's directives static while the
 # topology is driven entirely by the config.
 # ---------------------------------------------------------------------------
@@ -111,6 +111,93 @@ echo "Loading configuration from: $CONFIG_FILE"
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
+METHOD=${METHOD:-sft}
+
+# Resolve RESUME_FROM relative to the submit/repo dir when needed (configs often
+# use paths like grpo_7b_h100/checkpoint-10 that live under atpgllm/tests/).
+if [ -n "${RESUME_FROM:-}" ] && [ "$RESUME_FROM" != "None" ] && [ ! -d "$RESUME_FROM" ]; then
+    if [ -d "$_SCRIPT_DIR/$RESUME_FROM" ]; then
+        RESUME_FROM="$_SCRIPT_DIR/$RESUME_FROM"
+        echo "Resolved RESUME_FROM -> $RESUME_FROM"
+    fi
+fi
+
+# GRPO dual-adapter / quantization resume preflight (single- and multi-node).
+# Runs before the W&B snapshot so resolved RESUME_FROM / derived MODEL are recorded.
+validate_grpo_resume() {
+    local resume="$1"
+    local dual_new dual_legacy sft_adapter
+    [ -z "$resume" ] || [ "$resume" = "None" ] && return 0
+    if [ ! -d "$resume" ]; then
+        echo "ERROR: RESUME_FROM directory does not exist: $resume"
+        echo "       (cwd=$(pwd); script_dir=$_SCRIPT_DIR)"
+        exit 1
+    fi
+    dual_new=false
+    dual_legacy=false
+    sft_adapter=false
+    if [ -f "$resume/reference/adapter_config.json" ] && [ -f "$resume/policy/adapter_config.json" ]; then
+        dual_new=true
+    elif [ -f "$resume/combined/reference/adapter_config.json" ] \
+        && [ -f "$resume/combined/policy/adapter_config.json" ]; then
+        dual_legacy=true
+    elif [ -f "$resume/adapter_config.json" ]; then
+        sft_adapter=true
+    fi
+
+    if [ "$METHOD" = "grpo" ] && [ "${USE_DUAL_ADAPTER:-}" = "True" ]; then
+        if [ "$dual_new" = true ] || [ "$dual_legacy" = true ]; then
+            echo "GRPO resume: dual-adapter checkpoint detected at $resume"
+            echo "  layout: $([ "$dual_new" = true ] && echo new || echo legacy)"
+            echo "  path: 4-bit base + frozen reference + trainable policy (no merge)"
+        elif [ "$sft_adapter" = true ]; then
+            echo "GRPO resume: single-adapter (SFT→GRPO) checkpoint at $resume"
+            echo "  DualAdapterGRPOTrainer will create a new policy from the SFT adapter."
+        else
+            echo "ERROR: USE_DUAL_ADAPTER=True but RESUME_FROM is not a PEFT/dual-adapter checkpoint:"
+            echo "       $resume"
+            echo "       Expected reference/+policy/ (or combined/...), or top-level adapter_config.json."
+            exit 1
+        fi
+    fi
+
+    if [ "${RESUME_TRAINING_STATE:-}" = "True" ]; then
+        if [ ! -f "$resume/trainer_state.json" ]; then
+            echo "ERROR: RESUME_TRAINING_STATE=True but trainer_state.json missing in:"
+            echo "       $resume"
+            echo "       Point RESUME_FROM at a Trainer checkpoint-* directory, or set"
+            echo "       RESUME_TRAINING_STATE=False to load adapter weights only."
+            exit 1
+        fi
+        if [ -f "$resume/training_state_summary.json" ]; then
+            echo "GRPO resume: training_state_summary.json present (RESUMABLE metadata)."
+        fi
+    fi
+
+    # vLLM / trl vllm-serve always need the *base* Hub model. If MODEL is empty,
+    # derive it from the adapter config so single- and multi-node paths still work.
+    if [ -z "${MODEL:-}" ] || [ "$MODEL" = "None" ]; then
+        local cfg=""
+        if [ "$dual_new" = true ]; then
+            cfg="$resume/reference/adapter_config.json"
+        elif [ "$dual_legacy" = true ]; then
+            cfg="$resume/combined/reference/adapter_config.json"
+        elif [ "$sft_adapter" = true ]; then
+            cfg="$resume/adapter_config.json"
+        fi
+        if [ -n "$cfg" ] && [ -f "$cfg" ]; then
+            MODEL="$(python -c "import json,sys; print(json.load(open(sys.argv[1])).get('base_model_name_or_path') or '')" "$cfg" 2>/dev/null || true)"
+            if [ -n "$MODEL" ]; then
+                echo "Derived MODEL from checkpoint adapter_config: $MODEL"
+            fi
+        fi
+    fi
+}
+
+if [ "$METHOD" = "grpo" ] && [ -n "${RESUME_FROM:-}" ] && [ "$RESUME_FROM" != "None" ]; then
+    validate_grpo_resume "$RESUME_FROM"
+fi
+
 # Snapshot sourced values for Weights & Biases (exact launcher state at run time).
 write_launch_config_snapshot() {
     local _snap_stamp _snap_path _key _val
@@ -152,16 +239,22 @@ write_launch_config_snapshot
 # =============================================================================
 # Validate Required Configuration
 # =============================================================================
-METHOD=${METHOD:-sft}
-
 if [ -z "$TRAIN_DATASET" ]; then
     echo "ERROR: TRAIN_DATASET is not set in $CONFIG_FILE"
     exit 1
 fi
-# MODEL is required for SFT, optional for GRPO (which can resume from checkpoint).
-if [ -z "$MODEL" ] && [ "$METHOD" != "grpo" ]; then
-    echo "ERROR: MODEL is not set in $CONFIG_FILE (required for METHOD=$METHOD)"
-    exit 1
+# MODEL is required for SFT, and for GRPO whenever a vLLM server is started.
+# After validate_grpo_resume it may have been derived from the checkpoint.
+if [ -z "${MODEL:-}" ] || [ "$MODEL" = "None" ]; then
+    if [ "$METHOD" != "grpo" ]; then
+        echo "ERROR: MODEL is not set in $CONFIG_FILE (required for METHOD=$METHOD)"
+        exit 1
+    fi
+    if [ "${USE_VLLM:-}" = "True" ]; then
+        echo "ERROR: MODEL is empty and could not be derived from RESUME_FROM."
+        echo "       Set MODEL to the base Hub id (e.g. Qwen/Qwen2.5-7B-Instruct) for vLLM."
+        exit 1
+    fi
 fi
 
 # When DRY_RUN=True, print the commands that would be executed and skip

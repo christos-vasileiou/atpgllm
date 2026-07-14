@@ -415,6 +415,28 @@ class TrainingStateCheckpointCallback(TrainerCallback):
       were actually reached, so the next run picks up from beyond the
       buffered slice.
 
+    GRPO effective-batch metadata (matches TRL ``GRPOConfig`` /
+    ``DualAdapterGRPOTrainer``)
+    ----------------------------------------------------------------
+    TRL defines the *sequence* effective batch as::
+
+        effective_batch_sequences =
+            per_device_train_batch_size * world_size * gradient_accumulation_steps
+
+    and requires it to be divisible by ``num_generations``.  ``RepeatSampler``
+    then replicates each unique prompt ``num_generations`` times, so one
+    optimizer step touches this many *unique prompts*::
+
+        unique_prompts_per_step = effective_batch_sequences // num_generations
+
+    That is the same quantity stored as
+    ``DualAdapterGRPOTrainer._prompts_per_effective_batch``.  For GRPO the
+    summary's ``effective_batch_size`` field is this unique-prompt count
+    (not the raw sequence count).  ``prompts_seen_approx =
+    global_step * unique_prompts_per_step`` is also recorded for diagnostics;
+    it is **not** used for stream skip (the buffer was already fully drawn
+    from the stream at startup).
+
     Parameters
     ----------
     method : str, optional
@@ -427,6 +449,11 @@ class TrainingStateCheckpointCallback(TrainerCallback):
     buffer_size : int, optional
         GRPO only. The ``buffer_size`` that ``buffer_streaming_dataset``
         was asked to fill. Required when ``method="grpo"``.
+    num_generations : int, optional
+        GRPO only. Completions per prompt (``GRPOConfig.num_generations``).
+        Used to convert TRL's sequence effective batch into unique prompts
+        per optimizer step. Falls back to ``args.num_generations`` when
+        omitted.
     """
 
     def __init__(
@@ -434,6 +461,7 @@ class TrainingStateCheckpointCallback(TrainerCallback):
         method: Optional[str] = None,
         launch_skip_buffer_size: int = 0,
         buffer_size: Optional[int] = None,
+        num_generations: Optional[int] = None,
     ):
         self.method = method.lower() if isinstance(method, str) else None
         try:
@@ -447,6 +475,13 @@ class TrainingStateCheckpointCallback(TrainerCallback):
                 self.buffer_size = max(0, int(buffer_size))
             except (TypeError, ValueError):
                 self.buffer_size = None
+        if num_generations is None:
+            self.num_generations: Optional[int] = None
+        else:
+            try:
+                self.num_generations = max(1, int(num_generations))
+            except (TypeError, ValueError):
+                self.num_generations = None
 
     def _compute_skip_state(self, args, state) -> dict:
         """Return cumulative_skip_buffer_size + supporting metadata for the summary."""
@@ -462,26 +497,76 @@ class TrainingStateCheckpointCallback(TrainerCallback):
             grad_acc = int(getattr(args, "gradient_accumulation_steps", 1) or 1)
         except (TypeError, ValueError):
             grad_acc = 1
-        effective_batch_size = max(1, per_device) * max(1, world_size) * max(1, grad_acc)
+
+        # TRL GRPOConfig: "effective batch size" = sequences per optimizer step.
+        effective_batch_sequences = (
+            max(1, per_device) * max(1, world_size) * max(1, grad_acc)
+        )
+
+        num_generations = self.num_generations
+        if num_generations is None:
+            try:
+                num_generations = int(getattr(args, "num_generations", 0) or 0)
+            except (TypeError, ValueError):
+                num_generations = 0
+            if num_generations < 1:
+                num_generations = None
+
+        if self.method == "grpo":
+            # Unique prompts per optimizer step (RepeatSampler mini_repeat /
+            # DualAdapterGRPOTrainer._prompts_per_effective_batch).
+            g = max(1, int(num_generations or 1))
+            if effective_batch_sequences % g != 0:
+                logger.warning(
+                    "GRPO effective_batch_sequences (%s) is not divisible by "
+                    "num_generations (%s); unique_prompts_per_step uses floor division.",
+                    effective_batch_sequences, g,
+                )
+            unique_prompts_per_step = max(1, effective_batch_sequences // g)
+            # Summary "effective_batch_size" = unique prompts (what one step
+            # consumes from the buffered dataset), not raw sequences.
+            effective_batch_size = unique_prompts_per_step
+        else:
+            g = None
+            unique_prompts_per_step = None
+            effective_batch_size = effective_batch_sequences
 
         if self.method == "grpo" and self.buffer_size is not None:
+            # Stream skip: whole buffer was drawn once at startup.
             consumed = int(self.buffer_size)
+            prompts_seen_approx = int(state.global_step) * effective_batch_size
         else:
             consumed = int(state.global_step) * effective_batch_size
+            prompts_seen_approx = consumed
         cumulative = self.launch_skip_buffer_size + consumed
 
         skip_state: dict = {
             "method": self.method,
             "launch_skip_buffer_size": self.launch_skip_buffer_size,
             "effective_batch_size": effective_batch_size,
+            "effective_batch_sequences": effective_batch_sequences,
             "per_device_train_batch_size": per_device,
             "gradient_accumulation_steps": grad_acc,
             "world_size": world_size,
             "consumed_in_run": consumed,
             "cumulative_skip_buffer_size": cumulative,
+            "prompts_seen_approx": prompts_seen_approx,
         }
         if self.method == "grpo":
             skip_state["buffer_size"] = self.buffer_size
+            skip_state["num_generations"] = g
+            skip_state["unique_prompts_per_step"] = unique_prompts_per_step
+            try:
+                steps_per_generation = int(
+                    getattr(args, "steps_per_generation", 0) or 0
+                )
+            except (TypeError, ValueError):
+                steps_per_generation = 0
+            if steps_per_generation > 0:
+                skip_state["steps_per_generation"] = steps_per_generation
+                skip_state["generation_batch_size"] = (
+                    max(1, per_device) * max(1, world_size) * steps_per_generation
+                )
         return skip_state
 
     def on_save(self, args, state, control, **kwargs):
@@ -543,6 +628,18 @@ class TrainingStateCheckpointCallback(TrainerCallback):
             f"[TrainingStateCheckpoint] Step {state.global_step} | "
             f"Epoch {state.epoch:.4f} | LR {lr_str} | {status}"
         )
+        if self.method == "grpo" and skip_state:
+            uniq = skip_state.get("unique_prompts_per_step")
+            seqs = skip_state.get("effective_batch_sequences")
+            seen = skip_state.get("prompts_seen_approx")
+            if uniq is not None and seqs is not None:
+                print(
+                    f"  GRPO effective batch: {uniq} unique prompts/step "
+                    f"({seqs} sequences / {skip_state.get('num_generations')} gens); "
+                    f"prompts_seen_approx={seen} "
+                    f"(stream skip still uses buffer_size="
+                    f"{skip_state.get('buffer_size')})"
+                )
         if not resumable:
             missing = []
             if not has_trainer_state:

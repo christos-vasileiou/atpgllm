@@ -499,15 +499,74 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         model.disable_adapter = patched_disable_adapter
         return original_disable_adapter
     
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        """Reload Trainer state, then re-assert dual-adapter trainability.
+
+        HuggingFace ``Trainer._load_from_checkpoint`` reloads ``reference/`` and
+        ``policy/`` via ``PeftModel.load_adapter`` and then ``set_adapter``.
+        That can leave ``requires_grad`` / active-adapter flags inconsistent
+        with dual-adapter GRPO (frozen reference, trainable policy).  Re-apply
+        our setup after the stock reload so quantization + LoRA resume stays
+        correct under DDP and single-process runs.
+        """
+        super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        target = self.accelerator.unwrap_model(model if model is not None else self.model)
+        if isinstance(target, PeftModel):
+            missing = [
+                name for name in (self._ref_adapter_name, self._policy_adapter_name)
+                if name not in target.peft_config
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"Dual-adapter resume from '{resume_from_checkpoint}' is missing "
+                    f"adapter(s) {missing}. Available: {list(target.peft_config.keys())}. "
+                    f"Expected both '{self._ref_adapter_name}' and "
+                    f"'{self._policy_adapter_name}' (see DualAdapterGRPOTrainer.save_model)."
+                )
+            self._setup_adapter_training(target)
+            print(
+                "[DualAdapterGRPOTrainer] Re-applied dual-adapter trainability after "
+                f"checkpoint reload (active={target.active_adapter})."
+            )
+
     def train(self, *args, **kwargs):
         """Install the disable_adapter patch before training, restore after."""
         model = self.accelerator.unwrap_model(self.model)
         original_disable_adapter = self._patch_disable_adapter()
-        
+
+        resume_from = kwargs.get("resume_from_checkpoint")
+        if resume_from:
+            self._warn_if_world_size_mismatch(resume_from)
+
         try:
             return super().train(*args, **kwargs)
         finally:
             model.disable_adapter = original_disable_adapter
+
+    def _warn_if_world_size_mismatch(self, resume_from_checkpoint: str) -> None:
+        """HF RNG / optimizer shards are per-rank; world_size must match the save."""
+        summary_path = os.path.join(resume_from_checkpoint, "training_state_summary.json")
+        if not os.path.isfile(summary_path):
+            return
+        try:
+            with open(summary_path) as f:
+                summary = json.load(f)
+            saved = summary.get("world_size")
+            if saved is None:
+                return
+            current = int(getattr(self.accelerator, "num_processes", 1) or 1)
+            if int(saved) != current:
+                warnings.warn(
+                    f"Resuming dual-adapter GRPO from '{resume_from_checkpoint}' "
+                    f"saved with world_size={saved}, but this launch has "
+                    f"world_size={current}. Optimizer/RNG resume may fail or "
+                    f"diverge. Use the same train-GPU count as the original run "
+                    f"(e.g. grpo_h100_4gpu.conf → 3 train GPUs).",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            print(f"[DualAdapterGRPOTrainer] Could not check world_size for resume: {exc}")
 
     @profiling_decorator
     def _move_model_to_vllm(self):
@@ -1915,6 +1974,60 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 # Utility: load a checkpoint saved by DualAdapterGRPOTrainer
 # ──────────────────────────────────────────────────────────────────────────
 
+_NON_PEFT_ADAPTER_KEYS = frozenset({"max_model_length", "max_position_embeddings"})
+
+
+def _sanitize_adapter_config_file(adapter_config_path: Path) -> None:
+    """Strip non-PEFT keys that older callbacks may have injected into adapter_config.json."""
+    if not adapter_config_path.is_file():
+        return
+    try:
+        with open(adapter_config_path) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    removed = {k: cfg.pop(k) for k in _NON_PEFT_ADAPTER_KEYS if k in cfg}
+    if not removed:
+        return
+    try:
+        with open(adapter_config_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        print(
+            f"[load_dual_adapter_checkpoint] Removed non-PEFT keys from "
+            f"{adapter_config_path}: {list(removed.keys())}"
+        )
+    except OSError as exc:
+        print(
+            f"[load_dual_adapter_checkpoint] Warning: could not sanitize "
+            f"{adapter_config_path}: {exc}"
+        )
+
+
+def resolve_base_model_name_from_checkpoint(checkpoint_dir: str | Path) -> str | None:
+    """Return ``base_model_name_or_path`` from a dual-adapter or single-adapter checkpoint."""
+    resolved = _resolve_dual_adapter_dirs(checkpoint_dir)
+    candidates: list[Path] = []
+    if resolved is not None:
+        ref_dir, policy_dir, _ = resolved
+        candidates.extend(
+            [ref_dir / "adapter_config.json", policy_dir / "adapter_config.json"]
+        )
+    p = Path(checkpoint_dir)
+    candidates.append(p / "adapter_config.json")
+    for cfg_path in candidates:
+        if not cfg_path.is_file():
+            continue
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            name = cfg.get("base_model_name_or_path")
+            if name:
+                return name
+        except (OSError, json.JSONDecodeError):
+            continue
+    return None
+
+
 def _resolve_dual_adapter_dirs(
     checkpoint_dir: str | Path,
 ) -> tuple[Path, Path, str] | None:
@@ -2014,13 +2127,16 @@ def load_dual_adapter_checkpoint(
         f"(reference: {ref_dir}, policy: {policy_dir})"
     )
 
+    # Sanitize configs before PEFT reads them (same non-PEFT keys as
+    # model_utils.load_model_from_adapter).
+    _sanitize_adapter_config_file(ref_dir / "adapter_config.json")
+    _sanitize_adapter_config_file(policy_dir / "adapter_config.json")
+
     # ------------------------------------------------------------------
-    # Migrate legacy layout: copy policy's adapter_config.json +
-    # adapter_model.safetensors to the TOP LEVEL of the checkpoint.  The
-    # HuggingFace Trainer's ``_load_from_checkpoint`` — invoked when
-    # ``trainer.train(resume_from_checkpoint=...)`` runs — looks for those
-    # two files at the root of the checkpoint directory.  Without them the
-    # Trainer would either fail or silently skip the adapter reload.
+    # Ensure top-level policy adapter files exist for HF Trainer resume.
+    # ``Trainer._load_from_checkpoint`` prefers adapter *subdirs* when present
+    # (reference/ + policy/), but also needs a valid PEFT root for some paths
+    # and for tools that expect adapter_config.json at the checkpoint root.
     # One-shot, idempotent, safe to run every time.
     # ------------------------------------------------------------------
     is_distributed = (
@@ -2047,8 +2163,10 @@ def load_dual_adapter_checkpoint(
                         f"[load_dual_adapter_checkpoint] Warning: could not "
                         f"copy {fname} to top level: {exc}. HF Trainer may "
                         f"fail to auto-reload the adapter — weights are still "
-                        f"correct because they were loaded manually above."
+                        f"correct because they were loaded manually below."
                     )
+            elif src.exists() and dst.exists() and fname == "adapter_config.json":
+                _sanitize_adapter_config_file(dst)
     if is_distributed:
         torch.distributed.barrier()
 
@@ -2061,12 +2179,20 @@ def load_dual_adapter_checkpoint(
         )
 
     print(f"[load_dual_adapter_checkpoint] Base model: {base_model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    # Prefer tokenizer files saved with the checkpoint (chat template, etc.).
+    if (checkpoint_dir / "tokenizer_config.json").exists():
+        print(f"[load_dual_adapter_checkpoint] Loading tokenizer from: {checkpoint_dir}")
+        tokenizer = AutoTokenizer.from_pretrained(
+            checkpoint_dir.as_posix(), trust_remote_code=True
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
     if not tokenizer.eos_token:
         tokenizer.add_special_tokens({"eos_token": "</s>"})
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Always reload the 4-bit base + both adapters. Never merge_and_unload.
     base_model = load_quantised_model(base_model_name, device_map=device_map)
     base_model = prepare_model_for_kbit_training(
         base_model, use_gradient_checkpointing=True,
@@ -2085,7 +2211,27 @@ def load_dual_adapter_checkpoint(
         adapter_name=POLICY_ADAPTER_NAME,
         is_trainable=True,
     )
+    # set_adapter marks the active adapter trainable; then freeze reference.
     model.set_adapter(POLICY_ADAPTER_NAME)
+    for name, param in model.named_parameters():
+        if REFERENCE_ADAPTER_NAME in name and "lora" in name.lower():
+            param.requires_grad = False
+        elif POLICY_ADAPTER_NAME in name and "lora" in name.lower():
+            param.requires_grad = True
+
+    n_ref = sum(p.numel() for n, p in model.named_parameters() if REFERENCE_ADAPTER_NAME in n)
+    n_pol = sum(p.numel() for n, p in model.named_parameters() if POLICY_ADAPTER_NAME in n)
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f"[load_dual_adapter_checkpoint] Adapters ready "
+        f"(reference params={n_ref:,}, policy params={n_pol:,}, "
+        f"trainable={n_train:,}, active={model.active_adapter})"
+    )
+    if n_train <= 0:
+        raise RuntimeError(
+            "Dual-adapter resume loaded zero trainable parameters. "
+            "Policy adapter must be trainable for GRPO continuation."
+        )
     return model, tokenizer
 
 
