@@ -377,10 +377,19 @@ libatpgllm/
 │   │   ├── dataset.py           HF / design-description datasets
 │   │   ├── ARCHITECTURE.md      This document
 │   │   └── scripts/             CLI entrypoints (python -m atpgllm.graph.scripts.*)
+│   ├── training/                Conversation, datasets, GRPO trainers, tools, rewards
+│   │   └── data/                Package data (sim_config.json)
 │   └── multimodal/              Reserved: future llm ↔ graph integration
-└── tests/
+├── scripts/
+│   ├── train/                   training_code.py + Slurm launchers + configs/
+│   ├── eval/                    evaluate_model.py + checkpoint eval wrappers
+│   └── dataset/                 Dataset filter / token analysis CLIs
+├── experiments/                 Non-packaged legacy / notebooks / scratch
+└── tests/                       Pytest only
+    ├── unit/
+    ├── integration/
     └── graph/
-        ├── example_integration.py
+        ├── test_example_integration.py
         └── data/                Precomputed design descriptions (not shipped in wheel)
 ```
 

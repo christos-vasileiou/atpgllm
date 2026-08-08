@@ -109,6 +109,11 @@ ipython_config.py
 #   https://pdm.fming.dev/#use-with-ide
 .pdm.toml
 
+# uv
+#   Ignore uv.lock here: this repo pins via requirements.txt / the shared venv, and the lock
+#   is environment-specific. Regenerate locally with `uv lock` if needed; do not commit it.
+uv.lock
+
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 
@@ -179,11 +184,30 @@ tests/wandb/
 tests/unsloth_compiled_cache/
 # Local experiment output dirs (sft_32b_exper2, grpo_7b_exper3_v2, etc.)
 tests/*_exper*/
+tests/sft_*b*/
+tests/grpo_*b*/
 tests/small_sft_finetuned_models/
+# Default training/eval output root (new layout)
+runs/
+jobs/
+wandb/
 ds_zero3.json
 sample_dataset.jsonl
+# saved models
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.safetensors
+*.onnx
+*.onnx.gz
+*.onnx.gz.index
+*.onnx.gz.index.json
+*.onnx.gz.index.json.gz
 
 # Precomputed graph Stage-1 design descriptions (regenerate via
 # python -m atpgllm.graph.scripts.precompute_design_descriptions)
-tests/graph/data/design_descriptions.json
+tests/graph/data
 
+experiments/digitest.llm
+experiments/scratch

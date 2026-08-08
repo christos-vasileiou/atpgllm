@@ -40,6 +40,13 @@ include = ["atpgllm*"]
 
 [tool.setuptools.package-data]
 atpgllm = ["deepspeed_config.json"]
+"atpgllm.training" = ["data/*.json"]
 
 [tool.setuptools.dynamic]
 dependencies = {file = "requirements.txt"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
