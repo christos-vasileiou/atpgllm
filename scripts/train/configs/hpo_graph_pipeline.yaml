@@ -1,0 +1,146 @@
+version: 1
+
+study:
+  name: asap7-graph-pipeline-v1
+  artifacts_root: runs/hpo
+  sampler:
+    type: tpe
+    seed: 42
+    n_startup_trials: 16
+    n_ei_candidates: 48
+    multivariate: true
+    group: true
+    constant_liar: true
+  pruner:
+    type: hyperband
+    min_resource: 500
+    max_resource: 13500
+    reduction_factor: 3
+    bootstrap_count: 0
+  storage:
+    heartbeat_interval_seconds: 60
+    grace_period_seconds: 180
+    max_retry: 1
+
+dataset:
+  name: chrivasileiou/asap7-language-of-test-v2
+  revision: null
+  source_split: train
+  split_seed: 42
+  split_ratios: [0.8, 0.1, 0.1]
+  split_scan_records: 100000
+  validation_records: 512
+
+stages:
+  graph_pretrain:
+    trials: 72
+    fidelities: [500, 1500, 4500, 13500]
+    batch_size: 16
+    grad_accum: 1
+    validation_batches: 16
+    fixed:
+      num_workers: 0
+      sim_config: null
+      train_split: train
+      validation_split: validation
+    search:
+      node_dim: {type: categorical, choices: [128, 256]}
+      gin_hidden: {type: categorical, choices: [128, 256, 384, 512]}
+      gin_layers: {type: categorical, choices: [3, 4, 5, 6, 8]}
+      per_attr_dim: {type: categorical, choices: [8, 16, 32]}
+      attr_mlp_hidden: {type: categorical, choices: [128, 256]}
+      dropout: {type: float, low: 0.0, high: 0.2}
+      lr: {type: float, low: 0.00003, high: 0.003, log: true}
+      weight_decay: {type: float, low: 0.000001, high: 0.01, log: true}
+      grad_clip: {type: categorical, choices: [0.5, 1.0, 2.0]}
+      backtrack_ratio: {type: float, low: 0.25, high: 4.0, log: true}
+      discrepancy_ratio: {type: float, low: 0.25, high: 4.0, log: true}
+
+  graph_text_alignment:
+    trials: 48
+    fidelities: [500, 1500, 4500, 13500]
+    batch_size: 16
+    grad_accum: 1
+    validation_batches: 8
+    fixed:
+      text_model: answerdotai/ModernBERT-base
+      freeze_text: true
+      max_text_len: 512
+      max_answer_len: 512
+      num_workers: 0
+      train_split: train
+      validation_split: validation
+    search:
+      qformer_layers: {type: categorical, choices: [2, 4, 6, 8]}
+      qformer_hidden: {type: categorical, choices: [256, 384, 512, 768]}
+      qformer_heads: {type: categorical, choices: [4, 8, 12]}
+      num_queries: {type: categorical, choices: [8, 16, 32, 64]}
+      cross_attn_every_n: {type: categorical, choices: [1, 2]}
+      qformer_dropout: {type: float, low: 0.0, high: 0.15}
+      ffn_multiplier: {type: categorical, choices: [2, 4]}
+      proj_dim: {type: categorical, choices: [256, 512, 768]}
+      graph_policy: {type: categorical, choices: [frozen, last_layer]}
+      lr: {type: float, low: 0.00001, high: 0.0005, log: true}
+      weight_decay: {type: float, low: 0.000001, high: 0.01, log: true}
+      grad_clip: {type: categorical, choices: [0.5, 1.0, 2.0]}
+      gtm_ratio: {type: float, low: 0.25, high: 4.0, log: true}
+      gtg_ratio: {type: float, low: 0.25, high: 4.0, log: true}
+
+  multimodal_sft:
+    trials: 12
+    fidelities: [50, 150, 450]
+    batch_size: 1
+    grad_accum: 16
+    validation_batches: 8
+    fixed:
+      configs_per_parent: 3
+      pilot_optimizer_steps: 450
+      max_seq_len: 4096
+      heldout_metric: heldout_pass_at_1
+    search: {}
+
+  multimodal_grpo:
+    trials: 12
+    fidelities: [2000, 6000, 18000]
+    batch_size: 1
+    grad_accum: 8
+    validation_batches: 8
+    fixed:
+      configs_per_parent: 3
+      pilot_optimizer_steps: 20
+      max_prompt_length: 2048
+      max_completion_length: 2048
+      heldout_metric: heldout_pass_at_1
+    search: {}
+
+profiles:
+  smoke:
+    study:
+      name: asap7-graph-pipeline-smoke-v1
+      artifacts_root: /tmp/atpgllm-hpo-smoke
+      sampler:
+        n_startup_trials: 2
+      pruner:
+        min_resource: 1
+        max_resource: 3
+        reduction_factor: 2
+    dataset:
+      split_scan_records: 32
+      validation_records: 8
+    stages:
+      graph_pretrain:
+        trials: 4
+        fidelities: [1, 2, 3]
+        batch_size: 2
+        validation_batches: 1
+      graph_text_alignment:
+        trials: 4
+        fidelities: [1, 2, 3]
+        batch_size: 2
+        validation_batches: 1
+      multimodal_sft:
+        trials: 2
+        fidelities: [1, 2, 3]
+      multimodal_grpo:
+        trials: 2
+        fidelities: [1, 2, 3]

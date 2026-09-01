@@ -85,7 +85,7 @@ from atpgllm.training.dataset_utils import TrainingMode
 from atpgllm.training.dataset_utils import buffer_streaming_dataset
 from atpgllm.training.reward_function_factory import RewardFunctionFactory
 from atpgllm.training.tools import TOOLS, FAULT_SIMULATION_TOOL, fault_simulation_tool, fault_simulation_tool_handler, ToolHelper
-from atpgllm.training.revert_template import revert_chat_template
+from atpgllm.training.revert_template import parse_tool_call, revert_chat_template
 from atpgllm.training.sampling_strategies import (
     Verifier,
     list_available_strategies,
@@ -151,35 +151,6 @@ def estimate_pass_at_k(
 # =============================================================================
 # TOOL CALLING UTILITIES
 # =============================================================================
-
-def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse a tool call from model completion text.
-    
-    Expected format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-    
-    Parameters
-    ----------
-    text : str
-        The completion text to parse.
-    
-    Returns
-    -------
-    Optional[Dict]
-        Parsed tool call dict with at least ``name`` (``arguments`` may be
-        missing; use :func:`ensure_tool_call_arguments_dict` before mutating).
-    """
-    import regex as re
-    match = re.search(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', text, re.DOTALL)
-    if match:
-        try:
-            tool_call_data = json.loads(match.group(1))
-            if "name" in tool_call_data:
-                return tool_call_data
-        except json.JSONDecodeError:
-            pass
-    return None
-
 
 def ensure_tool_call_arguments_dict(tool_call: Dict[str, Any]) -> None:
     """
@@ -1753,6 +1724,7 @@ def sft_check_format_compliance(
         THINK_RE, TOOL_CALL_RE, INPUT_VECTOR_RE,
         EXPECTED_OUTPUT_RE, DETECTED_FAULTS_RE,
     )
+    from atpgllm.training.revert_template import parse_tool_call as parse_tc
 
     total = len(completions)
     details: Dict[str, int] = {
@@ -1770,13 +1742,7 @@ def sft_check_format_compliance(
         has_think = bool(THINK_RE.search(comp))
         tc_match = TOOL_CALL_RE.search(comp)
         has_tc = bool(tc_match)
-        has_tc_json = False
-        if tc_match:
-            try:
-                json.loads(tc_match.group(1))
-                has_tc_json = True
-            except (json.JSONDecodeError, ValueError):
-                pass
+        has_tc_json = parse_tc(comp) is not None
         has_iv = bool(INPUT_VECTOR_RE.search(comp))
         has_eo = bool(EXPECTED_OUTPUT_RE.search(comp))
         has_df = bool(DETECTED_FAULTS_RE.search(comp))

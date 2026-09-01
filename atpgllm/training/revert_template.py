@@ -5,7 +5,8 @@ Since transformers 4.57.3 does not provide response parsing in tokenizers/proces
 this module implements format-specific parsers for common chat templates.
 
 Supported formats:
-- ChatML (Qwen2, Qwen2.5, Qwen3, Qwen3.5, Zephyr, etc.): <|im_start|>role\\ncontent<|im_end|>
+- ChatML (Qwen2, Qwen2.5, Qwen3, Qwen3.5, Zephyr, Granite 4.2): <|im_start|>role\\ncontent<|im_end|>
+- Granite 3.x / 4.1: <|start_of_role|>role<|end_of_role|>content<|end_of_text|>
 - Llama/Mistral: [INST] content [/INST] with <<SYS>> for system
 - DeepSeek-R1-Distill-Qwen: <｜User｜ / <｜Assistant｜ / <｜end▁of▁sentence｜ (full-width)
 
@@ -30,6 +31,13 @@ if TYPE_CHECKING:
 
 CHATML_IM_START = "<|im_start|>"
 CHATML_IM_END = "<|im_end|>"
+GRANITE_START_ROLE = "<|start_of_role|>"
+GRANITE_END_ROLE = "<|end_of_role|>"
+GRANITE_EOT = "<|end_of_text|>"
+# Appended by Granite's jinja when tools= is passed (see ibm-granite chat_template.jinja).
+GRANITE_TOOL_SYSTEM_PREFIX = (
+    "You are a helpful assistant with access to the following tools."
+)
 LLAMA_INST_START = "[INST]"
 LLAMA_INST_END = "[/INST]"
 LLAMA_SYS_START = "<<SYS>>"
@@ -42,6 +50,8 @@ DEEPSEEK_EOS = "<｜end▁of▁sentence｜"
 
 def _detect_format_from_string(chat_string: str) -> str:
     """Detect chat format from the string content."""
+    if GRANITE_START_ROLE in chat_string and GRANITE_END_ROLE in chat_string:
+        return "granite"
     if CHATML_IM_START in chat_string and CHATML_IM_END in chat_string:
         return "chatml"
     if LLAMA_INST_START in chat_string and LLAMA_INST_END in chat_string:
@@ -51,9 +61,11 @@ def _detect_format_from_string(chat_string: str) -> str:
     # Fallback: try ChatML if im_start present (some models use only start)
     if CHATML_IM_START in chat_string:
         return "chatml"
+    if GRANITE_START_ROLE in chat_string:
+        return "granite"
     raise ValueError(
         f"Cannot detect chat format from string. "
-        f"Expected ChatML, Llama, or DeepSeek-R1. First 200 chars: {repr(chat_string[:200])}"
+        f"Expected ChatML, Granite, Llama, or DeepSeek-R1. First 200 chars: {repr(chat_string[:200])}"
     )
 
 
@@ -66,6 +78,8 @@ def _detect_format_from_tokenizer(tokenizer: "PreTrainedTokenizerBase") -> Optio
     # DeepSeek-R1 uses full-width ｜ - check before ChatML (both may have "User")
     if "User｜" in template_str or "Assistant｜" in template_str or "end▁of▁sentence" in template_str:
         return "deepseek_r1"
+    if "start_of_role" in template_str and "end_of_role" in template_str:
+        return "granite"
     if "im_start" in template_str or "im_end" in template_str:
         return "chatml"
     if "[INST]" in template_str or "[/INST]" in template_str:
@@ -79,8 +93,121 @@ def _detect_format_from_tokenizer(tokenizer: "PreTrainedTokenizerBase") -> Optio
 
 TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 TOOL_RESPONSE_PATTERN = re.compile(r"<tool_response>\s*(.*?)\s*</tool_response>", re.DOTALL)
-# Qwen-style tool system boilerplate marker
-TOOL_SYSTEM_MARKER = "\n\n# Tools\n\nYou may call one or more functions"
+# Qwen and Granite 4.2 both splice tools after this heading (wording after it differs).
+TOOL_SYSTEM_MARKER = "\n\n# Tools\n\n"
+TOOL_SYSTEM_HEADING = "# Tools\n\n"
+_XML_FUNCTION_RE = re.compile(r"<function=([^>\s]+)>(.*?)</function>", re.DOTALL)
+_XML_PARAMETER_RE = re.compile(r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+# Granite 4.2 default thinking generation prompt (jinja source uses escaped newlines).
+_GRANITE42_THINK_PROMPT_JINJA = "'<|im_start|>assistant\\n<think>\\n'"
+
+
+def _coerce_jsonish(value: str) -> Any:
+    text = value.strip()
+    if text[:1] in "{[":
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def _tool_call_from_inner(inner: str) -> Optional[Dict[str, Any]]:
+    """Parse JSON or Granite 4.2 XML inside ``<tool_call>``."""
+    blob = inner.strip()
+    if blob.startswith("{"):
+        try:
+            data = json.loads(blob)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and "name" in data:
+            args = data.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                except json.JSONDecodeError:
+                    pass
+            if not isinstance(args, dict):
+                args = {}
+            return {"name": data["name"], "arguments": args}
+    match = _XML_FUNCTION_RE.search(blob)
+    if not match:
+        return None
+    args: Dict[str, Any] = {}
+    for pm in _XML_PARAMETER_RE.finditer(match.group(2)):
+        args[pm.group(1)] = _coerce_jsonish(pm.group(2))
+    return {"name": match.group(1), "arguments": args}
+
+
+def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
+    """Return the first ``<tool_call>`` as ``{name, arguments}``, or None.
+
+    Accepts Qwen-style JSON (``{"name": ..., "arguments": {...}}``) and
+    Granite 4.2 XML (``<function=name><parameter=k>v</parameter></function>``).
+    ``arguments`` is always a dict when parsing succeeds.
+    """
+    if not text:
+        return None
+    match = TOOL_CALL_PATTERN.search(text)
+    if not match:
+        return None
+    return _tool_call_from_inner(match.group(1))
+
+
+def stringify_tool_arguments_for_template(
+    messages,
+    chat_template: Optional[str] = None,
+) -> None:
+    """JSON-stringify tool-call argument dicts in place, except Granite 4.2.
+
+    Qwen and Granite 4.1 jinja accept a JSON string. Granite 4.2 iterates
+    ``arguments|items`` and requires a dict.
+    """
+    tpl = chat_template or ""
+    if (
+        "im_start" in tpl
+        and "enable_thinking" in tpl
+        and "<function=" in tpl
+        and "start_of_role" not in tpl
+    ):
+        return
+    for message in messages:
+        if not isinstance(message, dict) or "tool_calls" not in message:
+            continue
+        for call in message["tool_calls"]:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(fn, dict):
+                continue
+            args = fn.get("arguments")
+            if isinstance(args, dict):
+                fn["arguments"] = json.dumps(args)
+
+
+def _assistant_tool_calls_and_text(content: str) -> tuple[List[Dict[str, Any]], str]:
+    tool_calls: List[Dict[str, Any]] = []
+    for inner in TOOL_CALL_PATTERN.findall(content):
+        parsed = _tool_call_from_inner(inner)
+        if parsed:
+            tool_calls.append({
+                "type": "function",
+                "function": {
+                    "name": parsed["name"],
+                    "arguments": parsed["arguments"],
+                },
+            })
+    text_content = TOOL_CALL_PATTERN.sub("", content).strip()
+    return tool_calls, text_content
+
+
+def _strip_tools_system(content: str) -> str:
+    """Drop tokenizer-appended tools boilerplate from a system turn."""
+    if TOOL_SYSTEM_MARKER in content:
+        return content.split(TOOL_SYSTEM_MARKER)[0]
+    if content.startswith(TOOL_SYSTEM_HEADING):
+        return ""
+    return content
 
 
 def _parse_chatml(chat_string: str) -> List[Dict[str, Any]]:
@@ -98,31 +225,13 @@ def _parse_chatml(chat_string: str) -> List[Dict[str, Any]]:
         content = match.group(2)
 
         if role == "system":
-            if TOOL_SYSTEM_MARKER in content:
-                clean_content = content.split(TOOL_SYSTEM_MARKER)[0]
-                messages.append({"role": "system", "content": clean_content})
-            else:
+            if TOOL_SYSTEM_MARKER in content or content.startswith(TOOL_SYSTEM_HEADING):
+                content = _strip_tools_system(content)
+            if content:
                 messages.append({"role": "system", "content": content})
 
         elif role == "assistant":
-            tool_calls: List[Dict[str, Any]] = []
-            found_calls = TOOL_CALL_PATTERN.findall(content)
-            for json_str in found_calls:
-                try:
-                    call_data = json.loads(json_str.strip())
-                    tool_calls.append({
-                        "type": "function",
-                        "function": {
-                            "name": call_data["name"],
-                            "arguments": json.dumps(call_data.get("arguments", {}))
-                            if not isinstance(call_data.get("arguments"), str)
-                            else call_data["arguments"],
-                        },
-                    })
-                except (json.JSONDecodeError, KeyError):
-                    pass  # Skip malformed tool calls
-
-            text_content = TOOL_CALL_PATTERN.sub("", content).strip()
+            tool_calls, text_content = _assistant_tool_calls_and_text(content)
             msg_obj: Dict[str, Any] = {"role": "assistant"}
             if text_content:
                 msg_obj["content"] = text_content
@@ -186,25 +295,7 @@ def _parse_llama(chat_string: str) -> List[Dict[str, Any]]:
             messages.append({"role": "user", "content": user_content})
 
         if assistant_content:
-            # Check for tool calls (Llama 3.1+ may use different format; support <tool_call> for consistency)
-            tool_calls: List[Dict[str, Any]] = []
-            found_calls = TOOL_CALL_PATTERN.findall(assistant_content)
-            for json_str in found_calls:
-                try:
-                    call_data = json.loads(json_str.strip())
-                    tool_calls.append({
-                        "type": "function",
-                        "function": {
-                            "name": call_data["name"],
-                            "arguments": json.dumps(call_data.get("arguments", {}))
-                            if not isinstance(call_data.get("arguments"), str)
-                            else call_data["arguments"],
-                        },
-                    })
-                except (json.JSONDecodeError, KeyError):
-                    pass
-
-            text_content = TOOL_CALL_PATTERN.sub("", assistant_content).strip()
+            tool_calls, text_content = _assistant_tool_calls_and_text(assistant_content)
             msg_obj: Dict[str, Any] = {"role": "assistant"}
             if text_content:
                 msg_obj["content"] = text_content
@@ -271,23 +362,7 @@ def _parse_deepseek_r1(chat_string: str) -> List[Dict[str, Any]]:
             content = content[: -len(DEEPSEEK_EOS)].strip()
 
         if role == "assistant":
-            tool_calls: List[Dict[str, Any]] = []
-            found_calls = TOOL_CALL_PATTERN.findall(content)
-            for json_str in found_calls:
-                try:
-                    call_data = json.loads(json_str.strip())
-                    tool_calls.append({
-                        "type": "function",
-                        "function": {
-                            "name": call_data["name"],
-                            "arguments": json.dumps(call_data.get("arguments", {}))
-                            if not isinstance(call_data.get("arguments"), str)
-                            else call_data["arguments"],
-                        },
-                    })
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            text_content = TOOL_CALL_PATTERN.sub("", content).strip()
+            tool_calls, text_content = _assistant_tool_calls_and_text(content)
             msg_obj: Dict[str, Any] = {"role": "assistant"}
             if text_content:
                 msg_obj["content"] = text_content
@@ -308,11 +383,66 @@ def _parse_deepseek_r1(chat_string: str) -> List[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
+# Granite 3.x / 4.1 parser (ibm-granite start_of_role chat_template.jinja)
+# -----------------------------------------------------------------------------
+
+
+def _parse_granite(chat_string: str) -> List[Dict[str, Any]]:
+    """
+    Parse Granite ``<|start_of_role|>role<|end_of_role|>content<|end_of_text|>``.
+
+    Tool results are rendered as a user turn wrapping ``<tool_response>``;
+    those are recovered as ``role="tool"``. Assistant ``<tool_call>`` JSON is
+    recovered as ``tool_calls``, matching the ChatML parser.
+    """
+    segments = [s.strip() for s in chat_string.split(GRANITE_EOT) if s.strip()]
+    block_pattern = re.compile(
+        r"<\|start_of_role\|>(.*?)<\|end_of_role\|>(.*)",
+        re.DOTALL,
+    )
+    messages: List[Dict[str, Any]] = []
+
+    for segment in segments:
+        match = block_pattern.search(segment)
+        if not match:
+            continue
+
+        role = match.group(1).strip()
+        content = match.group(2)
+
+        if role == "system":
+            if GRANITE_TOOL_SYSTEM_PREFIX in content:
+                content = content.split(GRANITE_TOOL_SYSTEM_PREFIX)[0].rstrip()
+            if content:
+                messages.append({"role": "system", "content": content})
+
+        elif role == "assistant":
+            tool_calls, text_content = _assistant_tool_calls_and_text(content)
+            msg_obj: Dict[str, Any] = {"role": "assistant"}
+            if text_content:
+                msg_obj["content"] = text_content
+            if tool_calls:
+                msg_obj["tool_calls"] = tool_calls
+            messages.append(msg_obj)
+
+        elif role == "user":
+            tool_responses = list(TOOL_RESPONSE_PATTERN.finditer(content))
+            if tool_responses:
+                for tr in tool_responses:
+                    messages.append({"role": "tool", "content": tr.group(1).strip()})
+            else:
+                messages.append({"role": "user", "content": content.strip()})
+
+    return messages
+
+
+# -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
 
 PARSERS = {
     "chatml": _parse_chatml,
+    "granite": _parse_granite,
     "llama": _parse_llama,
     "deepseek_r1": _parse_deepseek_r1,
 }
@@ -331,7 +461,15 @@ def get_generation_prompt_suffix(
         fmt = _detect_format_from_tokenizer(tokenizer)
     fmt = fmt or "chatml"
     if fmt == "chatml":
+        tpl = ""
+        if tokenizer is not None:
+            raw = getattr(tokenizer, "chat_template", None)
+            tpl = raw if isinstance(raw, str) else ""
+        if "enable_thinking" in tpl and _GRANITE42_THINK_PROMPT_JINJA in tpl:
+            return f"{CHATML_IM_START}assistant\n<think>\n"
         return f"{CHATML_IM_START}assistant\n"
+    if fmt == "granite":
+        return f"{GRANITE_START_ROLE}assistant{GRANITE_END_ROLE}"
     if fmt == "llama":
         return " "  # Llama often adds a space after [/INST]
     if fmt == "deepseek_r1":
@@ -354,6 +492,8 @@ def wrap_assistant_for_revert(
     fmt = fmt or "chatml"
     if fmt == "chatml":
         return f"{CHATML_IM_START}assistant\n{completion}{CHATML_IM_END}"
+    if fmt == "granite":
+        return f"{GRANITE_START_ROLE}assistant{GRANITE_END_ROLE}{completion}{GRANITE_EOT}"
     if fmt == "llama":
         return f"{LLAMA_INST_START} \n{LLAMA_INST_END} {completion}"
     if fmt == "deepseek_r1":
@@ -395,7 +535,7 @@ def revert_chat_template(
     tokenizer : PreTrainedTokenizerBase, optional
         Tokenizer with chat_template. Used to infer format if string detection fails.
     format_hint : str, optional
-        Override: "chatml", "llama", or "deepseek_r1".
+        Override: "chatml", "granite", "llama", or "deepseek_r1".
 
     Returns
     -------
@@ -411,8 +551,8 @@ def revert_chat_template(
                 fmt = _detect_format_from_tokenizer(tokenizer)
             if fmt is None:
                 raise ValueError(
-                    "Could not detect chat format. Pass format_hint='chatml' or 'llama', "
-                    "or ensure the string contains format markers."
+                    "Could not detect chat format. Pass format_hint='chatml', "
+                    "'granite', or 'llama', or ensure the string contains format markers."
                 )
 
     parser = PARSERS.get(fmt)

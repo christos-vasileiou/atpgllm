@@ -27,8 +27,8 @@
 #                                  pass@k pool (max k must be <= it). Alias: NUM_SAMPLES.
 #   SEARCH_BUDGET=3              — --budget: per-completion search width for mcts/evolutionary
 #                                  only (default: 3; orthogonal to NUM_COMPLETIONS)
-#   BEST_OF_N_WIDTH=4            — --n: per-completion i.i.d. samples for best_of_n only
-#                                  (default: 4; the best is kept; orthogonal to NUM_COMPLETIONS)
+#   BEST_OF_N_WIDTH=3            — --n: per-completion i.i.d. samples for best_of_n only
+#                                  (default: 3; the best is kept; orthogonal to NUM_COMPLETIONS)
 #   PASS_AT_K="1 2 4 8 16"       — space-separated pass@k values
 #   TEMPERATURE=0.7  TOP_P=0.95  MAX_NEW_TOKENS=16384  MAX_EVAL_SAMPLES=512
 #   THRESHOLD_MODE=fault_detected — fault_detected | positive_reward | full_accuracy

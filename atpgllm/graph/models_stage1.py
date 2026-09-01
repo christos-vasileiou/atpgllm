@@ -31,7 +31,7 @@ Both projected graph repr and projected text repr live in a shared
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 from torch import Tensor, nn
@@ -272,6 +272,15 @@ class NetlistGraphEncoder(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        self.config = {
+            "node_dim": node_dim,
+            "gin_hidden_dim": gin_hidden_dim,
+            "gin_num_layers": gin_num_layers,
+            "per_attr_dim": per_attr_dim,
+            "attr_mlp_hidden": attr_mlp_hidden,
+            "gin_num_pools": gin_num_pools,
+            "dropout": dropout,
+        }
         self.attr_encoder = AttributeDecompositionEncoder.from_vocab(
             vocab,
             per_attr_dim=per_attr_dim,
@@ -290,7 +299,11 @@ class NetlistGraphEncoder(nn.Module):
         self.graph_dim = gin_hidden_dim * gin_num_pools
 
     def forward(self, data) -> dict[str, Tensor]:
-        x = self.attr_encoder(data.gate_attrs, data.structural_feats)
+        x = self.attr_encoder(
+            data.gate_attrs,
+            data.structural_feats,
+            getattr(data, "fault_feats", None),
+        )
         return self.dag_gin(x, data.edge_index, data.batch)
 
 
@@ -376,19 +389,28 @@ class Stage1GraphTextModel(nn.Module):
         qformer_layers: int = 6,
         qformer_heads: int = 8,
         qformer_cross_every_n: int = 2,
+        qformer_ffn_multiplier: int = 4,
+        qformer_dropout: float = 0.0,
         num_queries: int = 32,
         proj_dim: int = 512,
         freeze_text: bool = False,
         text_attn_implementation: str = "sdpa",
+        graph_encoder_config: Optional[Mapping[str, object]] = None,
     ) -> None:
         super().__init__()
 
-        self.graph_encoder = NetlistGraphEncoder(
-            vocab=vocab,
-            node_dim=node_dim,
-            gin_hidden_dim=gin_hidden_dim,
-            gin_num_layers=gin_num_layers,
-        )
+        if graph_encoder_config is None:
+            self.graph_encoder = NetlistGraphEncoder(
+                vocab=vocab,
+                node_dim=node_dim,
+                gin_hidden_dim=gin_hidden_dim,
+                gin_num_layers=gin_num_layers,
+            )
+        else:
+            self.graph_encoder = NetlistGraphEncoder(
+                vocab=vocab,
+                **dict(graph_encoder_config),
+            )
 
         self.q_former = GraphQFormer(
             d_node=self.graph_encoder.out_dim,
@@ -396,7 +418,9 @@ class Stage1GraphTextModel(nn.Module):
             num_queries=num_queries,
             num_layers=qformer_layers,
             num_heads=qformer_heads,
+            ffn_dim=qformer_ffn_multiplier * qformer_hidden_dim,
             cross_attn_every_n=qformer_cross_every_n,
+            dropout=qformer_dropout,
         )
 
         self.text_encoder = TextEncoder(
@@ -409,6 +433,18 @@ class Stage1GraphTextModel(nn.Module):
         self.text_proj = nn.Linear(self.text_encoder.hidden_size, proj_dim)
 
         self.proj_dim = proj_dim
+        self.architecture_config = {
+            "graph_encoder": dict(self.graph_encoder.config),
+            "qformer_hidden_dim": qformer_hidden_dim,
+            "qformer_layers": qformer_layers,
+            "qformer_heads": qformer_heads,
+            "qformer_cross_every_n": qformer_cross_every_n,
+            "qformer_ffn_multiplier": qformer_ffn_multiplier,
+            "qformer_dropout": qformer_dropout,
+            "num_queries": num_queries,
+            "proj_dim": proj_dim,
+            "text_model_name": text_model_name,
+        }
 
     # -----------------------------------------------------------------
     # Forward

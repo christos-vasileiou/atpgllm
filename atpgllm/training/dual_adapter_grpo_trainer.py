@@ -52,7 +52,6 @@ import atexit
 import hashlib
 import json
 import os
-import re
 import shutil
 import time
 import threading
@@ -69,7 +68,12 @@ from trl import GRPOTrainer, GRPOConfig
 import copy
 import math
 from atpgllm.training.tools import TOOLS, ToolHelper
-from atpgllm.training.revert_template import revert_qwen2_5_template, revert_chat_template
+from atpgllm.training.revert_template import (
+    parse_tool_call as parse_tool_call_text,
+    revert_assistant_completion,
+    revert_chat_template,
+    stringify_tool_arguments_for_template,
+)
 from atpgllm.llm.reward_funcs import REWARD_LOGONLY_SUFFIX, train_scalar_from_reward_components
 
 # Adapter name constants
@@ -1099,7 +1103,10 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         mode = "train" if self.model.training else "eval"
         generation_start_time = time.perf_counter()
         
-        prompts = [revert_qwen2_5_template(prompt) for prompt in prompts]
+        prompts = [
+            revert_chat_template(prompt, tokenizer=self.processing_class)
+            for prompt in prompts
+        ]
         prompts = copy.deepcopy(prompts)
         
         original_padding_side = self.processing_class.padding_side
@@ -1115,7 +1122,12 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                 completions = [[{"role": "assistant", "content": content}] for content in contents]
             else:
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-                completions = [revert_qwen2_5_template("<|im_start|>assistant\n" + completion + "<|im_end|>") for completion in completions]
+                completions = [
+                    revert_assistant_completion(
+                        completion, tokenizer=self.processing_class
+                    )
+                    for completion in completions
+                ]
 
             # ── Step 3: Multi-turn tool calling loop ──
             # Scans completions for <tool_call> tags, executes matched tools,
@@ -1468,7 +1480,9 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 
             for i, idx in enumerate(idxs_with_tool):
                 if post_tool_texts[i]:
-                    post_tool_msg = revert_qwen2_5_template("<|im_start|>assistant\n" + post_tool_texts[i] + "<|im_end|>")
+                    post_tool_msg = revert_assistant_completion(
+                        post_tool_texts[i], tokenizer=self.processing_class
+                    )
                     if isinstance(completions[idx], list):
                         if isinstance(post_tool_msg, list) and isinstance(post_tool_msg[0], dict):
                             completions[idx] += post_tool_msg
@@ -1523,39 +1537,24 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
     def _parse_tool_call(self, completion):
         """
         Parse a tool call from model completion.
-        
-        Expected format: <tool_call>{"name": "function_name", "arguments": {...}}</tool_call>
-        
-        Override this method for different tool call formats.
-        
+
+        Accepts JSON ``<tool_call>{...}</tool_call>`` and Granite 4.2 XML
+        ``<function=`` / ``<parameter=`` inside ``<tool_call>``.
+
         Args:
             completion: Either a string or a list of message dicts (conversational format)
-            
+
         Returns:
             Dict with "name" and "arguments" keys if tool call found, None otherwise
         """
-        # Extract text content from completion
         if isinstance(completion, list):
-            # Conversational format - get content from last message
             text = completion[-1].get("content", "") if completion else ""
         elif isinstance(completion, dict):
-            # Single message dict
             text = completion.get("content", "")
         else:
-            # Plain string
             text = str(completion)
-        
-        # Parse <tool_call>{"name": ..., "arguments": ...}</tool_call>
-        match = re.search(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', text, re.DOTALL)
-        if match:
-            try:
-                tool_call_data = json.loads(match.group(1))
-                # Validate that it has required fields
-                if "name" in tool_call_data:
-                    return tool_call_data
-            except json.JSONDecodeError:
-                pass
-        return None
+
+        return parse_tool_call_text(text)
     
     def _generate_tool_continuation(self, prompts: list, max_tokens_override: int = None):
         """
@@ -1587,12 +1586,10 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         if self.accelerator.is_main_process and all_prompts:
             for prompt in all_prompts:
                 if is_conversational({"prompt": prompt}):
-                    for message in prompt:
-                        if "tool_calls" in message:
-                            for call in message["tool_calls"]:
-                                args = call["function"]["arguments"]
-                                if isinstance(args, dict):
-                                    call["function"]["arguments"] = json.dumps(args)
+                    stringify_tool_arguments_for_template(
+                        prompt,
+                        getattr(self.processing_class, "chat_template", None),
+                    )
 
             if is_conversational({"prompt": all_prompts[0]}):
                 formatted_prompts = [
@@ -1677,15 +1674,13 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             if is_conversational({"prompt": prompts[0]}):
                 prompts = [prepare_multimodal_messages_vllm(prompt) for prompt in prompts]
 
-            # vLLM requires tool_call arguments to be JSON strings, not dicts
+            # vLLM / Qwen templates want JSON strings; Granite 4.2 needs dicts.
             for prompt in prompts:
                 if is_conversational({"prompt": prompt}):
-                    for message in prompt:
-                        if "tool_calls" in message:
-                            for call in message["tool_calls"]:
-                                args = call["function"]["arguments"]
-                                if isinstance(args, dict):
-                                    call["function"]["arguments"] = json.dumps(args)
+                    stringify_tool_arguments_for_template(
+                        prompt,
+                        getattr(self.processing_class, "chat_template", None),
+                    )
 
             # ── Path 1: vLLM server mode (DDP collective) ──
             # Prompts arrive duplicated num_generations times.  We deduplicate,

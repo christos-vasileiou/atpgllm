@@ -24,9 +24,10 @@ No PyTorch dependency — pure Python / regex parsing.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -63,7 +64,9 @@ DRIVE_STRENGTH_CLASSES: List[str] = [
     "X16_PLUS",     # >= 16.0
 ]
 
-NUM_OUTPUT_CLASSES: List[str] = ["1", "2", "SPECIAL"]
+BINARY_CLASSES: List[str] = ["UNKNOWN", "False", "True"]
+NUM_OUTPUT_CLASSES: List[str] = ["UNKNOWN", "1", "2", "SPECIAL"]
+VOCAB_SCHEMA_VERSION = 1
 
 # ---------------------------------------------------------------------
 # SINGLE SOURCE OF TRUTH for which gate attributes are used by the model.
@@ -277,12 +280,12 @@ def _idx_num_outputs(a: "GateAttributes") -> int:
 _ATTRIBUTE_REGISTRY: Dict[str, Tuple[int, "callable"]] = {
     "logic_family":        (len(LOGIC_FAMILIES),          _idx_logic_family),
     "input_count":         (len(INPUT_COUNT_CLASSES),     _idx_input_count),
-    "output_complemented": (2,                            lambda a: int(a.output_complemented)),
-    "is_sequential":       (2,                            lambda a: int(a.is_sequential)),
+    "output_complemented": (len(BINARY_CLASSES),          lambda a: 2 if a.output_complemented else 1),
+    "is_sequential":       (len(BINARY_CLASSES),          lambda a: 2 if a.is_sequential else 1),
     "drive_strength":      (len(DRIVE_STRENGTH_CLASSES),  _idx_drive_strength),
     "num_outputs":         (len(NUM_OUTPUT_CLASSES),      _idx_num_outputs),
-    "tristate":            (2,                            lambda a: int(a.tristate)),
-    "is_clock_related":    (2,                            lambda a: int(a.is_clock_related)),
+    "tristate":            (len(BINARY_CLASSES),          lambda a: 2 if a.tristate else 1),
+    "is_clock_related":    (len(BINARY_CLASSES),          lambda a: 2 if a.is_clock_related else 1),
 }
 
 # Parallel registry: index -> human-readable label per attribute.
@@ -290,12 +293,12 @@ _ATTRIBUTE_REGISTRY: Dict[str, Tuple[int, "callable"]] = {
 _ATTRIBUTE_LABELS: Dict[str, List[str]] = {
     "logic_family":        LOGIC_FAMILIES,
     "input_count":         INPUT_COUNT_CLASSES,
-    "output_complemented": ["False", "True"],
-    "is_sequential":       ["False", "True"],
+    "output_complemented": BINARY_CLASSES,
+    "is_sequential":       BINARY_CLASSES,
     "drive_strength":      DRIVE_STRENGTH_CLASSES,
     "num_outputs":         NUM_OUTPUT_CLASSES,
-    "tristate":            ["False", "True"],
-    "is_clock_related":    ["False", "True"],
+    "tristate":            BINARY_CLASSES,
+    "is_clock_related":    BINARY_CLASSES,
 }
 
 # Sanity check: every name listed in ATTRIBUTE_NAMES must be registered.
@@ -341,14 +344,23 @@ class GateAttributeVocab:
         as read from ``sim_config.json["gate_funcs"]``.
     """
 
-    def __init__(self, gate_funcs: Dict[str, Dict[str, str]]) -> None:
+    def __init__(
+        self,
+        gate_funcs: Dict[str, Dict[str, str]],
+        attribute_names: Optional[Sequence[str]] = None,
+    ) -> None:
+        self.attribute_names = tuple(attribute_names or ATTRIBUTE_NAMES)
+        unknown = set(self.attribute_names) - set(_ATTRIBUTE_REGISTRY)
+        if unknown:
+            raise ValueError(f"Unknown gate attribute(s): {sorted(unknown)}")
         self._attrs: Dict[str, GateAttributes] = {}
         self._indices: Dict[str, Tuple[int, ...]] = {}
 
-        for cell_name, func_dict in gate_funcs.items():
+        for cell_name in sorted(gate_funcs):
+            func_dict = gate_funcs[cell_name]
             attrs = self._extract(cell_name, func_dict)
             self._attrs[cell_name] = attrs
-            self._indices[cell_name] = self._to_indices(attrs, cell_name)
+            self._indices[cell_name] = self._to_indices(attrs)
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -367,17 +379,84 @@ class GateAttributeVocab:
     @property
     def vocab_sizes(self) -> Dict[str, int]:
         """Number of classes for each *enabled* attribute (embedding layers)."""
-        return {name: _ATTRIBUTE_REGISTRY[name][0] for name in ATTRIBUTE_NAMES}
+        return {name: _ATTRIBUTE_REGISTRY[name][0] for name in self.attribute_names}
 
     @property
     def num_attributes(self) -> int:
-        return NUM_ATTRIBUTES
+        return len(self.attribute_names)
 
     def encode(self, cell_name: str) -> Tuple[int, ...]:
         """Return a tuple of integer indices for the enabled attributes."""
         if cell_name in self._indices:
             return self._indices[cell_name]
         return self._default_indices()
+
+    def to_dict(self) -> Dict[str, object]:
+        """Serialize the exact, versioned embedding contract for checkpoints."""
+        return {
+            "schema_version": VOCAB_SCHEMA_VERSION,
+            "attribute_names": list(self.attribute_names),
+            "labels": {
+                name: list(_ATTRIBUTE_LABELS[name])
+                for name in self.attribute_names
+            },
+            "cells": {
+                name: {
+                    "attrs": asdict(self._attrs[name]),
+                    "indices": list(self._indices[name]),
+                }
+                for name in sorted(self._attrs)
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, object]) -> "GateAttributeVocab":
+        """Restore a vocabulary and reject incompatible attribute schemas."""
+        version = payload.get("schema_version")
+        if version != VOCAB_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported gate-vocab schema {version!r}; "
+                f"expected {VOCAB_SCHEMA_VERSION}."
+            )
+        attribute_names = tuple(payload.get("attribute_names", ()))
+        labels = payload.get("labels", {})
+        for name in attribute_names:
+            expected = list(_ATTRIBUTE_LABELS.get(name, ()))
+            actual = list(labels.get(name, ())) if isinstance(labels, dict) else []
+            if actual != expected:
+                raise ValueError(
+                    f"Incompatible labels for gate attribute {name!r}: "
+                    f"checkpoint={actual}, runtime={expected}."
+                )
+
+        obj = cls.__new__(cls)
+        obj.attribute_names = attribute_names
+        obj._attrs = {}
+        obj._indices = {}
+        cells = payload.get("cells", {})
+        if not isinstance(cells, dict):
+            raise ValueError("Gate-vocab payload field 'cells' must be a mapping.")
+        for name in sorted(cells):
+            item = cells[name]
+            if not isinstance(item, dict):
+                raise ValueError(f"Invalid gate-vocab entry for {name!r}.")
+            obj._attrs[name] = GateAttributes(**item["attrs"])
+            obj._indices[name] = tuple(int(x) for x in item["indices"])
+        return obj
+
+    @property
+    def fingerprint(self) -> str:
+        canonical = json.dumps(
+            self.to_dict(), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def assert_compatible(self, other: "GateAttributeVocab") -> None:
+        if self.fingerprint != other.fingerprint:
+            raise ValueError(
+                "Gate attribute vocabulary mismatch: checkpoint and runtime "
+                "sim_config/attribute schema differ."
+            )
 
     def get_attrs(self, cell_name: str) -> GateAttributes:
         if cell_name in self._attrs:
@@ -423,24 +502,23 @@ class GateAttributeVocab:
         n_cells = len(self)
         n_combos = len(self.unique_combinations())
         ratio = n_cells / n_combos if n_combos else 0.0
-        print(f"{NUM_ATTRIBUTES} attrs enabled: {ATTRIBUTE_NAMES}")
+        print(f"{self.num_attributes} attrs enabled: {list(self.attribute_names)}")
         print(
             f"{n_cells} cells -> {n_combos} unique combinations "
             f"({ratio:.2f}x collapse)"
         )
 
-    @staticmethod
-    def describe(indices: Tuple[int, ...]) -> Dict[str, str]:
+    def describe(self, indices: Tuple[int, ...]) -> Dict[str, str]:
         """Convert an encoded tuple back to ``{attribute_name: label}``
-        using the currently enabled ``ATTRIBUTE_NAMES``."""
-        if len(indices) != NUM_ATTRIBUTES:
+        using this vocabulary's ordered attribute contract."""
+        if len(indices) != self.num_attributes:
             raise ValueError(
-                f"indices has length {len(indices)} but {NUM_ATTRIBUTES} "
-                f"attribute(s) are enabled: {ATTRIBUTE_NAMES}"
+                f"indices has length {len(indices)} but {self.num_attributes} "
+                f"attribute(s) are enabled: {self.attribute_names}"
             )
         return {
             name: _ATTRIBUTE_LABELS[name][idx]
-            for name, idx in zip(ATTRIBUTE_NAMES, indices)
+            for name, idx in zip(self.attribute_names, indices)
         }
 
     def report_bins(self, show_cells: bool = True) -> None:
@@ -456,7 +534,10 @@ class GateAttributeVocab:
         """
         combos = self.unique_combinations()
         bins = sorted(combos.items(), key=lambda kv: -len(kv[1]))
-        header = f"{len(self)} cells -> {len(bins)} bins (enabled: {ATTRIBUTE_NAMES})"
+        header = (
+            f"{len(self)} cells -> {len(bins)} bins "
+            f"(enabled: {list(self.attribute_names)})"
+        )
         print(header)
         print("-" * len(header))
         for i, (idx_tuple, cells) in enumerate(bins, start=1):
@@ -480,8 +561,8 @@ class GateAttributeVocab:
         bins = sorted(combos.items(), key=lambda kv: -len(kv[1]))
         sizes = [len(cells) for _, cells in bins]
         # Short label per bin: dominant logic_family (if enabled) + bin #
-        if "logic_family" in ATTRIBUTE_NAMES:
-            lf_pos = ATTRIBUTE_NAMES.index("logic_family")
+        if "logic_family" in self.attribute_names:
+            lf_pos = self.attribute_names.index("logic_family")
             labels = [
                 f"{i+1}. {LOGIC_FAMILIES[idx[lf_pos]]}"
                 for i, (idx, _) in enumerate(bins)
@@ -497,7 +578,7 @@ class GateAttributeVocab:
         ax.set_xlabel("Bin (sorted by size)")
         ax.set_title(
             f"{len(self)} cells -> {len(bins)} bins "
-            f"({len(ATTRIBUTE_NAMES)} attrs: {', '.join(ATTRIBUTE_NAMES)})",
+            f"({self.num_attributes} attrs: {', '.join(self.attribute_names)})",
             fontsize=9,
         )
         fig.tight_layout()
@@ -512,25 +593,25 @@ class GateAttributeVocab:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        if NUM_ATTRIBUTES == 0:
+        if self.num_attributes == 0:
             raise ValueError("No attributes enabled — nothing to plot.")
 
         # Count cells per (attribute, value) across the vocab
         counts: Dict[str, Dict[str, int]] = {
             name: {label: 0 for label in _ATTRIBUTE_LABELS[name]}
-            for name in ATTRIBUTE_NAMES
+            for name in self.attribute_names
         }
         for attrs in self._attrs.values():
-            for name in ATTRIBUTE_NAMES:
+            for name in self.attribute_names:
                 idx = _ATTRIBUTE_REGISTRY[name][1](attrs)
                 counts[name][_ATTRIBUTE_LABELS[name][idx]] += 1
 
-        ncols = min(3, NUM_ATTRIBUTES)
-        nrows = (NUM_ATTRIBUTES + ncols - 1) // ncols
+        ncols = min(3, self.num_attributes)
+        nrows = (self.num_attributes + ncols - 1) // ncols
         fig, axes = plt.subplots(
             nrows, ncols, figsize=(5 * ncols, 3 * nrows), squeeze=False
         )
-        for ax, name in zip(axes.flat, ATTRIBUTE_NAMES):
+        for ax, name in zip(axes.flat, self.attribute_names):
             labels = list(counts[name].keys())
             values = [counts[name][lbl] for lbl in labels]
             ax.bar(range(len(labels)), values, color="steelblue")
@@ -539,7 +620,7 @@ class GateAttributeVocab:
             ax.set_title(name, fontsize=10)
             ax.set_ylabel("# cells")
         # Hide any unused axes
-        for ax in axes.flat[NUM_ATTRIBUTES:]:
+        for ax in axes.flat[self.num_attributes:]:
             ax.set_visible(False)
         fig.suptitle(f"Per-attribute cell distribution ({len(self)} cells)")
         fig.tight_layout()
@@ -590,13 +671,11 @@ class GateAttributeVocab:
             ),
         )
 
-    @staticmethod
-    def _to_indices(attrs: GateAttributes, cell_name: str = "") -> Tuple[int, ...]:
+    def _to_indices(self, attrs: GateAttributes) -> Tuple[int, ...]:
         return tuple(
-            _ATTRIBUTE_REGISTRY[name][1](attrs) for name in ATTRIBUTE_NAMES
+            _ATTRIBUTE_REGISTRY[name][1](attrs) for name in self.attribute_names
         )
 
-    @staticmethod
-    def _default_indices() -> Tuple[int, ...]:
+    def _default_indices(self) -> Tuple[int, ...]:
         """All-unknown / all-false fallback (one entry per enabled attribute)."""
-        return tuple(0 for _ in ATTRIBUTE_NAMES)
+        return tuple(0 for _ in self.attribute_names)

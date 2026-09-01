@@ -19,15 +19,14 @@ Raw dataset fields (``user_content``, ``reasoning_content``,
 ``{expected_output}``, ``{input_vector}``, ``{detected_faults}``, ...)
 that must be resolved before the text is usable for training.
 
-The resolution logic (including fault-string parsing, JSON-dict
-compaction, SCOAP-style signal grouping, and step-wise reasoning
-template rendering) already lives in
-``libatpgllm/tests/conversation.py:ConversationExample.from_record``.
-We reuse it verbatim by adding the tests directory to ``sys.path`` on
-demand — no duplication, no drift.
+The resolution logic (including fault-string parsing, JSON-dict compaction,
+SCOAP-style signal grouping, and step-wise reasoning template rendering) lives
+in :class:`atpgllm.training.conversation.ConversationExample`. A legacy
+``tests_dir`` override remains only for old external checkouts.
 """
 
 import copy
+import hashlib
 import json
 import os
 import random
@@ -41,8 +40,13 @@ import torch
 from torch.utils.data import IterableDataset
 from torch_geometric.data import Batch, Data
 
+from .fault_context import attach_atpg_context
 from .gate_features import GateAttributeVocab
-from .netlist_parser import parse_verilog_to_pyg
+from .netlist_parser import (
+    parse_verilog_to_graph,
+    parse_verilog_to_pyg,
+    parsed_to_pyg,
+)
 
 
 # ---------------------------------------------------------------------
@@ -75,6 +79,12 @@ def _get_conversation_example(tests_dir: Optional[Path] = None):
     """
     global _CONVERSATION_EXAMPLE
     if _CONVERSATION_EXAMPLE is not None:
+        return _CONVERSATION_EXAMPLE
+
+    if tests_dir is None:
+        from atpgllm.training.conversation import ConversationExample
+
+        _CONVERSATION_EXAMPLE = ConversationExample
         return _CONVERSATION_EXAMPLE
 
     tests_path = _resolve_tests_dir(tests_dir)
@@ -166,6 +176,50 @@ def render_record(
     )
 
 
+def render_prompt_and_answer(
+    record: Dict[str, Any],
+    tokenizer,
+    tests_dir: Optional[Path] = None,
+    *,
+    compact_netlist: bool = False,
+) -> tuple[str, str]:
+    """Render the exact system/user prompt and assistant target used by SFT."""
+    rendered = render_record(record, tests_dir=tests_dir)
+    prompt_messages = [
+        dict(message)
+        for message in rendered.messages
+        if message["role"] in ("system", "user")
+    ]
+    if compact_netlist and rendered.netlist:
+        doc_id = hashlib.sha256(rendered.netlist.encode("utf-8")).hexdigest()[:16]
+        full_payload = {"doc_id": doc_id, "netlist": rendered.netlist}
+        compact_payload = {"doc_id": doc_id, "netlist": "<GRAPH_CONTEXT>"}
+        for message in prompt_messages:
+            message["content"] = message["content"].replace(
+                str(full_payload),
+                str(compact_payload),
+            )
+    assistant_messages = [
+        message
+        for message in rendered.messages
+        if message["role"] == "assistant"
+    ]
+    answer = "\n".join(m["content"] for m in assistant_messages).strip()
+
+    if getattr(tokenizer, "chat_template", None):
+        prompt = tokenizer.apply_chat_template(
+            prompt_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        prompt = "\n".join(
+            [f"<|{m['role']}|>\n{m['content']}" for m in prompt_messages]
+            + ["<|assistant|>\n"]
+        )
+    return prompt, answer
+
+
 # ---------------------------------------------------------------------
 # Caption / text synthesis
 # ---------------------------------------------------------------------
@@ -227,12 +281,62 @@ def record_to_pyg(
     if not netlist:
         return None
     try:
-        data = parse_verilog_to_pyg(netlist, gate_funcs, vocab=vocab)
+        parsed = parse_verilog_to_graph(netlist, gate_funcs)
+        data = parsed_to_pyg(parsed, vocab=vocab)
+        attach_atpg_context(data, parsed, gate_funcs, record)
     except Exception:
         return None
     if data.num_nodes < min_nodes:
         return None
     return data
+
+
+# ---------------------------------------------------------------------
+# Target-fault graph pretraining dataset
+# ---------------------------------------------------------------------
+
+
+class ASAP7GraphPretrainDataset(IterableDataset):
+    """Stream target-fault-conditioned graphs with ATPG node labels."""
+
+    def __init__(
+        self,
+        hf_stream: Iterable[Dict[str, Any]],
+        gate_funcs: Dict[str, Dict[str, str]],
+        vocab: GateAttributeVocab,
+        *,
+        skip_invalid: bool = True,
+    ) -> None:
+        super().__init__()
+        self.hf_stream = hf_stream
+        self.gate_funcs = gate_funcs
+        self.vocab = vocab
+        self.skip_invalid = skip_invalid
+
+    def __iter__(self) -> Iterator[Data]:
+        for record in self.hf_stream:
+            graph = record_to_pyg(record, self.gate_funcs, self.vocab)
+            if graph is None:
+                if self.skip_invalid:
+                    continue
+                raise ValueError(
+                    f"Failed to parse record: module={record.get('module_name')}"
+                )
+            if not (
+                bool(graph.has_propagation_labels.item())
+                or bool(graph.has_backtrack_labels.item())
+                or bool(graph.has_discrepancy_labels.item())
+            ):
+                if self.skip_invalid:
+                    continue
+                raise ValueError("Record has no graph-pretraining labels.")
+            yield graph
+
+
+def collate_graph_pretrain_batch(items: List[Data]) -> Batch:
+    if not items:
+        raise ValueError("Cannot collate an empty graph-pretraining batch.")
+    return Batch.from_data_list(items)
 
 
 # ---------------------------------------------------------------------

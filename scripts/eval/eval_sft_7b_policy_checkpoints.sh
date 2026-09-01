@@ -3,7 +3,14 @@
 #
 # Usage:
 #   ./eval_sft_7b_policy_checkpoints.sh
+#   POLICY_FOLDER=sft_7b_exper2 ./eval_sft_7b_policy_checkpoints.sh
+#   POLICY_FOLDER=sft_7b_exper2/checkpoint-40 ./eval_sft_7b_policy_checkpoints.sh
 #   EXP_ROOT=/path/to/sft_7b_exper2 EVAL_RESULTS_DIR=/path/to/results ./eval_sft_7b_policy_checkpoints.sh
+#
+# POLICY_FOLDER / EXP_ROOT path shapes (same two modes for both):
+#   <exp>                         — discover and eval all checkpoint-* under that folder
+#   <exp>/checkpoint-N            — eval that single checkpoint
+# POLICY_FOLDER is resolved under runs/ then tests/ when EXP_ROOT is unset.
 #
 # Optional:
 #   DRY_RUN=1  — print commands only
@@ -15,10 +22,10 @@
 #                                  model-free: random (PI/PO bitvectors; ≠ greedy). See sampling_strategies.py
 #   NUM_COMPLETIONS=16           — --num_completions: completions per problem for pass@k, the
 #                                  pass@k pool (max k must be <= it). Alias: NUM_SAMPLES.
-#   SEARCH_BUDGET=50             — --budget: per-completion search width for mcts/evolutionary
-#                                  only (default: 50; orthogonal to NUM_COMPLETIONS)
-#   BEST_OF_N_WIDTH=4            — --n: per-completion i.i.d. samples for best_of_n only
-#                                  (default: 4; the best is kept; orthogonal to NUM_COMPLETIONS)
+#   SEARCH_BUDGET=3              — --budget: per-completion search width for mcts/evolutionary
+#                                  only (default: 3; orthogonal to NUM_COMPLETIONS)
+#   BEST_OF_N_WIDTH=3            — --n: per-completion i.i.d. samples for best_of_n only
+#                                  (default: 3; the best is kept; orthogonal to NUM_COMPLETIONS)
 #   PASS_AT_K="1 2 4 8 16"       — space-separated pass@k values
 #   TEMPERATURE=0.7  TOP_P=0.95  MAX_NEW_TOKENS=16384  MAX_EVAL_SAMPLES=512
 #   THRESHOLD_MODE=fault_detected — fault_detected | positive_reward | full_accuracy
@@ -50,8 +57,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 EVAL_SCRIPT="${SCRIPT_DIR}/evaluate_model.py"
 POLICY_FOLDER="${POLICY_FOLDER:-sft_7b_exper2}"
-# Prefer runs/, fall back to legacy tests/ experiment dirs
+POLICY_FOLDER="${POLICY_FOLDER%/}"
+# Prefer runs/, fall back to legacy tests/ (POLICY_FOLDER may be exp or exp/ckpt).
 EXP_ROOT="${EXP_ROOT:-}"
+EXP_ROOT="${EXP_ROOT%/}"
 if [ -z "$EXP_ROOT" ]; then
   if [ -d "$REPO_ROOT/runs/$POLICY_FOLDER" ]; then
     EXP_ROOT="$REPO_ROOT/runs/$POLICY_FOLDER"
@@ -59,7 +68,27 @@ if [ -z "$EXP_ROOT" ]; then
     EXP_ROOT="$REPO_ROOT/tests/$POLICY_FOLDER"
   fi
 fi
-EVAL_RESULTS_DIR="${EVAL_RESULTS_DIR:-$REPO_ROOT/runs/eval_results_${POLICY_FOLDER}_policy}"
+EXP_ROOT="${EXP_ROOT%/}"
+if [[ ! -d "$EXP_ROOT" ]]; then
+  echo "error: path not found: $EXP_ROOT (POLICY_FOLDER=$POLICY_FOLDER)" >&2
+  exit 1
+fi
+
+# Normalize path shapes so EXP_ROOT is always the experiment dir and CHECKPOINTS
+# lists checkpoint-* basenames.
+CHECKPOINTS=()
+_target_base="$(basename "$EXP_ROOT")"
+if [[ "$_target_base" =~ ^checkpoint- ]]; then
+  CHECKPOINTS=("$_target_base")
+  EXP_ROOT="$(dirname "$EXP_ROOT")"
+else
+  mapfile -t CHECKPOINTS < <(
+    find "$EXP_ROOT" -maxdepth 1 -mindepth 1 -type d -name 'checkpoint-*' ! -name '*_merged_bf16' -printf '%f\n' | sort -V
+  )
+fi
+unset _target_base
+
+EVAL_RESULTS_DIR="${EVAL_RESULTS_DIR:-$REPO_ROOT/runs/eval_results_$(basename "$EXP_ROOT")_policy}"
 DRY_RUN="${DRY_RUN:-0}"
 EVAL_PROMPT_BATCH_SIZE="${EVAL_PROMPT_BATCH_SIZE:-16}"
 GENERATION_MICRO_BATCH_SIZE="${GENERATION_MICRO_BATCH_SIZE:-16}"
@@ -100,17 +129,7 @@ if [[ ! -f "$EVAL_SCRIPT" ]]; then
   echo "error: evaluate_model.py not found at $EVAL_SCRIPT" >&2
   exit 1
 fi
-if [[ ! -d "$EXP_ROOT" ]]; then
-  echo "error: experiment root not found: $EXP_ROOT" >&2
-  exit 1
-fi
-
 mkdir -p "$EVAL_RESULTS_DIR"
-
-# Exclude cached *_merged_bf16 exports produced by --merge_dequant.
-mapfile -t CHECKPOINTS < <(
-  find "$EXP_ROOT" -maxdepth 1 -mindepth 1 -type d -name 'checkpoint-*' ! -name '*_merged_bf16' -printf '%f\n' | sort -V
-)
 
 if [[ ${#CHECKPOINTS[@]} -eq 0 ]]; then
   echo "error: no checkpoint-* directories under $EXP_ROOT" >&2
@@ -188,6 +207,9 @@ for name in "${CHECKPOINTS[@]}"; do
   elif [[ "$SAMPLING_METHOD" == "best_of_n" ]]; then
     _out_tag="${_out_tag}_bon${BEST_OF_N_WIDTH}"
   fi
+  clean_path=${policy%/}
+  wandb_run_name="${clean_path#"${clean_path%/*/*}"/}_$SAMPLING_METHOD"
+  wandb_run_name="${wandb_run_name//\//_}"
   out_json="${EVAL_RESULTS_DIR}/${name}_passatk_${SAMPLING_METHOD}_${_out_tag}_t${TEMPERATURE}_topp${TOP_P}_b${EVAL_PROMPT_BATCH_SIZE}.json"
   out_stdout="${EVAL_RESULTS_DIR}/${name}_${SAMPLING_METHOD}_${_out_tag}_stdout.log"
   cmd=(
@@ -210,6 +232,7 @@ for name in "${CHECKPOINTS[@]}"; do
     --max_prompt_length "$MAX_PROMPT_LENGTH"
     --report_to wandb
     --output_file "$out_json"
+    --wandb_run_name "$wandb_run_name"
   )
   if [[ "$SAMPLING_METHOD" == "mcts" || "$SAMPLING_METHOD" == "evolutionary" ]]; then
     cmd+=( --budget "$SEARCH_BUDGET" )

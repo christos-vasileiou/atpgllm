@@ -109,6 +109,9 @@ LOGIC_VALUE = r"\*Logic(?P<val>[01]+)\*\s*"
 _GATE_INGREDIENT_RE = re.compile(GATE_INGREDIENT)
 _GATE_CONNECTIONS_RE = re.compile(GATE_CONNECTIONS)
 _LOGIC_VALUE_RE = re.compile(LOGIC_VALUE)
+_COMMON_OUTPUT_PINS = frozenset({
+    "Y", "Z", "ZN", "Q", "QN", "O", "OUT", "CO", "CON", "S", "SN",
+})
 
 # Declaration regex adapted to support ASAP7-style synthesised netlists.
 # Matches lines like:
@@ -194,10 +197,10 @@ def _parse_gates(verilog_text: str, gate_func: Dict) -> List[ParsedGate]:
     for match in _GATE_INGREDIENT_RE.finditer(verilog_text):
         gate_type, instance, connections_str = match.groups()
 
-        # Skip module headers or unknown cells
+        # Skip module headers. Unknown cells are retained and encoded through
+        # the vocabulary's explicit UNKNOWN values; their output pins use the
+        # conservative common-name fallback in _build_driver_sink_maps.
         if gate_type.startswith("module"):
-            continue
-        if gate_type not in gate_func:
             continue
 
         raw_conns = dict(_GATE_CONNECTIONS_RE.findall(connections_str))
@@ -231,6 +234,12 @@ def _build_driver_sink_maps(
         cell_type = gate.cell
         cell_outputs = set(gate_func.get(cell_type, {}).keys())
         instance_ports = set(gate.connections.keys())
+        if not cell_outputs:
+            cell_outputs = {
+                port
+                for port in instance_ports
+                if port.upper() in _COMMON_OUTPUT_PINS
+            }
 
         out_ports = instance_ports & cell_outputs
         in_ports = instance_ports - cell_outputs
@@ -450,10 +459,15 @@ def parsed_to_pyg(
 
     # ----- Attribute decomposition & structural features -----
     if vocab is not None:
-        gate_attrs = torch.tensor(
-            [vocab.encode(ct) for ct in cell_types],
-            dtype=torch.int64,
-        )
+        if num_nodes:
+            gate_attrs = torch.tensor(
+                [vocab.encode(ct) for ct in cell_types],
+                dtype=torch.int64,
+            )
+        else:
+            gate_attrs = torch.empty(
+                (0, vocab.num_attributes), dtype=torch.int64
+            )
         structural_feats = compute_structural_features(edge_index, num_nodes)
     else:
         gate_attrs = torch.zeros((num_nodes, NUM_ATTRIBUTES), dtype=torch.int64)

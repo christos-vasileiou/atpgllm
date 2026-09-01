@@ -2,9 +2,9 @@
 Stage 1 training entry point: BRIDGES-style graph-text pre-training on
 ``chrivasileiou/asap7-language-of-test``.
 
-Trains ``Stage1GraphTextModel`` (AttributeDecompositionEncoder +
-DAGGINEncoder + GraphQFormer + ModernBERT text encoder) with the
-combined GTC + GTM + GTG loss.
+Loads a versioned Stage-A DAG checkpoint, then trains
+``Stage1GraphTextModel`` with the combined GTC + GTM + GTG loss. The DAG
+encoder is frozen by default; Q-Former and graph/text projections train.
 
 Example
 -------
@@ -12,7 +12,8 @@ Example
 Activate the project env (alias: ``activate``), then::
 
     python -m atpgllm.graph.scripts.train_stage1 \\
-        --sim-config tests/sim_config.json \\
+        --sim-config atpgllm/training/data/sim_config.json \\
+        --graph-ckpt runs/graph_pretrain/graph_pretrain_final.pt \\
         --output-dir checkpoints/graph_stage1 \\
         --per-device-train-batch-size 4 --grad-accum 4 --max-steps 50000 --lr 1e-4
 
@@ -54,6 +55,12 @@ from atpgllm.graph import (
     collate_graph_text_batch,
 )
 from atpgllm.graph.train_stage1 import LossWeights
+from atpgllm.graph.checkpoints import (
+    STAGE_GRAPH_PRETRAIN,
+    STAGE_GRAPH_TEXT_ALIGNMENT,
+    load_stage_checkpoint,
+    save_stage_checkpoint,
+)
 
 
 # ---------------------------------------------------------------------
@@ -86,6 +93,17 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--text-model", type=str, default="answerdotai/ModernBERT-base")
     p.add_argument("--output-dir", type=Path, required=True)
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--graph-ckpt",
+        type=Path,
+        help="Stage-A graph_pretrain checkpoint used to initialize the DAG encoder.",
+    )
+    source.add_argument(
+        "--resume",
+        type=Path,
+        help="Resume a graph_text_alignment checkpoint including optimizer state.",
+    )
 
     p.add_argument(
         "--per-device-train-batch-size",
@@ -129,6 +147,12 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--freeze-text", action="store_true",
                    help="Freeze ModernBERT weights (train only projectors + Q-Former + graph).")
+    p.add_argument(
+        "--graph-policy",
+        choices=("frozen", "last_layer", "full"),
+        default="frozen",
+        help="DAG encoder policy for alignment. Q-Former/projectors remain trainable.",
+    )
     p.add_argument(
         "--fp32",
         action="store_true",
@@ -180,6 +204,17 @@ def _parse_args() -> argparse.Namespace:
         help="W&B mode.",
     )
     return p.parse_args()
+
+
+def _set_graph_policy(model: Stage1GraphTextModel, policy: str) -> None:
+    for parameter in model.graph_encoder.parameters():
+        parameter.requires_grad = policy == "full"
+    if policy == "last_layer":
+        for parameter in model.graph_encoder.dag_gin.layers[-1].parameters():
+            parameter.requires_grad = True
+        if model.graph_encoder.dag_gin.jk_proj is not None:
+            for parameter in model.graph_encoder.dag_gin.jk_proj.parameters():
+                parameter.requires_grad = True
 
 
 def _wandb_config_dict(args: argparse.Namespace) -> dict[str, Any]:
@@ -318,6 +353,29 @@ def main() -> None:
         proj_dim=args.proj_dim,
         freeze_text=args.freeze_text,
     )
+    resume_payload = None
+    if args.graph_ckpt is not None:
+        graph_checkpoint = load_stage_checkpoint(
+            args.graph_ckpt,
+            expected_stages=[STAGE_GRAPH_PRETRAIN],
+            vocab=vocab,
+            expected_architecture={
+                "graph_encoder": model.graph_encoder.config,
+            },
+        )
+        model.graph_encoder.load_state_dict(
+            graph_checkpoint["states"]["graph_encoder"],
+            strict=True,
+        )
+    else:
+        resume_payload = load_stage_checkpoint(
+            args.resume,
+            expected_stages=[STAGE_GRAPH_TEXT_ALIGNMENT],
+            vocab=vocab,
+            expected_architecture=model.architecture_config,
+        )
+        model.load_state_dict(resume_payload["states"]["model"], strict=True)
+    _set_graph_policy(model, args.graph_policy)
 
     trainer = Stage1Trainer(
         model=model,
@@ -363,6 +421,15 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    if resume_payload is not None:
+        trainer.gtm_loss.load_state_dict(
+            resume_payload["states"]["gtm_loss"], strict=True
+        )
+        trainer.gtg_loss.load_state_dict(
+            resume_payload["states"]["gtg_loss"], strict=True
+        )
+        if resume_payload.get("optimizer"):
+            optimizer.load_state_dict(resume_payload["optimizer"])
 
     wb_run = None
     try:
@@ -372,7 +439,7 @@ def main() -> None:
         raise SystemExit(1) from e
 
     # --- Train ---
-    step = 0
+    step = int(resume_payload["step"]) if resume_payload is not None else 0
     track_metrics = args.metrics_json is not None
     history_window = track_metrics or (wb_run is not None)
     weighted_history: deque[float] = deque(
@@ -427,16 +494,24 @@ def main() -> None:
 
             if not args.no_save and step % args.save_every == 0:
                 ckpt_path = args.output_dir / f"stage1_step{step}.pt"
-                torch.save(
-                    {
+                save_stage_checkpoint(
+                    ckpt_path,
+                    stage=STAGE_GRAPH_TEXT_ALIGNMENT,
+                    parent_stage=(
+                        STAGE_GRAPH_TEXT_ALIGNMENT
+                        if resume_payload is not None
+                        else STAGE_GRAPH_PRETRAIN
+                    ),
+                    vocab=vocab,
+                    architecture=model.architecture_config,
+                    states={
                         "model": trainer.model.state_dict(),
                         "gtm_loss": trainer.gtm_loss.state_dict(),
                         "gtg_loss": trainer.gtg_loss.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "step": step,
-                        "args": vars(args),
                     },
-                    ckpt_path,
+                    optimizer_state=optimizer.state_dict(),
+                    step=step,
+                    session=vars(args),
                 )
                 print(f"Saved {ckpt_path}")
 
@@ -490,14 +565,24 @@ def main() -> None:
         # Final save
         if not args.no_save:
             final = args.output_dir / "stage1_final.pt"
-            torch.save(
-                {
+            save_stage_checkpoint(
+                final,
+                stage=STAGE_GRAPH_TEXT_ALIGNMENT,
+                parent_stage=(
+                    STAGE_GRAPH_TEXT_ALIGNMENT
+                    if resume_payload is not None
+                    else STAGE_GRAPH_PRETRAIN
+                ),
+                vocab=vocab,
+                architecture=model.architecture_config,
+                states={
                     "model": trainer.model.state_dict(),
                     "gtm_loss": trainer.gtm_loss.state_dict(),
                     "gtg_loss": trainer.gtg_loss.state_dict(),
-                    "args": vars(args),
                 },
-                final,
+                optimizer_state=optimizer.state_dict(),
+                step=step,
+                session=vars(args),
             )
             print(f"Final checkpoint: {final}")
     finally:

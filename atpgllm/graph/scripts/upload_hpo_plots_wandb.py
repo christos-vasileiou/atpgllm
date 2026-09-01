@@ -6,11 +6,12 @@ This does **not** create a new W&B *project*. You pass the **existing** project
 a **new run** in that project to hold the HTML media (runs are what hold panels
 and artifacts). To keep runs next to a sweep, pass the same values you used
 for the search, e.g. ``--entity`` / ``WANDB_ENTITY`` and ``--group optuna`` to
-match ``--wandb-group`` from ``search_stage1_loss_weights``.
+match ``--wandb-group`` from a legacy ``search_stage1_loss_weights`` run.
 
-**Preferred path:** run ``search_stage1_loss_weights`` with ``--wandb-project``;
-when the HPO search finishes, the **hpo_summary** run already logs these plots
-(see script docstring there) — use this uploader only for old runs or retries.
+This uploader is retained only for old runs or retries. New graph-pipeline
+searches use PostgreSQL-backed
+``atpgllm.graph.scripts.search_graph_pipeline``; W&B is optional tracking, not
+the optimizer or study authority.
 
 Each ``*.html`` is parsed, converted with Plotly to **CDN** HTML
 (``to_html(..., full_html=False, include_plotlyjs="cdn")``) so the W&B panel can

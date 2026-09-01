@@ -21,8 +21,6 @@ import asyncio
 import atexit
 import contextlib
 import copy
-import json
-import re
 import threading
 import time
 import warnings
@@ -45,7 +43,12 @@ from vllm.sampling_params import GuidedDecodingParams
 
 from contextlib import nullcontext
 
-from atpgllm.training.revert_template import revert_qwen2_5_template
+from atpgllm.training.revert_template import (
+    parse_tool_call as parse_tool_call_text,
+    revert_assistant_completion,
+    revert_chat_template,
+    stringify_tool_arguments_for_template,
+)
 from atpgllm.training.tools import TOOLS, ToolHelper
 
 
@@ -274,7 +277,10 @@ class ToolCallingGRPOTrainer(GRPOTrainer):
         mode = "train" if self.model.training else "eval"
         generation_start_time = time.perf_counter()
 
-        prompts = [revert_qwen2_5_template(prompt) for prompt in prompts]
+        prompts = [
+            revert_chat_template(prompt, tokenizer=self.processing_class)
+            for prompt in prompts
+        ]
         prompts = copy.deepcopy(prompts)
 
         original_padding_side = self.processing_class.padding_side
@@ -289,7 +295,9 @@ class ToolCallingGRPOTrainer(GRPOTrainer):
             else:
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
                 completions = [
-                    revert_qwen2_5_template("<|im_start|>assistant\n" + completion + "<|im_end|>")
+                    revert_assistant_completion(
+                        completion, tokenizer=self.processing_class
+                    )
                     for completion in completions
                 ]
 
@@ -578,8 +586,8 @@ class ToolCallingGRPOTrainer(GRPOTrainer):
 
             for i, idx in enumerate(idxs_with_tool):
                 if post_tool_texts[i]:
-                    post_tool_msg = revert_qwen2_5_template(
-                        "<|im_start|>assistant\n" + post_tool_texts[i] + "<|im_end|>"
+                    post_tool_msg = revert_assistant_completion(
+                        post_tool_texts[i], tokenizer=self.processing_class
                     )
                     if isinstance(completions[idx], list):
                         if isinstance(post_tool_msg, list) and isinstance(post_tool_msg[0], dict):
@@ -636,15 +644,7 @@ class ToolCallingGRPOTrainer(GRPOTrainer):
         else:
             text = str(completion)
 
-        match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
-        if match:
-            try:
-                tool_call_data = json.loads(match.group(1))
-                if "name" in tool_call_data:
-                    return tool_call_data
-            except json.JSONDecodeError:
-                pass
-        return None
+        return parse_tool_call_text(text)
 
     def _generate_tool_continuation(self, prompts: list, max_tokens_override: int = None):
         device = self.accelerator.device
@@ -665,12 +665,10 @@ class ToolCallingGRPOTrainer(GRPOTrainer):
         if self.accelerator.is_main_process and all_prompts:
             for prompt in all_prompts:
                 if is_conversational({"prompt": prompt}):
-                    for message in prompt:
-                        if "tool_calls" in message:
-                            for call in message["tool_calls"]:
-                                args = call["function"]["arguments"]
-                                if isinstance(args, dict):
-                                    call["function"]["arguments"] = json.dumps(args)
+                    stringify_tool_arguments_for_template(
+                        prompt,
+                        getattr(self.processing_class, "chat_template", None),
+                    )
 
             if is_conversational({"prompt": all_prompts[0]}):
                 formatted_prompts = [
@@ -741,12 +739,10 @@ class ToolCallingGRPOTrainer(GRPOTrainer):
 
             for prompt in prompts:
                 if is_conversational({"prompt": prompt}):
-                    for message in prompt:
-                        if "tool_calls" in message:
-                            for call in message["tool_calls"]:
-                                args = call["function"]["arguments"]
-                                if isinstance(args, dict):
-                                    call["function"]["arguments"] = json.dumps(args)
+                    stringify_tool_arguments_for_template(
+                        prompt,
+                        getattr(self.processing_class, "chat_template", None),
+                    )
 
             if self.vllm_mode == "server":
                 all_prompts = gather_object(prompts)

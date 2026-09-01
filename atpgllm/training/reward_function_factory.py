@@ -108,7 +108,7 @@ class RewardFunctionFactory:
     DETECTED_FAULTS_RE = re.compile(r"DETECTED_FAULTS:\s\"(.*?)\"", re.DOTALL)
     SYMBOLS_RE = re.compile(r'\w+')
     THINKING_RE = re.compile(r"(?<=<think>)([\s\S]*?)(?=<\/think>)", re.DOTALL)
-    TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+    TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
     TOOL_RESPONSE_RE = re.compile(r"<tool_response>(.*?)</tool_response>", re.DOTALL)
     
     # Regex to capture full Verilog declarations

@@ -13,15 +13,10 @@ Graph modality pipeline:
 Text modality pipeline:
     text → ModernBERT-base (or any HF encoder) → [B, H] sentence embedding
 
-Two-stage training:
-    Stage 1: contrastive (GTC), matching (GTM) and generative (GTG) losses
-             on paired (graph, text) examples (see losses_stage1).
-    Stage 2: connect the frozen graph stack to a causal LLM via a soft-prompt
-             projection; finetune the LLM with (optional) LoRA on SFT
-             targets (see stage2_model).
-
-A future ``atpgllm.multimodal`` package will integrate this encoder with
-``atpgllm.llm`` (shared collate, SFT/GRPO, reward wiring).
+Staged training:
+    Stage A: target-fault-conditioned DAG encoder pretraining.
+    Stage B: Q-Former graph/text alignment with GTC, GTM, and GTG.
+    Stage C/D: ``atpgllm.multimodal`` soft-prefix QLoRA SFT and GRPO.
 """
 
 from .models_stage1 import (  # noqa: F401
@@ -56,13 +51,28 @@ from .gate_features import (  # noqa: F401
     GateAttributeVocab,
     GateAttributes,
 )
+from .fault_context import (  # noqa: F401
+    FAULT_FEATURE_NAMES,
+    NUM_FAULT_FEATURES,
+    FaultSpec,
+    attach_atpg_context,
+    parse_fault,
+)
 from .node_encoder import AttributeDecompositionEncoder  # noqa: F401
 from .dag_gin import DAGGINEncoder, DAGGINLayer  # noqa: F401
+from .pretrain import (  # noqa: F401
+    GraphPretrainingModel,
+    GraphPretrainLosses,
+    GraphPretrainOutputs,
+)
 from .dataset import (  # noqa: F401
     ASAP7DesignDataset,
     ASAP7GraphTextDataset,
+    ASAP7GraphPretrainDataset,
+    collate_graph_pretrain_batch,
     collate_graph_text_batch,
     make_text_caption,
+    render_prompt_and_answer,
 )
 from .stage2_model import (  # noqa: F401
     Stage2GraphTextLM,
@@ -83,9 +93,17 @@ __all__ = [
     # Node-level encoders
     "GateAttributeVocab",
     "GateAttributes",
+    "FaultSpec",
+    "FAULT_FEATURE_NAMES",
+    "NUM_FAULT_FEATURES",
+    "parse_fault",
+    "attach_atpg_context",
     "AttributeDecompositionEncoder",
     "DAGGINEncoder",
     "DAGGINLayer",
+    "GraphPretrainingModel",
+    "GraphPretrainLosses",
+    "GraphPretrainOutputs",
     # Losses and heads
     "GraphTextContrastiveLoss",
     "GraphTextMatchingHead",
@@ -103,8 +121,11 @@ __all__ = [
     # Dataset utilities
     "ASAP7DesignDataset",
     "ASAP7GraphTextDataset",
+    "ASAP7GraphPretrainDataset",
+    "collate_graph_pretrain_batch",
     "collate_graph_text_batch",
     "make_text_caption",
+    "render_prompt_and_answer",
     # Stage 2 LLM bridge
     "Stage2GraphTextLM",
     "build_stage2_inputs",

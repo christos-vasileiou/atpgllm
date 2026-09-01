@@ -178,6 +178,9 @@ class Stage1Trainer:
             if getattr(g, "structural_feats", None) is not None:
                 if g.structural_feats.is_floating_point():
                     g.structural_feats = g.structural_feats.to(self.param_dtype)
+            if getattr(g, "fault_feats", None) is not None:
+                if g.fault_feats.is_floating_point():
+                    g.fault_feats = g.fault_feats.to(self.param_dtype)
             if getattr(g, "x", None) is not None and g.x.is_floating_point():
                 g.x = g.x.to(self.param_dtype)
         return {

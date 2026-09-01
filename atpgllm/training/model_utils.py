@@ -692,6 +692,173 @@ def patch_qwen_chat_template_for_assistant_mask(tokenizer) -> bool:
     return True
 
 
+def patch_granite_chat_template_for_assistant_mask(tokenizer) -> bool:
+    """Inject ``{% generation %}`` markers into a Granite 3.x/4.1 chat template.
+
+    IBM Granite 3.x/4.1 instruct templates render assistant turns as::
+
+        <|start_of_role|>assistant<|end_of_role|>{content}{tool_calls}<|end_of_text|>
+
+    without ``{% generation %}``, so ``return_assistant_tokens_mask=True`` is
+    all zeros and ``SFTConfig(assistant_only_loss=True)`` cannot work.  This
+    helper wraps assistant *content* (and tool-call JSON / EOS) in a generation
+    block while leaving the role header outside it — matching
+    ``add_generation_prompt=True``, which emits only
+    ``<|start_of_role|>assistant<|end_of_role|>``.
+
+    Granite 4.2 uses ChatML (``im_start``) with XML tool calls; that layout is
+    handled by :func:`patch_granite42_chat_template_for_assistant_mask`.
+
+    Returns ``True`` if a patch was applied, ``False`` if generation markers
+    were already present.  Raises ``RuntimeError`` if the template is not the
+    known Granite layout.
+    """
+    tpl = tokenizer.chat_template or ""
+    if "{% generation %}" in tpl or "{%- generation %}" in tpl:
+        return False
+
+    new = tpl.replace(
+        "    {%- elif message.role == 'assistant' %}\n"
+        "        {{- '<|start_of_role|>' + message.role + '<|end_of_role|>' + content.val }}\n",
+        "    {%- elif message.role == 'assistant' %}\n"
+        "        {{- '<|start_of_role|>' + message.role + '<|end_of_role|>' }}\n"
+        "        {%- generation %}\n"
+        "        {{- content.val }}\n",
+    ).replace(
+        "        {%- endif %}\n"
+        "        {{- '<|end_of_text|>\\n' }}\n"
+        "    {%- elif message.role == 'tool' %}",
+        "        {%- endif %}\n"
+        "        {{- '<|end_of_text|>\\n' }}\n"
+        "        {%- endgeneration %}\n"
+        "    {%- elif message.role == 'tool' %}",
+    )
+
+    if (
+        new == tpl
+        or new.count("{%- generation %}") != 1
+        or new.count("{%- endgeneration %}") != 1
+    ):
+        raise RuntimeError(
+            "patch_granite_chat_template_for_assistant_mask: could not locate the "
+            "expected Granite template patterns. Inspect tokenizer.chat_template; "
+            "the upstream ibm-granite chat_template.jinja may have changed."
+        )
+
+    tokenizer.chat_template = new
+    return True
+
+
+def _is_granite42_chat_template(tpl: str) -> bool:
+    """True for Granite 4.2 ChatML jinja (thinking + XML ``<function=`` tools)."""
+    return (
+        "im_start" in tpl
+        and "enable_thinking" in tpl
+        and "<function=" in tpl
+        and "start_of_role" not in tpl
+    )
+
+
+def patch_granite42_chat_template_for_assistant_mask(tokenizer) -> bool:
+    """Inject ``{% generation %}`` markers into a Granite 4.2 ChatML template.
+
+    ``ibm-granite/granite-4.2-*`` uses ChatML (``<|im_start|>``) with
+    ``enable_thinking`` and XML tool calls (``<function=`` / ``<parameter=``),
+    not Granite 4.1's ``start_of_role`` layout.  Stock jinja has no
+    ``{% generation %}`` markers.
+
+    Assistant *content* (thinking, XML tool calls, ``<|im_end|>``) is wrapped
+    in a generation block; ``<|im_start|>assistant\\n`` stays outside so it
+    matches ``add_generation_prompt=True`` (``<|im_start|>assistant\\n<think>\\n``
+    when thinking is on).
+
+    Returns ``True`` if a patch was applied, ``False`` if generation markers
+    were already present.  Raises ``RuntimeError`` if the template is not the
+    known Granite 4.2 layout.
+    """
+    tpl = tokenizer.chat_template or ""
+    if "{% generation %}" in tpl or "{%- generation %}" in tpl:
+        return False
+
+    new = (
+        tpl.replace(
+            "            {{- '<|im_start|>assistant\\n' }}\n"
+            "                {%- set include_content = not (truncate_history_thinking and loop.index0 < ns.last_user_idx) %}",
+            "            {{- '<|im_start|>assistant\\n' }}\n"
+            "                {%- generation %}\n"
+            "                {%- set include_content = not (truncate_history_thinking and loop.index0 < ns.last_user_idx) %}",
+        ).replace(
+            "                {{- '<|im_end|>\\n' }}\n"
+            "        {%- else %}\n"
+            "            {# Assistant message doesn't have tool calls. #}",
+            "                {{- '<|im_end|>\\n' }}\n"
+            "                {%- endgeneration %}\n"
+            "        {%- else %}\n"
+            "            {# Assistant message doesn't have tool calls. #}",
+        ).replace(
+            "                {{- '<|im_start|>assistant\\n' ~ (content | default('', true) | string | trim) ~ '<|im_end|>\\n' }}",
+            "                {{- '<|im_start|>assistant\\n' }}\n"
+            "                {%- generation %}\n"
+            "                {{- (content | default('', true) | string | trim) ~ '<|im_end|>\\n' }}\n"
+            "                {%- endgeneration %}",
+        ).replace(
+            "                    {{- '<|im_start|>assistant\\n' ~ c ~ '<|im_end|>\\n' }}",
+            "                    {{- '<|im_start|>assistant\\n' }}\n"
+            "                    {%- generation %}\n"
+            "                    {{- c ~ '<|im_end|>\\n' }}\n"
+            "                    {%- endgeneration %}",
+        ).replace(
+            "                    {{- '<|im_start|>assistant\\n<|im_end|>\\n' }}",
+            "                    {{- '<|im_start|>assistant\\n' }}\n"
+            "                    {%- generation %}\n"
+            "                    {{- '<|im_end|>\\n' }}\n"
+            "                    {%- endgeneration %}",
+        )
+    )
+
+    if (
+        new == tpl
+        or new.count("{%- generation %}") != 4
+        or new.count("{%- endgeneration %}") != 4
+    ):
+        raise RuntimeError(
+            "patch_granite42_chat_template_for_assistant_mask: could not locate "
+            "the expected Granite 4.2 ChatML patterns. Inspect "
+            "tokenizer.chat_template; the upstream ibm-granite chat_template.jinja "
+            "may have changed."
+        )
+
+    tokenizer.chat_template = new
+    return True
+
+
+def patch_chat_template_for_assistant_mask(tokenizer) -> bool:
+    """Dispatch assistant-mask patching for Qwen ChatML or Granite templates.
+
+    No-op (returns ``False``) when the template already contains
+    ``{% generation %}``.  Routes Granite 3.x/4.1 (``start_of_role``),
+    Granite 4.2 (ChatML + ``enable_thinking`` + XML ``<function=``), and
+    Qwen (``im_start``) to the format-specific patchers.  Raises if the
+    template is none of these and has no generation markers, so SFT does
+    not silently train on every token.
+    """
+    tpl = tokenizer.chat_template or ""
+    if "{% generation %}" in tpl or "{%- generation %}" in tpl:
+        return False
+    if "start_of_role" in tpl and "end_of_role" in tpl:
+        return patch_granite_chat_template_for_assistant_mask(tokenizer)
+    if _is_granite42_chat_template(tpl):
+        return patch_granite42_chat_template_for_assistant_mask(tokenizer)
+    if "im_start" in tpl:
+        return patch_qwen_chat_template_for_assistant_mask(tokenizer)
+    raise RuntimeError(
+        "patch_chat_template_for_assistant_mask: tokenizer.chat_template has no "
+        "{% generation %} markers and is neither Qwen ChatML, Granite "
+        "start_of_role, nor Granite 4.2 ChatML. Inspect the template before "
+        "running assistant_only_loss=True."
+    )
+
+
 # =====================================================================
 # Standard adapter loading (no unsloth)
 # =====================================================================

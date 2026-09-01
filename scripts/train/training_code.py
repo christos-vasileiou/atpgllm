@@ -179,7 +179,7 @@ from atpgllm.training.model_utils import (                                      
     prepare_lora_model,
     smart_sync_model_config,
     load_model_from_adapter,
-    patch_qwen_chat_template_for_assistant_mask,
+    patch_chat_template_for_assistant_mask,
 )
 
 
@@ -401,11 +401,11 @@ def train_with_sft(
     # ------------------------------------------------------------------
     if assistant_only_loss:
         # Patch the tokenizer's chat template so SFTTrainer can produce
-        # assistant_masks. For Qwen2/2.5/3 the stock template lacks
-        # {% generation %} markers; this injects them around the two assistant
-        # rendering paths. No-op for templates that already mark assistant
-        # blocks (e.g. Llama-3.1+ Instruct).
-        if patch_qwen_chat_template_for_assistant_mask(tokenizer):
+        # assistant_masks. Qwen2/2.5/3, Granite 3.x/4.1 (start_of_role), and
+        # Granite 4.2 (ChatML + XML tools) stock templates lack {% generation %}
+        # markers; this injects them around assistant content. No-op for
+        # templates that already mark assistant blocks (e.g. Llama-3.1+ Instruct).
+        if patch_chat_template_for_assistant_mask(tokenizer):
             print("[SFT] Patched tokenizer chat_template with {% generation %} "
                   "markers for assistant_only_loss=True.")
         sft_format = "messages"
@@ -1072,10 +1072,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=_env("ASSISTANT_ONLY_LOSS", "1").lower() in ("1", "true", "yes"),
         help="SFT only. If set (default), compute loss only on assistant tokens "
-             "(content + tool-call JSON); system / user / tool-response tokens are "
-             "masked out. The dataset is emitted as `messages` + `tools` and the "
-             "Qwen2/2.5/3 chat template is patched in-place to add {%% generation %%} "
-             "markers required by TRL. Use --no-assistant_only_loss to revert to the "
+             "(content + tool-call JSON or Granite 4.2 XML); system / user / "
+             "tool-response tokens are masked out. The dataset is emitted as "
+             "`messages` + `tools` and the Qwen2/2.5/3 or Granite chat template "
+             "is patched in-place to add "
+             "{%% generation %%} markers required by TRL. Use --no-assistant_only_loss "
+             "to revert to the "
              "legacy behavior (pre-rendered `text` field, language-modeling loss over "
              "every non-pad token). Env: ASSISTANT_ONLY_LOSS (1/0).",
     )

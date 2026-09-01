@@ -44,7 +44,7 @@ import torch
 from torch import Tensor, nn
 from torch_geometric.data import Batch
 
-from .dataset import record_to_pyg, render_record
+from .dataset import record_to_pyg, render_prompt_and_answer
 from .gate_features import GateAttributeVocab
 from .models_stage1 import Stage1GraphTextModel
 
@@ -239,35 +239,8 @@ def _render_prompt_and_answer(
     tokenizer,
     tests_dir: Optional[Path],
 ) -> tuple[str, str]:
-    """Render a record into (prompt_text, answer_text).
-
-    All ``{placeholder}`` tokens are resolved via
-    :func:`render_record` (which delegates to
-    ``ConversationExample.from_record``). The prompt is formatted with
-    the tokenizer's chat template when available (Qwen / Llama / …);
-    otherwise a plain role-tagged fallback is used.
-    """
-    rendered = render_record(record, tests_dir=tests_dir)
-
-    prompt_msgs = [m for m in rendered.messages if m["role"] in ("system", "user")]
-    answer_msgs = [m for m in rendered.messages if m["role"] == "assistant"]
-    answer_text = "\n".join(m["content"] for m in answer_msgs).strip()
-
-    chat_tpl = getattr(tokenizer, "chat_template", None)
-    if chat_tpl:
-        prompt_text = tokenizer.apply_chat_template(
-            prompt_msgs,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-    else:
-        parts: List[str] = []
-        for m in prompt_msgs:
-            parts.append(f"<|{m['role']}|>\n{m['content']}")
-        parts.append("<|assistant|>\n")
-        prompt_text = "\n".join(parts)
-
-    return prompt_text, answer_text
+    """Backward-compatible alias for the shared renderer."""
+    return render_prompt_and_answer(record, tokenizer, tests_dir=tests_dir)
 
 
 def build_stage2_inputs(
@@ -277,13 +250,14 @@ def build_stage2_inputs(
     tokenizer,
     max_seq_len: int = 2048,
     tests_dir: Optional[Path] = None,
+    compact_netlist: bool = False,
 ) -> Dict[str, Any]:
     """Build a Stage-2 SFT batch from raw dataset records.
 
     Each record must expose ``netlist``, ``user_content``,
     ``answer_content`` (or equivalent) and friends.  Placeholder
     rendering is handled by
-    ``libatpgllm/tests/conversation.py:ConversationExample.from_record``
+    :class:`atpgllm.training.conversation.ConversationExample`
     so the prompt and target match the main SFT pipeline exactly.
 
     Returns a dict compatible with :meth:`Stage2GraphTextLM.forward`.
@@ -297,8 +271,11 @@ def build_stage2_inputs(
         if data is None:
             continue
 
-        prompt_text, answer_text = _render_prompt_and_answer(
-            rec, tokenizer, tests_dir=tests_dir,
+        prompt_text, answer_text = render_prompt_and_answer(
+            rec,
+            tokenizer,
+            tests_dir=tests_dir,
+            compact_netlist=compact_netlist,
         )
 
         ids, start = _build_prompt_answer_ids(

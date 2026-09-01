@@ -2,11 +2,15 @@
 
 ## Overview
 
-This document describes the graph encoder pipeline that transforms structural
-gate-level netlists into fixed-dimensional embeddings compatible with large
-language models.  The architecture is designed for Automatic Test Pattern
-Generation (ATPG) where the LLM (Qwen2.5-7B, fine-tuned with GRPO) must
-reason about circuit topology, fault propagation, and signal controllability.
+This document is the executable contract for the graph-conditioned ATPG
+pipeline. It transforms a structural gate-level netlist plus a target stuck-at
+fault into fixed-dimensional embeddings, aligns those embeddings with text,
+and injects them into the current QLoRA causal-LM path for SFT and GRPO.
+
+The implementation separates inference inputs from supervision. The netlist
+and target fault produce graph features. Ground-truth propagation gates,
+backtrack gates, snapshots, expected outputs, and detected faults remain labels
+or reward inputs; they are never graph-encoder inputs.
 
 The pipeline maps an arbitrary-size netlist graph G = {V, E} to:
 - **Per-node embeddings** `[N, 256]` for cross-modal attention (Q-Former)
@@ -37,7 +41,7 @@ Verilog Netlist (text)
 |                       |       | Boolean functions per cell |
 | Cell name parsing:    |       +---------------------------+
 |   AOI333xp33_ASAP7... |
-|   → 8 attribute indices|
+|   → A attribute indices|
 +-----------+-----------+
             |
             v
@@ -45,8 +49,8 @@ Verilog Netlist (text)
 | Attribute Decomp.     |   node_encoder.py
 | Encoder (nn.Module)   |
 |                       |
-| 8 learned embeddings  |   [N, 8] int → [N, 128] embedded
-| + 4 structural feats  |   [N, 4] float (depth, degree)
+| A learned embeddings  |   [N, A] int → [N, A*d_attr] embedded
+| + structure + fault   |   [N, 9] float (depth, degree, target)
 | → MLP fusion          |   → [N, 256] initial node embedding
 +-----------+-----------+
             |
@@ -65,11 +69,16 @@ Verilog Netlist (text)
 +-----------+-----------+
             |
             v
-    [Future: Q-Former]
+    Q-Former (implemented)
     32 learnable queries cross-attend to N gate tokens
-    → [1, 32, 768] → Linear → [1, 32, 3584]
-    → Prepend as soft prompts to Qwen2.5-7B
+    → [B, 32, d_q] → MLP → [B, 32, d_LM]
+    → prepend as soft prompts to the causal LM
 ```
+
+The parser also attaches five target-fault features to each node:
+`is_fault_site`, `drives_fault_net`, `reads_fault_net`, `stuck_at_zero`, and
+`stuck_at_one`. A PI fault therefore conditions its sink gates even when no
+gate drives the target net.
 
 
 ## Component 1: Gate Attribute Decomposition
@@ -92,25 +101,32 @@ A monolithic embedding table (one vector per cell name) would:
 
 ### Solution: Attribute Decomposition
 
-Each cell is decomposed into 8 categorical/binary attributes, each with its
-own small learned embedding:
+Each cell can be decomposed into eight categorical/binary attributes. The
+checkpointed production contract currently enables the four entries in
+`ATTRIBUTE_NAMES`: `logic_family`, `input_count`, `is_sequential`, and
+`num_outputs`. Changing this ordered list intentionally changes the vocabulary
+fingerprint and invalidates incompatible checkpoints.
 
 | # | Attribute             | Classes | Examples                              | Why it matters for ATPG             |
 |---|-----------------------|---------|---------------------------------------|-------------------------------------|
 | 0 | `logic_family`        | 23      | AND, OR, AOI, DFF, FA, TIE, ...      | Determines boolean behaviour and fault sensitisation conditions |
 | 1 | `input_count`         | 7       | 1, 2, 3, 4, 5, 6+                    | More inputs = harder controllability; more potential fault masking |
-| 2 | `output_complemented` | 2       | True (NAND, NOR, AOI) / False (AND)   | Inverted output changes fault effect polarity (s-a-0 vs s-a-1 detection) |
-| 3 | `is_sequential`       | 2       | DFF, LATCH vs combinational           | Sequential boundaries break fault propagation; require scan chains |
+| 2 | `output_complemented` | 3       | UNKNOWN / True / False                | Inverted output changes fault effect polarity (s-a-0 vs s-a-1 detection) |
+| 3 | `is_sequential`       | 3       | UNKNOWN / DFF,LATCH / combinational   | Sequential boundaries break fault propagation; require scan chains |
 | 4 | `drive_strength`      | 11      | TINY(<0.5), X1, X2, X4, X16+         | Higher drive = more fanout capacity; affects timing-aware ATPG |
 | 5 | `num_outputs`         | 3       | 1 (most), 2 (FA: carry+sum), special  | Multi-output gates create coupled fault effects |
-| 6 | `tristate`            | 2       | True / False                          | Placeholder for future PDKs with tristate buffers |
-| 7 | `is_clock_related`    | 2       | ICG, CKINVDC vs normal                | Clock gates require special ATPG handling (launch/capture) |
+| 6 | `tristate`            | 3       | UNKNOWN / True / False                | Placeholder for future PDKs with tristate buffers |
+| 7 | `is_clock_related`    | 3       | UNKNOWN / ICG,CKINVDC / normal        | Clock gates require special ATPG handling (launch/capture) |
 
-**Total embedding parameters:** 52 vectors × 16 dims = **832 parameters**.
+Every enabled attribute has an explicit index-0 UNKNOWN value. Unknown cell
+types are retained by the parser, using common output-pin names as a
+conservative connectivity fallback. `GateAttributeVocab.to_dict()` serializes
+labels, active ordering, cells, and indices; its SHA-256 fingerprint is checked
+at every checkpoint transition.
 
 ### Why not monolithic embeddings?
 
-| Criterion                | Monolithic (202×256)    | Attribute Decomposition (52×16 + MLP) |
+| Criterion                | Monolithic (202×256)    | Attribute decomposition |
 |--------------------------|------------------------|---------------------------------------|
 | Parameters               | 51,712                 | 51,648 (similar)                      |
 | Sharing across variants  | None                   | 7/8 attributes shared for drive variants |
@@ -190,13 +206,13 @@ after the topological traversal are assigned max_depth + 1.
 ### Architecture
 
 ```
-gate_attrs [N, 8] (int64)          structural_feats [N, 4] (float32)
+gate_attrs [N, A] (int64)          structure [N, 4] + fault [N, 5]
      |                                       |
      v                                       |
-8 × nn.Embedding(n_classes, 16)              |
+A × nn.Embedding(n_classes, d_attr)           |
      |                                       |
      v                                       |
- concat → [N, 128]                           |
+ concat → [N, A*d_attr]                      |
      |                                       |
      +------------------+--------------------+
                         |
@@ -204,7 +220,7 @@ gate_attrs [N, 8] (int64)          structural_feats [N, 4] (float32)
                    concat → [N, 132]
                         |
                         v
-              Linear(132, 128) + LayerNorm + GELU
+              Linear(A*d_attr+9, 128) + LayerNorm + GELU
                         |
                         v
               Linear(128, 256) + LayerNorm
@@ -337,25 +353,32 @@ output including:
 | Multi-line connections | `.CI(\n\add_x_1/n39 )` | `[\s\S]+?` in gate pattern spans newlines |
 
 The parser produces:
-- `gate_attrs [N, 8]` — attribute indices via `GateAttributeVocab`
+- `gate_attrs [N, A]` — versioned attribute indices via `GateAttributeVocab`
 - `structural_feats [N, 4]` — depth/degree via `compute_structural_features`
 - `edge_index [2, E]` — directed edges (driver → sink)
+- `fault_feats [N, 5]` — target location/direction and stuck-at polarity
 - Backward-compatible `x [N, 1]` dummy features
 
+Dataset records additionally carry `propagation_mask`, `backtrack_mask`, and
+`discrepancy_mask` with per-graph validity flags. The discrepancy mask compares
+Good Machine and Bad Machine values on each gate's output nets. These tensors
+supervise encoder pretraining only.
 
-## Parameter Budget
 
-| Component                      | Parameters   | Memory (bf16) |
-|--------------------------------|-------------|---------------|
-| Gate attribute embeddings      | 832         | 1.6 KB        |
-| Node encoder MLP               | 50,816      | 99 KB         |
-| DAG-GIN (6 layers + JK)       | 2,907,660   | 5.5 MB        |
-| **Total graph encoder**        | **2,959,308** | **~5.7 MB** |
-| Q-Former (future, BERT-based) | ~130M       | ~260 MB       |
-| Projection to Qwen (future)   | ~2.8M       | ~5.4 MB       |
-| Qwen2.5-7B (4-bit quantised)  | ~7B         | ~4 GB         |
+## Shape Contracts
 
-The graph encoder adds < 0.04% overhead to the total model size.
+- Graph batch: PyG `Batch` with `gate_attrs [N,A]`,
+  `structural_feats [N,4]`, optional `fault_feats [N,5]`,
+  `edge_index [2,E]`, and `batch [N]`.
+- DAG encoder: `node_embs [N,d_g]`, `graph_embs [B,4*d_g]`.
+- Q-Former: densifies nodes with a valid-node mask and returns
+  `query_embs [B,Q,d_q]`; padded nodes are masked in cross-attention.
+- LM projector: `query_embs -> graph_prefix [B,Q,d_LM]`.
+- SFT input: `[graph_prefix, token_embeddings]`; graph and prompt labels are
+  `-100`, so only assistant tokens contribute to causal-LM loss.
+- GRPO: grouped completions are generated from the same graph prefix. Policy,
+  old-policy, and frozen-reference log probabilities all include their
+  corresponding graph prefix.
 
 
 ## File Inventory
@@ -367,9 +390,12 @@ libatpgllm/
 │   ├── graph/                   Graph modality (this package)
 │   │   ├── __init__.py          Public API re-exports
 │   │   ├── gate_features.py     Attribute decomposition vocabulary (pure Python)
+│   │   ├── fault_context.py     Target-fault inputs + non-leaking node labels
 │   │   ├── node_encoder.py      Attribute embedding + structural features → node emb
 │   │   ├── dag_gin.py           DAG-aware bidirectional GIN encoder
 │   │   ├── netlist_parser.py    Verilog → PyG graph (with structural features)
+│   │   ├── pretrain.py          Stage-A ATPG node objectives
+│   │   ├── checkpoints.py       Versioned stage-transition contract
 │   │   ├── models_stage1.py     Stage 1 model (NetlistGNN + Q-Former)
 │   │   ├── losses_stage1.py     GTC / GTM / GTG losses
 │   │   ├── train_stage1.py      Stage 1 training loop
@@ -379,7 +405,7 @@ libatpgllm/
 │   │   └── scripts/             CLI entrypoints (python -m atpgllm.graph.scripts.*)
 │   ├── training/                Conversation, datasets, GRPO trainers, tools, rewards
 │   │   └── data/                Package data (sim_config.json)
-│   └── multimodal/              Reserved: future llm ↔ graph integration
+│   └── multimodal/              Soft-prefix model, loading, SFT data, GRPO loss
 ├── scripts/
 │   ├── train/                   training_code.py + Slurm launchers + configs/
 │   ├── eval/                    evaluate_model.py + checkpoint eval wrappers
@@ -394,20 +420,121 @@ libatpgllm/
 ```
 
 
-## Next Steps
+## Executable Stages and Session Boundaries
 
-1. **Upgrade Q-Former cross-attention** — replace single-token graph attention
-   (`[B, 1, 768]`) with per-node attention (`[B, N, 768]`), letting 32
-   learnable queries selectively attend to different circuit structures.
+Run from `libatpgllm/` after activating the project environment.
 
-2. **LLM alignment projection** — Linear layer from Q-Former output (768) to
-   Qwen2.5-7B embedding dimension (3584).
+### Stage A — target-conditioned DAG encoder pretraining
 
-3. **Stage 1 pre-training** — Train graph encoder + Q-Former with
-   GTC/GTM/GTG losses on (netlist, text description) pairs.
+```bash
+activate && python -m atpgllm.graph.scripts.train_graph_encoder \
+  --dataset chrivasileiou/asap7-language-of-test-v2 \
+  --output-dir runs/graph_pretrain
+```
 
-4. **Stage 2 fine-tuning** — Freeze graph encoder, train projection +
-   Qwen2.5 LoRA on graph-conditioned ATPG tasks.
+The netlist and target fault are inputs. Three node heads supervise fault
+propagation, ATPG backtracking, and Good/Bad Machine discrepancy masks. The
+checkpoint exports the DAG encoder; auxiliary heads do not cross into the LLM.
 
-5. **Stage 3 GRPO** — Freeze all graph components, train only Qwen2.5 LoRA
-   with fault simulation reward. Graph tokens prepended as soft prompts.
+### Stage B — Q-Former and graph/text alignment
+
+```bash
+activate && python -m atpgllm.graph.scripts.train_stage1 \
+  --sim-config atpgllm/training/data/sim_config.json \
+  --graph-ckpt runs/graph_pretrain/graph_pretrain_final.pt \
+  --output-dir runs/graph_alignment --graph-policy frozen
+```
+
+This stage trains per-node Q-Former cross-attention and graph/text projectors
+with GTC, GTM, and GTG. `--graph-policy` is `frozen`, `last_layer`, or `full`.
+The default freezes the Stage-A encoder. Precomputed per-design descriptions
+avoid contradictory captions for one circuit.
+
+### Stage C — graph-conditioned QLoRA SFT
+
+```bash
+activate && python scripts/train/multimodal_training.py --method sft \
+  --alignment-ckpt runs/graph_alignment/stage1_final.pt \
+  --output-dir runs/multimodal_sft --graph-policy full
+```
+
+The rendered prompt replaces the duplicated Verilog body with a stable
+`<GRAPH_CONTEXT>` payload while retaining its `doc_id`; topology is supplied by
+the graph prefix. The target fault remains in user text and graph features.
+Answer-only labels preserve the current conversation target. `full` jointly
+updates the DAG encoder, Q-Former, LM projector, and LoRA adapter; `qformer`,
+`last_layer`, and `frozen` provide explicit ablations.
+
+### Stage D — graph-conditioned QLoRA GRPO
+
+```bash
+activate && python scripts/train/multimodal_training.py --method grpo \
+  --alignment-ckpt runs/graph_alignment/stage1_final.pt \
+  --sft-ckpt runs/multimodal_sft/multimodal_sft_final.pt \
+  --output-dir runs/multimodal_grpo --graph-policy full
+```
+
+GRPO uses the existing fault-simulation reward factory. A frozen SFT LoRA
+adapter and frozen SFT graph stack form the reference policy; a separate policy
+adapter plus the selected graph modules are optimized jointly. The local
+rollout loop is correctness-first and does not use vLLM.
+
+The same commands are captured in sourceable configs:
+
+```bash
+bash scripts/train/run_graph_roadmap.sh scripts/train/configs/graph_pretrain.conf
+bash scripts/train/run_graph_roadmap.sh scripts/train/configs/graph_alignment.conf
+bash scripts/train/run_graph_roadmap.sh scripts/train/configs/multimodal_sft.conf
+bash scripts/train/run_graph_roadmap.sh scripts/train/configs/multimodal_grpo.conf
+```
+
+## Hyperparameter Search
+
+The executable HPO hierarchy is documented in `docs/GRAPH_HPO.md` and
+configured by `scripts/train/configs/hpo_graph_pipeline.yaml`. It uses
+PostgreSQL-backed Optuna grouped multivariate TPE with constant-liar sampling
+and Hyperband pruning.
+
+Ordinary trials execute one stage only:
+
+```text
+Stage-A trial -> graph_pretrain checkpoint
+promoted Stage-A checkpoint -> Stage-B trial -> alignment checkpoint
+promoted Stage-B checkpoint -> planned Stage-C SFT screen
+promoted SFT checkpoint -> planned Stage-D GRPO pilot
+```
+
+Stage-A pruning uses held-out propagation/discrepancy/backtrack node metrics.
+Stage-B pruning uses graph/text retrieval, matching average precision, and GTG
+validation loss. Stage C/D remain explicit top-K launch plans until a
+graph-aware simulator evaluator can select them from scheduled held-out
+evaluation; training reward is not an HPO objective.
+
+## Checkpoint Contract and Resume
+
+Every `.pt` session boundary has format `atpgllm.graph-stack` version 1 and
+stores stage, parent stage, step, vocabulary payload/fingerprint, architecture,
+module states, optimizer state, and launch arguments. Allowed transitions are:
+
+```text
+graph_pretrain -> graph_text_alignment -> multimodal_sft -> multimodal_grpo
+```
+
+Each stage may also resume its own stage. Use `--resume` for optimizer/session
+recovery; use the preceding stage's dedicated checkpoint argument for a fresh
+transition. Legacy graph checkpoints are rejected because they cannot prove
+attribute-order and shape compatibility.
+
+## Current Limitations
+
+- The parser targets synthesized structural netlists. Unknown cells are
+  retained using conventional output-pin names, but libraries with unusual pin
+  naming need an explicit gate-function entry.
+- Sequential feedback is tolerated by structural-depth fallback, but this is
+  not a scan-chain/timing model.
+- Stage-D generation is single-prompt grouped sampling without vLLM, DDP, or
+  tool-call continuation. It preserves graph gradients but is slower than the
+  text-only TRL/vLLM path.
+- Full 7B QLoRA SFT/GRPO requires CUDA, bitsandbytes, model access, and enough
+  device memory. CPU tests cover parser, vocabulary, masks, shapes, checkpoint
+  compatibility, SFT prefix labels, and the GRPO objective.

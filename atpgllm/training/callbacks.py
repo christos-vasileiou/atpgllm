@@ -87,7 +87,7 @@ _RNG_STATE_PREFIX = "rng_state"
 # Regex patterns for format checking (mirrors RewardFunctionFactory)
 # =====================================================================
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 TOOL_RESPONSE_RE = re.compile(r"<tool_response>(.*?)</tool_response>", re.DOTALL)
 INPUT_VECTOR_RE = re.compile(r'INPUT_VECTOR:\s*"(.*?)"', re.DOTALL)
 EXPECTED_OUTPUT_RE = re.compile(r'EXPECTED_OUTPUT:\s*"(.*?)"', re.DOTALL)
@@ -1335,18 +1335,14 @@ class SFTStoppingCallback(TrainerCallback):
                 logger.warning(f"Generation failed for batch {batch_idx} (start={start}): {e}")
                 all_completions.extend([""] * len(batch_prompts))
 
+        from atpgllm.training.revert_template import parse_tool_call
+
         for completion in all_completions[:total]:
             # Check individual components
             has_think = bool(self.THINK_RE.search(completion))
             tc_match = self.TOOL_CALL_RE.search(completion)
             has_tool_call = bool(tc_match)
-            has_tool_json = False
-            if tc_match:
-                try:
-                    json.loads(tc_match.group(1))
-                    has_tool_json = True
-                except (json.JSONDecodeError, ValueError):
-                    pass
+            has_tool_json = parse_tool_call(completion) is not None
             has_iv = bool(self.INPUT_VECTOR_RE.search(completion))
             has_eo = bool(self.EXPECTED_OUTPUT_RE.search(completion))
             has_df = bool(self.DETECTED_FAULTS_RE.search(completion))
@@ -1997,29 +1993,11 @@ class SFTStoppingCallback(TrainerCallback):
     def _parse_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
         """
         Parse a tool call from model completion text.
-        
-        Expected format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-        
-        Parameters
-        ----------
-        text : str
-            The completion text to parse.
-        
-        Returns
-        -------
-        Optional[Dict]
-            Parsed tool call dict with 'name' and 'arguments', or None.
+
+        Accepts JSON ``<tool_call>{...}</tool_call>`` and Granite 4.2 XML.
         """
-        import regex as re
-        match = self.TOOL_CALL_RE.search(text)
-        if match:
-            try:
-                tool_call_data = json.loads(match.group(1))
-                if "name" in tool_call_data:
-                    return tool_call_data
-            except json.JSONDecodeError:
-                pass
-        return None
+        from atpgllm.training.revert_template import parse_tool_call
+        return parse_tool_call(text)
 
 
     # ------------------------------------------------------------------
@@ -2060,15 +2038,18 @@ class SFTStoppingCallback(TrainerCallback):
         assistant message (with tool call) and the tool response, ready for
         ``apply_chat_template(add_generation_prompt=True)``.
         """
-        from atpgllm.training.revert_template import revert_qwen2_5_template, revert_chat_template
+        from atpgllm.training.revert_template import (
+            get_generation_prompt_suffix,
+            revert_chat_template,
+        )
 
         # Strip the trailing generation prompt suffix before parsing
         clean = original_prompt
-        gen_suffix = "<|im_start|>assistant\n"
-        if clean.endswith(gen_suffix):
+        gen_suffix = get_generation_prompt_suffix(tokenizer=self.tokenizer)
+        if gen_suffix and clean.endswith(gen_suffix):
             clean = clean[: -len(gen_suffix)]
 
-        messages = revert_qwen2_5_template(clean)
+        messages = revert_chat_template(clean, tokenizer=self.tokenizer)
 
         # Content before <tool_call>
         tc_start = first_turn.find("<tool_call>")
