@@ -22,7 +22,7 @@ avoids coupling the reward correction to a separate trainer upgrade.
 For target fault $f=(n,s)$, where $n$ is the fault net and $s\in\{0,1\}$
 is the stuck value, let $\mathbf{x}$ be the generated PI assignment and let
 $\mathrm{Sim}(\mathbf{x},f)$ produce good- and faulty-machine values
-$(g_v,b_v)$ for net $v$.
+$`(g_v,b_v)`$ for net $v$.
 
 Production uses `resolve_fault_sim_runner()` and therefore the configured
 `fast`, `tetramax`, or `hybrid` backend. If TetraMAX reports an authoritative
@@ -47,23 +47,23 @@ All four raw values lie in $[0,1]$.
 
 ### Detection
 
-$$
+```math
 r_{\mathrm{det}}
 =
 \mathbb{I}\!\left[\exists o\in\mathrm{PO}: g_o\neq b_o\right].
-$$
+```
 
 For a TetraMAX-backed call, the corresponding TetraMAX detection result
 replaces the Python PO predicate. This is the highest-priority objective.
 
 ### Fault-site activation
 
-$$
+```math
 r_{\mathrm{act}}
 =
 \mathbb{I}[b_n=s]\,
 \mathbb{I}[g_n\neq b_n].
-$$
+```
 
 Activation is retained when detection is zero. It is the only pre-detection
 shaping objective and supplies physically grounded variation in some all-fail
@@ -73,7 +73,7 @@ groups.
 
 For the parsed claimed good-machine outputs $\hat{\mathbf{y}}$,
 
-$$
+```math
 \rho_{\mathrm{PO}}
 =
 \frac{1}{|\mathrm{PO}|}
@@ -82,28 +82,28 @@ $$
 \mathbb{I}[\hat y_o=g_o],
 \qquad
 r_{\mathrm{fid}}=r_{\mathrm{det}}\rho_{\mathrm{PO}}.
-$$
+```
 
 The denominator is every canonical PO, not only supplied names. Missing and
 invalid values therefore receive no fidelity credit.
 
 ### Interface and format compliance
 
-Let $\rho_{\mathrm{PI}}$ be the fraction of canonical PI names supplied with a
+Let $`\rho_{\mathrm{PI}}`$ be the fraction of canonical PI names supplied with a
 binary value. This is completeness, not agreement with the dataset's one
 reference vector; multiple distinct detecting patterns are valid.
 
-Let $\rho_{\mathrm{struct}}$ be the mean of the available structural checks:
+Let $`\rho_{\mathrm{struct}}`$ be the mean of the available structural checks:
 `<think>`, `<tool_call>`, `<tool_response>`, `INPUT_VECTOR`,
 `EXPECTED_OUTPUT`, and `DETECTED_FAULTS`. Checks whose extractor is not
 configured are omitted. The final objective is
 
-$$
+```math
 r_{\mathrm{fmt}}
 =
 r_{\mathrm{det}}\,
 \frac{\rho_{\mathrm{struct}}+\rho_{\mathrm{PI}}}{2}.
-$$
+```
 
 Both fidelity and format are conditioned on detection, following the paper's
 recommendation to prevent easier objectives from dominating a harder,
@@ -114,19 +114,19 @@ prioritized correctness objective.
 For prompt $i$, rollout $j\in\{1,\ldots,G\}$, and objective
 $k\in\{1,\ldots,K\}$, the implementation first computes
 
-$$
+```math
 Z_{ijk}
 =
 \frac{r_{ijk}-\mu_{ik}}{\sigma_{ik}+\epsilon},
 \qquad
 \epsilon=10^{-4},
-$$
+```
 
-where $\mu_{ik}$ and $\sigma_{ik}$ are the mean and sample standard
+where $`\mu_{ik}`$ and $`\sigma_{ik}`$ are the mean and sample standard
 deviation over valid rollouts for objective $k$ within prompt group $i$.
 Weights are then applied after normalization:
 
-$$
+```math
 u_{ij}
 =
 \sum_k w_k Z_{ijk},
@@ -134,25 +134,25 @@ u_{ij}
 (w_{\mathrm{det}},w_{\mathrm{act}},w_{\mathrm{fid}},w_{\mathrm{fmt}})
 =
 (1.00,0.25,0.20,0.05).
-$$
+```
 
 Finally, over every valid sequence in the globally gathered generation batch
 $\mathcal{B}$,
 
-$$
+```math
 A_{ij}
 =
 \frac{u_{ij}-\operatorname{mean}_{\mathcal{B}}(u)}
 {\operatorname{std}_{\mathcal{B}}(u)+\epsilon}.
-$$
+```
 
 The final normalization is sequence-level: each completion contributes once,
 independent of completion length.
 
 Raw scaling cannot express GDPO priority because a positive multiplicative
-factor is removed by per-objective normalization. The explicit $w_k$ values
+factor is removed by per-objective normalization. The explicit $`w_k`$ values
 are therefore the only cross-objective priorities. A common positive scaling
-of all $w_k$ is mostly canceled by final batch normalization.
+of all $`w_k`$ is mostly canceled by final batch normalization.
 
 ## Degenerate and missing rewards
 
