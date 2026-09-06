@@ -14,6 +14,8 @@ ensure_data_preprocessing_on_path()
 
 from fault_sim import OptimizedNetlist, resolve_fault_sim_runner
 from atpgllm.llm.reward_funcs import (
+    ATPG_GDPO_OBJECTIVE_KEYS,
+    ATPG_GDPO_OBJECTIVE_WEIGHTS,
     extract_json_tool_response_and_convert_to_df,
     extract_markdown_table,
     markdown_table_to_dataframe,
@@ -286,10 +288,10 @@ class RewardFunctionFactory:
         Parameters
         ----------
         return_component_dicts
-            If True, each reward is a component dict from ``test_generation_grpo_reward``; use
-            with :class:`DualAdapterGRPOTrainer`, which sums values for the GRPO loss and logs
-            per-component means. If False (default), returns one scalar per completion (sum of
-            components) for trainers that only accept floats.
+            If True, each reward is a component dict from ``test_generation_grpo_reward``.
+            The custom GRPO trainers recognize the attached GDPO metadata, preserve the four
+            semantic objective columns, and log the remaining ``*_logonly`` diagnostics.
+            If False (default), returns one scalar per completion for legacy callers.
         
         Returns a function with signature:
             reward_fn(prompts, completions, **kwargs) -> List[Dict[str, float]] or List[float]
@@ -360,5 +362,11 @@ class RewardFunctionFactory:
                 ret_rewards = [0.0] * len(prompts)
             
             return ret_rewards
+
+        if return_component_dicts:
+            # Trainer-side GDPO uses this explicit order. Attaching metadata to
+            # the callable avoids treating every diagnostic key as an objective.
+            reward_fn.gdpo_objective_keys = ATPG_GDPO_OBJECTIVE_KEYS
+            reward_fn.gdpo_objective_weights = ATPG_GDPO_OBJECTIVE_WEIGHTS
         
         return reward_fn

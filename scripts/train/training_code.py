@@ -148,6 +148,10 @@ from transformers import AutoTokenizer
 
 from atpgllm.training.tools import TOOLS, fault_simulation_tool_handler
 from atpgllm.training.reward_function_factory import RewardFunctionFactory
+from atpgllm.llm.reward_funcs import (
+    ATPG_GDPO_OBJECTIVE_KEYS,
+    ATPG_GDPO_OBJECTIVE_WEIGHTS,
+)
 from atpgllm.training.callbacks import (
     ThroughputMetricsCallback,
     ContextLengthHistogramCallback,
@@ -490,7 +494,7 @@ def train_with_sft(
             launch_skip_buffer_size=skip_buffer_size,
         ),
     ]
-
+    import code; code.interact(local=dict(globals(), **locals()))
     trainer = SFTTrainer(
         model=model,
         train_dataset=train_dataset,
@@ -747,6 +751,10 @@ def train_with_grpo(
     print("Initializing reward function factory...")
     reward_factory = RewardFunctionFactory(config_path='sim_config.json')
     reward_fn = reward_factory.create_reward_function(return_component_dicts=True)
+    gdpo_priorities = dict(
+        zip(ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS, strict=True)
+    )
+    print(f"[GDPO] normalize-then-sum objectives: {gdpo_priorities}")
     
     # Set up training arguments using GRPOConfig.  RL typically requires more
     # exploration, so use a smaller learning rate and more steps.
@@ -792,15 +800,15 @@ def train_with_grpo(
         # Whether to compute importance sampling ratios at the `"token"` or `"sequence"` level.
         # `"token"`: keeps raw per-token log-probability ratios. 
         # `"sequence"`: averages them across valid tokens into a single ratio per sequence — generally more stable (see GSPO paper).
-        scale_rewards=False, 
+        # The custom trainers perform per-objective group normalization and
+        # final global-batch normalization. A second TRL scaling pass would
+        # corrupt the GDPO advantage.
+        scale_rewards=False,
         # Preserve the netlist-diversity-maximising order produced by
         # buffer_streaming_dataset(maximize_diversity_by="netlist"): the
         # RepeatSampler only keeps dataset order when shuffle_dataset is False
         # (otherwise it re-randomises and destroys the per-batch diversity).
         shuffle_dataset=False,
-        # - `True` or `"group"` (default): rewards are scaled by the standard deviation within each group, ensuring unit variance within a group.
-        # - `"batch"`: rewards are scaled by the standard deviation across the entire batch
-        # - `False` or `"none"`: no scaling is applied. The [Dr. GRPO paper] recommends not scaling rewards, as scaling by the standard deviation introduces a question-level difficulty bias.
         # Logging options
         log_completions=True,
         num_completions_to_print=10,

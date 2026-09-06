@@ -25,12 +25,23 @@ warnings.filterwarnings("ignore")
 # (see ``train_scalar_from_reward_components`` and DualAdapterGRPOTrainer reward parsing).
 REWARD_LOGONLY_SUFFIX = "_logonly"
 
+# GDPO priorities are applied after each objective is normalized. Raw reward
+# magnitudes therefore do not encode cross-objective importance.
+ATPG_GDPO_OBJECTIVE_KEYS = ("detection", "activation", "fidelity", "format")
+ATPG_GDPO_OBJECTIVE_WEIGHTS = (1.0, 0.25, 0.20, 0.05)
+
 
 def train_scalar_from_reward_components(components: Dict[str, float]) -> float:
-  """Training scalar: sum all components except ``*_logonly`` monitor-only entries."""
-  return float(
-    sum(v for k, v in components.items() if not str(k).endswith(REWARD_LOGONLY_SUFFIX))
+  """Weighted scalar fallback for callers that cannot consume GDPO objectives."""
+  objective_weights = dict(
+    zip(ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS)
   )
+  total = 0.0
+  for key, value in components.items():
+    if str(key).endswith(REWARD_LOGONLY_SUFFIX):
+      continue
+    total += float(value) * objective_weights.get(key, 1.0)
+  return float(total)
 
 
 def extract_json_tool_response_and_convert_to_df(text: str) -> Optional[pd.DataFrame]:
@@ -171,47 +182,60 @@ def _po_prediction_score(
   except Exception:
     return 0.0, len(po_rows)
   ok = 0
-  total = 0
+  supplied = 0
   for po, row in po_rows.iterrows():
     if po not in pred:
       continue
-    total += 1
+    supplied += 1
     sim_g = _cell_to_int(row["Good Machine"])
     if sim_g is None:
       continue
-    if int(pred[po]) == sim_g:
+    try:
+      pred_value = int(pred[po])
+    except (TypeError, ValueError):
+      continue
+    if pred_value == sim_g:
       ok += 1
-  denom = total if total else len(po_rows)
-  return (ok / denom) if denom else 0.0, total
+  # Missing outputs are incorrect; scoring only the supplied subset lets a
+  # one-output answer claim perfect fidelity on a multi-output design.
+  denom = len(po_rows)
+  return (ok / denom) if denom else 0.0, supplied
 
 
 def _pi_assignment_score(
-    simulation_df: pd.DataFrame, pred_input_vector: str
+    simulation_df: pd.DataFrame,
+    pred_input_vector: str,
+    required_inputs: Optional[List[str]] = None,
 ) -> Tuple[float, int]:
-  """Fraction of PIs where INPUT_VECTOR matches simulated good machine."""
-  if simulation_df is None or "PIs" not in simulation_df.columns:
-    return 0.0, 0
-  pi_rows = simulation_df.loc[simulation_df["PIs"]]
-  if pi_rows.empty:
+  """Fraction of canonical PIs supplied with valid binary values."""
+  if simulation_df is None:
     return 0.0, 0
   sep = ":" if ":" in pred_input_vector else "="
   try:
     pred = convert_string_to_dict(pred_input_vector, sep=sep)
   except Exception:
-    return 0.0, len(pi_rows)
+    return 0.0, len(required_inputs or [])
+
+  if required_inputs is None:
+    if "PIs" not in simulation_df.columns:
+      return 0.0, 0
+    required_inputs = list(simulation_df.index[simulation_df["PIs"]])
+  if not required_inputs:
+    return 0.0, 0
+
   ok = 0
-  total = 0
-  for pi, row in pi_rows.iterrows():
+  supplied = 0
+  for pi in required_inputs:
     if pi not in pred:
       continue
-    total += 1
-    sim_g = _cell_to_int(row["Good Machine"])
-    if sim_g is None:
+    supplied += 1
+    try:
+      value = int(pred[pi])
+    except (TypeError, ValueError):
       continue
-    if int(pred[pi]) == sim_g:
+    if value in (0, 1):
       ok += 1
-  denom = total if total else len(pi_rows)
-  return (ok / denom) if denom else 0.0, total
+  return ok / len(required_inputs), supplied
 
 
 def _tool_response_po_consistency_bonus(completion: str, simulation_df: pd.DataFrame) -> float:
@@ -261,35 +285,12 @@ def _mentions_target_fault(text: str, fault: str, fault_net: str) -> float:
 
 def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> List[Dict[str, float]]:
   """
-  GRPO-oriented reward for ATPG-style completions: learn a test vector that *detects* the target fault.
+  ATPG reward with four explicit GDPO objectives.
 
-  Authoritative signal: the fault simulator (``fault_sim`` / ``fast_fault_sim``) on the model's
-  ``INPUT_VECTOR`` and ``EXPECTED_OUTPUT``.
-
-  **Training scalar** — DualAdapterGRPOTrainer sums all numeric values except keys ending in
-  ``_logonly`` (dashboard-only). Prefer tuning the documented ``reward_weight_*`` kwargs.
-
-  Main train components:
-
-  - **fault_detect_inpvector** — binary detection plus *dense* PO observability (fraction of POs
-    where good≠bad) and *shaped* fault-site score (partial credit when bad matches stuck-at).
-  - **expected_output** / **input_vector** — weighted PO/PI match plus optional perfect-match bonus.
-  - **fault_simulation** — tool JSON ``<tool_response>`` PO consistency vs gold simulation.
-  - **detected_faults** — mention of target fault in ``DETECTED_FAULTS`` plus optional perfect bonus.
-  - **pred_simulation** — weighted accuracy of completion simulation table vs gold (if present).
-  - **format** / **sim_table_bonus** — template and JSON-table shaping.
-
-  Keys ending with ``_logonly`` mirror discrete accuracies for W&B only (not in the policy loss).
-
-  Optional kwargs include ``reward_weight_fault_detected_po`` (12), ``reward_weight_fault_site`` (4),
-  ``reward_weight_po_obs`` (2.5), ``reward_site_partial_credit`` (0.38),
-  ``reward_weight_po_match`` (5), ``reward_weight_pi_match`` (3),
-  ``reward_perfect_po_bonus`` / ``reward_perfect_pi_bonus`` / ``reward_perfect_mention_bonus`` (1),
-  ``reward_weight_pred_table`` (2.75), ``reward_pred_table_acc_bias`` (0.2;
-  train term is ``weight * max(0, acc - bias)``), ``reward_weight_tool_json_bonus`` (1),
-  ``reward_weight_fault_mention`` (1.5), ``reward_format_weight`` (0.12).
-
-  Returns per-completion component dicts (trainer sums train keys only).
+  ``detection`` is the authoritative functional objective. ``activation`` is
+  the only pre-detection progress signal. ``fidelity`` and ``format`` are
+  conditioned on detection so easy reporting proxies cannot train the policy
+  independently. Keys ending in ``_logonly`` are diagnostics only.
   """
   netlists = kwargs.get("netlists", None)
   if netlists is None:
@@ -328,40 +329,23 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
     if fault_sim_runner is None:
       raise ValueError("fault_sim function must be provided when using lib_gate_funcs")
 
-  w_detect = float(kwargs.get("reward_weight_fault_detected_po", 12.0))
-  w_site = float(kwargs.get("reward_weight_fault_site", 4.0))
-  w_po_obs = float(kwargs.get("reward_weight_po_obs", 2.5))
-  site_partial = float(kwargs.get("reward_site_partial_credit", 0.38))
-  w_po = float(kwargs.get("reward_weight_po_match", 5.0))
-  w_pi = float(kwargs.get("reward_weight_pi_match", 3.0))
-  w_tool_json = float(kwargs.get("reward_weight_tool_json_bonus", 1.0))
-  w_fault_mention = float(kwargs.get("reward_weight_fault_mention", 1.5))
-  w_pred_table = float(kwargs.get("reward_weight_pred_table", 2.75))
-  pred_table_acc_bias = float(kwargs.get("reward_pred_table_acc_bias", 0.2))
-  perfect_po = float(kwargs.get("reward_perfect_po_bonus", 1.0))
-  perfect_pi = float(kwargs.get("reward_perfect_pi_bonus", 1.0))
-  perfect_mention = float(kwargs.get("reward_perfect_mention_bonus", 1.0))
-  format_weight = float(kwargs.get("reward_format_weight", 0.12))
-  # Shaping credit earned when the fault is NOT actually detected is
-  # attenuated to this fraction, so the true binary detection dominates the scalar.
-  undetected_scale = float(kwargs.get("reward_undetected_shaping_scale", 0.2))
-
   rewards: List[Dict[str, float]] = []
   module_names = kwargs.get("module_name") or []
 
   for idx, (prompt, completion, netlist) in enumerate(zip(prompts, completions, netlists)):
-    # Keys are non-overlapping so sum(...) is a well-defined total (GRPO / logging).
     out: Dict[str, float] = {
+      "detection": 0.0,
+      "activation": 0.0,
+      "fidelity": 0.0,
       "format": 0.0,
-      "fault_detect_inpvector": 0.0,
-      "fault_simulation": 0.0,
-      "expected_output": 0.0,
-      "input_vector": 0.0,
-      "detected_faults": 0.0,
-      "pred_simulation": 0.0,
-      "sim_table_bonus": 0.0,
+      "format_compliance_logonly": 0.0,
+      "pi_completeness_logonly": 0.0,
+      "tool_response_fidelity_logonly": 0.0,
+      "fault_mention_logonly": 0.0,
+      "sim_table_present_logonly": 0.0,
       "pred_vs_fault_sim_acc_logonly": 0.0,
       "fault_detected_by_pred_input_vector_acc_logonly": 0.0,
+      "fault_site_activated_acc_logonly": 0.0,
       "expected_output_acc_logonly": 0.0,
       "input_vector_acc_logonly": 0.0,
       "detected_faults_acc_logonly": 0.0,
@@ -373,45 +357,52 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
       fault, net = fault_info[0]
     stuck_at = int(fault[-1]) if fault else -1
 
-    # Light format shaping (optional extractors)
+    format_checks: List[float] = []
     for fn in (thinking_fn, tool_call_fn, tool_response_fn):
       if fn is not None:
         try:
-          out["format"] += format_weight if fn(completion) else -0.35
+          format_checks.append(float(bool(fn(completion))))
         except Exception:
-          out["format"] -= 0.35
+          format_checks.append(0.0)
 
     pred_input = (input_vector_fn(completion) or [None])[0]
     pred_output = (expected_output_fn(completion) or [None])[0]
     pred_faults = (detected_faults_fn(completion) or [None])[0]
 
-    if pred_input:
-      out["format"] += format_weight
-    else:
-      out["format"] -= 0.5
-    if pred_output:
-      out["format"] += format_weight
-    else:
-      out["format"] -= 0.5
-    if pred_faults:
-      out["format"] += format_weight
-    else:
-      out["format"] -= 0.5
+    format_checks.extend(
+      [float(bool(pred_input)), float(bool(pred_output)), float(bool(pred_faults))]
+    )
+    format_score = (
+      sum(format_checks) / len(format_checks) if format_checks else 0.0
+    )
+    out["format_compliance_logonly"] = format_score
 
     sim_from_completion = _simulation_table_from_completion(completion, simulation_fn)
     if sim_from_completion is not None:
-      out["sim_table_bonus"] = 0.35
+      out["sim_table_present_logonly"] = 1.0
 
-    if not (fault and net and pred_input and pred_output and netlist):
+    if not (fault and net and pred_input and netlist):
       rewards.append(out)
       continue
 
     mod_name = module_names[idx] if idx < len(module_names) else None
+    canonical_outputs = list(getattr(netlist, "output_nets", []) or [])
+    canonical_inputs = list(getattr(netlist, "input_nets", []) or [])
+    # Values are placeholders only. fast_fault_sim uses these canonical names
+    # to mark POs and computes their values from the circuit.
+    simulation_outputs: Any
+    if canonical_outputs:
+      simulation_outputs = {po: 0 for po in canonical_outputs}
+    elif pred_output:
+      simulation_outputs = pred_output
+    else:
+      rewards.append(out)
+      continue
 
     try:
       result = fault_sim_runner(
         pred_input,
-        pred_output,
+        simulation_outputs,
         f"{fault} {net}",
         netlist,
         gate_func,
@@ -435,25 +426,32 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
     else:
       detected = _fault_detected_at_pos(fault_simulation)
     site_ok = _fault_site_activated(fault_simulation, net, stuck_at)
-    po_score, _ = _po_prediction_score(fault_simulation, pred_output)
-    pi_score, _ = _pi_assignment_score(fault_simulation, pred_input)
+    po_score, _ = (
+      _po_prediction_score(fault_simulation, pred_output)
+      if pred_output
+      else (0.0, 0)
+    )
+    pi_score, _ = _pi_assignment_score(
+      fault_simulation,
+      pred_input,
+      required_inputs=canonical_inputs or None,
+    )
 
     tool_bonus = _tool_response_po_consistency_bonus(completion, fault_simulation)
     mention = _mentions_target_fault(pred_faults, fault, net) if pred_faults else 0.0
 
     detected_f = float(detected)
     site_ok_f = float(site_ok)
-    # When the fault is genuinely detected, pay full shaping; otherwise damp it so
-    # "looks-right-but-doesn't-detect" completions can't out-score real detections.
-    shaping = 1.0 if detected else undetected_scale
 
-    out["fault_detect_inpvector"] = w_detect * detected_f + w_site * site_ok_f * shaping
-    out["fault_detected_by_pred_input_vector_acc_logonly"] = 1. if detected and site_ok else 0.
-
-    out["expected_output"] = (w_po * po_score + (perfect_po if po_score >= 0.999 else 0.0)) * shaping
-    out["input_vector"] = (w_pi * pi_score + (perfect_pi if pi_score >= 0.999 else 0.0)) * shaping
-    out["fault_simulation"] = w_tool_json * tool_bonus
-    out["detected_faults"] = (w_fault_mention * mention + (perfect_mention if mention >= 0.99 else 0.0)) * shaping
+    out["detection"] = detected_f
+    out["activation"] = site_ok_f
+    out["fidelity"] = detected_f * po_score
+    out["format"] = detected_f * (0.5 * format_score + 0.5 * pi_score)
+    out["fault_detected_by_pred_input_vector_acc_logonly"] = detected_f
+    out["fault_site_activated_acc_logonly"] = site_ok_f
+    out["pi_completeness_logonly"] = pi_score
+    out["tool_response_fidelity_logonly"] = min(1.0, tool_bonus / 1.5)
+    out["fault_mention_logonly"] = mention
     out["expected_output_acc_logonly"] = 1.0 if po_score >= 0.999 else 0.0
     out["input_vector_acc_logonly"] = 1.0 if pi_score >= 0.999 else 0.0
     out["detected_faults_acc_logonly"] = 1.0 if mention >= 0.99 else 0.0
@@ -473,8 +471,6 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
         if matches:
           acc = sum(matches) / len(matches)
           out["pred_vs_fault_sim_acc_logonly"] = acc
-          # Single train signal (old sum used both raw acc and 3*(acc-0.5), double-counting).
-          out["pred_simulation"] = w_pred_table * max(0.0, acc - pred_table_acc_bias)
       except Exception:
         pass
 

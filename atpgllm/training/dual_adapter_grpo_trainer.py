@@ -66,7 +66,6 @@ from peft import LoraConfig, PeftModel
 from peft.tuners.lora import LoraLayer
 from trl import GRPOTrainer, GRPOConfig
 import copy
-import math
 from atpgllm.training.tools import TOOLS, ToolHelper
 from atpgllm.training.revert_template import (
     parse_tool_call as parse_tool_call_text,
@@ -74,7 +73,12 @@ from atpgllm.training.revert_template import (
     revert_chat_template,
     stringify_tool_arguments_for_template,
 )
-from atpgllm.llm.reward_funcs import REWARD_LOGONLY_SUFFIX, train_scalar_from_reward_components
+from atpgllm.llm.reward_funcs import REWARD_LOGONLY_SUFFIX
+from atpgllm.training.gdpo import (
+    compute_gdpo_advantages,
+    reward_output_to_tensors,
+    select_objective_columns,
+)
 
 # Adapter name constants
 REFERENCE_ADAPTER_NAME = "reference"
@@ -723,41 +727,43 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         self, output_reward_func: list, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[str] | None]:
         """
-        Convert reward function output into per-row scalar totals (for GRPO) and an optional
-        per-row, per-component matrix for dashboard metrics.
-
-        Dict outputs: the training scalar sums values for all keys **except** those whose names
-        end with ``_logonly`` (monitor-only metrics; see ``train_scalar_from_reward_components``).
+        Convert reward output into a temporary scalar diagnostic and an optional
+        per-row component matrix. For ATPG component dictionaries, the matrix is
+        subsequently converted to GDPO advantages; the temporary sum is not used
+        by the policy loss.
 
         Supports:
           - list[float] / list of numeric scalars (legacy)
           - list[dict[str, float]] from :func:`test_generation_grpo_reward` (via factory)
         """
-        row_scalars: list[float] = []
-        first_dict: dict | None = next((r for r in output_reward_func if isinstance(r, dict)), None)
-        if first_dict is None:
-            for r in output_reward_func:
-                if r is None or (isinstance(r, float) and math.isnan(r)):
-                    row_scalars.append(float("nan"))
-                else:
-                    row_scalars.append(float(r))
-            return torch.tensor(row_scalars, dtype=torch.float32, device=device), None, None
+        return reward_output_to_tensors(
+            output_reward_func,
+            device,
+            logonly_suffix=REWARD_LOGONLY_SUFFIX,
+        )
 
-        keys = sorted(first_dict.keys())
-
-        rows: list[list[float]] = []
-        for r in output_reward_func:
-            if isinstance(r, dict):
-                row_scalars.append(train_scalar_from_reward_components(r))
-                rows.append([float(r.get(k, 0.0)) for k in keys])
-            elif r is None or (isinstance(r, float) and math.isnan(r)):
-                row_scalars.append(float("nan"))
-                rows.append([float("nan")] * len(keys))
-            else:
-                row_scalars.append(float(r))
-                rows.append([float("nan")] * len(keys))
-        comp_mat = torch.tensor(rows, dtype=torch.float32, device=device)
-        return torch.tensor(row_scalars, dtype=torch.float32, device=device), comp_mat, keys
+    def _log_gdpo_diagnostics(self, result, objective_keys: list[str]) -> None:
+        """Log objective activity and final global advantage scale."""
+        metrics_root = getattr(self, "_metrics", None)
+        if metrics_root is None:
+            return
+        mode = "train" if self.model.training else "eval"
+        bucket = metrics_root.setdefault(mode, {})
+        for idx, key in enumerate(objective_keys):
+            active = result.active_group_objectives[:, idx].float().mean().item()
+            bucket.setdefault(f"gdpo/objective_active_fraction/{key}", []).append(active)
+        valid_advantages = result.advantages[result.valid_rows]
+        mean = valid_advantages.mean().item() if valid_advantages.numel() else 0.0
+        std = (
+            valid_advantages.std(unbiased=True).item()
+            if valid_advantages.numel() > 1
+            else 0.0
+        )
+        bucket.setdefault("gdpo/advantage_mean", []).append(mean)
+        bucket.setdefault("gdpo/advantage_std", []).append(std)
+        bucket.setdefault("gdpo/missing_row_fraction", []).append(
+            (~result.valid_rows).float().mean().item()
+        )
 
     def _log_reward_component_means(
         self, comp_mat: torch.Tensor, keys: list[str], reward_func_name: str
@@ -853,7 +859,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         rescuable_frac = None
         graded_cols = [
             key_idx[k]
-            for k in ("fault_detect_inpvector", "input_vector", "expected_output")
+            for k in ("activation", "fidelity", "format")
             if k in key_idx
         ]
         n_all_fail = int(all_fail.sum().item())
@@ -981,6 +987,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         reward_kwargs["trainer_state"] = self.state
 
         async_funcs_info = []
+        gdpo_payload = None
         
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names, strict=True)
@@ -1021,6 +1028,32 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     rewards_per_func[:, i] = scalars
                     if comp_mat is not None and comp_keys is not None:
                         self._log_reward_component_means(comp_mat, comp_keys, reward_func_name)
+                        objective_keys = getattr(
+                            reward_func, "gdpo_objective_keys", None
+                        )
+                        objective_weights = getattr(
+                            reward_func, "gdpo_objective_weights", None
+                        )
+                        if objective_keys and objective_weights:
+                            if len(self.reward_funcs) != 1:
+                                raise ValueError(
+                                    "ATPG GDPO component rewards must be the only reward function"
+                                )
+                            selected_objectives = select_objective_columns(
+                                comp_mat, comp_keys, objective_keys
+                            )
+                            scalars = selected_objectives @ torch.as_tensor(
+                                objective_weights,
+                                dtype=torch.float32,
+                                device=device,
+                            )
+                            rewards_per_func[:, i] = scalars
+                            gdpo_payload = (
+                                i,
+                                selected_objectives,
+                                list(objective_keys),
+                                list(objective_weights),
+                            )
                         self._log_group_sampling_diagnostics(
                             scalars, comp_mat, comp_keys, reward_func_name
                         )
@@ -1059,6 +1092,33 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     self._log_reward_component_means(
                         comp_mat, comp_keys, reward_func_name
                     )
+                    reward_func = self.reward_funcs[idx]
+                    objective_keys = getattr(
+                        reward_func, "gdpo_objective_keys", None
+                    )
+                    objective_weights = getattr(
+                        reward_func, "gdpo_objective_weights", None
+                    )
+                    if objective_keys and objective_weights:
+                        if len(self.reward_funcs) != 1:
+                            raise ValueError(
+                                "ATPG GDPO component rewards must be the only reward function"
+                            )
+                        selected_objectives = select_objective_columns(
+                            comp_mat, comp_keys, objective_keys
+                        )
+                        scalars = selected_objectives @ torch.as_tensor(
+                            objective_weights,
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                        rewards_per_func[:, idx] = scalars
+                        gdpo_payload = (
+                            idx,
+                            selected_objectives,
+                            list(objective_keys),
+                            list(objective_weights),
+                        )
                     self._log_group_sampling_diagnostics(
                         scalars, comp_mat, comp_keys, reward_func_name
                     )
@@ -1078,6 +1138,27 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 
         # Gather across DDP ranks — rewards must be global for per-group normalisation
         rewards_per_func = gather(rewards_per_func)
+        if gdpo_payload is not None:
+            if self.scale_rewards not in (False, "none"):
+                raise ValueError(
+                    "ATPG GDPO performs both normalization stages; set scale_rewards=False"
+                )
+            reward_index, local_objectives, objective_keys, objective_weights = (
+                gdpo_payload
+            )
+            global_objectives = gather(local_objectives)
+            num_generations = (
+                self.num_generations
+                if self.model.training
+                else self.num_generations_eval
+            )
+            gdpo_result = compute_gdpo_advantages(
+                global_objectives,
+                num_generations,
+                objective_weights,
+            )
+            rewards_per_func[:, reward_index] = gdpo_result.advantages
+            self._log_gdpo_diagnostics(gdpo_result, objective_keys)
         return rewards_per_func
 
     def _generate(self, prompts: list):

@@ -1,3 +1,23 @@
+"""Graph-conditioned SFT and GRPO integration."""
+
+from .data import (  # noqa: F401
+    GraphPromptExample,
+    build_graph_prompt_example,
+    build_multimodal_sft_batch,
+)
+from .grpo import graph_grpo_loss, group_relative_advantages  # noqa: F401
+from .loading import load_aligned_graph_stack  # noqa: F401
+from .model import GraphConditionedCausalLM  # noqa: F401
+
+__all__ = [
+    "GraphConditionedCausalLM",
+    "GraphPromptExample",
+    "build_graph_prompt_example",
+    "build_multimodal_sft_batch",
+    "graph_grpo_loss",
+    "group_relative_advantages",
+    "load_aligned_graph_stack",
+]
 """
 Reserved package for cross-modal integration of ``atpgllm.llm`` and
 ``atpgllm.graph``.
