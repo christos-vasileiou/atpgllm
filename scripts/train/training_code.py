@@ -494,7 +494,7 @@ def train_with_sft(
             launch_skip_buffer_size=skip_buffer_size,
         ),
     ]
-    import code; code.interact(local=dict(globals(), **locals()))
+    
     trainer = SFTTrainer(
         model=model,
         train_dataset=train_dataset,
@@ -774,8 +774,9 @@ def train_with_grpo(
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=5e-6,
         max_steps=max_steps,
-        logging_steps=5,
-        save_steps=10,
+        logging_steps=1,
+        save_steps=1,
+        logging_first_step=True,
         bf16=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},

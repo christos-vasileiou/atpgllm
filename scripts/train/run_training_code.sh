@@ -123,8 +123,36 @@ source "$CONFIG_FILE"
 
 METHOD=${METHOD:-sft}
 
+# Resolve RESUME_FROM=latest -> newest checkpoint-* under OUTPUT_DIR.
+# Must run before validate_grpo_resume and the W&B launch snapshot.
+if [ "${RESUME_FROM:-}" = "latest" ]; then
+    _out="$OUTPUT_DIR"
+    if [ ! -d "$_out" ] && [ -n "${OUTPUT_DIR:-}" ]; then
+        if [ -d "$_REPO_ROOT/$OUTPUT_DIR" ]; then
+            _out="$_REPO_ROOT/$OUTPUT_DIR"
+        elif [ -d "$_SCRIPT_DIR/$OUTPUT_DIR" ]; then
+            _out="$_SCRIPT_DIR/$OUTPUT_DIR"
+        fi
+    fi
+    if [ -z "${OUTPUT_DIR:-}" ] || [ ! -d "$_out" ]; then
+        echo "ERROR: RESUME_FROM=latest but OUTPUT_DIR is missing or does not exist: ${OUTPUT_DIR:-(empty)}"
+        echo "       (tried: $OUTPUT_DIR, $_REPO_ROOT/$OUTPUT_DIR, and $_SCRIPT_DIR/$OUTPUT_DIR; cwd=$(pwd))"
+        exit 1
+    fi
+    _latest="$(
+        find "$_out" -maxdepth 1 -mindepth 1 -type d -name 'checkpoint-*' 2>/dev/null \
+            | sort -V | tail -n1
+    )"
+    if [ -z "$_latest" ]; then
+        echo "ERROR: RESUME_FROM=latest but no checkpoint-* directories under: $_out"
+        exit 1
+    fi
+    RESUME_FROM="$_latest"
+    echo "Resolved RESUME_FROM=latest -> $RESUME_FROM"
+fi
+
 # Resolve RESUME_FROM relative to repo root / legacy tests/ when needed.
-if [ -n "${RESUME_FROM:-}" ] && [ "$RESUME_FROM" != "None" ] && [ ! -d "$RESUME_FROM" ]; then
+if [ -n "${RESUME_FROM:-}" ] && [ "$RESUME_FROM" != "None" ] && [ "$RESUME_FROM" != "latest" ] && [ ! -d "$RESUME_FROM" ]; then
     if [ -d "$_REPO_ROOT/$RESUME_FROM" ]; then
         RESUME_FROM="$_REPO_ROOT/$RESUME_FROM"
         echo "Resolved RESUME_FROM -> $RESUME_FROM"
