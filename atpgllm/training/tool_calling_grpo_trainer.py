@@ -46,7 +46,8 @@ from contextlib import nullcontext
 from atpgllm.training.revert_template import (
     parse_tool_call as parse_tool_call_text,
     revert_assistant_completion,
-    revert_chat_template,
+    revert_generation_prompt,
+    restore_generation_prefix,
     stringify_tool_arguments_for_template,
 )
 from atpgllm.training.tools import TOOLS, ToolHelper
@@ -56,9 +57,10 @@ from atpgllm.training.gdpo import (
     reward_output_to_tensors,
     select_objective_columns,
 )
+from atpgllm.training.grpo_loss import GenerationBatchLossMixin
 
 
-class ToolCallingGRPOTrainer(GRPOTrainer):
+class ToolCallingGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
     """
     GRPOTrainer with multi-turn ``<tool_call>...</tool_call>`` support.
 
@@ -393,6 +395,11 @@ class ToolCallingGRPOTrainer(GRPOTrainer):
             )
 
         rewards_per_func = gather(rewards_per_func)
+        mode = "train" if self.model.training else "eval"
+        for index, name in enumerate(self.reward_func_names):
+            self._metrics[mode].setdefault(f"rewards/{name}/raw_mean", []).append(
+                float(torch.nanmean(rewards_per_func[:, index]).item())
+            )
         if gdpo_payload is not None:
             if self.scale_rewards not in (False, "none"):
                 raise ValueError(
@@ -423,7 +430,7 @@ class ToolCallingGRPOTrainer(GRPOTrainer):
         generation_start_time = time.perf_counter()
 
         prompts = [
-            revert_chat_template(prompt, tokenizer=self.processing_class)
+            revert_generation_prompt(prompt, tokenizer=self.processing_class)
             for prompt in prompts
         ]
         prompts = copy.deepcopy(prompts)
@@ -436,7 +443,9 @@ class ToolCallingGRPOTrainer(GRPOTrainer):
 
             if is_conversational({"prompt": prompts[0]}):
                 contents = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-                completions = [[{"role": "assistant", "content": content}] for content in contents]
+                completions = [[{"role": "assistant", "content": restore_generation_prefix(
+                    content, self.processing_class, self.chat_template_kwargs
+                )}] for content in contents]
             else:
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
                 completions = [
@@ -732,7 +741,9 @@ class ToolCallingGRPOTrainer(GRPOTrainer):
             for i, idx in enumerate(idxs_with_tool):
                 if post_tool_texts[i]:
                     post_tool_msg = revert_assistant_completion(
-                        post_tool_texts[i], tokenizer=self.processing_class
+                        restore_generation_prefix(post_tool_texts[i], self.processing_class,
+                                                  self.chat_template_kwargs),
+                        tokenizer=self.processing_class
                     )
                     if isinstance(completions[idx], list):
                         if isinstance(post_tool_msg, list) and isinstance(post_tool_msg[0], dict):

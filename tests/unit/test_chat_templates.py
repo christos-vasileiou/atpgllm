@@ -258,3 +258,47 @@ def test_patch_real_granite42_jinja_if_cached():
     assert tok.chat_template.count("{%- generation %}") == 4
     assert get_generation_prompt_suffix(tokenizer=tok) == "<|im_start|>assistant\n<think>\n"
     assert patch_chat_template_for_assistant_mask(tok) is False
+
+
+def test_generation_prompt_removes_only_the_open_assistant_placeholder():
+    from atpgllm.training.revert_template import revert_generation_prompt
+
+    history = ("<|im_start|>user\nquestion<|im_end|>\n"
+               "<|im_start|>assistant\n<think>real reasoning</think>answer<|im_end|>\n"
+               "<|im_start|>user\nfollowup<|im_end|>\n")
+    for suffix in ("<|im_start|>assistant\n<think>\n",
+                   "<|im_start|>assistant\n<think></think>", "<|im_start|>assistant\n"):
+        messages = revert_generation_prompt(history + suffix, _Tok(_GRANITE42_STUB))
+        assert [row["role"] for row in messages] == ["user", "assistant", "user"]
+        assert "real reasoning" in messages[1]["content"]
+    structured = [{"role": "user", "content": "hello"}]
+    copied = revert_generation_prompt(structured)
+    copied[0]["content"] = "changed"
+    assert structured[0]["content"] == "hello"
+
+
+def test_real_granite42_prompt_and_tool_prefix_preservation():
+    import pytest
+    from transformers import AutoTokenizer
+    from atpgllm.training.revert_template import revert_generation_prompt, restore_generation_prefix
+
+    checkpoint = Path(__file__).resolve().parents[2] / "runs/sft_granite_4.2_8b/checkpoint-200"
+    if not (checkpoint / "tokenizer_config.json").exists():
+        pytest.skip("Local Granite SFT tokenizer is not available")
+    tokenizer = AutoTokenizer.from_pretrained(str(checkpoint), local_files_only=True)
+    original = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Test sa0 y[16]."}], tokenize=False, add_generation_prompt=True)
+    messages = revert_generation_prompt(original, tokenizer)
+    rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    assert rendered == original
+    assert tokenizer.encode(rendered) == tokenizer.encode(original)
+    assert rendered.count("<|im_start|>assistant") == 1
+    # Restore the template-owned thought opening before rebuilding tool history.
+    generated = 'Check the fault.</think>\n<tool_call>{"name":"sim","arguments":{}}</tool_call>'
+    content = restore_generation_prefix(generated, tokenizer)
+    messages += [{"role": "assistant", "content": content}, {"role": "tool", "content": "detected"}]
+    continued = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prefix = tokenizer.encode(original + generated + "<|im_end|>\n", add_special_tokens=False)
+    actual = tokenizer.encode(continued, add_special_tokens=False)
+    assert actual[:len(prefix)] == prefix
+    assert continued.count("<|im_start|>assistant") == 2

@@ -331,6 +331,7 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
 
   rewards: List[Dict[str, float]] = []
   module_names = kwargs.get("module_name") or []
+  dataset_faults = kwargs.get("fault")
 
   for idx, (prompt, completion, netlist) in enumerate(zip(prompts, completions, netlists)):
     out: Dict[str, float] = {
@@ -349,9 +350,20 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
       "expected_output_acc_logonly": 0.0,
       "input_vector_acc_logonly": 0.0,
       "detected_faults_acc_logonly": 0.0,
+      "simulation_valid_logonly": 0.0,
+      "simulator_error_logonly": 0.0,
     }
 
-    fault_info = fault_fn(prompt)
+    dataset_fault = None
+    if isinstance(dataset_faults, str):
+      dataset_fault = dataset_faults
+    elif dataset_faults is not None and idx < len(dataset_faults):
+      dataset_fault = dataset_faults[idx]
+    fault_info = (
+      fault_fn(prompt, fault=dataset_fault)
+      if dataset_fault
+      else fault_fn(prompt)
+    )
     fault, net = (None, None)
     if fault_info:
       fault, net = fault_info[0]
@@ -411,15 +423,19 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
       )
       fault_simulation, _fault_sim_rewards = result
     except Exception:
+      out["simulator_error_logonly"] = 1.0
       rewards.append(out)
       continue
 
     if not isinstance(fault_simulation, pd.DataFrame) or fault_simulation.empty:
+      out["simulator_error_logonly"] = 1.0
       rewards.append(out)
       continue
     if "error" in fault_simulation.columns:
+      out["simulator_error_logonly"] = 1.0
       rewards.append(out)
       continue
+    out["simulation_valid_logonly"] = 1.0
 
     if _fault_sim_rewards.get("tetramax_available"):
       detected = bool(_fault_sim_rewards.get("tetramax_detected"))
@@ -534,4 +550,3 @@ if __name__ == "__main__":
     detected_faults_re
   )
   print(f"Test Generation: {rewards}")
-

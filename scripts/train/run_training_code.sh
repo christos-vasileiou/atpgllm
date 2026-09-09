@@ -123,7 +123,7 @@ source "$CONFIG_FILE"
 
 METHOD=${METHOD:-sft}
 
-# Resolve RESUME_FROM=latest -> newest checkpoint-* under OUTPUT_DIR.
+# Resolve RESUME_FROM=latest -> most recently completed resumable checkpoint.
 # Must run before validate_grpo_resume and the W&B launch snapshot.
 if [ "${RESUME_FROM:-}" = "latest" ]; then
     _out="$OUTPUT_DIR"
@@ -139,12 +139,8 @@ if [ "${RESUME_FROM:-}" = "latest" ]; then
         echo "       (tried: $OUTPUT_DIR, $_REPO_ROOT/$OUTPUT_DIR, and $_SCRIPT_DIR/$OUTPUT_DIR; cwd=$(pwd))"
         exit 1
     fi
-    _latest="$(
-        find "$_out" -maxdepth 1 -mindepth 1 -type d -name 'checkpoint-*' 2>/dev/null \
-            | sort -V | tail -n1
-    )"
-    if [ -z "$_latest" ]; then
-        echo "ERROR: RESUME_FROM=latest but no checkpoint-* directories under: $_out"
+    if ! _latest="$(python "$_REPO_ROOT/atpgllm/training/checkpoints.py" "$_out")"; then
+        echo "ERROR: RESUME_FROM=latest found no completed resumable checkpoint under: $_out"
         exit 1
     fi
     RESUME_FROM="$_latest"
@@ -250,7 +246,10 @@ write_launch_config_snapshot() {
         PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS MAX_STEPS REPORT_TO
         MAX_MODEL_LEN MAX_PROMPT_LENGTH MAX_COMPLETION_LENGTH
         ASSISTANT_ONLY_LOSS BUFFER_SIZE NUM_GENERATIONS STEPS_PER_GENERATION
-        NETLIST_DIVERSITY_STRATEGY
+        NETLIST_DIVERSITY_STRATEGY DISABLE_DROPOUT VLLM_IMPORTANCE_SAMPLING_MODE
+        GRPO_LEARNING_RATE GRPO_WARMUP_STEPS FIXED_EVAL_SIZE FIXED_EVAL_SPLIT
+        FIXED_EVAL_MANIFEST FIXED_EVAL_SEED FIXED_EVAL_STEPS
+        FIXED_EVAL_GENERATIONS FIXED_EVAL_BATCH_SIZE
         USE_DUAL_ADAPTER USE_DDP USE_VLLM VLLM_MODE PORT
         TENSOR_PARALLEL_SIZE DATA_PARALLEL_SIZE VLLM_GPU_MEM_UTIL
         PARTITION NUM_NODES GPUS_PER_NODE CPUS_PER_TASK MEM
@@ -433,7 +432,28 @@ build_cmd_args() {
             --num_generations "$NUM_GENERATIONS"
             --steps_per_generation "$STEPS_PER_GENERATION"
             --max_completion_length "$MAX_COMPLETION_LENGTH"
+            --vllm_importance_sampling_mode "${VLLM_IMPORTANCE_SAMPLING_MODE:-token_truncate}"
+            --grpo_learning_rate "${GRPO_LEARNING_RATE:-5e-6}"
+            --grpo_warmup_steps "${GRPO_WARMUP_STEPS:-10}"
+            --fixed_eval_size "${FIXED_EVAL_SIZE:-0}"
         )
+        if [ "${FIXED_EVAL_SIZE:-0}" -gt 0 ]; then
+            CMD_ARGS+=(
+                --fixed_eval_split "${FIXED_EVAL_SPLIT:-test}"
+                --fixed_eval_seed "${FIXED_EVAL_SEED:-1729}"
+                --fixed_eval_steps "${FIXED_EVAL_STEPS:-5}"
+                --fixed_eval_generations "${FIXED_EVAL_GENERATIONS:-3}"
+                --fixed_eval_batch_size "${FIXED_EVAL_BATCH_SIZE:-1}"
+            )
+            if [ -n "${FIXED_EVAL_MANIFEST:-}" ]; then
+                CMD_ARGS+=(--fixed_eval_manifest "$FIXED_EVAL_MANIFEST")
+            fi
+        fi
+        if [ "${DISABLE_DROPOUT:-True}" == "False" ]; then
+            CMD_ARGS+=(--no-disable_dropout)
+        else
+            CMD_ARGS+=(--disable_dropout)
+        fi
         # Buffer ordering strategy for netlist diversity per effective batch.
         if [ -n "$NETLIST_DIVERSITY_STRATEGY" ]; then
             CMD_ARGS+=(--netlist_diversity_strategy "$NETLIST_DIVERSITY_STRATEGY")
@@ -482,6 +502,8 @@ build_cmd_args() {
         echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION"
         echo "MAX_COMPLETION_LENGTH: $MAX_COMPLETION_LENGTH"
         echo "NETLIST_DIVERSITY_STRATEGY: ${NETLIST_DIVERSITY_STRATEGY:-even_spacing}"
+        echo "DISABLE_DROPOUT: ${DISABLE_DROPOUT:-True}"
+        echo "VLLM_IMPORTANCE_SAMPLING_MODE: ${VLLM_IMPORTANCE_SAMPLING_MODE:-token_truncate}"
     fi
     echo "=============================================="
     echo "CMD_ARGS: ${CMD_ARGS[*]}"

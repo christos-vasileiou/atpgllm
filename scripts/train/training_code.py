@@ -535,6 +535,17 @@ def train_with_grpo(
     lora_target_modules: list[str] | None = None,
     qwen_moe: bool = False,
     netlist_diversity_strategy: str = "even_spacing",
+    disable_dropout: bool = True,
+    vllm_importance_sampling_mode: str = "token_truncate",
+    grpo_learning_rate: float = 5e-6,
+    grpo_warmup_steps: int = 10,
+    fixed_eval_size: int = 0,
+    fixed_eval_split: str = "test",
+    fixed_eval_manifest: str = None,
+    fixed_eval_seed: int = 1729,
+    fixed_eval_steps: int = 5,
+    fixed_eval_generations: int = 3,
+    fixed_eval_batch_size: int = 1,
     **kwargs,
 ) -> None:
     """
@@ -607,6 +618,19 @@ def train_with_grpo(
         LoRA hyper-parameters for new adapters / policy adapter
         (:func:`model_utils.get_lora_config`).  When loading from
         ``resume_from``, existing adapter shapes still apply where relevant.
+    disable_dropout : bool
+        Disable model and LoRA dropout during GRPO so copied policy/reference
+        adapters produce deterministic, comparable log probabilities.
+    vllm_importance_sampling_mode : str
+        vLLM-to-training policy correction mode. Token-level truncation avoids
+        exponentiating summed mismatch across long ATPG completions.
+    grpo_learning_rate, grpo_warmup_steps
+        Optimizer settings; the fixed-evaluation pilot uses 1e-6 and two steps.
+    fixed_eval_size : int
+        Zero disables evaluation. Otherwise freeze this many faults from
+        fixed_eval_split, exclude their circuits from the training buffer, and
+        evaluate before training and every fixed_eval_steps optimizer updates.
+        See scripts/train/FIXED_EVALUATION.md for manifest and batch semantics.
     """
     # -- Validate resume flags -----------------------------------------
     resume_checkpoint = None
@@ -630,6 +654,13 @@ def train_with_grpo(
         load_dual_adapter_checkpoint,
         resolve_base_model_name_from_checkpoint,
     )
+
+    if fixed_eval_size < 0 or fixed_eval_steps < 1:
+        raise ValueError("fixed_eval_size must be nonnegative and fixed_eval_steps positive")
+    if grpo_learning_rate <= 0 or grpo_warmup_steps < 0:
+        raise ValueError("GRPO learning rate must be positive and warmup steps nonnegative")
+    if fixed_eval_size and not (use_dual_adapter and use_vllm and vllm_mode == "server" and resume_from):
+        raise ValueError("Fixed evaluation currently requires dual adapters, an SFT/GRPO checkpoint, and vLLM server mode")
 
     # Determine device_map: per-GPU for DDP, "auto" otherwise
     device_map = _get_device_map(use_ddp)
@@ -745,12 +776,89 @@ def train_with_grpo(
         diversity_strategy=netlist_diversity_strategy,
     )
 
+    eval_dataset = None
+    fixed_manifest = None
+    eval_records = []
+    eval_data_state = None
+    if fixed_eval_size:
+        from accelerate import PartialState
+        from datasets import Dataset
+        from atpgllm.training.fixed_eval import (
+            digest, load_or_create_manifest, training_indices_without_holdout,
+            validate_eval_layout, checkpoint_manifest, circuit_ids,
+            training_buffer_state, validate_resume_buffer,
+        )
+        state = PartialState()
+        validate_eval_layout(fixed_eval_size, fixed_eval_generations,
+                             fixed_eval_batch_size, state.num_processes)
+        saved_manifest = checkpoint_manifest(resume_checkpoint)
+        # Introducing evaluation must not move a legacy checkpoint's sampler
+        # cursor by deleting training rows. Select unseen circuits instead.
+        holdout_policy = (
+            saved_manifest["protocol"]["training_holdout_policy"] if saved_manifest else
+            "preserve_training_buffer" if resume_checkpoint else "exclude_evaluation_circuits"
+        )
+        training_circuits = (
+            set().union(*(circuit_ids(row) for row in train_dataset))
+            if holdout_policy == "preserve_training_buffer" else set()
+        )
+        protocol = {
+            "dataset": dataset_path, "split": fixed_eval_split,
+            "size": fixed_eval_size, "seed": fixed_eval_seed,
+            "candidate_pool_size": fixed_eval_size * 8,
+            "tokenizer_vocab_sha256": digest(tokenizer.get_vocab()),
+            "special_tokens_sha256": digest(tokenizer.special_tokens_map),
+            "chat_template_sha256": digest(tokenizer.chat_template),
+            "max_prompt_length": max_prompt_length,
+            "max_completion_length": max_completion_length,
+            "max_model_len": max_model_len,
+            "generations": fixed_eval_generations,
+            "per_device_batch_size": fixed_eval_batch_size,
+            "world_size": state.num_processes,
+            "temperature": 1.0, "top_p": 1.0,
+            "fault_sim_backend": os.environ.get("FAULT_SIM_BACKEND", "fast"),
+            "prompt_pipeline": "single_generation_prefix_v1",
+            "training_holdout_policy": holdout_policy,
+        }
+
+        def eval_candidates():
+            raw = load_dataset(dataset_path, split=fixed_eval_split, streaming=True)
+            formatted = format_dataset_for_training(raw, tokenizer, TrainingMode.GRPO)
+            if training_circuits:
+                formatted = formatted.filter(
+                    lambda row: circuit_ids(row).isdisjoint(training_circuits)
+                )
+            return buffer_streaming_dataset(
+                formatted, buffer_size=fixed_eval_size * 8, shuffle=False,
+                tokenizer=tokenizer, max_prompt_length=max_prompt_length,
+            )
+
+        manifest_path = fixed_eval_manifest or str(Path(output_dir) / "fixed_eval_manifest.json")
+        with state.main_process_first():
+            fixed_manifest = load_or_create_manifest(
+                manifest_path, protocol, eval_candidates, resume_checkpoint=resume_checkpoint
+            )
+        eval_dataset = Dataset.from_list(fixed_manifest["examples"])
+        indices = training_indices_without_holdout(train_dataset, fixed_manifest["examples"])
+        if holdout_policy == "preserve_training_buffer" and len(indices) != len(train_dataset):
+            raise ValueError("Evaluation circuits overlap a resumed training buffer; "
+                             "refusing to change its saved sampler position")
+        print(f"[Fixed eval] {len(eval_dataset)} frozen faults; excluded "
+              f"{len(train_dataset) - len(indices)} training rows by circuit identity; "
+              f"manifest={manifest_path}, sha256={fixed_manifest['examples_sha256']}")
+        train_dataset = train_dataset.select(indices)
+        eval_data_state = training_buffer_state(train_dataset)
+        validate_resume_buffer(resume_checkpoint, eval_data_state)
+
     # =========================================================================
     # REWARD FUNCTION SETUP
     # =========================================================================
     print("Initializing reward function factory...")
     reward_factory = RewardFunctionFactory(config_path='sim_config.json')
     reward_fn = reward_factory.create_reward_function(return_component_dicts=True)
+    if fixed_eval_size:
+        from atpgllm.training.fixed_eval import capture_rewards
+        reward_fn = capture_rewards(reward_fn, eval_records)
     gdpo_priorities = dict(
         zip(ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS, strict=True)
     )
@@ -772,7 +880,7 @@ def train_with_grpo(
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=5e-6,
+        learning_rate=grpo_learning_rate,
         max_steps=max_steps,
         logging_steps=1,
         save_steps=1,
@@ -783,12 +891,15 @@ def train_with_grpo(
         report_to=report_to,
         lr_scheduler_type="cosine",
         lr_scheduler_kwargs={'num_cycles': 0.4},
-        warmup_steps=10,
-        # --- Step 2: prevent entropy / diversity collapse -------------------
-        beta=0.03,                # KL to the FIXED SFT reference (was 0.0 = no anchor). Range 0.01–0.05; this is the single most important change.
-        temperature=1.0,          # keep rollout exploration high (was implicitly 1.0)
-        top_entropy_quantile=0.8, # only update the top-80% highest-entropy tokens (was 1.0), so confident tokens stop being driven to ~0 entropy
-        # leave sync_ref_model=False (default): you WANT a fixed SFT anchor, not one that drifts toward the (collapsing) policy.
+        warmup_steps=grpo_warmup_steps,
+        eval_strategy="steps" if fixed_eval_size else "no",
+        eval_on_start=bool(fixed_eval_size),
+        eval_steps=fixed_eval_steps if fixed_eval_size else None,
+        per_device_eval_batch_size=fixed_eval_batch_size,
+        num_generations_eval=fixed_eval_generations if fixed_eval_size else None,
+        beta=0.03,                # Keep the frozen SFT reference across resumes.
+        temperature=1.0,
+        top_entropy_quantile=0.8,
         # GRPO-specific options
         loss_type="dapo", # "grpo", "dr_grpo", "dapo", "bnpo", "cispo", default is "dapo"
         num_generations=max(num_generations, 2),
@@ -797,6 +908,8 @@ def train_with_grpo(
         use_vllm=use_vllm,
         vllm_mode=vllm_mode,
         vllm_server_base_url=vllm_server_url,
+        disable_dropout=disable_dropout,
+        vllm_importance_sampling_mode=vllm_importance_sampling_mode,
         importance_sampling_level="sequence", # "token" or "sequence" : sequence provides more stable training and better alignment with sequence-level rewards
         # Whether to compute importance sampling ratios at the `"token"` or `"sequence"` level.
         # `"token"`: keeps raw per-token log-probability ratios. 
@@ -828,11 +941,20 @@ def train_with_grpo(
     ]
 
     if use_dual_adapter:
-        trainer = DualAdapterGRPOTrainer(
+        trainer_class = DualAdapterGRPOTrainer
+        if fixed_eval_size:
+            from atpgllm.training.fixed_eval import FixedEvaluationMixin
+
+            class FixedEvalGRPOTrainer(FixedEvaluationMixin, DualAdapterGRPOTrainer):
+                pass
+
+            trainer_class = FixedEvalGRPOTrainer
+        trainer = trainer_class(
             model=model,
             reward_funcs=[reward_fn],
             args=training_args,
             train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
             processing_class=tokenizer,
             policy_lora_config=policy_lora_config,
             tool_functions={'fault_simulation_tool': fault_simulation_tool_handler},
@@ -840,6 +962,10 @@ def train_with_grpo(
             tools=TOOLS,
             vllm_max_model_len=max_model_len if use_vllm else None,
         )
+        if fixed_eval_size:
+            trainer.configure_fixed_evaluation(
+                fixed_manifest, eval_records, output_dir, resume_from, eval_data_state
+            )
     else:
         trainer = ToolCallingGRPOTrainer(
             model=model,
@@ -900,6 +1026,11 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "use_vllm",
     "vllm_mode",
     "vllm_server_url",
+    "disable_dropout",
+    "vllm_importance_sampling_mode",
+    "grpo_learning_rate", "grpo_warmup_steps",
+    "fixed_eval_size", "fixed_eval_split", "fixed_eval_manifest", "fixed_eval_seed",
+    "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size",
 })
 
 
@@ -1024,8 +1155,31 @@ def main() -> None:
                              "(e.g. http://localhost:8000). Used when --use_vllm is set.")
     parser.add_argument("--vllm_mode", type=str, default=_env('VLLM_MODE', "server"), choices=["colocate", "server"],
                         help="VLLM mode")
+    parser.add_argument(
+        "--vllm_importance_sampling_mode",
+        type=str,
+        default=_env("VLLM_IMPORTANCE_SAMPLING_MODE", "token_truncate"),
+        choices=["token_truncate", "token_mask", "sequence_truncate", "sequence_mask"],
+        help="GRPO vLLM correction mode. Token truncation is the safe default for long completions.",
+    )
+    parser.add_argument(
+        "--disable_dropout",
+        action=argparse.BooleanOptionalAction,
+        default=_env("DISABLE_DROPOUT", "1").lower() in ("1", "true", "yes"),
+        help="GRPO: disable model/LoRA dropout for stable policy-reference log-probabilities.",
+    )
     parser.add_argument("--num_generations", type=int, default=_env('NUM_GENERATIONS', 8),
                         help="Number of generations per prompt to sample.")
+    parser.add_argument("--grpo_learning_rate", type=float, default=_env("GRPO_LEARNING_RATE", 5e-6))
+    parser.add_argument("--grpo_warmup_steps", type=int, default=_env("GRPO_WARMUP_STEPS", 10))
+    parser.add_argument("--fixed_eval_size", type=int, default=_env("FIXED_EVAL_SIZE", 0),
+                        help="Frozen held-out faults; 0 disables the in-training evaluation pilot.")
+    parser.add_argument("--fixed_eval_split", default=_env("FIXED_EVAL_SPLIT", "test"))
+    parser.add_argument("--fixed_eval_manifest", default=_env("FIXED_EVAL_MANIFEST", None))
+    parser.add_argument("--fixed_eval_seed", type=int, default=_env("FIXED_EVAL_SEED", 1729))
+    parser.add_argument("--fixed_eval_steps", type=int, default=_env("FIXED_EVAL_STEPS", 5))
+    parser.add_argument("--fixed_eval_generations", type=int, default=_env("FIXED_EVAL_GENERATIONS", 3))
+    parser.add_argument("--fixed_eval_batch_size", type=int, default=_env("FIXED_EVAL_BATCH_SIZE", 1))
     parser.add_argument(
         "--netlist_diversity_strategy",
         type=str,
@@ -1197,6 +1351,10 @@ def main() -> None:
         name=wandb_name,
         settings=wandb.Settings(console="wrap") # Forces capture of Python stdout/stderr
     )
+    # Transformers rewrites eval_fixed/* to eval/fixed/* for W&B. Use the
+    # restored optimizer step, not W&B's per-process/profiling event counter.
+    wandb.define_metric("eval/fixed/global_step")
+    wandb.define_metric("eval/fixed/*", step_metric="eval/fixed/global_step")
 
     # W&B file uploads: resolve symlinks so the path shares os.getcwd()'s
     # canonical namespace (getcwd() resolves symlinks, abspath() does not),

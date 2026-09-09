@@ -104,7 +104,10 @@ class RewardFunctionFactory:
     """
     
     # Regex patterns for parsing model completions
-    FAULT_RE = re.compile(r"(sa\d)\s+(\w+)", re.DOTALL)
+    # Preserve indexed and escaped Verilog identifiers (e.g. y[89], \foo.bar).
+    # Prompt prose quotes the fault, while the authoritative dataset field is a
+    # bare ``saN <net>`` string, so stop only at whitespace or a quote.
+    FAULT_RE = re.compile(r"\b(sa\d)\s+([^\s\"']+)")
     INPUT_VECTOR_RE = re.compile(r"INPUT_VECTOR:\s\"(.*?)\"", re.DOTALL)
     EXPECTED_OUTPUT_RE = re.compile(r"EXPECTED_OUTPUT:\s\"(.*?)\"", re.DOTALL)
     DETECTED_FAULTS_RE = re.compile(r"DETECTED_FAULTS:\s\"(.*?)\"", re.DOTALL)
@@ -231,7 +234,7 @@ class RewardFunctionFactory:
     
     @staticmethod
     def fault_fn(x: str, **kwargs) -> List[tuple]:
-        """Extract fault information from prompt."""
+        """Extract fault information, preferring the authoritative dataset field."""
         fault = kwargs.get('fault', None)
         if fault is not None:
             x = fault

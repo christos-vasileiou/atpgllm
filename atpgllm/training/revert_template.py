@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -475,6 +476,44 @@ def get_generation_prompt_suffix(
     if fmt == "deepseek_r1":
         return f"{DEEPSEEK_ASSISTANT}"
     return ""
+
+
+def revert_generation_prompt(prompt, tokenizer=None, format_hint=None):
+    """Recover context messages without turning an open prefix into history.
+
+    Only an exact, trailing generation placeholder is removed. Completed
+    assistant turns and nonempty assistant prefills remain intact. Structured
+    conversations are copied so the tool loop cannot mutate the dataset.
+    """
+    if isinstance(prompt, list):
+        return copy.deepcopy(prompt)
+    suffix = get_generation_prompt_suffix(tokenizer, format_hint)
+    suffixes = [suffix] if suffix.strip() else []
+    # Granite can render either thinking mode. Also handle ChatML prompts
+    # saved without a tokenizer and with the ordinary empty assistant header.
+    if "<|im_start|>" in prompt:
+        suffixes += ["<|im_start|>assistant\n<think>\n",
+                     "<|im_start|>assistant\n<think></think>",
+                     "<|im_start|>assistant\n"]
+    for candidate in sorted(set(suffixes), key=len, reverse=True):
+        if prompt.endswith(candidate):
+            prompt = prompt[:-len(candidate)]
+            break
+    return revert_chat_template(prompt, tokenizer=tokenizer, format_hint=format_hint)
+
+
+def restore_generation_prefix(completion, tokenizer=None, chat_template_kwargs=None):
+    """Restore template-owned thought text in message history, never token IDs.
+
+    Granite's opening <think> belongs to prompt_ids, not completion_ids. When
+    rebuilding a conversation for tool continuation it must be present in the
+    assistant message, or rerendering changes the conditioning prefix.
+    """
+    suffix = get_generation_prompt_suffix(tokenizer)
+    if suffix == "<|im_start|>assistant\n<think>\n":
+        thinking = (chat_template_kwargs or {}).get("enable_thinking", True)
+        return ("<think>\n" if thinking else "<think></think>") + completion
+    return completion
 
 
 def wrap_assistant_for_revert(

@@ -691,8 +691,8 @@ class TrainingStateCheckpointCallback(TrainerCallback):
             checkpoint_dir, "training_state_summary.json"
         )
         try:
-            with open(summary_path, "w") as f:
-                json.dump(summary, f, indent=2)
+            from atpgllm.training.fixed_eval import write_json_atomic
+            write_json_atomic(summary_path, summary)
         except OSError as exc:
             logger.warning(
                 "Could not write training state summary: %s", exc

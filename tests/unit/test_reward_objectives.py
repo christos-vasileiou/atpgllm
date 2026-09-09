@@ -9,6 +9,7 @@ from atpgllm.llm.reward_funcs import (
     test_generation_grpo_reward as score_generation,
     train_scalar_from_reward_components,
 )
+from atpgllm.training.reward_function_factory import RewardFunctionFactory
 from fault_sim import fast_fault_sim
 
 
@@ -36,7 +37,14 @@ def _simulation(*, detected=True):
     )
 
 
-def _score(completion, *, detected=True):
+def _score(
+    completion,
+    *,
+    detected=True,
+    prompt="target sa0 n_fault",
+    dataset_fault=None,
+    fault_fn=None,
+):
     calls = []
 
     def simulator(input_vector, expected_output, fault, netlist, gate_func, **kwargs):
@@ -44,17 +52,19 @@ def _score(completion, *, detected=True):
         return _simulation(detected=detected), {}
 
     netlist = SimpleNamespace(input_nets=["a", "b"], output_nets=["y"])
+    reward_kwargs = {"fault": [dataset_fault]} if dataset_fault is not None else {}
     rewards = score_generation(
-        ["target sa0 n_fault"],
+        [prompt],
         [completion],
         netlists=[netlist],
-        fault_fn=lambda _: [("sa0", "n_fault")],
+        fault_fn=fault_fn or (lambda _: [("sa0", "n_fault")]),
         simulation_fn=lambda _: [],
         input_vector_fn=_extract("INPUT_VECTOR"),
         expected_output_fn=_extract("EXPECTED_OUTPUT"),
         detected_faults_fn=_extract("DETECTED_FAULTS"),
         lib_gate_funcs={},
         fault_sim=simulator,
+        **reward_kwargs,
     )
     return rewards[0], calls
 
@@ -116,6 +126,29 @@ def test_missing_expected_output_does_not_block_detection():
     assert reward["detection"] == 1.0
     assert reward["fidelity"] == 0.0
     assert 0.0 < reward["format"] < 1.0
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        ("sa1 y[89]", [("sa1", "y[89]")]),
+        (r"sa0 \escaped.net[3]", [("sa0", r"\escaped.net[3]")]),
+    ],
+)
+def test_fault_parser_preserves_verilog_identifier(fault, expected):
+    assert RewardFunctionFactory.fault_fn(f"target fault: '{fault}'") == expected
+
+
+def test_dataset_fault_is_authoritative_over_prompt_text():
+    _, calls = _score(
+        'INPUT_VECTOR:"a:1,b:0" EXPECTED_OUTPUT:"y:1" '
+        'DETECTED_FAULTS:"sa0 n_fault"',
+        prompt="target sa1 wrong_net",
+        dataset_fault="sa0 n_fault",
+        fault_fn=RewardFunctionFactory.fault_fn,
+    )
+
+    assert calls[0][2] == "sa0 n_fault"
 
 
 def test_logonly_diagnostics_do_not_enter_legacy_scalar():

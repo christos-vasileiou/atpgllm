@@ -70,7 +70,8 @@ from atpgllm.training.tools import TOOLS, ToolHelper
 from atpgllm.training.revert_template import (
     parse_tool_call as parse_tool_call_text,
     revert_assistant_completion,
-    revert_chat_template,
+    revert_generation_prompt,
+    restore_generation_prefix,
     stringify_tool_arguments_for_template,
 )
 from atpgllm.llm.reward_funcs import REWARD_LOGONLY_SUFFIX
@@ -79,6 +80,7 @@ from atpgllm.training.gdpo import (
     reward_output_to_tensors,
     select_objective_columns,
 )
+from atpgllm.training.grpo_loss import GenerationBatchLossMixin
 
 # Adapter name constants
 REFERENCE_ADAPTER_NAME = "reference"
@@ -96,7 +98,7 @@ from trl.models import unwrap_model_for_generation
 from vllm import SamplingParams
 from vllm.sampling_params import GuidedDecodingParams
 
-class DualAdapterGRPOTrainer(GRPOTrainer):
+class DualAdapterGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
     """
     GRPOTrainer variant that uses a dual-adapter (LoRA-on-LoRA) approach.
 
@@ -626,6 +628,12 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
                     merged_weight = merged_weight.to("cuda:0")
                     if hasattr(self, "vllm_client") and self.vllm_client is not None:
                         self.vllm_client.update_named_param(vllm_name, merged_weight)
+
+        # Cached attention states belong to the previous weights. This override
+        # must preserve the cache invalidation performed by TRL's base method.
+        if self.vllm_mode == "server" and self.accelerator.is_main_process:
+            self.vllm_client.reset_prefix_cache()
+        self.accelerator.wait_for_everyone()
     
     def save_model(self, output_dir: str = None, _internal_call: bool = False, **kwargs):
         """
@@ -817,23 +825,23 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             *graded* reward component still differs across samples (Phase-2 headroom:
             a dense sub-goal signal could rescue groups binary detection marks dead).
 
-        Computed on local rows only (no DDP collectives) to stay deadlock-free; on
-        multi-GPU the logged values reflect the main process's slice of groups.
+        Gathered in rank order before grouping, so groups split across ranks
+        during evaluation and global training statistics are both correct.
         """
         if comp_mat is None or not comp_keys:
             return
         detect_key = "fault_detected_by_pred_input_vector_acc_logonly"
         if detect_key not in comp_keys:
             return  # only the test-generation reward carries fault detection
-        G = int(getattr(self, "num_generations", 0) or 0)
+        G = int(self.num_generations if self.model.training else self.num_generations_eval)
         if G < 2:
             return
         metrics_root = getattr(self, "_metrics", None)
         if metrics_root is None:
             return
 
-        scal = scalars.detach().float()
-        comp = comp_mat.detach().float()
+        scal = gather(scalars.detach().float())
+        comp = gather(comp_mat.detach().float())
         n = scal.shape[0]
         if n == 0 or n % G != 0:
             return  # only score when rows tile cleanly into complete groups
@@ -915,7 +923,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         proxy/reward hacking and policy collapse far easier. These metrics make
         that visible.
 
-        Logged under ``diagnostics/netlist_diversity/`` (train only, local rows):
+        Logged under ``diagnostics/netlist_diversity/`` (train only, global rows):
           * ``unique_in_generation_batch``      — distinct netlists in this gen batch.
           * ``effective_batch_unique_count``    — distinct netlists over a rolling
             window of ``prompts_per_effective_batch`` unique prompts (= one
@@ -924,8 +932,8 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             (1.0 = every prompt in the step is a different netlist).
           * ``cumulative_unique_seen``          — distinct netlists seen so far.
 
-        Computed on local rows only (no DDP collectives) to stay deadlock-free;
-        on multi-GPU the values reflect the main process's slice.
+        All ranks enter this method once per generation batch. Rank-ordered
+        gathering makes the rolling window match the global effective batch.
         """
         if not self.model.training or not inputs:
             return
@@ -934,7 +942,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             return
 
         G = max(1, int(getattr(self, "num_generations", 1) or 1))
-        ids = [self._netlist_identity(ex.get("netlist")) for ex in inputs]
+        ids = gather_object([self._netlist_identity(ex.get("netlist")) for ex in inputs])
         # Collapse the G completions per prompt down to one id per unique prompt.
         prompt_ids = ids[::G] if len(ids) % G == 0 else list(dict.fromkeys(ids))
 
@@ -1138,6 +1146,11 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
 
         # Gather across DDP ranks — rewards must be global for per-group normalisation
         rewards_per_func = gather(rewards_per_func)
+        mode = "train" if self.model.training else "eval"
+        for index, name in enumerate(self.reward_func_names):
+            self._metrics[mode].setdefault(f"rewards/{name}/raw_mean", []).append(
+                float(torch.nanmean(rewards_per_func[:, index]).item())
+            )
         if gdpo_payload is not None:
             if self.scale_rewards not in (False, "none"):
                 raise ValueError(
@@ -1185,7 +1198,7 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
         generation_start_time = time.perf_counter()
         
         prompts = [
-            revert_chat_template(prompt, tokenizer=self.processing_class)
+            revert_generation_prompt(prompt, tokenizer=self.processing_class)
             for prompt in prompts
         ]
         prompts = copy.deepcopy(prompts)
@@ -1200,7 +1213,9 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             # ── Step 2: Decode raw token IDs into text / message dicts ──
             if is_conversational({"prompt": prompts[0]}):
                 contents = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-                completions = [[{"role": "assistant", "content": content}] for content in contents]
+                completions = [[{"role": "assistant", "content": restore_generation_prefix(
+                    content, self.processing_class, self.chat_template_kwargs
+                )}] for content in contents]
             else:
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
                 completions = [
@@ -1562,7 +1577,9 @@ class DualAdapterGRPOTrainer(GRPOTrainer):
             for i, idx in enumerate(idxs_with_tool):
                 if post_tool_texts[i]:
                     post_tool_msg = revert_assistant_completion(
-                        post_tool_texts[i], tokenizer=self.processing_class
+                        restore_generation_prefix(post_tool_texts[i], self.processing_class,
+                                                  self.chat_template_kwargs),
+                        tokenizer=self.processing_class
                     )
                     if isinstance(completions[idx], list):
                         if isinstance(post_tool_msg, list) and isinstance(post_tool_msg[0], dict):
