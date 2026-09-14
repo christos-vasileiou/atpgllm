@@ -8,7 +8,6 @@ from atpgllm.training._paths import ensure_data_preprocessing_on_path, resolve_s
 ensure_data_preprocessing_on_path()
 
 from fault_sim import OptimizedNetlist, resolve_fault_sim_runner
-from atpgllm.training.reward_function_factory import RewardFunctionFactory
 
 
 # =============================================================================
@@ -35,6 +34,10 @@ TOOLS = [FAULT_SIMULATION_TOOL]
 
 
 async def fault_simulation_tool_handler(input_vector: str | Dict[str, int], output_vector: str | Dict[str, int], fault: str, doc_id: str, netlist: str) -> str:
+    # Formatting/tokenizer preflights only need the schema. Load the reward
+    # stack when the simulation handler is actually called.
+    from atpgllm.training.reward_function_factory import RewardFunctionFactory
+
     try:
         with resolve_sim_config_path().open("r", encoding="utf-8") as f:
             gate_func = json.load(f)

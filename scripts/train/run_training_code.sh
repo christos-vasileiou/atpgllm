@@ -245,6 +245,7 @@ write_launch_config_snapshot() {
         RESUME_FROM RESUME_TRAINING_STATE AUTO_SKIP_FROM_RESUME SKIP_BUFFER_SIZE
         PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS MAX_STEPS REPORT_TO
         MAX_MODEL_LEN MAX_PROMPT_LENGTH MAX_COMPLETION_LENGTH
+        SFT_CIRCUIT_VALIDATION SFT_EVAL_STEPS SFT_EVAL_PER_CIRCUIT
         ASSISTANT_ONLY_LOSS BUFFER_SIZE NUM_GENERATIONS STEPS_PER_GENERATION
         NETLIST_DIVERSITY_STRATEGY DISABLE_DROPOUT VLLM_IMPORTANCE_SAMPLING_MODE
         GRPO_LEARNING_RATE GRPO_WARMUP_STEPS FIXED_EVAL_SIZE FIXED_EVAL_SPLIT
@@ -390,6 +391,11 @@ build_cmd_args() {
 
     if [ "$QWEN_MOE" == "True" ]; then
         CMD_ARGS+=(--qwen_moe)
+    fi
+
+    if [ "$METHOD" == "sft" ] && [[ "${SFT_CIRCUIT_VALIDATION:-False}" =~ ^([Tt]rue|1)$ ]]; then
+        CMD_ARGS+=(--sft_circuit_validation --sft_eval_steps "${SFT_EVAL_STEPS:-10}"
+                   --sft_eval_per_circuit "${SFT_EVAL_PER_CIRCUIT:-8}")
     fi
 
     # SFT only: assistant-only loss (mask system/user/tool-response tokens)

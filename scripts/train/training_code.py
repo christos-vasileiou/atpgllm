@@ -261,6 +261,9 @@ def train_with_sft(
     lora_target_modules: list[str] | None = None,
     qwen_moe: bool = False,
     assistant_only_loss: bool = True,
+    sft_circuit_validation: bool = False,
+    sft_eval_steps: int = 10,
+    sft_eval_per_circuit: int = 8,
     **kwargs,
 ) -> None:
     """
@@ -269,15 +272,10 @@ def train_with_sft(
     containing the necessary fields.  The resulting LoRA weights will be
     saved in *output_dir*.
 
-    An ``SFTStoppingCallback`` is automatically attached.  It monitors:
-
-    1. **Format compliance** – can the reward function parse ≥ 95 % of
-       validation outputs?
-    2. **Output diversity** – are 10 completions from a single prompt
-       sufficiently distinct?
-
-    When both criteria are met the trainer stops, and the checkpoint is
-    ready to be used as the starting point for GRPO.
+    With ``sft_circuit_validation``, audit a repaired local dataset before loading
+    weights, evaluate a fixed sample from entire held-out circuit groups at step
+    zero and periodically, and save the checkpoint with the lowest validation
+    loss. Validation loss measures teacher-forced prediction, not ATPG success.
 
     Parameters
     ----------
@@ -323,22 +321,11 @@ def train_with_sft(
         Raw rows per batch for the fast streaming skip/filter pipeline.
     skip_num_workers : int, optional
         Parallel workers for skip/filter/format batches (default: min(16, CPUs)).
-    use_vllm : bool
-        If *True*, validation generation in the stopping callback uses
-        a **persistent vLLM server** for faster batch inference.  Start
-        the server on a spare GPU before training with dynamic LoRA
-        loading enabled::
-
-            VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \\
-                CUDA_VISIBLE_DEVICES=2 vllm serve <model_name> \\
-                --enable-lora --max-lora-rank 64 --port 8000
-
-    vllm_server_url : str, optional
-        Base URL of the running vLLM server (default
-        ``"http://localhost:8000"`` when ``use_vllm=True``).
-    eval_buffer_size : int
-        Number of examples to buffer from the test split for the
-        stopping callback validation (default 30).
+    sft_circuit_validation : bool
+        Require a local repaired dataset manifest and circuit-disjoint validation.
+        Resumed adapters must have matching dataset provenance.
+    sft_eval_steps, sft_eval_per_circuit : int
+        Evaluation/save interval and maximum distinct faults per held-out circuit.
     max_model_len : int
         Maximum sequence length passed to ``SFTConfig(max_length=...)``.
     max_prompt_length : int
@@ -358,6 +345,14 @@ def train_with_sft(
         Ignored when ``resume_from`` loads an existing adapter (architecture
         comes from the checkpoint).
     """
+    data_manifest = dataset_fingerprint = None
+    if sft_circuit_validation:
+        from atpgllm.training.sft_validation import (
+            check_sft_dataset, load_circuit_train, prepare_circuit_validation,
+            sft_evaluation_config,
+        )
+        data_manifest, dataset_fingerprint = check_sft_dataset(dataset_path, resume_from)
+
     lora_config = _resolve_lora_config(
         lora_rank, lora_alpha, lora_target_modules, qwen_moe,
     )
@@ -421,7 +416,25 @@ def train_with_sft(
               "non-pad tokens, incl. system / user / tool-response).")
 
     # Load dataset (streaming for memory efficiency)
-    data = load_dataset(dataset_path, split="train", streaming=True)
+    data = (load_circuit_train(dataset_path) if sft_circuit_validation
+            else load_dataset(dataset_path, split="train", streaming=True))
+    eval_dataset = None
+    if sft_circuit_validation:
+        eval_dataset, validation_report = prepare_circuit_validation(
+            dataset_path, data_manifest, tokenizer, sft_format=sft_format,
+            max_prompt_length=max_prompt_length, max_model_len=max_model_len,
+            per_circuit=sft_eval_per_circuit,
+        )
+        if int(os.environ.get("RANK", "0")) == 0:
+            import json
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(output_dir) / "sft_data_manifest.json").write_text(json.dumps({
+                "dataset_sha256": dataset_fingerprint,
+                "dataset_path": str(Path(dataset_path).resolve()),
+                "validation": validation_report,
+            }, indent=2) + "\n")
+        print(f"[SFT] Fixed validation: {len(eval_dataset)} examples on "
+              f"{len(validation_report['circuits'])} unseen circuit groups.")
 
     # Format dataset into the chosen SFT layout
     train_dataset = format_dataset_for_training(
@@ -468,6 +481,8 @@ def train_with_sft(
         # Enable token counting so ThroughputMetricsCallback can compute tokens/sec
         include_num_input_tokens_seen=True,
     )
+    if sft_circuit_validation:
+        sft_kwargs.update(sft_evaluation_config(sft_eval_steps))
     if assistant_only_loss:
         # SFTTrainer detects the conversational layout from the "messages"
         # column and applies the chat template internally with
@@ -498,6 +513,7 @@ def train_with_sft(
     trainer = SFTTrainer(
         model=model,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
         args=training_args,
         callbacks=shared_callbacks,
@@ -1015,6 +1031,9 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "lora_target_modules",
     "qwen_moe",
     "assistant_only_loss",
+    "sft_circuit_validation",
+    "sft_eval_steps",
+    "sft_eval_per_circuit",
 })
 _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "buffer_size",
@@ -1140,6 +1159,10 @@ def main() -> None:
         help="SFT streaming: parallel workers for skip/filter batches "
              "(default: min(16, CPU count)). Env: SKIP_NUM_WORKERS",
     )
+    parser.add_argument("--sft_circuit_validation", action="store_true",
+                        help="Audit repaired local circuit splits and enable fixed SFT validation")
+    parser.add_argument("--sft_eval_steps", type=int, default=10)
+    parser.add_argument("--sft_eval_per_circuit", type=int, default=8)
     parser.add_argument("--max_steps", type=int, default=_env('MAX_STEPS', 1),
                         help="Maximum number of training steps")
     parser.add_argument("--per_device_train_batch_size", type=int, default=_env('PER_DEVICE_TRAIN_BATCH_SIZE', 1),
