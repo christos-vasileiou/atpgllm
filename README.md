@@ -42,6 +42,10 @@ If you encounter installation issues:
 
 ## Usage
 
+For evaluation search methods, see the
+[MCTS and evolutionary sampling review and design](docs/search/README.md) and
+the [checkpoint evaluation guide](scripts/eval/README.md).
+
 ### Training
 
 For **multi/single-gpu** training use:
