@@ -45,10 +45,11 @@ The previous runtime defaults are shared by both scripts:
 | Environment variable | Default |
 | --- | --- |
 | `EVAL_DATASET` | `chrivasileiou/asap7-language-of-test-v2` |
-| `SAMPLING_METHOD` | `greedy` (`random`, `best_of_n`, `mcts`, `evolutionary` also supported) |
+| `SAMPLING_METHOD` | `greedy` (`random`, `best_of_n`, `mcts`, `evolutionary`, `vector_evolutionary` also supported) |
 | `NUM_COMPLETIONS` | `50` (`NUM_SAMPLES` is an alias) |
 | `PASS_AT_K` | `1 2 4 8 16` (each must be ≤ `NUM_COMPLETIONS`) |
-| `SEARCH_BUDGET` | `50`, only for `mcts` / `evolutionary` |
+| `SEARCH_BUDGET` | `50`, only for `mcts` / `evolutionary` / `vector_evolutionary` |
+| `SEARCH_CONFIG` | Unset; optional validated search JSON file |
 | `BEST_OF_N_WIDTH` | `4`, only for `best_of_n` |
 | `TEMPERATURE` / `TOP_P` | `0.7` / `0.95` |
 | `MAX_NEW_TOKENS` / `MAX_PROMPT_LENGTH` | `16384` / `4096` |
@@ -64,3 +65,17 @@ The previous runtime defaults are shared by both scripts:
 
 Each checkpoint produces a metrics JSON and a stdout log in `EVAL_RESULTS_DIR`.
 Choose `EVAL_DATASET` to match the training dataset when using a different source.
+
+For the MCTS and evolutionary sampling design, historical implementation
+review, and scientific references, see
+[MCTS and evolutionary sampling with tools](../../docs/search/README.md).
+The documents distinguish delivered behavior from remaining experiments.
+
+The pass@k evaluator now uses `conversation-search-v1` for tool-aware model
+sampling, with independent per-completion budgets and final-answer scoring.
+See [run instructions and configuration](../../docs/search/IMPLEMENTATION.md).
+`SEARCH_CONFIG` (or `--search_config`) accepts a JSON configuration; a starting
+file is [conversation_search.json](configs/conversation_search.json).
+The `vector_evolutionary` model-free baseline accepts `SEARCH_BUDGET` as well.
+New launcher filenames include `csv1`; each metrics JSON also has a neighboring
+`*.slots.jsonl` with trajectories and usage. Training reward parsing is unchanged.

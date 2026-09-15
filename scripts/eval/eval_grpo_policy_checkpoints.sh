@@ -11,7 +11,7 @@
 # Choices separated by "|" in comments mean select ONE value, not a shell pipe.
 #
 # Sampling and pass@k:
-# export SAMPLING_METHOD=greedy          # greedy|random|best_of_n|mcts|evolutionary
+# export SAMPLING_METHOD=greedy          # greedy|random|best_of_n|mcts|evolutionary|vector_evolutionary
 # export NUM_COMPLETIONS=50             # Integer >= 1; independent completions per problem
 # export PASS_AT_K="1 2 4 8 16"          # Space-separated integers: 1 <= k <= NUM_COMPLETIONS
 # export TEMPERATURE=0.7                # Float >= 0; 0 = deterministic token selection
@@ -165,19 +165,19 @@ for k in "${K_VALUES[@]}"; do
 done
 [[ "$MERGE_DEQUANT" == 0 || "$MERGE_DEQUANT" == 1 ]] || die "MERGE_DEQUANT must be 0 or 1"
 case "$SAMPLING_METHOD" in
-  greedy|random|best_of_n|mcts|evolutionary) ;;
-  *) die "SAMPLING_METHOD must be greedy|random|best_of_n|mcts|evolutionary" ;;
+  greedy|random|best_of_n|mcts|evolutionary|vector_evolutionary) ;;
+  *) die "SAMPLING_METHOD must be greedy|random|best_of_n|mcts|evolutionary|vector_evolutionary" ;;
 esac
-if [[ -n "${SEARCH_BUDGET:-}" && "$SAMPLING_METHOD" != mcts && "$SAMPLING_METHOD" != evolutionary ]]; then
-  die "SEARCH_BUDGET applies only to mcts/evolutionary"
+if [[ -n "${SEARCH_BUDGET:-}" && "$SAMPLING_METHOD" != mcts && "$SAMPLING_METHOD" != evolutionary && "$SAMPLING_METHOD" != vector_evolutionary ]]; then
+  die "SEARCH_BUDGET applies only to mcts/evolutionary/vector_evolutionary"
 fi
 if [[ -n "${BEST_OF_N_WIDTH:-}" && "$SAMPLING_METHOD" != best_of_n ]]; then
   die "BEST_OF_N_WIDTH applies only to best_of_n"
 fi
 SEARCH_ARGS=()
-OUT_TAG="nc${NUM_COMPLETIONS}"
+OUT_TAG="csv1_nc${NUM_COMPLETIONS}"
 case "$SAMPLING_METHOD" in
-  mcts|evolutionary)
+  mcts|evolutionary|vector_evolutionary)
     SEARCH_BUDGET="${SEARCH_BUDGET:-50}"
     positive_integer "$SEARCH_BUDGET" || die "SEARCH_BUDGET must be a positive integer"
     SEARCH_ARGS=(--budget "$SEARCH_BUDGET")
@@ -193,7 +193,7 @@ esac
 
 # Explicit TP_SIZE wins; otherwise use the visible GPUs. Dry runs need no GPU.
 if [[ -z "${TP_SIZE:-}" ]]; then
-  if [[ "$SAMPLING_METHOD" == random ]]; then
+  if [[ "$SAMPLING_METHOD" == random || "$SAMPLING_METHOD" == vector_evolutionary ]]; then
     TP_SIZE=1
   elif [[ -n "${CUDA_VISIBLE_DEVICES+x}" ]]; then
     [[ -n "$CUDA_VISIBLE_DEVICES" && "$CUDA_VISIBLE_DEVICES" != "-1" ]] || die "no visible CUDA devices"

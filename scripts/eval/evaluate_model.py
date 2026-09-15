@@ -6,13 +6,12 @@ Evaluation script for dual-adapter models (SFT + GRPO) using pass@k metrics.
 
 This module evaluates a model trained through SFT → GRPO by:
 1. Loading the dual-adapter model via HF PEFT or vLLM natively
-   (skipped for model-free ``--sampling_method random``).
+   (skipped for model-free sampling methods).
 2. Loading the eval split of `chrivasileiou/asap7-language-of-test`
 3. For batches of prompts, generating num_completions completions each, where
    each completion is one independent application of the chosen sampling
    strategy (with tool-calling support on model-based methods).
-4. Executing tool calls (fault simulation) when the model requests them
-   (``greedy`` and optional tool loop on search strategies).
+4. Executing tool calls through the common conversation runner.
 5. Computing rewards via RewardFunctionFactory
 6. Calculating pass@k metrics (pass@1, pass@5, pass@10, etc.)
 
@@ -24,7 +23,8 @@ Sampling methods (``--sampling_method`` / ``SAMPLING_METHOD``):
       ``sampling_strategies.py``)
 
   Model-free (no LLM):
-    * ``random`` — uniform PI/PO bitvector baseline; **not** the greedy path
+    * ``random`` — uniform PI/PO bitvector baseline
+    * ``vector_evolutionary`` — PI genetic search with simulated outputs
 
 The pass@k metric (from the Codex paper, Chen et al. 2021) estimates:
     pass@k = E[1 - C(n-c, k) / C(n, k)]
@@ -64,6 +64,7 @@ import time
 import warnings
 import random as py_random
 from collections import defaultdict
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -79,15 +80,16 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, GenerationConfig
 from peft import PeftModel
 
-from atpgllm.training.dual_adapter_grpo_trainer import load_dual_adapter_model, REFERENCE_ADAPTER_NAME, POLICY_ADAPTER_NAME
 from atpgllm.training.conversation import ConversationExample
 from atpgllm.training.dataset_utils import TrainingMode
 from atpgllm.training.dataset_utils import buffer_streaming_dataset
 from atpgllm.training.reward_function_factory import RewardFunctionFactory
 from atpgllm.training.tools import TOOLS, FAULT_SIMULATION_TOOL, fault_simulation_tool, fault_simulation_tool_handler, ToolHelper
 from atpgllm.training.revert_template import parse_tool_call, revert_chat_template
+from atpgllm.training.search_types import SearchConfig, PROTOCOL_VERSION, Usage, accepted
 from atpgllm.training.sampling_strategies import (
     Verifier,
+    MODEL_FREE_STRATEGY_NAMES,
     list_available_strategies,
     make_hf_generator,
     make_strategy,
@@ -96,6 +98,12 @@ from atpgllm.training.sampling_strategies import (
 )
 
 warnings.filterwarnings("ignore")
+
+
+def load_eval_adapter(adapter):
+    """Load training-specific adapter code only for the HF model path."""
+    from atpgllm.training.dual_adapter_grpo_trainer import load_dual_adapter_model
+    return load_dual_adapter_model(adapter=adapter)
 
 
 # =============================================================================
@@ -596,7 +604,7 @@ def _eval_record_fault_meta(record: Any) -> Tuple[str, str]:
     return "", ""
 
 
-def format_eval_prompt(record: Dict[str, Any], tokenizer: AutoTokenizer) -> str:
+def format_eval_prompt(record: Dict[str, Any], tokenizer: AutoTokenizer, *, return_messages=False):
     """
     Format a dataset record into a prompt for evaluation.
     
@@ -631,7 +639,7 @@ def format_eval_prompt(record: Dict[str, Any], tokenizer: AutoTokenizer) -> str:
         add_generation_prompt=True,
     )
     
-    return prompt
+    return (prompt, prompt_messages) if return_messages else prompt
 
 
 # =============================================================================
@@ -730,29 +738,7 @@ def is_completion_correct(reward: Dict[str, float], threshold_mode: str = "fault
     bool
         True if the completion passes the threshold.
     """
-    def _get_acc(key: str) -> float:
-        """Read an _acc field with fallback to its _logonly variant.
-
-        ``test_generation_grpo_reward`` currently emits only ``..._logonly``
-        keys for accuracy metrics (they're informational, not part of the
-        GRPO loss). Keep reading the bare ``..._acc`` first so any future
-        refactor that re-introduces them stays compatible.
-        """
-        return float(reward.get(key, reward.get(f"{key}_logonly", 0)))
-
-    if threshold_mode == "fault_detected":
-        return _get_acc("fault_detected_by_pred_input_vector_acc") == 1
-    elif threshold_mode == "positive_reward":
-        return sum(reward.values()) > 0
-    elif threshold_mode == "full_accuracy":
-        return (
-            _get_acc("fault_detected_by_pred_input_vector_acc") == 1 and
-            _get_acc("input_vector_acc") == 1 and
-            _get_acc("expected_output_acc") == 1 and
-            _get_acc("detected_faults_acc") == 1
-        )
-    else:
-        raise ValueError(f"Unknown threshold mode: {threshold_mode}")
+    return accepted(reward, threshold_mode)
 
 
 def wandb_run_name_from_adapter(adapter: Path) -> str:
@@ -919,6 +905,7 @@ def evaluate(
     merge_dequant: bool = False,
     budget: Optional[int] = None,
     best_of_n_width: Optional[int] = None,
+    search_config: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Main evaluation function.
@@ -982,11 +969,16 @@ def evaluate(
     Dict[str, Any]
         Results dictionary with pass@k scores and detailed metrics.
     """
+    resolved_search_config = SearchConfig.load(search_config)
+    if num_completions < 1:
+        raise ValueError("num_completions must be positive")
     if k_values is None:
         k_values = [1, 5, 10]
     
     # Validate k values
     for k in k_values:
+        if k < 1:
+            raise ValueError("pass@k requires k >= 1")
         if k > num_completions:
             raise ValueError(
                 f"k={k} > num_completions={num_completions}. Cannot compute "
@@ -996,7 +988,7 @@ def evaluate(
     # ``budget`` (mcts/evolutionary) and ``best_of_n_width`` (best_of_n) are the
     # same concept — the per-completion search width (B) — under different flag
     # names; ``greedy`` / ``random`` take neither. Normalize to a single ``width``.
-    if sampling_method in ("mcts", "evolutionary"):
+    if sampling_method in ("mcts", "evolutionary", "vector_evolutionary"):
         if budget is None:
             raise ValueError(
                 f"--budget is required when --sampling_method={sampling_method}"
@@ -1036,8 +1028,8 @@ def evaluate(
     # 1. Load Model (skipped for model-free ``random``)
     # =========================================================================
     print("=" * 70)
-    if sampling_method == "random":
-        print("LOADING TOKENIZER (model-free random baseline)")
+    if sampling_method in MODEL_FREE_STRATEGY_NAMES:
+        print(f"LOADING TOKENIZER (model-free {sampling_method} baseline)")
     else:
         print("LOADING MODEL")
     print("=" * 70)
@@ -1056,11 +1048,8 @@ def evaluate(
     lora_request = None
     generation_config = None
 
-    if sampling_method == "random":
-        print(
-            "Sampling method 'random': skipping LLM/vLLM load "
-            "(uniform I/O bitvector baseline)."
-        )
+    if sampling_method in MODEL_FREE_STRATEGY_NAMES:
+        print(f"Sampling method '{sampling_method}': skipping LLM/vLLM load.")
     elif backend == "vllm":
         from vllm import LLM, SamplingParams
         from vllm.lora.request import LoRARequest
@@ -1128,7 +1117,7 @@ def evaluate(
                 "which is QLoRA-faithful by construction."
             )
         # Standard HF PEFT
-        model = load_dual_adapter_model(adapter=adapter)
+        model = load_eval_adapter(adapter)
         model.eval()
         
         generation_config = GenerationConfig(
@@ -1182,6 +1171,8 @@ def evaluate(
                     "dataset": dataset_path,
                     "num_completions": num_completions,
                     "sampling_method": sampling_method,
+                    "search_protocol_version": PROTOCOL_VERSION,
+                    "search_config": asdict(resolved_search_config),
                     "width": width,
                     "k_values": k_values,
                     "temperature": temperature,
@@ -1215,80 +1206,23 @@ def evaluate(
     
     eval_start_time = time.time()
     # =========================================================================
-    # 4.5. Build the search / model-free strategy (if not greedy).
-    # ``greedy`` keeps the built-in LLM tool-calling generation below.
-    # ``random`` is model-free (no LLM). Search strategies may run the same
-    # fault-simulation tool loop as greedy when max_tool_rounds >= 1.
+    # 4.5. All pass@k policies use versioned scoring and slot accounting.
+    # Model-based policies share the structured conversation runner.
     # =========================================================================
-    strategy = None
-    if sampling_method == "random":
-        verifier = Verifier(reward_factory)
-        strategy = make_strategy(
-            "random",
-            None,
-            verifier,
-            num_completions=num_completions,
-            width=None,
-            seed=seed,
-        )
-        print(
-            f"Sampling strategy: random "
-            f"(model-free bitvector baseline; num_completions={num_completions})"
-        )
-    elif sampling_method != "greedy":
-        verifier = Verifier(reward_factory)
-        if backend == "vllm":
-            generator = make_vllm_generator(
-                model, tokenizer, lora_request, generation_config,
-            )
-        else:
-            generator = make_hf_generator(
-                model, tokenizer, generation_config,
-                micro_batch_size=generation_micro_batch_size,
-            )
-        strategy_kwargs = {}
-        if sampling_method == "mcts":
-            strategy_kwargs["branching"] = 3
-            strategy_kwargs["chunk_tokens"] = 256
-            strategy_kwargs["rollout_max_tokens"] = None
-            # PUCT (AlphaZero / Silver 2017) selection knobs: c_puct trades off
-            # exploration vs exploitation; prior_temperature (tau) sharpens or
-            # flattens the LM policy prior P(s, a) over sampled chunks.
-            strategy_kwargs["c_puct"] = 1.25
-            strategy_kwargs["prior_temperature"] = 1.0
-            strategy_kwargs["chunk_temperature"] = 0.9
-            strategy_kwargs["rollout_temperature"] = 0.7
-        elif sampling_method == "evolutionary":
-            strategy_kwargs["population_size"] = 6
-            strategy_kwargs["elite_fraction"] = 0.5
-            strategy_kwargs["mutation_temperature"] = 1.0
-            strategy_kwargs["crossover_temperature"] = 0.7
-            strategy_kwargs["crossover_max_tokens"] = 2048
-        
-        use_tools = max_tool_rounds >= 1
-        strategy = make_strategy(
-            sampling_method,
-            generator,
-            verifier,
-            num_completions=num_completions,
-            width=width,
-            use_tools=use_tools,
-            max_tool_rounds=max_tool_rounds,
-            **strategy_kwargs,
-        )
-        width_label = "best_of_n_width" if sampling_method == "best_of_n" else "search_budget"
-        print(
-            f"Sampling strategy: {sampling_method} "
-            f"(model-based; num_completions={num_completions}, {width_label}={width}, "
-            f"tool_calling={'on' if use_tools else 'off'}, "
-            f"max_tool_rounds={max_tool_rounds})"
-        )
+    verifier = Verifier(reward_factory)
+    if sampling_method in MODEL_FREE_STRATEGY_NAMES:
+        generator = None
+    elif backend == "vllm":
+        generator = make_vllm_generator(model, tokenizer, lora_request, generation_config)
     else:
-        print(
-            "Sampling strategy: greedy "
-            f"(model-based LLM i.i.d. + tool calling; "
-            f"num_completions={num_completions})"
-        )
+        generator = make_hf_generator(model, tokenizer, generation_config,
+                                      micro_batch_size=generation_micro_batch_size)
+    strategy = make_strategy(
+        sampling_method, generator, verifier, num_completions=num_completions,
+        width=width, use_tools=max_tool_rounds >= 1, max_tool_rounds=max_tool_rounds,
+        seed=seed, threshold_mode=threshold_mode, search_config=resolved_search_config,
+    )
+    print(f"Sampling protocol: {PROTOCOL_VERSION}; method={sampling_method}; width={width}")
 
     n_records = len(eval_records)
     batch_starts = list(range(0, n_records, max(1, eval_prompt_batch_size)))
@@ -1311,15 +1245,15 @@ def evaluate(
         
         for slot, (idx, record) in enumerate(zip(global_indices, chunk)):
             try:
-                prompt_text = format_eval_prompt(record.copy(), tokenizer)
+                prompt_text, messages = format_eval_prompt(record.copy(), tokenizer, return_messages=True)
                 ok_prompts.append(prompt_text)
-                ok_records.append(record)
+                ok_records.append({**record, "_search_messages": messages})
                 ok_slot.append(slot)
             except Exception as e:
                 print(f"Warning: Failed to format prompt for sample {idx}: {e}")
                 fault_s, mod_s = _eval_record_fault_meta(record)
                 chunk_num_correct[slot] = 0
-                chunk_rewards[slot] = []
+                chunk_rewards[slot] = [{"search_failure_logonly": 1.0} for _ in range(num_completions)]
                 chunk_time_seconds[slot] = 0.0
                 chunk_problem_result[slot] = {
                     "idx": idx,
@@ -1328,102 +1262,22 @@ def evaluate(
                     "error": f"prompt_format_error: {e}",
                     "num_correct": 0,
                     "num_completions": num_completions,
+                    "completions": [""] * num_completions,
+                    "search_slots": [{"completion_slot": i, "status": "INFRA_ERROR",
+                                      "error": f"prompt_format_error: {e}", "usage": asdict(Usage())}
+                                     for i in range(num_completions)],
                 }
         
         if ok_prompts:
             gen_t0 = time.time()
-            if strategy is not None:
-                # Non-greedy method (search or model-free random): strategy
-                # owns both generation/construction and scoring.
-                flat_completions, rewards_flat, _ = run_strategy_batch(
-                    strategy=strategy,
-                    prompts=ok_prompts,
-                    records=ok_records,
-                    num_completions=num_completions,
-                )
-                gen_dt = time.time() - gen_t0
-                prompts_rep = [p for p in ok_prompts for _ in range(num_completions)]
-                records_rep = [r for r in ok_records for _ in range(num_completions)]
-            else:
-                if backend == "vllm":
-                    flat_completions = generate_batch_n_completions_vllm(
-                        llm=model,
-                        tokenizer=tokenizer,
-                        prompt_texts=ok_prompts,
-                        n=num_completions,
-                        sampling_params=generation_config,
-                        lora_request=lora_request,
-                        max_tool_rounds=max_tool_rounds,
-                    )
-                else:
-                    flat_completions = generate_batch_n_completions_hf(
-                        model=model,
-                        tokenizer=tokenizer,
-                        prompt_texts=ok_prompts,
-                        n=num_completions,
-                        generation_config=generation_config,
-                        max_tool_rounds=max_tool_rounds,
-                        micro_batch_size=generation_micro_batch_size,
-                    )
-                gen_dt = time.time() - gen_t0
+            flat_completions, rewards_flat, raw_results = run_strategy_batch(
+                strategy, ok_prompts, ok_records, num_completions,
+            )
+            gen_dt = time.time() - gen_t0
+            prompts_rep = [p for p in ok_prompts for _ in range(num_completions)]
 
-                expected_flat = len(ok_prompts) * num_completions
-                if len(flat_completions) != expected_flat:
-                    print(
-                        f"Warning: expected {expected_flat} completions "
-                        f"({len(ok_prompts)} prompts × num_completions={num_completions}), "
-                        f"got {len(flat_completions)}; padding or truncating to match."
-                    )
-                    if len(flat_completions) < expected_flat:
-                        flat_completions = flat_completions + [""] * (
-                            expected_flat - len(flat_completions)
-                        )
-                    else:
-                        flat_completions = flat_completions[:expected_flat]
-
-                prompts_rep = [p for p in ok_prompts for _ in range(num_completions)]
-                records_rep = [r for r in ok_records for _ in range(num_completions)]
-                try:
-                    rewards_flat = evaluate_completions(
-                        reward_factory=reward_factory,
-                        prompts=prompts_rep,
-                        completions=flat_completions,
-                        records=records_rep,
-                    )
-                except Exception as e:
-                    print(f"Warning: Batch reward computation failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    zero_r = {
-                        'format': 0, 'pred_simulation': 0, 'fault_simulation': 0,
-                        'input_vector': 0, 'expected_output': 0, 'detected_faults': 0,
-                        'fault_detect_inpvector': 0, 'pred_vs_fault_sim_acc': 0,
-                        'fault_detected_by_pred_input_vector_acc': 0,
-                        'expected_output_acc': 0, 'input_vector_acc': 0,
-                        'detected_faults_acc': 0,
-                    }
-                    rewards_flat = [zero_r] * (len(ok_prompts) * num_completions)
-            
-            n_reward = len(rewards_flat)
-            if n_reward != len(prompts_rep):
-                print(
-                    f"Warning: reward list length {n_reward} != "
-                    f"{len(prompts_rep)} (prompts × completions); adjusting."
-                )
-                if n_reward < len(prompts_rep):
-                    zero_r = {
-                        'format': 0, 'pred_simulation': 0, 'fault_simulation': 0,
-                        'input_vector': 0, 'expected_output': 0, 'detected_faults': 0,
-                        'fault_detect_inpvector': 0, 'pred_vs_fault_sim_acc': 0,
-                        'fault_detected_by_pred_input_vector_acc': 0,
-                        'expected_output_acc': 0, 'input_vector_acc': 0,
-                        'detected_faults_acc': 0,
-                    }
-                    rewards_flat = rewards_flat + [zero_r] * (
-                        len(prompts_rep) - n_reward
-                    )
-                else:
-                    rewards_flat = rewards_flat[: len(prompts_rep)]
+            if len(rewards_flat) != len(prompts_rep):
+                raise RuntimeError("Search rewards must align exactly with completion slots")
             
             per_problem_time = gen_dt / max(len(ok_prompts), 1)
             
@@ -1447,6 +1301,8 @@ def evaluate(
                     "num_correct": num_correct,
                     "num_completions": num_completions,
                     "time_seconds": chunk_time_seconds[slot],
+                    "completions": raw_results[j].completions,
+                    "search_slots": raw_results[j].slots,
                     "rewards_summary": {
                         "mean_total_reward": np.mean(
                             [sum(r.values()) for r in problem_rewards]
@@ -1547,17 +1403,31 @@ def evaluate(
         "avg_time_per_sample_seconds": round(eval_time / max(len(eval_records), 1), 2),
         "num_completions": num_completions,
         "sampling_method": sampling_method,
+        "search_protocol_version": PROTOCOL_VERSION,
+        "search_config": asdict(resolved_search_config),
         "search_width": width,
         "temperature": temperature,
         "threshold_mode": threshold_mode,
     }
     
+    search_usage = defaultdict(int)
+    for problem_result in all_results:
+        for search_slot in problem_result.get("search_slots", []):
+            for key, value in search_slot.get("usage", {}).items():
+                search_usage[key] += value
+    aggregate_metrics["search_usage"] = dict(search_usage)
+
     # Per-component accuracy averages across all problems
     component_metrics = defaultdict(list)
+    component_keys = {key for rewards in all_rewards for reward in rewards for key in reward}
     for problem_rewards in all_rewards:
         for reward in problem_rewards:
-            for key, value in reward.items():
-                component_metrics[key].append(value)
+            for key in component_keys:
+                component_metrics[key].append(reward.get(key, 0.0))
+    aggregate_metrics["failed_completion_slots"] = sum(
+        reward.get("search_failure_logonly", 0) > 0
+        for rewards in all_rewards for reward in rewards
+    )
     
     avg_component_metrics = {
         f"avg_{key}": float(np.mean(values))
@@ -1566,9 +1436,9 @@ def evaluate(
     
     # Accuracy metrics (only the _acc fields, which are 0 or 1)
     accuracy_metrics = {
-        key: float(np.mean(values))
+        key.removesuffix("_logonly"): float(np.mean(values))
         for key, values in component_metrics.items()
-        if key.endswith("_acc")
+        if key.endswith("_acc") or key.endswith("_acc_logonly")
     }
     
     print("\nComponent Accuracy Metrics:")
@@ -1605,6 +1475,8 @@ def evaluate(
             "eval_prompt_batch_size": eval_prompt_batch_size,
             "generation_micro_batch_size": generation_micro_batch_size,
             "sampling_method": sampling_method,
+            "search_protocol_version": PROTOCOL_VERSION,
+            "search_config": asdict(resolved_search_config),
         },
     }
     
@@ -1617,6 +1489,15 @@ def evaluate(
         os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
         with open(output_file, "w") as f:
             json.dump(detailed_output, f, indent=2, default=str)
+        slots_path = str(Path(output_file).with_suffix(".slots.jsonl"))
+        with open(slots_path, "w") as f:
+            for problem_result in all_results:
+                for slot_index, slot_result in enumerate(problem_result.get("search_slots", [])):
+                    row = {**slot_result, "problem_index": problem_result["idx"],
+                           "config": results["config"],
+                           "completion": problem_result["completions"][slot_index]}
+                    f.write(json.dumps(row, default=str) + "\n")
+        print(f"Per-slot trajectories and usage saved to: {slots_path}")
         print(f"\nDetailed results saved to: {output_file}")
     
     # Log final metrics to wandb
@@ -2724,8 +2605,8 @@ Examples:
         "--generation_micro_batch_size",
         type=int,
         default=int(_env("GENERATION_MICRO_BATCH_SIZE", "8")),
-        help="Transformers backend: max parallel sequences per generate() call "
-             "when expanding to batch_size * num_completions paths (default: 8).",
+        help="HF SFT stopping evaluation micro-batch size (default: 8). "
+             "Pass@k conversation search uses individual HF requests for isolated seeds.",
     )
     parser.add_argument(
         "--sampling_method",
@@ -2736,16 +2617,20 @@ Examples:
             "Sampling method. Model-based: 'greedy' (default) = LLM i.i.d. "
             "generation with tool calling; 'best_of_n' / 'mcts' / "
             "'evolutionary' = search (sampling_strategies.py). Model-free: "
-            "'random' = uniform PI/PO bitvectors scored by the verifier "
-            "(no LLM). Do not confuse 'greedy' with 'random'."
+            "'random' = uniform PI/PO bitvectors; 'vector_evolutionary' = "
+            "PI genetic search with simulator-derived outputs."
         ),
+    )
+    parser.add_argument(
+        "--search_config", default=_env("SEARCH_CONFIG"),
+        help="JSON configuration for conversation search budgets and operators.",
     )
     parser.add_argument(
         "--budget",
         type=int,
         default=int(_env("SEARCH_BUDGET")) if _env("SEARCH_BUDGET") else None,
-        help="mcts/evolutionary only: per-completion search width (B). Scored "
-             "rollouts (mcts) or completions evaluated (evolutionary) per "
+        help="mcts/evolutionary/vector_evolutionary: per-completion search width (B). "
+             "attempts, including invalid/incomplete attempts, per "
              "independent search. Orthogonal to --num_completions.",
     )
     parser.add_argument(
@@ -2885,6 +2770,7 @@ Examples:
             merge_dequant=args.merge_dequant,
             budget=args.budget,
             best_of_n_width=args.n,
+            search_config=args.search_config,
         )
 
 if __name__ == "__main__":

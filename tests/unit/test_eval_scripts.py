@@ -111,6 +111,7 @@ def test_invalid_checkpoint_and_missing_argument_fail(launcher, kind):
 
 @pytest.mark.parametrize("method,flag,width", [("mcts", "--budget", "50"),
                                                 ("evolutionary", "--budget", "50"),
+                                                ("vector_evolutionary", "--budget", "50"),
                                                 ("best_of_n", "--n", "4")])
 def test_sampling_and_logging_overrides(launcher, tmp_path, method, flag, width):
     repo, run = launcher
@@ -123,6 +124,7 @@ def test_sampling_and_logging_overrides(launcher, tmp_path, method, flag, width)
     assert args[args.index("--wandb_run_name") + 1] == "custom run"
     assert args[args.index("--report_to") + 1] == "none"
     assert "--merge_dequant" not in args
+    assert 'csv1' in args[args.index('--output_file') + 1]
 
 
 def test_dry_run_and_validation(launcher, tmp_path):

@@ -1,0 +1,21 @@
+{
+  "max_generated_tokens": 32768,
+  "max_simulator_requests": 32,
+  "max_simulator_executions": 32,
+  "finalization_tokens": 1024,
+  "action_tokens": 2048,
+  "max_actions": 32,
+  "repair_limit": 1,
+  "infrastructure_retry_limit": 1,
+  "duplicate_limit": 3,
+  "max_children": 8,
+  "c_puct": 1.25,
+  "prior": "uniform",
+  "population_size": 6,
+  "seed_temperatures": [0.5, 0.8, 1.0],
+  "mutation_temperature": 1.0,
+  "crossover_temperature": 0.7,
+  "operator_weights": [0.5, 0.25, 0.15, 0.1],
+  "controller_edits": true,
+  "save_trace": false
+}
