@@ -285,7 +285,7 @@ def generate_with_tools(
                 try:
                     ensure_tool_call_arguments_dict(tool_call)
                     tool_call["arguments"].update(
-                        {"netlist": ToolHelper.get_netlist(prompt_text)}
+                        ToolHelper.context(prompt_text)
                     )
                     tool_result = execute_tool_call(tool_call)
                     messages = revert_chat_template(
@@ -402,11 +402,9 @@ def generate_batch_n_completions_vllm(
                     try:
                         ensure_tool_call_arguments_dict(tool_call)
                         tool_call["arguments"].update(
-                            {
-                                "netlist": ToolHelper.get_netlist(
+                            ToolHelper.context(
                                     states[i]["current_input"]
                                 )
-                            }
                         )
                         tool_result = execute_tool_call(tool_call)
                         
@@ -532,11 +530,9 @@ def generate_batch_n_completions_hf(
                             try:
                                 ensure_tool_call_arguments_dict(tool_call)
                                 tool_call["arguments"].update(
-                                    {
-                                        "netlist": ToolHelper.get_netlist(
+                                    ToolHelper.context(
                                             states[idx]["current_input"]
                                         )
-                                    }
                                 )
                                 tool_result = execute_tool_call(tool_call)
                                 messages = revert_chat_template(
@@ -674,7 +670,7 @@ def evaluate_completions(
         Per-completion reward dictionaries with component scores.
     """
     from atpgllm.llm.reward_funcs import test_generation_reward
-    from fault_sim import resolve_fault_sim_runner
+    from fault_sim import resolve_fault_sim_runner, _use_tetramax_backend
     
     # Build kwargs
     netlists = []
@@ -709,6 +705,8 @@ def evaluate_completions(
         print(f"Warning: Reward computation failed: {e}")
         import traceback
         traceback.print_exc()
+        if _use_tetramax_backend():
+            return [{'simulator_error_logonly': 1.0} for _ in prompts]
         rewards = [{'format': 0, 'pred_simulation': 0, 'fault_simulation': 0,
                      'input_vector': 0, 'expected_output': 0, 'detected_faults': 0,
                      'fault_detect_inpvector': 0, 'pred_vs_fault_sim_acc': 0,
@@ -1209,6 +1207,8 @@ def evaluate(
     # 4.5. All pass@k policies use versioned scoring and slot accounting.
     # Model-based policies share the structured conversation runner.
     # =========================================================================
+    from atpgllm.training.simulator_provenance import runtime_provenance
+    simulator_provenance = runtime_provenance()
     verifier = Verifier(reward_factory)
     if sampling_method in MODEL_FREE_STRATEGY_NAMES:
         generator = None
@@ -1429,14 +1429,21 @@ def evaluate(
         for rewards in all_rewards for reward in rewards
     )
     
+    aggregate_metrics['simulator_failed_completion_slots'] = sum(
+        reward.get('simulator_error_logonly', 0) > 0
+        for rewards in all_rewards for reward in rewards
+    )
+    aggregate_metrics['simulator_failure_denominator_policy'] = 'Failures remain unsuccessful completion slots in pass@k; reported separately.'
+    aggregate_metrics['simulator'] = simulator_provenance
+
     avg_component_metrics = {
-        f"avg_{key}": float(np.mean(values))
+        f"avg_{key}": float(np.nanmean(values))
         for key, values in component_metrics.items()
     }
     
     # Accuracy metrics (only the _acc fields, which are 0 or 1)
     accuracy_metrics = {
-        key.removesuffix("_logonly"): float(np.mean(values))
+        key.removesuffix("_logonly"): float(np.nanmean(values))
         for key, values in component_metrics.items()
         if key.endswith("_acc") or key.endswith("_acc_logonly")
     }
@@ -1809,7 +1816,7 @@ def _sft_eval_generate_hf(
                 continue
             ensure_tool_call_arguments_dict(tc)
             tc["arguments"].update(
-                {"netlist": ToolHelper.get_netlist(expanded[idx])}
+                ToolHelper.context(expanded[idx])
             )
             result = execute_tool_call(tc)
             try:

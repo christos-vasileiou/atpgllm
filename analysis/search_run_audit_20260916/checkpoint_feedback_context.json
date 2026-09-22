@@ -1,0 +1,251 @@
+{
+  "groups": {
+    "base_ctx16384_tools1_seed42": {
+      "all": {
+        "matched_final_slots": 117,
+        "wrong_request": 43,
+        "corrected_wrong_request": 43,
+        "copied_wrong_request": 0
+      },
+      "full_history_le_8192": {
+        "matched_final_slots": 54,
+        "wrong_request": 19,
+        "corrected_wrong_request": 19,
+        "copied_wrong_request": 0
+      },
+      "full_history_le_7680": {
+        "matched_final_slots": 40,
+        "wrong_request": 14,
+        "corrected_wrong_request": 14,
+        "copied_wrong_request": 0
+      }
+    },
+    "base_ctx8192_tools1_seed42": {
+      "all": {
+        "matched_final_slots": 48,
+        "wrong_request": 16,
+        "corrected_wrong_request": 16,
+        "copied_wrong_request": 0
+      },
+      "full_history_le_8192": {
+        "matched_final_slots": 48,
+        "wrong_request": 16,
+        "corrected_wrong_request": 16,
+        "copied_wrong_request": 0
+      },
+      "full_history_le_7680": {
+        "matched_final_slots": 40,
+        "wrong_request": 15,
+        "corrected_wrong_request": 15,
+        "copied_wrong_request": 0
+      }
+    },
+    "grpo_ctx16384_tools1_seed42": {
+      "all": {
+        "matched_final_slots": 127,
+        "wrong_request": 84,
+        "corrected_wrong_request": 4,
+        "copied_wrong_request": 80
+      },
+      "full_history_le_8192": {
+        "matched_final_slots": 116,
+        "wrong_request": 77,
+        "corrected_wrong_request": 4,
+        "copied_wrong_request": 73
+      },
+      "full_history_le_7680": {
+        "matched_final_slots": 113,
+        "wrong_request": 75,
+        "corrected_wrong_request": 4,
+        "copied_wrong_request": 71
+      }
+    },
+    "grpo_ctx8192_tools1_seed42": {
+      "all": {
+        "matched_final_slots": 118,
+        "wrong_request": 81,
+        "corrected_wrong_request": 4,
+        "copied_wrong_request": 77
+      },
+      "full_history_le_8192": {
+        "matched_final_slots": 118,
+        "wrong_request": 81,
+        "corrected_wrong_request": 4,
+        "copied_wrong_request": 77
+      },
+      "full_history_le_7680": {
+        "matched_final_slots": 116,
+        "wrong_request": 81,
+        "corrected_wrong_request": 4,
+        "copied_wrong_request": 77
+      }
+    },
+    "sft_ctx16384_tools1_seed42": {
+      "all": {
+        "matched_final_slots": 107,
+        "wrong_request": 72,
+        "corrected_wrong_request": 5,
+        "copied_wrong_request": 67
+      },
+      "full_history_le_8192": {
+        "matched_final_slots": 102,
+        "wrong_request": 70,
+        "corrected_wrong_request": 5,
+        "copied_wrong_request": 65
+      },
+      "full_history_le_7680": {
+        "matched_final_slots": 97,
+        "wrong_request": 67,
+        "corrected_wrong_request": 5,
+        "copied_wrong_request": 62
+      }
+    },
+    "sft_ctx8192_tools1_seed42": {
+      "all": {
+        "matched_final_slots": 111,
+        "wrong_request": 78,
+        "corrected_wrong_request": 2,
+        "copied_wrong_request": 76
+      },
+      "full_history_le_8192": {
+        "matched_final_slots": 111,
+        "wrong_request": 78,
+        "corrected_wrong_request": 2,
+        "copied_wrong_request": 76
+      },
+      "full_history_le_7680": {
+        "matched_final_slots": 107,
+        "wrong_request": 77,
+        "corrected_wrong_request": 2,
+        "copied_wrong_request": 75
+      }
+    }
+  },
+  "short_wrong_copy_examples": {
+    "grpo_ctx16384_tools1_seed42": {
+      "job": "grpo_ctx16384_tools1_seed42",
+      "comparison_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912:original",
+      "module": "dimc_macro_add_3u_82_4",
+      "completion_slot": 0,
+      "rendered_full_history_tokens": 2581,
+      "vector": {
+        "in1[0]": 0,
+        "in1[1]": 1,
+        "in1[2]": 0
+      },
+      "requested_output": {
+        "out1[0]": 1,
+        "out1[1]": 0,
+        "out1[2]": 1
+      },
+      "good_output": {
+        "out1[0]": 1,
+        "out1[1]": 1,
+        "out1[2]": 0
+      },
+      "final_expected_output": {
+        "out1[0]": 1,
+        "out1[1]": 0,
+        "out1[2]": 1
+      },
+      "detection": 1.0
+    },
+    "grpo_ctx8192_tools1_seed42": {
+      "job": "grpo_ctx8192_tools1_seed42",
+      "comparison_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912:original",
+      "module": "dimc_macro_add_3u_82_4",
+      "completion_slot": 2,
+      "rendered_full_history_tokens": 1838,
+      "vector": {
+        "in1[0]": 0,
+        "in1[1]": 1,
+        "in1[2]": 0
+      },
+      "requested_output": {
+        "out1[0]": 1,
+        "out1[1]": 0,
+        "out1[2]": 0
+      },
+      "good_output": {
+        "out1[0]": 1,
+        "out1[1]": 1,
+        "out1[2]": 0
+      },
+      "final_expected_output": {
+        "out1[0]": 1,
+        "out1[1]": 0,
+        "out1[2]": 0
+      },
+      "detection": 1.0
+    },
+    "sft_ctx16384_tools1_seed42": {
+      "job": "sft_ctx16384_tools1_seed42",
+      "comparison_id": "a6aa9594168b8f702ab1f963b2f84795617dbdd9b324f46931201b9fa6faf179:original",
+      "module": "minus_8",
+      "completion_slot": 3,
+      "rendered_full_history_tokens": 2409,
+      "vector": {
+        "data_in[0]": 0,
+        "data_in[1]": 0,
+        "data_in[2]": 1,
+        "data_in[3]": 1,
+        "data_in[4]": 1,
+        "data_in[5]": 0
+      },
+      "requested_output": {
+        "data_out[0]": 0,
+        "data_out[1]": 0,
+        "data_out[2]": 1,
+        "data_out[3]": 1,
+        "data_out[4]": 1,
+        "data_out[5]": 0
+      },
+      "good_output": {
+        "data_out[0]": 0,
+        "data_out[1]": 0,
+        "data_out[2]": 1,
+        "data_out[3]": 0,
+        "data_out[4]": 1,
+        "data_out[5]": 0
+      },
+      "final_expected_output": {
+        "data_out[0]": 0,
+        "data_out[1]": 0,
+        "data_out[2]": 1,
+        "data_out[3]": 1,
+        "data_out[4]": 1,
+        "data_out[5]": 0
+      },
+      "detection": 0.0
+    },
+    "sft_ctx8192_tools1_seed42": {
+      "job": "sft_ctx8192_tools1_seed42",
+      "comparison_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912:original",
+      "module": "dimc_macro_add_3u_82_4",
+      "completion_slot": 2,
+      "rendered_full_history_tokens": 1730,
+      "vector": {
+        "in1[0]": 0,
+        "in1[1]": 1,
+        "in1[2]": 0
+      },
+      "requested_output": {
+        "out1[0]": 1,
+        "out1[1]": 0,
+        "out1[2]": 1
+      },
+      "good_output": {
+        "out1[0]": 1,
+        "out1[1]": 1,
+        "out1[2]": 0
+      },
+      "final_expected_output": {
+        "out1[0]": 1,
+        "out1[1]": 0,
+        "out1[2]": 1
+      },
+      "detection": 1.0
+    }
+  },
+  "caveat": "Valid finals whose input equals the last simulated input. Full histories are reconstructed with the shared tokenizer/template and thinking preserved, not a trace of every intermediate generation prefix. The 7,680-token stratum leaves a margin below 8,192. This diagnoses copying within the earlier context size; it does not isolate the causal effect of SFT training length."
+}

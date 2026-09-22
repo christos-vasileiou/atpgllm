@@ -540,6 +540,7 @@ def train_with_grpo(
     vllm_mode: Optional[Literal["colocate", "server"]] = None,
     vllm_server_url: str = None,
     num_generations: int = 8,
+    train_best_of_n: int = 0,
     steps_per_generation: int = 1,
     max_model_len: int = 8192,
     max_completion_length: int = 4096,
@@ -560,7 +561,7 @@ def train_with_grpo(
     fixed_eval_manifest: str = None,
     fixed_eval_seed: int = 1729,
     fixed_eval_steps: int = 5,
-    fixed_eval_generations: int = 3,
+    fixed_eval_generations: int = 1,
     fixed_eval_batch_size: int = 1,
     **kwargs,
 ) -> None:
@@ -670,6 +671,11 @@ def train_with_grpo(
         load_dual_adapter_checkpoint,
         resolve_base_model_name_from_checkpoint,
     )
+
+    from atpgllm.training.best_of_n import validate_best_of_n
+    validate_best_of_n(train_best_of_n, num_generations)
+    if fixed_eval_size and fixed_eval_generations != 1:
+        raise ValueError("Fixed evaluation is greedy; set FIXED_EVAL_GENERATIONS=1")
 
     if fixed_eval_size < 0 or fixed_eval_steps < 1:
         raise ValueError("fixed_eval_size must be nonnegative and fixed_eval_steps positive")
@@ -831,7 +837,7 @@ def train_with_grpo(
             "generations": fixed_eval_generations,
             "per_device_batch_size": fixed_eval_batch_size,
             "world_size": state.num_processes,
-            "temperature": 1.0, "top_p": 1.0,
+            "temperature": 0.0, "top_p": 1.0, "sampling_method": "greedy",
             "fault_sim_backend": os.environ.get("FAULT_SIM_BACKEND", "fast"),
             "prompt_pipeline": "single_generation_prefix_v1",
             "training_holdout_policy": holdout_policy,
@@ -930,9 +936,13 @@ def train_with_grpo(
         # Whether to compute importance sampling ratios at the `"token"` or `"sequence"` level.
         # `"token"`: keeps raw per-token log-probability ratios. 
         # `"sequence"`: averages them across valid tokens into a single ratio per sequence — generally more stable (see GSPO paper).
-        # The custom trainers perform per-objective group normalization and
-        # final global-batch normalization. A second TRL scaling pass would
-        # corrupt the GDPO advantage.
+        # GDPO already applies two scaling stages: first, each reward objective
+        # is normalized within its generation group; second, the combined
+        # advantage is normalized across the global batch. Setting this to True
+        # does not add a supported third scaling pass: the custom trainers raise
+        # an error to prevent TRL from re-scaling the completed GDPO advantage.
+        # TODO: Add an explicit legacy-GRPO mode that bypasses GDPO and allows
+        # TRL's scale_rewards setting to be configured normally.
         scale_rewards=False,
         # Preserve the netlist-diversity-maximising order produced by
         # buffer_streaming_dataset(maximize_diversity_by="netlist"): the
@@ -945,7 +955,9 @@ def train_with_grpo(
         log_unique_prompts=True,
     )
 
+    from atpgllm.training.simulator_provenance import SimulatorProvenanceCallback
     shared_callbacks = [
+        SimulatorProvenanceCallback(resume_checkpoint),
         ThroughputMetricsCallback(),
         ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
         TrainingStateCheckpointCallback(
@@ -994,6 +1006,8 @@ def train_with_grpo(
             callbacks=shared_callbacks,
         )
 
+    trainer.train_best_of_n = train_best_of_n
+    print(f"[Training sampling] candidates={train_best_of_n or num_generations}, retained={num_generations}, temperature=1.0")
     if resume_checkpoint:
         patch_trainer_cpu_optimizer_resume(trainer)
     trainer.train(resume_from_checkpoint=resume_checkpoint)
@@ -1038,6 +1052,7 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
 _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "buffer_size",
     "num_generations",
+    "train_best_of_n",
     "netlist_diversity_strategy",
     "steps_per_generation",
     "max_completion_length",
@@ -1193,6 +1208,8 @@ def main() -> None:
     )
     parser.add_argument("--num_generations", type=int, default=_env('NUM_GENERATIONS', 8),
                         help="Number of generations per prompt to sample.")
+    parser.add_argument("--train_best_of_n", type=int, default=_env("TRAIN_BEST_OF_N", 0),
+                        help="Training candidates per prompt; keep best NUM_GENERATIONS by simulator reward. 0 disables; otherwise a multiple of NUM_GENERATIONS.")
     parser.add_argument("--grpo_learning_rate", type=float, default=_env("GRPO_LEARNING_RATE", 5e-6))
     parser.add_argument("--grpo_warmup_steps", type=int, default=_env("GRPO_WARMUP_STEPS", 10))
     parser.add_argument("--fixed_eval_size", type=int, default=_env("FIXED_EVAL_SIZE", 0),
@@ -1201,7 +1218,7 @@ def main() -> None:
     parser.add_argument("--fixed_eval_manifest", default=_env("FIXED_EVAL_MANIFEST", None))
     parser.add_argument("--fixed_eval_seed", type=int, default=_env("FIXED_EVAL_SEED", 1729))
     parser.add_argument("--fixed_eval_steps", type=int, default=_env("FIXED_EVAL_STEPS", 5))
-    parser.add_argument("--fixed_eval_generations", type=int, default=_env("FIXED_EVAL_GENERATIONS", 3))
+    parser.add_argument("--fixed_eval_generations", type=int, default=_env("FIXED_EVAL_GENERATIONS", 1))
     parser.add_argument("--fixed_eval_batch_size", type=int, default=_env("FIXED_EVAL_BATCH_SIZE", 1))
     parser.add_argument(
         "--netlist_diversity_strategy",

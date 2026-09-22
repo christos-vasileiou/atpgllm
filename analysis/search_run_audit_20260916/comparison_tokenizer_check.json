@@ -1,0 +1,6 @@
+{
+  "same_vocab": true,
+  "base_eos_token_id": 100257,
+  "sft_eos_token_id": 100257,
+  "same_chat_template": false
+}

@@ -1,0 +1,916 @@
+{
+  "runs": {
+    "random": {
+      "pass@1": 0.6051025390625,
+      "pass@2": 0.7500325520833333,
+      "pass@4": 0.8558250343406593,
+      "pass@8": 0.9045770202020202,
+      "pass@16": 0.923828125,
+      "num_eval_samples": 512,
+      "num_valid_samples": 512,
+      "num_errors": 0,
+      "total_eval_time_seconds": 51.94,
+      "avg_time_per_sample_seconds": 0.1,
+      "num_completions": 16,
+      "sampling_method": "random",
+      "search_protocol_version": "conversation-search-v1",
+      "search_config": {
+        "max_generated_tokens": 32768,
+        "max_simulator_requests": 32,
+        "max_simulator_executions": 32,
+        "finalization_tokens": 1024,
+        "action_tokens": 2048,
+        "max_actions": 32,
+        "repair_limit": 1,
+        "infrastructure_retry_limit": 1,
+        "duplicate_limit": 3,
+        "max_children": 8,
+        "c_puct": 1.25,
+        "prior": "uniform",
+        "population_size": 6,
+        "seed_temperatures": [
+          0.5,
+          0.8,
+          1.0
+        ],
+        "mutation_temperature": 1.0,
+        "crossover_temperature": 0.7,
+        "operator_weights": [
+          0.5,
+          0.25,
+          0.15,
+          0.1
+        ],
+        "controller_edits": true,
+        "save_trace": false
+      },
+      "search_width": null,
+      "temperature": 0.7,
+      "threshold_mode": "fault_detected",
+      "search_usage": {
+        "attempts": 8192,
+        "generated_tokens": 0,
+        "prompt_tokens": 0,
+        "generation_requests": 0,
+        "simulator_requests": 8192,
+        "simulator_executions": 8192,
+        "cache_hits": 0,
+        "tool_calls": 0,
+        "infrastructure_errors": 0,
+        "invalid_actions": 0,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "failed_completion_slots": 0,
+      "accuracy_metrics": {
+        "fault_site_activated_acc": 0.6854248046875,
+        "pred_vs_fault_sim_acc": 0.0,
+        "detected_faults_acc": 1.0,
+        "expected_output_acc": 0.0594482421875,
+        "fault_detected_by_pred_input_vector_acc": 0.6051025390625,
+        "input_vector_acc": 1.0
+      },
+      "successes": 4957,
+      "solved_problems": 473,
+      "status": {
+        "FINAL": 8192
+      },
+      "stop_reason": {
+        "attempt_limit": 3235,
+        "accepted": 4957
+      },
+      "attempts_distribution": {
+        "1": 8192
+      },
+      "mean_unique_vectors": 1.0,
+      "full_accuracy_selected": 0.025146484375
+    },
+    "greedy": {
+      "pass@1": 0.605712890625,
+      "pass@2": 0.764697265625,
+      "pass@4": 0.8708555116758242,
+      "pass@8": 0.9256437572843823,
+      "pass@16": 0.955078125,
+      "num_eval_samples": 512,
+      "num_valid_samples": 512,
+      "num_errors": 0,
+      "total_eval_time_seconds": 29437.88,
+      "avg_time_per_sample_seconds": 57.5,
+      "num_completions": 16,
+      "sampling_method": "greedy",
+      "search_protocol_version": "conversation-search-v1",
+      "search_config": {
+        "max_generated_tokens": 32768,
+        "max_simulator_requests": 32,
+        "max_simulator_executions": 32,
+        "finalization_tokens": 1024,
+        "action_tokens": 2048,
+        "max_actions": 32,
+        "repair_limit": 1,
+        "infrastructure_retry_limit": 1,
+        "duplicate_limit": 3,
+        "max_children": 8,
+        "c_puct": 1.25,
+        "prior": "uniform",
+        "population_size": 6,
+        "seed_temperatures": [
+          0.5,
+          0.8,
+          1.0
+        ],
+        "mutation_temperature": 1.0,
+        "crossover_temperature": 0.7,
+        "operator_weights": [
+          0.5,
+          0.25,
+          0.15,
+          0.1
+        ],
+        "controller_edits": true,
+        "save_trace": false
+      },
+      "search_width": null,
+      "temperature": 0.7,
+      "threshold_mode": "fault_detected",
+      "search_usage": {
+        "attempts": 8192,
+        "generated_tokens": 21592593,
+        "prompt_tokens": 131660505,
+        "generation_requests": 20745,
+        "simulator_requests": 15416,
+        "simulator_executions": 7767,
+        "cache_hits": 7649,
+        "tool_calls": 7753,
+        "infrastructure_errors": 0,
+        "invalid_actions": 791,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "failed_completion_slots": 529,
+      "accuracy_metrics": {
+        "expected_output_acc": 0.1533203125,
+        "input_vector_acc": 0.9354248046875,
+        "fault_detected_by_pred_input_vector_acc": 0.605712890625,
+        "fault_site_activated_acc": 0.6822509765625,
+        "pred_vs_fault_sim_acc": 0.9337158203125,
+        "detected_faults_acc": 0.8895263671875
+      },
+      "successes": 4962,
+      "solved_problems": 489,
+      "status": {
+        "FINAL": 7663,
+        "EXHAUSTED": 225,
+        "INVALID": 304
+      },
+      "stop_reason": {
+        "accepted": 4962,
+        "attempt_limit": 3043,
+        "token_or_action_limit": 187
+      },
+      "attempts_distribution": {
+        "1": 8192
+      },
+      "mean_unique_vectors": 0.9354248046875,
+      "full_accuracy_selected": 0.107177734375
+    },
+    "mcts": {
+      "pass@1": 0.7567138671875,
+      "pass@2": 0.8678385416666666,
+      "pass@4": 0.9224351820054946,
+      "pass@8": 0.9478058833527583,
+      "pass@16": 0.96484375,
+      "num_eval_samples": 512,
+      "num_valid_samples": 512,
+      "num_errors": 0,
+      "total_eval_time_seconds": 43791.95,
+      "avg_time_per_sample_seconds": 85.53,
+      "num_completions": 16,
+      "sampling_method": "mcts",
+      "search_protocol_version": "conversation-search-v1",
+      "search_config": {
+        "max_generated_tokens": 32768,
+        "max_simulator_requests": 32,
+        "max_simulator_executions": 32,
+        "finalization_tokens": 1024,
+        "action_tokens": 2048,
+        "max_actions": 32,
+        "repair_limit": 1,
+        "infrastructure_retry_limit": 1,
+        "duplicate_limit": 3,
+        "max_children": 8,
+        "c_puct": 1.25,
+        "prior": "uniform",
+        "population_size": 6,
+        "seed_temperatures": [
+          0.5,
+          0.8,
+          1.0
+        ],
+        "mutation_temperature": 1.0,
+        "crossover_temperature": 0.7,
+        "operator_weights": [
+          0.5,
+          0.25,
+          0.15,
+          0.1
+        ],
+        "controller_edits": true,
+        "save_trace": false
+      },
+      "search_width": 4,
+      "temperature": 0.7,
+      "threshold_mode": "fault_detected",
+      "search_usage": {
+        "attempts": 14857,
+        "generated_tokens": 31197147,
+        "prompt_tokens": 187754600,
+        "generation_requests": 31855,
+        "simulator_requests": 24544,
+        "simulator_executions": 10617,
+        "cache_hits": 13927,
+        "tool_calls": 10716,
+        "infrastructure_errors": 0,
+        "invalid_actions": 1471,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "failed_completion_slots": 253,
+      "accuracy_metrics": {
+        "detected_faults_acc": 0.9288330078125,
+        "fault_detected_by_pred_input_vector_acc": 0.7567138671875,
+        "fault_site_activated_acc": 0.826904296875,
+        "expected_output_acc": 0.1693115234375,
+        "pred_vs_fault_sim_acc": 0.9671630859375,
+        "input_vector_acc": 0.9691162109375
+      },
+      "successes": 6199,
+      "solved_problems": 494,
+      "status": {
+        "FINAL": 7939,
+        "INVALID": 97,
+        "EXHAUSTED": 156
+      },
+      "stop_reason": {
+        "accepted": 6199,
+        "attempt_limit": 1755,
+        "token_or_action_limit": 238
+      },
+      "attempts_distribution": {
+        "1": 5112,
+        "4": 1777,
+        "2": 1272,
+        "3": 31
+      },
+      "mean_unique_vectors": 1.2850341796875,
+      "full_accuracy_selected": 0.130859375
+    },
+    "best_of_n": {
+      "pass@1": 0.851318359375,
+      "pass@2": 0.9214518229166666,
+      "pass@4": 0.9510312929258242,
+      "pass@8": 0.9685448232323233,
+      "pass@16": 0.98046875,
+      "num_eval_samples": 512,
+      "num_valid_samples": 512,
+      "num_errors": 0,
+      "total_eval_time_seconds": 50164.15,
+      "avg_time_per_sample_seconds": 97.98,
+      "num_completions": 16,
+      "sampling_method": "best_of_n",
+      "search_protocol_version": "conversation-search-v1",
+      "search_config": {
+        "max_generated_tokens": 32768,
+        "max_simulator_requests": 32,
+        "max_simulator_executions": 32,
+        "finalization_tokens": 1024,
+        "action_tokens": 2048,
+        "max_actions": 32,
+        "repair_limit": 1,
+        "infrastructure_retry_limit": 1,
+        "duplicate_limit": 3,
+        "max_children": 8,
+        "c_puct": 1.25,
+        "prior": "uniform",
+        "population_size": 6,
+        "seed_temperatures": [
+          0.5,
+          0.8,
+          1.0
+        ],
+        "mutation_temperature": 1.0,
+        "crossover_temperature": 0.7,
+        "operator_weights": [
+          0.5,
+          0.25,
+          0.15,
+          0.1
+        ],
+        "controller_edits": true,
+        "save_trace": false
+      },
+      "search_width": 4,
+      "temperature": 0.7,
+      "threshold_mode": "fault_detected",
+      "search_usage": {
+        "attempts": 14292,
+        "generated_tokens": 35314665,
+        "prompt_tokens": 202283714,
+        "generation_requests": 35015,
+        "simulator_requests": 26752,
+        "simulator_executions": 13276,
+        "cache_hits": 13476,
+        "tool_calls": 13456,
+        "infrastructure_errors": 0,
+        "invalid_actions": 1653,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "failed_completion_slots": 229,
+      "accuracy_metrics": {
+        "fault_detected_by_pred_input_vector_acc": 0.851318359375,
+        "fault_site_activated_acc": 0.9091796875,
+        "input_vector_acc": 0.9720458984375,
+        "detected_faults_acc": 0.9302978515625,
+        "expected_output_acc": 0.169921875,
+        "pred_vs_fault_sim_acc": 0.9698486328125
+      },
+      "successes": 6974,
+      "solved_problems": 502,
+      "status": {
+        "FINAL": 7963,
+        "INVALID": 62,
+        "EXHAUSTED": 167
+      },
+      "stop_reason": {
+        "accepted": 6974,
+        "attempt_limit": 949,
+        "token_or_action_limit": 269
+      },
+      "attempts_distribution": {
+        "1": 5167,
+        "2": 1208,
+        "3": 559,
+        "4": 1258
+      },
+      "mean_unique_vectors": 1.598388671875,
+      "full_accuracy_selected": 0.145263671875
+    },
+    "evolutionary": {
+      "pass@1": 0.8446044921875,
+      "pass@2": 0.9204427083333333,
+      "pass@4": 0.9542764852335165,
+      "pass@8": 0.9716192878302253,
+      "pass@16": 0.98046875,
+      "num_eval_samples": 512,
+      "num_valid_samples": 512,
+      "num_errors": 0,
+      "total_eval_time_seconds": 53291.5,
+      "avg_time_per_sample_seconds": 104.08,
+      "num_completions": 16,
+      "sampling_method": "evolutionary",
+      "search_protocol_version": "conversation-search-v1",
+      "search_config": {
+        "max_generated_tokens": 32768,
+        "max_simulator_requests": 32,
+        "max_simulator_executions": 32,
+        "finalization_tokens": 1024,
+        "action_tokens": 2048,
+        "max_actions": 32,
+        "repair_limit": 1,
+        "infrastructure_retry_limit": 1,
+        "duplicate_limit": 3,
+        "max_children": 8,
+        "c_puct": 1.25,
+        "prior": "uniform",
+        "population_size": 6,
+        "seed_temperatures": [
+          0.5,
+          0.8,
+          1.0
+        ],
+        "mutation_temperature": 1.0,
+        "crossover_temperature": 0.7,
+        "operator_weights": [
+          0.5,
+          0.25,
+          0.15,
+          0.1
+        ],
+        "controller_edits": true,
+        "save_trace": false
+      },
+      "search_width": 4,
+      "temperature": 0.7,
+      "threshold_mode": "fault_detected",
+      "search_usage": {
+        "attempts": 14313,
+        "generated_tokens": 36469670,
+        "prompt_tokens": 215708820,
+        "generation_requests": 35613,
+        "simulator_requests": 26716,
+        "simulator_executions": 13267,
+        "cache_hits": 13449,
+        "tool_calls": 13445,
+        "infrastructure_errors": 0,
+        "invalid_actions": 1634,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "failed_completion_slots": 274,
+      "accuracy_metrics": {
+        "input_vector_acc": 0.966552734375,
+        "pred_vs_fault_sim_acc": 0.9647216796875,
+        "fault_detected_by_pred_input_vector_acc": 0.8446044921875,
+        "expected_output_acc": 0.1856689453125,
+        "detected_faults_acc": 0.9278564453125,
+        "fault_site_activated_acc": 0.902099609375
+      },
+      "successes": 6919,
+      "solved_problems": 502,
+      "status": {
+        "FINAL": 7918,
+        "EXHAUSTED": 211,
+        "INVALID": 63
+      },
+      "stop_reason": {
+        "accepted": 6919,
+        "token_or_action_limit": 308,
+        "attempt_limit": 965
+      },
+      "attempts_distribution": {
+        "3": 525,
+        "1": 5152,
+        "4": 1278,
+        "2": 1237
+      },
+      "mean_unique_vectors": 1.5946044921875,
+      "full_accuracy_selected": 0.1563720703125
+    },
+    "vector_evolutionary": {
+      "pass@1": 0.8492431640625,
+      "pass@2": 0.9029296874999999,
+      "pass@4": 0.9266987894917583,
+      "pass@8": 0.9411277741355867,
+      "pass@16": 0.951171875,
+      "num_eval_samples": 512,
+      "num_valid_samples": 512,
+      "num_errors": 0,
+      "total_eval_time_seconds": 86.85,
+      "avg_time_per_sample_seconds": 0.17,
+      "num_completions": 16,
+      "sampling_method": "vector_evolutionary",
+      "search_protocol_version": "conversation-search-v1",
+      "search_config": {
+        "max_generated_tokens": 32768,
+        "max_simulator_requests": 32,
+        "max_simulator_executions": 32,
+        "finalization_tokens": 1024,
+        "action_tokens": 2048,
+        "max_actions": 32,
+        "repair_limit": 1,
+        "infrastructure_retry_limit": 1,
+        "duplicate_limit": 3,
+        "max_children": 8,
+        "c_puct": 1.25,
+        "prior": "uniform",
+        "population_size": 6,
+        "seed_temperatures": [
+          0.5,
+          0.8,
+          1.0
+        ],
+        "mutation_temperature": 1.0,
+        "crossover_temperature": 0.7,
+        "operator_weights": [
+          0.5,
+          0.25,
+          0.15,
+          0.1
+        ],
+        "controller_edits": true,
+        "save_trace": false
+      },
+      "search_width": 4,
+      "temperature": 0.7,
+      "threshold_mode": "fault_detected",
+      "search_usage": {
+        "attempts": 15025,
+        "generated_tokens": 0,
+        "prompt_tokens": 0,
+        "generation_requests": 0,
+        "simulator_requests": 29506,
+        "simulator_executions": 14817,
+        "cache_hits": 14689,
+        "tool_calls": 0,
+        "infrastructure_errors": 128,
+        "invalid_actions": 0,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "failed_completion_slots": 64,
+      "accuracy_metrics": {
+        "fault_site_activated_acc": 0.933349609375,
+        "expected_output_acc": 0.9921875,
+        "pred_vs_fault_sim_acc": 0.0,
+        "detected_faults_acc": 0.9921875,
+        "input_vector_acc": 0.9921875,
+        "fault_detected_by_pred_input_vector_acc": 0.8492431640625
+      },
+      "successes": 6957,
+      "solved_problems": 487,
+      "status": {
+        "FINAL": 8128,
+        "INFRA_ERROR": 64
+      },
+      "stop_reason": {
+        "accepted": 6957,
+        "attempt_limit": 1171,
+        "infrastructure_retry_limit": 64
+      },
+      "attempts_distribution": {
+        "4": 1509,
+        "2": 1208,
+        "1": 4926,
+        "3": 549
+      },
+      "mean_unique_vectors": 1.8087158203125,
+      "full_accuracy_selected": 0.8492431640625
+    }
+  },
+  "comparisons": [
+    {
+      "a": "greedy",
+      "b": "random",
+      "k": 1,
+      "delta": 0.0006103515625,
+      "ci95": [
+        -0.0203857421875,
+        0.021728515625
+      ],
+      "wins": 190,
+      "ties": 90,
+      "losses": 232
+    },
+    {
+      "a": "greedy",
+      "b": "random",
+      "k": 4,
+      "delta": 0.015030477335164832,
+      "ci95": [
+        -0.0022360330099587896,
+        0.03260806576236261
+      ],
+      "wins": 174,
+      "ties": 173,
+      "losses": 165
+    },
+    {
+      "a": "greedy",
+      "b": "random",
+      "k": 16,
+      "delta": 0.03125,
+      "ci95": [
+        0.009765625,
+        0.052734375
+      ],
+      "wins": 25,
+      "ties": 478,
+      "losses": 9
+    },
+    {
+      "a": "best_of_n",
+      "b": "vector_evolutionary",
+      "k": 1,
+      "delta": 0.0020751953125,
+      "ci95": [
+        -0.0133056640625,
+        0.017578125
+      ],
+      "wins": 135,
+      "ties": 209,
+      "losses": 168
+    },
+    {
+      "a": "best_of_n",
+      "b": "vector_evolutionary",
+      "k": 4,
+      "delta": 0.024332503434065934,
+      "ci95": [
+        0.00952896956559066,
+        0.039807343535370875
+      ],
+      "wins": 60,
+      "ties": 392,
+      "losses": 60
+    },
+    {
+      "a": "best_of_n",
+      "b": "vector_evolutionary",
+      "k": 16,
+      "delta": 0.029296875,
+      "ci95": [
+        0.01171875,
+        0.048828125
+      ],
+      "wins": 19,
+      "ties": 489,
+      "losses": 4
+    },
+    {
+      "a": "evolutionary",
+      "b": "vector_evolutionary",
+      "k": 1,
+      "delta": -0.004638671875,
+      "ci95": [
+        -0.020751953125,
+        0.0120849609375
+      ],
+      "wins": 131,
+      "ties": 191,
+      "losses": 190
+    },
+    {
+      "a": "evolutionary",
+      "b": "vector_evolutionary",
+      "k": 4,
+      "delta": 0.02757769574175824,
+      "ci95": [
+        0.013546102335164836,
+        0.04280104417067307
+      ],
+      "wins": 59,
+      "ties": 388,
+      "losses": 65
+    },
+    {
+      "a": "evolutionary",
+      "b": "vector_evolutionary",
+      "k": 16,
+      "delta": 0.029296875,
+      "ci95": [
+        0.01171875,
+        0.046875
+      ],
+      "wins": 18,
+      "ties": 491,
+      "losses": 3
+    },
+    {
+      "a": "mcts",
+      "b": "best_of_n",
+      "k": 1,
+      "delta": -0.0946044921875,
+      "ci95": [
+        -0.10595703125,
+        -0.08312683105468754
+      ],
+      "wins": 40,
+      "ties": 184,
+      "losses": 288
+    },
+    {
+      "a": "mcts",
+      "b": "best_of_n",
+      "k": 4,
+      "delta": -0.028596110920329668,
+      "ci95": [
+        -0.03816559173248626,
+        -0.0196671370621566
+      ],
+      "wins": 12,
+      "ties": 321,
+      "losses": 179
+    },
+    {
+      "a": "mcts",
+      "b": "best_of_n",
+      "k": 16,
+      "delta": -0.015625,
+      "ci95": [
+        -0.029296875,
+        -0.00390625
+      ],
+      "wins": 1,
+      "ties": 502,
+      "losses": 9
+    }
+  ],
+  "strata": [
+    {
+      "stratum": "zero hits in uniform probe (not proof of p=0)",
+      "n": 10,
+      "random": 0.0,
+      "greedy": 0.15,
+      "mcts": 0.21875,
+      "best_of_n": 0.325,
+      "evolutionary": 0.3,
+      "vector_evolutionary": 0.0
+    },
+    {
+      "stratum": "uniform_p<=0.1",
+      "n": 35,
+      "random": 0.033928571428571426,
+      "greedy": 0.15,
+      "mcts": 0.21607142857142858,
+      "best_of_n": 0.30892857142857144,
+      "evolutionary": 0.3464285714285714,
+      "vector_evolutionary": 0.11785714285714285
+    },
+    {
+      "stratum": "0.1<uniform_p<=0.5",
+      "n": 187,
+      "random": 0.41677807486631013,
+      "greedy": 0.5020053475935828,
+      "mcts": 0.679144385026738,
+      "best_of_n": 0.8382352941176471,
+      "evolutionary": 0.8255347593582888,
+      "vector_evolutionary": 0.8345588235294118
+    },
+    {
+      "stratum": "uniform_p>0.5",
+      "n": 280,
+      "random": 0.8238839285714286,
+      "greedy": 0.7482142857142857,
+      "mcts": 0.8953125,
+      "best_of_n": 0.9466517857142858,
+      "evolutionary": 0.9390625,
+      "vector_evolutionary": 0.9808035714285714
+    }
+  ],
+  "replay_mismatches": {
+    "random": 0,
+    "greedy": 0,
+    "mcts": 0,
+    "best_of_n": 0,
+    "evolutionary": 0,
+    "vector_evolutionary": 0
+  },
+  "missing_outputs": [
+    {
+      "idx": 108,
+      "module": "ctrl",
+      "outputs": [
+        "npcop[0]",
+        "aluop[0]",
+        "aluop[1]",
+        "aluop[2]",
+        "aluop[3]"
+      ]
+    },
+    {
+      "idx": 321,
+      "module": "controlunit",
+      "outputs": [
+        "aluop[0]",
+        "aluop[1]",
+        "branch",
+        "memread",
+        "memtoreg",
+        "memwrite",
+        "alusrc",
+        "regwrite"
+      ]
+    },
+    {
+      "idx": 395,
+      "module": "top",
+      "outputs": [
+        "leds[0]"
+      ]
+    },
+    {
+      "idx": 474,
+      "module": "msrv32_img",
+      "outputs": [
+        "imm_out[5]",
+        "imm_out[6]",
+        "imm_out[7]",
+        "imm_out[8]",
+        "imm_out[9]",
+        "imm_out[10]",
+        "imm_out[11]",
+        "imm_out[12]",
+        "imm_out[13]",
+        "imm_out[14]",
+        "imm_out[15]",
+        "imm_out[16]",
+        "imm_out[17]",
+        "imm_out[18]",
+        "imm_out[19]",
+        "imm_out[20]",
+        "imm_out[21]",
+        "imm_out[22]",
+        "imm_out[23]",
+        "imm_out[24]",
+        "imm_out[25]",
+        "imm_out[26]",
+        "imm_out[27]",
+        "imm_out[28]",
+        "imm_out[29]",
+        "imm_out[30]",
+        "imm_out[31]"
+      ]
+    }
+  ],
+  "unique_netlist_hashes": 512,
+  "uniform_probe_mean": 0.6007605195045471,
+  "uniform_best4_mean": 0.8577254344694314,
+  "constant2_random2_expected": 0.8986318960087374,
+  "constant2_random2_observed": {
+    "pass@1": 0.8968505859375,
+    "pass@2": 0.926318359375,
+    "pass@4": 0.9490631438873627,
+    "pass@8": 0.9622418597027972,
+    "pass@16": 0.966796875,
+    "simulator_evaluations": 14654,
+    "successes": 7347,
+    "solved_problems": 495
+  },
+  "exact_circuits": 213,
+  "constants": {
+    "all_zero": 0.5234375,
+    "all_one": 0.541015625,
+    "zero_or_one": 0.81640625
+  },
+  "pi_bits": {
+    "16": 22,
+    "4": 34,
+    "14": 7,
+    "32": 57,
+    "64": 11,
+    "67": 3,
+    "26": 5,
+    "23": 6,
+    "33": 18,
+    "60": 5,
+    "80": 24,
+    "63": 1,
+    "30": 3,
+    "12": 14,
+    "19": 9,
+    "34": 6,
+    "6": 25,
+    "25": 4,
+    "3": 21,
+    "47": 2,
+    "144": 5,
+    "66": 8,
+    "11": 7,
+    "9": 11,
+    "54": 2,
+    "61": 1,
+    "15": 4,
+    "27": 5,
+    "8": 22,
+    "36": 5,
+    "29": 4,
+    "17": 15,
+    "40": 5,
+    "48": 5,
+    "10": 9,
+    "49": 2,
+    "18": 5,
+    "35": 4,
+    "108": 1,
+    "22": 4,
+    "41": 2,
+    "45": 4,
+    "5": 12,
+    "37": 5,
+    "72": 1,
+    "2": 11,
+    "7": 11,
+    "21": 7,
+    "20": 4,
+    "39": 3,
+    "53": 2,
+    "38": 2,
+    "59": 1,
+    "65": 6,
+    "62": 1,
+    "43": 2,
+    "98": 1,
+    "69": 2,
+    "52": 1,
+    "13": 2,
+    "78": 1,
+    "24": 4,
+    "71": 1,
+    "44": 3,
+    "28": 9,
+    "68": 1,
+    "58": 1,
+    "76": 1,
+    "97": 1,
+    "55": 1,
+    "51": 1,
+    "31": 1,
+    "129": 1,
+    "50": 2,
+    "1": 1,
+    "74": 1,
+    "42": 1
+  },
+  "target_is_pi": 67,
+  "target_is_po": 170
+}

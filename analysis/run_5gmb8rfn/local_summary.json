@@ -1,0 +1,104 @@
+{
+  "history_counts": {
+    "header": 1,
+    "run": 1,
+    "environment": 2,
+    "files": 25,
+    "telemetry": 9,
+    "metric": 177,
+    "output_raw": 1217,
+    "stats": 10816,
+    "config": 2,
+    "summary": 40462,
+    "history": 20231
+  },
+  "tail_error": null,
+  "optimizer_steps": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+  ],
+  "eval_circuits": 72,
+  "paired_evaluation": {
+    "0": {
+      "detection_delta": 0.0,
+      "paired_fault_bootstrap_95ci": [
+        0.0,
+        0.0
+      ],
+      "faults_improved": 0,
+      "faults_worsened": 0,
+      "faults_unchanged": 72,
+      "metrics": {
+        "detection": 0.6481481481481481,
+        "activation_without_detection": 0.08333333333333333,
+        "solved_at_k": 0.8888888888888888,
+        "all_fail_fraction": 0.1111111111111111,
+        "simulation_valid_fraction": 0.9722222222222222,
+        "simulator_error_fraction": 0.009259259259259259,
+        "pi_complete_fraction": 0.9305555555555556,
+        "expected_output_exact_fraction": 0.08796296296296297,
+        "num_faults": 72,
+        "num_completions": 216,
+        "k": 3
+      }
+    },
+    "5": {
+      "detection_delta": -0.03240740740740741,
+      "paired_fault_bootstrap_95ci": [
+        -0.09259259259259259,
+        0.02314814814814815
+      ],
+      "faults_improved": 13,
+      "faults_worsened": 16,
+      "faults_unchanged": 43,
+      "metrics": {
+        "detection": 0.6157407407407407,
+        "activation_without_detection": 0.05092592592592592,
+        "solved_at_k": 0.8333333333333334,
+        "all_fail_fraction": 0.16666666666666666,
+        "simulation_valid_fraction": 0.9444444444444444,
+        "simulator_error_fraction": 0.013888888888888888,
+        "pi_complete_fraction": 0.8842592592592593,
+        "expected_output_exact_fraction": 0.09259259259259259,
+        "num_faults": 72,
+        "num_completions": 216,
+        "k": 3
+      }
+    },
+    "10": {
+      "detection_delta": -0.023148148148148147,
+      "paired_fault_bootstrap_95ci": [
+        -0.07870370370370372,
+        0.037037037037037035
+      ],
+      "faults_improved": 9,
+      "faults_worsened": 14,
+      "faults_unchanged": 49,
+      "metrics": {
+        "detection": 0.625,
+        "activation_without_detection": 0.06944444444444445,
+        "solved_at_k": 0.8611111111111112,
+        "all_fail_fraction": 0.1388888888888889,
+        "simulation_valid_fraction": 0.9722222222222222,
+        "simulator_error_fraction": 0.009259259259259259,
+        "pi_complete_fraction": 0.9166666666666666,
+        "expected_output_exact_fraction": 0.0787037037037037,
+        "num_faults": 72,
+        "num_completions": 216,
+        "k": 3
+      }
+    }
+  }
+}

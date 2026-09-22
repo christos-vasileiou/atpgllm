@@ -1,0 +1,9 @@
+{
+  "labels": 23,
+  "detected": 22,
+  "all_expected_outputs_correct": 3,
+  "missing_output_names": 0,
+  "wrong_supplied_output_values": 20,
+  "eval_circuit_overlap_below_sft_limit": 21,
+  "eval_task_overlap_below_sft_limit": 6
+}

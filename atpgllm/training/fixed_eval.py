@@ -156,8 +156,8 @@ def training_indices_without_holdout(training_rows, examples) -> list[int]:
 
 
 def validate_eval_layout(size: int, generations: int, per_device_batch: int, world: int):
-    if min(size, generations, per_device_batch, world) < 1 or generations < 2:
-        raise ValueError("Fixed GRPO evaluation requires positive sizes and at least two generations")
+    if min(size, generations, per_device_batch, world) < 1:
+        raise ValueError("Fixed GRPO evaluation requires positive sizes")
     batch = per_device_batch * world
     if batch % generations or (size * generations) % batch:
         raise ValueError(
@@ -231,6 +231,8 @@ class FixedEvaluationMixin:
         import torch
         from accelerate.utils import gather_object
 
+        if self.num_generations_eval != 1:
+            raise ValueError("Greedy fixed evaluation requires FIXED_EVAL_GENERATIONS=1")
         seed = self.fixed_eval_manifest["protocol"]["seed"]
         python_state, numpy_state = random.getstate(), np.random.get_state()
         was_training = self.model.training
@@ -255,7 +257,13 @@ class FixedEvaluationMixin:
                 for device in devices:
                     torch.cuda.default_generators[device].manual_seed(seed)
                 # Both initial generation and tool continuations forward these kwargs.
-                self.args.generation_kwargs = {**(generation_kwargs or {}), "seed": seed}
+                # Override decoding only. Keep self.temperature at its training
+                # value: TRL also uses it as a divisor when computing logprobs.
+                self.args.generation_kwargs = {
+                    **(generation_kwargs or {}), "seed": seed,
+                    "temperature": 0.0, "top_p": 1.0, "top_k": -1,
+                    "min_p": 0.0, "n": 1,
+                }
                 result = super().evaluate(*args, **kwargs)
                 records = gather_object(self.fixed_eval_records)
                 metrics = summarize_records(

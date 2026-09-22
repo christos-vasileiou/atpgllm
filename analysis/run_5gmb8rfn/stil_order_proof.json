@@ -1,0 +1,239 @@
+[
+  {
+    "dataset_train_shard_row": 20451,
+    "example_id": "817c319bdcc0dc09678e6a7b87d07b5636a19783451a605d7ceffe378da9ff6b",
+    "module": "4077_ex_102_test_vector_and",
+    "stil_path": "/work/cxv200006/transformers_atpg/data/freeset/out.freeset.asap7sc7p5t_28.rvt.tt/4077_ex_102_test_vector_and/simulation.stil",
+    "pattern": 15,
+    "stil_pi_order": [
+      "a[8]",
+      "a[7]",
+      "a[6]",
+      "a[5]",
+      "a[4]",
+      "a[3]",
+      "a[2]",
+      "a[1]",
+      "a[0]",
+      "b[8]",
+      "b[7]",
+      "b[6]",
+      "b[5]",
+      "b[4]",
+      "b[3]",
+      "b[2]",
+      "b[1]",
+      "b[0]"
+    ],
+    "stil_po_order": [
+      "out1",
+      "out2",
+      "out3[8]",
+      "out3[7]",
+      "out3[6]",
+      "out3[5]",
+      "out3[4]",
+      "out3[3]",
+      "out3[2]",
+      "out3[1]",
+      "out3[0]"
+    ],
+    "dataset_input_order": [
+      "a[0]",
+      "a[1]",
+      "a[2]",
+      "a[3]",
+      "a[4]",
+      "a[5]",
+      "a[6]",
+      "a[7]",
+      "a[8]",
+      "b[0]",
+      "b[1]",
+      "b[2]",
+      "b[3]",
+      "b[4]",
+      "b[5]",
+      "b[6]",
+      "b[7]",
+      "b[8]"
+    ],
+    "dataset_output_order": [
+      "out3[0]",
+      "out3[1]",
+      "out3[2]",
+      "out3[3]",
+      "out3[4]",
+      "out3[5]",
+      "out3[6]",
+      "out3[7]",
+      "out3[8]",
+      "out1",
+      "out2"
+    ],
+    "incorrect_label_bits": {
+      "out3[1]": {
+        "label": 1,
+        "boolean_truth": 0
+      },
+      "out3[4]": {
+        "label": 1,
+        "boolean_truth": 0
+      },
+      "out3[7]": {
+        "label": 0,
+        "boolean_truth": 1
+      },
+      "out3[8]": {
+        "label": 0,
+        "boolean_truth": 1
+      }
+    },
+    "dataset_label_disagrees_with_boolean_logic": true,
+    "stil_order_repairs_all_outputs": true,
+    "corrected_input_vector": {
+      "a[8]": 1,
+      "a[7]": 1,
+      "a[6]": 0,
+      "a[5]": 1,
+      "a[4]": 1,
+      "a[3]": 1,
+      "a[2]": 1,
+      "a[1]": 0,
+      "a[0]": 0,
+      "b[8]": 0,
+      "b[7]": 1,
+      "b[6]": 1,
+      "b[5]": 1,
+      "b[4]": 1,
+      "b[3]": 1,
+      "b[2]": 1,
+      "b[1]": 1,
+      "b[0]": 1
+    },
+    "corrected_expected_output": {
+      "out1": 1,
+      "out2": 1,
+      "out3[8]": 1,
+      "out3[7]": 0,
+      "out3[6]": 1,
+      "out3[5]": 0,
+      "out3[4]": 0,
+      "out3[3]": 0,
+      "out3[2]": 0,
+      "out3[1]": 1,
+      "out3[0]": 1
+    }
+  },
+  {
+    "dataset_train_shard_row": 2038,
+    "example_id": "0fc50d96401de94ac6208dba1067f81966b51968d8046b7d53a145c01f0f6ccd",
+    "module": "4128_core_c1_clic",
+    "stil_path": "/work/cxv200006/transformers_atpg/data/freeset/out.freeset.asap7sc7p5t_28.rvt.tt/4128_core_c1_clic/simulation.stil",
+    "pattern": 3,
+    "stil_pi_order": [
+      "interrupt_plic_in",
+      "interrupt_soft_in",
+      "interrupt_time_in",
+      "exception_illegal_instruction",
+      "exception_breakpoint",
+      "exception_ecall_mmode"
+    ],
+    "stil_po_order": [
+      "interrupt_out",
+      "interrupt_code[7]",
+      "interrupt_code[6]",
+      "interrupt_code[5]",
+      "interrupt_code[4]",
+      "interrupt_code[3]",
+      "interrupt_code[2]",
+      "interrupt_code[1]",
+      "interrupt_code[0]",
+      "exception_out",
+      "exception_code[7]",
+      "exception_code[6]",
+      "exception_code[5]",
+      "exception_code[4]",
+      "exception_code[3]",
+      "exception_code[2]",
+      "exception_code[1]",
+      "exception_code[0]"
+    ],
+    "dataset_input_order": [
+      "interrupt_plic_in",
+      "interrupt_soft_in",
+      "interrupt_time_in",
+      "exception_illegal_instruction",
+      "exception_breakpoint",
+      "exception_ecall_mmode"
+    ],
+    "dataset_output_order": [
+      "interrupt_code[0]",
+      "interrupt_code[1]",
+      "interrupt_code[2]",
+      "interrupt_code[3]",
+      "interrupt_code[4]",
+      "interrupt_code[5]",
+      "interrupt_code[6]",
+      "interrupt_code[7]",
+      "exception_code[0]",
+      "exception_code[1]",
+      "exception_code[2]",
+      "exception_code[3]",
+      "exception_code[4]",
+      "exception_code[5]",
+      "exception_code[6]",
+      "exception_code[7]",
+      "interrupt_out",
+      "exception_out"
+    ],
+    "incorrect_label_bits": {
+      "interrupt_code[1]": {
+        "label": 0,
+        "boolean_truth": 1
+      },
+      "interrupt_code[2]": {
+        "label": 0,
+        "boolean_truth": 1
+      },
+      "interrupt_code[6]": {
+        "label": 1,
+        "boolean_truth": 0
+      },
+      "interrupt_code[7]": {
+        "label": 1,
+        "boolean_truth": 0
+      }
+    },
+    "dataset_label_disagrees_with_boolean_logic": true,
+    "stil_order_repairs_all_outputs": true,
+    "corrected_input_vector": {
+      "interrupt_plic_in": 1,
+      "interrupt_soft_in": 0,
+      "interrupt_time_in": 1,
+      "exception_illegal_instruction": 0,
+      "exception_breakpoint": 1,
+      "exception_ecall_mmode": 1
+    },
+    "corrected_expected_output": {
+      "interrupt_out": 1,
+      "interrupt_code[7]": 0,
+      "interrupt_code[6]": 0,
+      "interrupt_code[5]": 0,
+      "interrupt_code[4]": 0,
+      "interrupt_code[3]": 0,
+      "interrupt_code[2]": 1,
+      "interrupt_code[1]": 1,
+      "interrupt_code[0]": 1,
+      "exception_out": 1,
+      "exception_code[7]": 0,
+      "exception_code[6]": 0,
+      "exception_code[5]": 0,
+      "exception_code[4]": 0,
+      "exception_code[3]": 0,
+      "exception_code[2]": 0,
+      "exception_code[1]": 1,
+      "exception_code[0]": 1
+    }
+  }
+]

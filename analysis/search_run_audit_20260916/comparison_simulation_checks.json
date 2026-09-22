@@ -1,0 +1,269 @@
+{
+  "pilot": [
+    {
+      "source_circuit_id": "0a860d396e458c00136d6c66a08e7f85a135a244576df66f24a0624ca28b2d1b",
+      "module": "half_wave",
+      "fault": "sa1 n2",
+      "pi_bits": 8,
+      "po_bits": 8,
+      "exact": true,
+      "probes": 256,
+      "uniform_detection": 0.49609375,
+      "unresolved_outputs": []
+    },
+    {
+      "source_circuit_id": "3f55b6755437bc9927481a4cb94f2256f2e11b9ebac9179168f7a0acfb7658f5",
+      "module": "multiple_module_opt2",
+      "fault": "sa1 y",
+      "pi_bits": 4,
+      "po_bits": 1,
+      "exact": true,
+      "probes": 16,
+      "uniform_detection": 1.0,
+      "unresolved_outputs": []
+    },
+    {
+      "source_circuit_id": "4f296a8476b727776f0b4c35a350c290c503b49bf89017e56a96bbc585e1ed67",
+      "module": "dummy_generator",
+      "fault": "sa1 load",
+      "pi_bits": 2,
+      "po_bits": 33,
+      "exact": true,
+      "probes": 4,
+      "uniform_detection": 1.0,
+      "unresolved_outputs": []
+    },
+    {
+      "source_circuit_id": "8d0fa1ca10731e4f8a4ae57ad319bab2cb9a46d6c0c8b80896b8569c18953f2f",
+      "module": "slave2",
+      "fault": "sa0 ready_out",
+      "pi_bits": 65,
+      "po_bits": 3,
+      "exact": false,
+      "probes": 8192,
+      "uniform_detection": 1.0,
+      "unresolved_outputs": []
+    },
+    {
+      "source_circuit_id": "920b6c68ccf9005784459839e38f772fad5d194cec04c73006c413575c240f84",
+      "module": "pc_sel",
+      "fault": "sa0 n4",
+      "pi_bits": 32,
+      "po_bits": 2,
+      "exact": false,
+      "probes": 8192,
+      "uniform_detection": 0.474853515625,
+      "unresolved_outputs": []
+    },
+    {
+      "source_circuit_id": "a6aa9594168b8f702ab1f963b2f84795617dbdd9b324f46931201b9fa6faf179",
+      "module": "minus_8",
+      "fault": "sa0 n4",
+      "pi_bits": 6,
+      "po_bits": 6,
+      "exact": true,
+      "probes": 64,
+      "uniform_detection": 0.25,
+      "unresolved_outputs": []
+    },
+    {
+      "source_circuit_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912",
+      "module": "dimc_macro_add_3u_82_4",
+      "fault": "sa0 n4",
+      "pi_bits": 3,
+      "po_bits": 3,
+      "exact": true,
+      "probes": 8,
+      "uniform_detection": 0.75,
+      "unresolved_outputs": []
+    },
+    {
+      "source_circuit_id": "f9691a3f81874239f9dfe76e69677a70848001360877ed4405cf51bd1ed9b93f",
+      "module": "ar_rxd_2",
+      "fault": "sa0 ce_wr",
+      "pi_bits": 3,
+      "po_bits": 32,
+      "exact": true,
+      "probes": 8,
+      "uniform_detection": 1.0,
+      "unresolved_outputs": []
+    },
+    {
+      "source_circuit_id": "ffcd53738c9ea3dc72f459fcf7bf219973f604fb2c57578b3478843de9f92b65",
+      "module": "adder",
+      "fault": "sa0 n8",
+      "pi_bits": 8,
+      "po_bits": 8,
+      "exact": true,
+      "probes": 256,
+      "uniform_detection": 0.25,
+      "unresolved_outputs": []
+    }
+  ],
+  "bus_regressions": [
+    {
+      "idx": 108,
+      "module": "ctrl",
+      "input_nets": [
+        "opcode[0]",
+        "opcode[1]",
+        "opcode[2]",
+        "opcode[3]",
+        "opcode[4]",
+        "opcode[5]",
+        "opcode[6]",
+        "fun3[12]",
+        "fun3[13]",
+        "fun3[14]",
+        "fun7[25]",
+        "fun7[26]",
+        "fun7[27]",
+        "fun7[28]",
+        "fun7[29]",
+        "fun7[30]",
+        "fun7[31]"
+      ],
+      "output_nets": [
+        "npcop[1]",
+        "npcop[2]",
+        "aluop[0]",
+        "aluop[1]",
+        "aluop[2]",
+        "aluop[3]",
+        "extop[0]",
+        "extop[1]",
+        "extop[2]",
+        "wdsel[0]",
+        "wdsel[1]",
+        "wen",
+        "asel",
+        "bsel",
+        "rfwr"
+      ],
+      "all_outputs_resolved_zero_one": [
+        true,
+        true
+      ]
+    },
+    {
+      "idx": 321,
+      "module": "controlunit",
+      "input_nets": [
+        "opcode[2]",
+        "opcode[3]",
+        "opcode[4]",
+        "opcode[5]",
+        "opcode[6]"
+      ],
+      "output_nets": [
+        "aluop[0]",
+        "aluop[1]",
+        "branch",
+        "memread",
+        "memtoreg",
+        "memwrite",
+        "alusrc",
+        "regwrite"
+      ],
+      "all_outputs_resolved_zero_one": [
+        true,
+        true
+      ]
+    },
+    {
+      "idx": 395,
+      "module": "top",
+      "input_nets": [
+        "bcd[0]",
+        "bcd[1]",
+        "bcd[2]",
+        "bcd[3]"
+      ],
+      "output_nets": [
+        "leds[1]",
+        "leds[2]",
+        "leds[3]",
+        "leds[4]",
+        "leds[5]",
+        "leds[6]",
+        "leds[7]"
+      ],
+      "all_outputs_resolved_zero_one": [
+        true,
+        true
+      ]
+    },
+    {
+      "idx": 474,
+      "module": "msrv32_img",
+      "input_nets": [
+        "instr_in[7]",
+        "instr_in[8]",
+        "instr_in[9]",
+        "instr_in[10]",
+        "instr_in[11]",
+        "instr_in[12]",
+        "instr_in[13]",
+        "instr_in[14]",
+        "instr_in[15]",
+        "instr_in[16]",
+        "instr_in[17]",
+        "instr_in[18]",
+        "instr_in[19]",
+        "instr_in[20]",
+        "instr_in[21]",
+        "instr_in[22]",
+        "instr_in[23]",
+        "instr_in[24]",
+        "instr_in[25]",
+        "instr_in[26]",
+        "instr_in[27]",
+        "instr_in[28]",
+        "instr_in[29]",
+        "instr_in[30]",
+        "instr_in[31]",
+        "imm_type_in[0]",
+        "imm_type_in[1]",
+        "imm_type_in[2]"
+      ],
+      "output_nets": [
+        "imm_out[0]",
+        "imm_out[1]",
+        "imm_out[2]",
+        "imm_out[3]",
+        "imm_out[4]",
+        "imm_out[5]",
+        "imm_out[6]",
+        "imm_out[7]",
+        "imm_out[8]",
+        "imm_out[9]",
+        "imm_out[10]",
+        "imm_out[11]",
+        "imm_out[12]",
+        "imm_out[13]",
+        "imm_out[14]",
+        "imm_out[15]",
+        "imm_out[16]",
+        "imm_out[17]",
+        "imm_out[18]",
+        "imm_out[19]",
+        "imm_out[20]",
+        "imm_out[21]",
+        "imm_out[22]",
+        "imm_out[23]",
+        "imm_out[24]",
+        "imm_out[25]",
+        "imm_out[26]",
+        "imm_out[27]",
+        "imm_out[28]",
+        "imm_out[29]",
+        "imm_out[30]",
+        "imm_out[31]"
+      ],
+      "all_outputs_resolved_zero_one": [
+        true,
+        true
+      ]
+    }
+  ]
+}

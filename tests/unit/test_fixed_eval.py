@@ -60,9 +60,10 @@ class FixedEvalTests(unittest.TestCase):
                 fixed.load_or_create_manifest(path, protocol, lambda: [])
 
     def test_layout_prevents_partial_groups_and_padding(self):
+        fixed.validate_eval_layout(72, 1, 1, 3)
         fixed.validate_eval_layout(72, 3, 1, 3)
         fixed.validate_eval_layout(72, 4, 4, 1)
-        for layout in [(72, 4, 1, 3), (73, 2, 2, 3), (72, 1, 1, 3)]:
+        for layout in [(72, 4, 1, 3), (73, 2, 2, 3), (72, 0, 1, 3)]:
             with self.assertRaises(ValueError):
                 fixed.validate_eval_layout(*layout)
 
@@ -145,12 +146,13 @@ class FixedEvalTests(unittest.TestCase):
                 self.model.train(False)
                 random.random()
                 self._logs["completion"].append("eval")
-                assert self.args.generation_kwargs == {"existing": True, "seed": 9}
+                assert self.args.generation_kwargs == {"existing": True, "seed": 9,
+                    "temperature": 0.0, "top_p": 1.0, "top_k": -1, "min_p": 0.0, "n": 1}
+                assert self.temperature == 1.0
                 if self.fail_eval:
                     raise RuntimeError("generation failed")
                 self.fixed_eval_records.extend([
-                    {"example_id": "a", "components": components(1)},
-                    {"example_id": "a", "components": components(0)}])
+                    {"example_id": "a", "components": components(1)}])
                 return {}
             def log(self, metrics):
                 self.logged = metrics
@@ -175,7 +177,8 @@ class FixedEvalTests(unittest.TestCase):
                                                      is_main_process=True, wait_for_everyone=lambda: None)
                 trainer.state = SimpleNamespace(global_step=0)
                 trainer.args = SimpleNamespace(generation_kwargs={"existing": True})
-                trainer.num_generations_eval = 2
+                trainer.num_generations_eval = 1
+                trainer.temperature = 1.0
                 trainer._logs = {"completion": deque(["train"])}
                 original_logs = trainer._logs
                 trainer.fail_eval = fail
@@ -187,7 +190,7 @@ class FixedEvalTests(unittest.TestCase):
                         trainer.evaluate()
                 else:
                     result = trainer.evaluate()
-                    self.assertEqual(result["eval_fixed/detection"], 0.5)
+                    self.assertEqual(result["eval_fixed/detection"], 1.0)
                     self.assertTrue((Path(folder) / "fixed_eval/step-000000.json").exists())
                 self.assertEqual(random.getstate(), rng_state)
                 self.assertIs(trainer._logs, original_logs)

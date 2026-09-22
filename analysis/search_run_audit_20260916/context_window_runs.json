@@ -1,0 +1,84 @@
+{
+  "chrivasileiou/sft-training/n5wplmt8": {
+    "config": {
+      "max_length": 8192,
+      "max_model_len": 8192,
+      "max_prompt_length": 2048,
+      "model_name": "ibm-granite/granite-4.2-8b",
+      "dataset_path": "chrivasileiou/asap7-language-of-test-v2",
+      "output_dir": "runs/sft_granite_4.2_8b",
+      "resume_from": "",
+      "resume_training_state": false,
+      "skip_buffer_size": 0,
+      "assistant_only_loss": true,
+      "packing": false,
+      "git_commit": "eec7da165478915c3689597843d1c7b9d02b42e3",
+      "launch_config": {
+        "OUTPUT_DIR": "runs/sft_granite_4.2_8b",
+        "BUFFER_SIZE": "10000",
+        "RESUME_FROM": "",
+        "MAX_MODEL_LEN": "8192",
+        "SKIP_BUFFER_SIZE": "0",
+        "MAX_PROMPT_LENGTH": "2048",
+        "MAX_COMPLETION_LENGTH": "6144"
+      }
+    },
+    "state": "finished"
+  },
+  "chrivasileiou/grpo-training/5gmb8rfn": {
+    "config": {
+      "max_length": 20,
+      "max_model_len": 16384,
+      "max_prompt_length": null,
+      "max_completion_length": 12288,
+      "model_name": "ibm-granite/granite-4.2-8b",
+      "dataset_path": "chrivasileiou/asap7-language-of-test-v2",
+      "output_dir": "runs/grpo_granite_4.2_8b",
+      "resume_from": "runs/sft_granite_4.2_8b/checkpoint-200",
+      "resume_training_state": false,
+      "buffer_size": 60000,
+      "skip_buffer_size": 0,
+      "assistant_only_loss": true,
+      "git_commit": "c35088f59036666fa63bc009d314c561f2b0d5de",
+      "fixed_eval_size": 72,
+      "launch_config": {
+        "OUTPUT_DIR": "runs/grpo_granite_4.2_8b",
+        "BUFFER_SIZE": "60000",
+        "RESUME_FROM": "runs/sft_granite_4.2_8b/checkpoint-200",
+        "MAX_MODEL_LEN": "16384",
+        "SKIP_BUFFER_SIZE": "0",
+        "MAX_PROMPT_LENGTH": "4096",
+        "MAX_COMPLETION_LENGTH": "12288"
+      }
+    },
+    "state": "crashed"
+  },
+  "chrivasileiou/grpo-training/f9uuxsrt": {
+    "config": {
+      "max_length": 20,
+      "max_model_len": 16384,
+      "max_prompt_length": null,
+      "max_completion_length": 12288,
+      "model_name": "ibm-granite/granite-4.2-8b",
+      "dataset_path": "chrivasileiou/asap7-language-of-test-v2",
+      "output_dir": "runs/grpo_granite_4.2_8b",
+      "resume_from": "runs/grpo_granite_4.2_8b/checkpoint-34",
+      "resume_training_state": true,
+      "buffer_size": 60000,
+      "skip_buffer_size": 0,
+      "assistant_only_loss": true,
+      "git_commit": "9ae4ca939289f95a844a80d2c39a9c6d251eaf64",
+      "fixed_eval_size": 72,
+      "launch_config": {
+        "OUTPUT_DIR": "runs/grpo_granite_4.2_8b",
+        "BUFFER_SIZE": "60000",
+        "RESUME_FROM": "runs/grpo_granite_4.2_8b/checkpoint-34",
+        "MAX_MODEL_LEN": "16384",
+        "SKIP_BUFFER_SIZE": "0",
+        "MAX_PROMPT_LENGTH": "4096",
+        "MAX_COMPLETION_LENGTH": "12288"
+      }
+    },
+    "state": "crashed"
+  }
+}

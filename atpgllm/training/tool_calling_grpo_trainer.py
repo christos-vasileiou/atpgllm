@@ -21,6 +21,7 @@ import asyncio
 import atexit
 import contextlib
 import copy
+import os
 import threading
 import time
 import warnings
@@ -58,9 +59,10 @@ from atpgllm.training.gdpo import (
     select_objective_columns,
 )
 from atpgllm.training.grpo_loss import GenerationBatchLossMixin
+from atpgllm.training.best_of_n import BestOfNTrainingMixin
 
 
-class ToolCallingGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
+class ToolCallingGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRPOTrainer):
     """
     GRPOTrainer with multi-turn ``<tool_call>...</tool_call>`` support.
 
@@ -134,6 +136,13 @@ class ToolCallingGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
     def _reward_output_to_scalars_and_components(
         self, output_reward_func: list, device: torch.device
     ):
+        from atpgllm.llm.reward_funcs import using_native_simulator
+        if using_native_simulator():
+            from atpgllm.training.tools import abort_on_simulator_failure
+            abort_on_simulator_failure(self, any(
+                isinstance(row, dict) and row.get("simulator_error_logonly", 0)
+                for row in output_reward_func
+            ))
         return reward_output_to_tensors(
             output_reward_func,
             device,
@@ -143,6 +152,8 @@ class ToolCallingGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
     def _log_reward_component_means(
         self, comp_mat: torch.Tensor, keys: list[str], reward_func_name: str
     ) -> None:
+        if getattr(self, "_ranking_candidates", False):
+            return
         metrics_root = getattr(self, "_metrics", None)
         if metrics_root is None:
             return
@@ -395,6 +406,8 @@ class ToolCallingGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
             )
 
         rewards_per_func = gather(rewards_per_func)
+        if getattr(self, "_ranking_candidates", False):
+            return rewards_per_func
         mode = "train" if self.model.training else "eval"
         for index, name in enumerate(self.reward_func_names):
             self._metrics[mode].setdefault(f"rewards/{name}/raw_mean", []).append(
@@ -425,6 +438,9 @@ class ToolCallingGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
 
     @profiling_decorator
     def _generate(self, prompts: list):
+        if getattr(self, "_best_of_inputs", None) is not None and not getattr(self, "_ranking_candidates", False):
+            return self._generate_best_of_n(prompts)
+
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
         generation_start_time = time.perf_counter()
@@ -568,204 +584,193 @@ class ToolCallingGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
         else:
             max_model_len = getattr(self.model.config, "max_position_embeddings", 4096)
 
-        while True:
-            prompts_for_gen = []
+        from atpgllm.training.tools import ToolScheduler, abort_on_simulator_failure
+        with ToolScheduler(self.tool_functions) as scheduler:
+            while True:
+                prompts_for_gen = []
 
-            if idxs_with_tool:
-                prompt_completion_tools = []
-                for i, idx in enumerate(idxs_with_tool):
-                    if is_conversational({"prompt": prompts[idx]}):
-                        conv = copy.deepcopy(prompts[idx])
-                    else:
-                        conv = [{"role": "user", "content": prompts[idx]}]
-
-                    if isinstance(completions[idx], list):
-                        for msg in completions[idx]:
-                            conv.append(msg)
-                    else:
-                        conv.append({"role": "assistant", "content": completions[idx]})
-
-                    prompt_completion_tools.append(conv)
-
-                for i, idx in enumerate(idxs_with_tool):
-                    tool_call = tool_calls[i]
-                    tool_name = tool_call.get("name")
-                    tool_args = tool_call.get("arguments", {})
-                    tool_args["netlist"] = ToolHelper.get_netlist(prompts[idx][1]["content"])
-
-                    if tool_name in self.tool_functions:
-                        tool_call_count += 1
-                        try:
-                            func = self.tool_functions[tool_name]
-                            if asyncio.iscoroutinefunction(func):
-                                if self._has_async_reward_funcs:
-                                    future = asyncio.run_coroutine_threadsafe(
-                                        func(**tool_args), self.async_reward_loop
-                                    )
-                                    result = future.result(timeout=60)
-                                else:
-                                    result = asyncio.get_event_loop().run_until_complete(
-                                        func(**tool_args)
-                                    )
-                            else:
-                                result = func(**tool_args)
-                        except Exception as e:
-                            tool_failure_count += 1
-                            result = f"Tool execution failed: {e}"
-                    else:
-                        tool_failure_count += 1
-                        result = (
-                            f"Unknown tool: {tool_name}. "
-                            f"Available tools: {list(self.tool_functions.keys())}"
-                        )
-
-                    tool_message = {"role": "tool", "name": tool_name, "content": str(result)}
-                    prompt_completion_tools[i].append(tool_message)
-
-                    if isinstance(completions[idx], list):
-                        completions[idx].append(tool_message)
-
-                tokenized_convs = [
-                    self.processing_class.apply_chat_template(
-                        conv,
-                        tokenize=True,
-                        tools=self.tools,
-                        add_generation_prompt=True,
-                    )
-                    for conv in prompt_completion_tools
-                ]
-                pct_ids = [t if isinstance(t, list) else t["input_ids"] for t in tokenized_convs]
-
-                overlong = [len(pct) >= max_model_len for pct in pct_ids]
-
-                for i, idx in enumerate(idxs_with_tool):
-                    if overlong[i]:
-                        prompt_length = len(prompt_ids[idx])
-                        ct = pct_ids[i][prompt_length : prompt_length + self.max_completion_length]
-                        completion_ids[idx] = ct
-                        current_mask_len = len(tool_mask[idx])
-                        if len(ct) > current_mask_len:
-                            tool_mask[idx] += [0] * (len(ct) - current_mask_len)
-                        elif len(ct) < current_mask_len:
-                            tool_mask[idx] = tool_mask[idx][: len(ct)]
-                        if logprobs is not None:
-                            current_logprobs_len = len(logprobs[idx])
-                            if len(ct) > current_logprobs_len:
-                                logprobs[idx] += [0.0] * (len(ct) - current_logprobs_len)
-                            elif len(ct) < current_logprobs_len:
-                                logprobs[idx] = logprobs[idx][: len(ct)]
-
-                surviving_indices = [i for i, o in enumerate(overlong) if not o]
-                idxs_with_tool = [idxs_with_tool[i] for i in surviving_indices]
-                prompt_completion_tools = [prompt_completion_tools[i] for i in surviving_indices]
-                pct_ids = [pct_ids[i] for i in surviving_indices]
+                tool_calls, idxs_with_tool, batch_outcomes = scheduler.take(
+                    self, tool_calls, idxs_with_tool, prompts
+                )
+                abort_on_simulator_failure(self, any(failed for _, failed in batch_outcomes))
 
                 if idxs_with_tool:
-                    prompts_for_gen = prompt_completion_tools
+                    prompt_completion_tools = []
+                    for i, idx in enumerate(idxs_with_tool):
+                        if is_conversational({"prompt": prompts[idx]}):
+                            conv = copy.deepcopy(prompts[idx])
+                        else:
+                            conv = [{"role": "user", "content": prompts[idx]}]
 
-            local_has_gen = len(prompts_for_gen) > 0
-            if self.accelerator.num_processes > 1:
-                sync_tensor = torch.tensor([1 if local_has_gen else 0], device=device)
-                any_has_gen = self.accelerator.gather(sync_tensor).sum().item() > 0
-            else:
-                any_has_gen = local_has_gen
+                        if isinstance(completions[idx], list):
+                            for msg in completions[idx]:
+                                conv.append(msg)
+                        else:
+                            conv.append({"role": "assistant", "content": completions[idx]})
 
-            if not any_has_gen:
-                break
+                        prompt_completion_tools.append(conv)
 
-            prompt_completion_tool_ids, post_tool_ids, post_tool_logprobs, _ = (
-                self._generate_tool_continuation(prompts_for_gen)
-            )
-
-            if not idxs_with_tool:
-                continue
-
-            for i, idx in enumerate(idxs_with_tool):
-                pct = prompt_completion_tool_ids[i]
-                orig_prompt = prompt_ids[idx]
-                if pct[: len(orig_prompt)] != orig_prompt:
-                    warnings.warn(
-                        "The chat template may not be prefix-preserving. "
-                        "This could affect training quality."
-                    )
-                    break
-
-            for i, idx in enumerate(idxs_with_tool):
-                prompt_len = len(prompt_ids[idx])
-                completion_tool_ids = prompt_completion_tool_ids[i][prompt_len:]
-                excess_length = (
-                    len(completion_tool_ids) + len(post_tool_ids[i]) - self.max_completion_length
-                )
-
-                if excess_length > 0:
-                    if len(post_tool_ids[i]) > excess_length:
-                        post_tool_ids[i] = post_tool_ids[i][:-excess_length]
-                        if post_tool_logprobs is not None and post_tool_logprobs[i]:
-                            post_tool_logprobs[i] = post_tool_logprobs[i][:-excess_length]
-                    else:
-                        remaining_excess = excess_length - len(post_tool_ids[i])
-                        post_tool_ids[i] = []
-                        if post_tool_logprobs is not None:
-                            post_tool_logprobs[i] = []
-                        if remaining_excess > 0:
-                            prompt_completion_tool_ids[i] = prompt_completion_tool_ids[i][
-                                :-remaining_excess
+                    for i, idx in enumerate(idxs_with_tool):
+                        tool_name = tool_calls[i].get("name")
+                        result, _ = batch_outcomes[i]
+                        tool_call_count += 1
+                        tool_failure_count += int(result.startswith("Tool execution failed:"))
+                        tool_message = {"role": "tool", "name": tool_name, "content": result}
+                        prompt_completion_tools[i].append(tool_message)
+                        if isinstance(completions[idx], list):
+                            completions[idx].append(tool_message)
+                        else:
+                            completions[idx] = [
+                                {'role': 'assistant', 'content': completions[idx]}, tool_message
                             ]
 
-            for i, idx in enumerate(idxs_with_tool):
-                prompt_length = len(prompt_ids[idx])
-                old_completion_length = len(completion_ids[idx])
+                    tokenized_convs = [
+                        self.processing_class.apply_chat_template(
+                            conv,
+                            tokenize=True,
+                            tools=self.tools,
+                            add_generation_prompt=True,
+                        )
+                        for conv in prompt_completion_tools
+                    ]
+                    pct_ids = [t if isinstance(t, list) else t["input_ids"] for t in tokenized_convs]
 
-                new_completion = prompt_completion_tool_ids[i][prompt_length:] + post_tool_ids[i]
+                    overlong = [len(pct) >= max_model_len for pct in pct_ids]
 
-                pct_completion_len = len(prompt_completion_tool_ids[i]) - prompt_length
-                tool_result_length = pct_completion_len - old_completion_length
-                post_tool_length = len(post_tool_ids[i])
+                    for i, idx in enumerate(idxs_with_tool):
+                        if overlong[i]:
+                            prompt_length = len(prompt_ids[idx])
+                            ct = pct_ids[i][prompt_length : prompt_length + self.max_completion_length]
+                            completion_ids[idx] = ct
+                            current_mask_len = len(tool_mask[idx])
+                            if len(ct) > current_mask_len:
+                                tool_mask[idx] += [0] * (len(ct) - current_mask_len)
+                            elif len(ct) < current_mask_len:
+                                tool_mask[idx] = tool_mask[idx][: len(ct)]
+                            if logprobs is not None:
+                                current_logprobs_len = len(logprobs[idx])
+                                if len(ct) > current_logprobs_len:
+                                    logprobs[idx] += [0.0] * (len(ct) - current_logprobs_len)
+                                elif len(ct) < current_logprobs_len:
+                                    logprobs[idx] = logprobs[idx][: len(ct)]
 
-                tool_mask[idx] = (
-                    tool_mask[idx] + [0] * tool_result_length + [1] * post_tool_length
+                    surviving_indices = [i for i, o in enumerate(overlong) if not o]
+                    idxs_with_tool = [idxs_with_tool[i] for i in surviving_indices]
+                    prompt_completion_tools = [prompt_completion_tools[i] for i in surviving_indices]
+                    pct_ids = [pct_ids[i] for i in surviving_indices]
+
+                    if idxs_with_tool:
+                        prompts_for_gen = prompt_completion_tools
+
+                local_has_gen = len(prompts_for_gen) > 0
+                if self.accelerator.num_processes > 1:
+                    sync_tensor = torch.tensor([1 if local_has_gen else 0], device=device)
+                    any_has_gen = self.accelerator.gather(sync_tensor).sum().item() > 0
+                else:
+                    any_has_gen = local_has_gen
+
+                if not any_has_gen:
+                    pending = torch.tensor([bool(scheduler.pending)], device=device)
+                    if self.accelerator.num_processes > 1:
+                        pending = self.accelerator.gather(pending)
+                    if pending.any().item():
+                        tool_calls, idxs_with_tool = [], []
+                        continue
+                    break
+
+                prompt_completion_tool_ids, post_tool_ids, post_tool_logprobs, _ = (
+                    self._generate_tool_continuation(prompts_for_gen)
                 )
-                completion_ids[idx] = new_completion
 
-                if logprobs is not None:
-                    logprobs[idx] = logprobs[idx] + [0.0] * tool_result_length
-                    if post_tool_logprobs is not None and post_tool_logprobs[i]:
-                        logprobs[idx] = logprobs[idx] + post_tool_logprobs[i]
-                    else:
-                        logprobs[idx] = logprobs[idx] + [0.0] * post_tool_length
+                if not idxs_with_tool:
+                    continue
 
-            post_tool_texts = self.processing_class.batch_decode(
-                post_tool_ids, skip_special_tokens=True
-            )
+                for i, idx in enumerate(idxs_with_tool):
+                    pct = prompt_completion_tool_ids[i]
+                    orig_prompt = prompt_ids[idx]
+                    if pct[: len(orig_prompt)] != orig_prompt:
+                        warnings.warn(
+                            "The chat template may not be prefix-preserving. "
+                            "This could affect training quality."
+                        )
+                        break
 
-            for i, idx in enumerate(idxs_with_tool):
-                if post_tool_texts[i]:
-                    post_tool_msg = revert_assistant_completion(
-                        restore_generation_prefix(post_tool_texts[i], self.processing_class,
-                                                  self.chat_template_kwargs),
-                        tokenizer=self.processing_class
+                for i, idx in enumerate(idxs_with_tool):
+                    prompt_len = len(prompt_ids[idx])
+                    completion_tool_ids = prompt_completion_tool_ids[i][prompt_len:]
+                    excess_length = (
+                        len(completion_tool_ids) + len(post_tool_ids[i]) - self.max_completion_length
                     )
-                    if isinstance(completions[idx], list):
-                        if isinstance(post_tool_msg, list) and isinstance(post_tool_msg[0], dict):
-                            completions[idx] += post_tool_msg
-                        elif isinstance(post_tool_msg, dict):
-                            completions[idx].append(post_tool_msg)
-                    else:
-                        completions[idx] = [
-                            {"role": "assistant", "content": completions[idx]},
-                            post_tool_msg,
-                        ]
 
-            new_tool_calls = [self._parse_tool_call(text) for text in post_tool_texts]
-            new_idxs_with_tool = []
-            new_tool_calls_filtered = []
-            for i, idx in enumerate(idxs_with_tool):
-                if new_tool_calls[i] is not None:
-                    new_idxs_with_tool.append(idx)
-                    new_tool_calls_filtered.append(new_tool_calls[i])
+                    if excess_length > 0:
+                        if len(post_tool_ids[i]) > excess_length:
+                            post_tool_ids[i] = post_tool_ids[i][:-excess_length]
+                            if post_tool_logprobs is not None and post_tool_logprobs[i]:
+                                post_tool_logprobs[i] = post_tool_logprobs[i][:-excess_length]
+                        else:
+                            remaining_excess = excess_length - len(post_tool_ids[i])
+                            post_tool_ids[i] = []
+                            if post_tool_logprobs is not None:
+                                post_tool_logprobs[i] = []
+                            if remaining_excess > 0:
+                                prompt_completion_tool_ids[i] = prompt_completion_tool_ids[i][
+                                    :-remaining_excess
+                                ]
 
-            idxs_with_tool = new_idxs_with_tool
-            tool_calls = new_tool_calls_filtered
+                for i, idx in enumerate(idxs_with_tool):
+                    prompt_length = len(prompt_ids[idx])
+                    old_completion_length = len(completion_ids[idx])
+
+                    new_completion = prompt_completion_tool_ids[i][prompt_length:] + post_tool_ids[i]
+
+                    pct_completion_len = len(prompt_completion_tool_ids[i]) - prompt_length
+                    tool_result_length = pct_completion_len - old_completion_length
+                    post_tool_length = len(post_tool_ids[i])
+
+                    tool_mask[idx] = (
+                        tool_mask[idx] + [0] * tool_result_length + [1] * post_tool_length
+                    )
+                    completion_ids[idx] = new_completion
+
+                    if logprobs is not None:
+                        logprobs[idx] = logprobs[idx] + [0.0] * tool_result_length
+                        if post_tool_logprobs is not None and post_tool_logprobs[i]:
+                            logprobs[idx] = logprobs[idx] + post_tool_logprobs[i]
+                        else:
+                            logprobs[idx] = logprobs[idx] + [0.0] * post_tool_length
+
+                post_tool_texts = self.processing_class.batch_decode(
+                    post_tool_ids, skip_special_tokens=True
+                )
+
+                for i, idx in enumerate(idxs_with_tool):
+                    if post_tool_texts[i]:
+                        post_tool_msg = revert_assistant_completion(
+                            restore_generation_prefix(post_tool_texts[i], self.processing_class,
+                                                      self.chat_template_kwargs),
+                            tokenizer=self.processing_class
+                        )
+                        if isinstance(completions[idx], list):
+                            if isinstance(post_tool_msg, list) and isinstance(post_tool_msg[0], dict):
+                                completions[idx] += post_tool_msg
+                            elif isinstance(post_tool_msg, dict):
+                                completions[idx].append(post_tool_msg)
+                        else:
+                            completions[idx] = [
+                                {"role": "assistant", "content": completions[idx]},
+                                post_tool_msg,
+                            ]
+
+                new_tool_calls = [self._parse_tool_call(text) for text in post_tool_texts]
+                new_idxs_with_tool = []
+                new_tool_calls_filtered = []
+                for i, idx in enumerate(idxs_with_tool):
+                    if new_tool_calls[i] is not None:
+                        new_idxs_with_tool.append(idx)
+                        new_tool_calls_filtered.append(new_tool_calls[i])
+
+                idxs_with_tool = new_idxs_with_tool
+                tool_calls = new_tool_calls_filtered
 
         mode = "train" if self.model.training else "eval"
         if tool_call_count > 0:

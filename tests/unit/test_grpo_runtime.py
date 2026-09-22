@@ -71,3 +71,35 @@ def test_checkpoint_marker_removed_before_rewriting_weights(tmp_path):
     trainer.state = SimpleNamespace(global_step=5)
     trainer.accelerator = SimpleNamespace(is_main_process=True, wait_for_everyone=lambda: None)
     trainer._save_checkpoint(None, None)
+
+
+def test_greedy_eval_settings_reach_initial_and_tool_continuation_requests():
+    from contextlib import nullcontext
+    requests = []
+
+    def generate(**kwargs):
+        # Mirror TRL server precedence: generation_kwargs override named defaults.
+        settings = {**kwargs, **kwargs["generation_kwargs"]}
+        requests.append(settings)
+        assert settings["n"] == 1
+        assert settings["temperature"] == 0.0
+        return {"prompt_ids": [[1]], "completion_ids": [[2]], "logprobs": [[-0.1]]}
+
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(device="cpu", is_main_process=True,
+                                    process_index=0, gather=lambda x: x),
+        model=SimpleNamespace(training=False), use_vllm=True, vllm_mode="server",
+        state=SimpleNamespace(global_step=1), _last_loaded_step=1,
+        num_generations=16, num_generations_eval=1,
+        max_completion_length=100, repetition_penalty=1., temperature=1.,
+        top_p=1., top_k=None, min_p=None, guided_decoding_regex=None,
+        args=SimpleNamespace(generation_kwargs={"temperature": 0., "n": 1, "seed": 9}),
+        vllm_client=SimpleNamespace(generate=generate), rollout_func=None,
+    )
+    scope = dict(gather_object=lambda x: x, broadcast_object_list=lambda *a, **kw: None,
+                 is_conversational=lambda x: False, profiling_context=lambda *a: nullcontext())
+    for name in ("_generate_single_turn", "_generate_tool_continuation"):
+        result = method(name, **scope)(trainer, ["prompt"])
+        assert result[1] == [[2]]
+    assert len(requests) == 2
+    assert trainer.temperature == 1.0  # logprob scaling never divides by zero

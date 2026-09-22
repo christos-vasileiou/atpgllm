@@ -86,7 +86,7 @@ class Verifier:
         self._scalar = train_scalar_from_reward_components
 
     def problem(self, prompt, record):
-        from fault_sim import OptimizedNetlist
+        from fault_sim import OptimizedNetlist, prepare_netlist
         from .reward_function_factory import RewardFunctionFactory
         field = record.get("netlist", "")
         raw = field.get("netlist", "") if isinstance(field, dict) else field
@@ -94,7 +94,7 @@ class Verifier:
             raise ValueError("Missing authoritative netlist")
         net_hash = hashlib.sha256(raw.encode()).hexdigest()
         doc_id = str(field.get("doc_id", "")) if isinstance(field, dict) else net_hash[:16]
-        netlist = OptimizedNetlist(raw, self.reward_factory.gate_funcs,
+        netlist = prepare_netlist(raw, self.reward_factory.gate_funcs,
                                    RewardFunctionFactory.DECL_RE, RewardFunctionFactory.NAME_RE)
         fault = str(record.get("fault", "")).strip()
         if not re.fullmatch(r"sa[01]\s+\S+", fault):
@@ -152,7 +152,8 @@ class Verifier:
 
     @staticmethod
     def failure(status, reason=""):
-        return CompletionScore(components={"search_failure_logonly": 1.0}, status=status)
+        return CompletionScore(components={"search_failure_logonly": 1.0,
+            "simulator_error_logonly": float(status == "INFRA_ERROR")}, status=status)
 
     def score_state(self, problem, state, context):
         if state.status != "FINAL":

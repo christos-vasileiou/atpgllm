@@ -1,0 +1,1048 @@
+{
+  "version": 1,
+  "seed": 42,
+  "tokenizer": "runs/sft_granite_4.2_8b/checkpoint-200",
+  "tokenizer_vocab_sha256": "256cfb53b9e049f0c155a08563faadb8f17e17c763d9f4e72213fd25eb9fa4a8",
+  "chat_template_sha256": "b6fc5afffffd28dde8015a8d93854f9caa3160a325f8417f421e9e5e8ebc9a75",
+  "max_prompt_tokens": 4096,
+  "tools_sha256": "d031489952bd02123b3b87285e54d4a58219c30997d562a1f962888ee3a52b06",
+  "dataset_cache": "/home/eng/c/cxv200006/.cache/huggingface/datasets/chrivasileiou___asap7-language-of-test-v2/default/0.0.0/d35cfea64eadf30fb3b39735b0e8d20bffcc3345",
+  "provenance": {
+    "train_circuits": 2848,
+    "test_circuits": 2870,
+    "raw_disjoint_candidates": 22,
+    "excluded": [
+      {
+        "source_id": "9e1038c787d25bb9ac1b4e8991c49b0e73b28ac646882eeb53291f308f013d50",
+        "reason": "candidate_parse: Unresolved output in benchmark construction"
+      },
+      {
+        "source_id": "085ef615c75b5577b52ec404bc90a7a2bac2e2cc2c42c21220bf05180583f11a",
+        "reason": "structural_duplicate"
+      },
+      {
+        "source_id": "536c0262db619b8f856a48361ea45001b5145daa338894b54650cb68cecfd776",
+        "reason": "structural_duplicate"
+      },
+      {
+        "source_id": "55d193afa497f00132575748ace8a98e3a837b84c8a858a52e24eb6e9cff072e",
+        "reason": "structural_duplicate"
+      },
+      {
+        "source_id": "695ec3a10c8665d62e4e138da69b7ef9fad609a59ce3641ddcfd9f02c9fab973",
+        "reason": "structural_duplicate"
+      },
+      {
+        "source_id": "6c359332cadffdb34f3f95c837cb5c30db01dcae99f46743e6d2b51a6fd47f79",
+        "reason": "structural_duplicate"
+      },
+      {
+        "source_id": "72adf9e37adb2373842f8622f9430b499053b95c32190b7834cff4917dd993a3",
+        "reason": "Unresolved or cyclic circuit"
+      },
+      {
+        "source_id": "9313da60bcd60fa003bb2b8a4c7370cbd16e8a1a7e91dc76fd71e29a69ca703b",
+        "reason": "structural_duplicate"
+      },
+      {
+        "source_id": "96ce2de6d93991e903fe56a52d2122e903f2317570892cc82ed14516b3a4eee7",
+        "reason": "structural_duplicate"
+      },
+      {
+        "source_id": "bdc5041b8df22c1601f98502b7d54e46993542c9a11e4e56bb230ca91641221c",
+        "reason": "structural_duplicate"
+      },
+      {
+        "source_id": "df9e30aec4071ef71b1140e1837193541cfd65e4a80ad1fea4ba7e0034840e1b",
+        "reason": "structural_duplicate"
+      },
+      {
+        "source_id": "e27f575cb680b54bac05c4b733b40a0977110e4eeaba0d4bab52168772e0f71d",
+        "reason": "structural_duplicate"
+      },
+      {
+        "source_id": "f542905ae7989dff428c079637b906ae31637d5de75f690ae04cf95f6dbdbdb3",
+        "reason": "structural_duplicate"
+      }
+    ],
+    "disjointness_scope": "Full cached train split; exact normalized text plus compiled-cone hashes. Not source-family or pretraining disjointness.",
+    "training_structural_unresolved": 0,
+    "eligible_circuits": 9,
+    "examples": 36
+  },
+  "examples": [
+    {
+      "netlist": {
+        "doc_id": "0a860d396e458c00",
+        "netlist": "module half_wave ( sine, out );\ninput [7:0] sine;\noutput [7:0] out;\nwire   n2;\nassign out[7] = sine[7];\nINVxp33_ASAP7_75t_R U11 ( .A(sine[7]), .Y(n2) );\nOR2x2_ASAP7_75t_R U12 ( .A(sine[0]), .B(n2), .Y(out[0]) );\nOR2x2_ASAP7_75t_R U13 ( .A(sine[5]), .B(n2), .Y(out[5]) );\nOR2x2_ASAP7_75t_R U14 ( .A(sine[4]), .B(n2), .Y(out[4]) );\nOR2x2_ASAP7_75t_R U15 ( .A(sine[3]), .B(n2), .Y(out[3]) );\nOR2x2_ASAP7_75t_R U16 ( .A(sine[6]), .B(n2), .Y(out[6]) );\nOR2x2_ASAP7_75t_R U17 ( .A(sine[2]), .B(n2), .Y(out[2]) );\nOR2x2_ASAP7_75t_R U18 ( .A(sine[1]), .B(n2), .Y(out[1]) );\nendmodule"
+      },
+      "fault": "sa1 n2",
+      "module_name": "half_wave",
+      "source_circuit_id": "0a860d396e458c00136d6c66a08e7f85a135a244576df66f24a0624ca28b2d1b",
+      "variant": "original",
+      "comparison_id": "0a860d396e458c00136d6c66a08e7f85a135a244576df66f24a0624ca28b2d1b:original",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"half_wave\" to detect \"sa1 n2\" in this netlist:\n{'doc_id': '0a860d396e458c00', 'netlist': 'module half_wave ( sine, out );\\ninput [7:0] sine;\\noutput [7:0] out;\\nwire   n2;\\nassign out[7] = sine[7];\\nINVxp33_ASAP7_75t_R U11 ( .A(sine[7]), .Y(n2) );\\nOR2x2_ASAP7_75t_R U12 ( .A(sine[0]), .B(n2), .Y(out[0]) );\\nOR2x2_ASAP7_75t_R U13 ( .A(sine[5]), .B(n2), .Y(out[5]) );\\nOR2x2_ASAP7_75t_R U14 ( .A(sine[4]), .B(n2), .Y(out[4]) );\\nOR2x2_ASAP7_75t_R U15 ( .A(sine[3]), .B(n2), .Y(out[3]) );\\nOR2x2_ASAP7_75t_R U16 ( .A(sine[6]), .B(n2), .Y(out[6]) );\\nOR2x2_ASAP7_75t_R U17 ( .A(sine[2]), .B(n2), .Y(out[2]) );\\nOR2x2_ASAP7_75t_R U18 ( .A(sine[1]), .B(n2), .Y(out[1]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 841,
+      "renaming": {},
+      "structural_id": "d490c1f6e5f47c108cbd6c28642b1cf6e453996f3612183676320ffa1cac2ddb"
+    },
+    {
+      "netlist": {
+        "doc_id": "4d0458807e4055ab",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001 );\ninput [7:0] net_0000;\noutput [7:0] net_0001;\nwire   net_0002;\nassign net_0001[7] = net_0000[7];\nINVxp33_ASAP7_75t_R gate_0001 ( .A(net_0000[7]), .Y(net_0002) );\nOR2x2_ASAP7_75t_R gate_0002 ( .A(net_0000[0]), .B(net_0002), .Y(net_0001[0]) );\nOR2x2_ASAP7_75t_R gate_0003 ( .A(net_0000[5]), .B(net_0002), .Y(net_0001[5]) );\nOR2x2_ASAP7_75t_R gate_0004 ( .A(net_0000[4]), .B(net_0002), .Y(net_0001[4]) );\nOR2x2_ASAP7_75t_R gate_0005 ( .A(net_0000[3]), .B(net_0002), .Y(net_0001[3]) );\nOR2x2_ASAP7_75t_R gate_0006 ( .A(net_0000[6]), .B(net_0002), .Y(net_0001[6]) );\nOR2x2_ASAP7_75t_R gate_0007 ( .A(net_0000[2]), .B(net_0002), .Y(net_0001[2]) );\nOR2x2_ASAP7_75t_R gate_0008 ( .A(net_0000[1]), .B(net_0002), .Y(net_0001[1]) );\nendmodule"
+      },
+      "fault": "sa1 net_0002",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "0a860d396e458c00136d6c66a08e7f85a135a244576df66f24a0624ca28b2d1b",
+      "variant": "renamed",
+      "comparison_id": "0a860d396e458c00136d6c66a08e7f85a135a244576df66f24a0624ca28b2d1b:renamed",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa1 net_0002\" in this netlist:\n{'doc_id': '4d0458807e4055ab', 'netlist': 'module circuit_anonymous ( net_0000, net_0001 );\\ninput [7:0] net_0000;\\noutput [7:0] net_0001;\\nwire   net_0002;\\nassign net_0001[7] = net_0000[7];\\nINVxp33_ASAP7_75t_R gate_0001 ( .A(net_0000[7]), .Y(net_0002) );\\nOR2x2_ASAP7_75t_R gate_0002 ( .A(net_0000[0]), .B(net_0002), .Y(net_0001[0]) );\\nOR2x2_ASAP7_75t_R gate_0003 ( .A(net_0000[5]), .B(net_0002), .Y(net_0001[5]) );\\nOR2x2_ASAP7_75t_R gate_0004 ( .A(net_0000[4]), .B(net_0002), .Y(net_0001[4]) );\\nOR2x2_ASAP7_75t_R gate_0005 ( .A(net_0000[3]), .B(net_0002), .Y(net_0001[3]) );\\nOR2x2_ASAP7_75t_R gate_0006 ( .A(net_0000[6]), .B(net_0002), .Y(net_0001[6]) );\\nOR2x2_ASAP7_75t_R gate_0007 ( .A(net_0000[2]), .B(net_0002), .Y(net_0001[2]) );\\nOR2x2_ASAP7_75t_R gate_0008 ( .A(net_0000[1]), .B(net_0002), .Y(net_0001[1]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 933,
+      "renaming": {
+        "sine": "net_0000",
+        "out": "net_0001",
+        "n2": "net_0002"
+      },
+      "structural_id": "d490c1f6e5f47c108cbd6c28642b1cf6e453996f3612183676320ffa1cac2ddb"
+    },
+    {
+      "netlist": {
+        "doc_id": "88e42ad2629bd197",
+        "netlist": "module half_wave ( sine, out );\ninput [7:0] sine;\noutput [7:0] out;\nwire   n2;\nOR2x2_ASAP7_75t_R U13 ( .A(sine[5]), .B(n2), .Y(out[5]) );\nOR2x2_ASAP7_75t_R U16 ( .A(sine[6]), .B(n2), .Y(out[6]) );\nOR2x2_ASAP7_75t_R U17 ( .A(sine[2]), .B(n2), .Y(out[2]) );\nOR2x2_ASAP7_75t_R U14 ( .A(sine[4]), .B(n2), .Y(out[4]) );\nOR2x2_ASAP7_75t_R U18 ( .A(sine[1]), .B(n2), .Y(out[1]) );\nOR2x2_ASAP7_75t_R U12 ( .A(sine[0]), .B(n2), .Y(out[0]) );\nOR2x2_ASAP7_75t_R U15 ( .A(sine[3]), .B(n2), .Y(out[3]) );\nassign out[7] = sine[7];\nINVxp33_ASAP7_75t_R U11 ( .A(sine[7]), .Y(n2) );\nendmodule"
+      },
+      "fault": "sa1 n2",
+      "module_name": "half_wave",
+      "source_circuit_id": "0a860d396e458c00136d6c66a08e7f85a135a244576df66f24a0624ca28b2d1b",
+      "variant": "reordered",
+      "comparison_id": "0a860d396e458c00136d6c66a08e7f85a135a244576df66f24a0624ca28b2d1b:reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"half_wave\" to detect \"sa1 n2\" in this netlist:\n{'doc_id': '88e42ad2629bd197', 'netlist': 'module half_wave ( sine, out );\\ninput [7:0] sine;\\noutput [7:0] out;\\nwire   n2;\\nOR2x2_ASAP7_75t_R U13 ( .A(sine[5]), .B(n2), .Y(out[5]) );\\nOR2x2_ASAP7_75t_R U16 ( .A(sine[6]), .B(n2), .Y(out[6]) );\\nOR2x2_ASAP7_75t_R U17 ( .A(sine[2]), .B(n2), .Y(out[2]) );\\nOR2x2_ASAP7_75t_R U14 ( .A(sine[4]), .B(n2), .Y(out[4]) );\\nOR2x2_ASAP7_75t_R U18 ( .A(sine[1]), .B(n2), .Y(out[1]) );\\nOR2x2_ASAP7_75t_R U12 ( .A(sine[0]), .B(n2), .Y(out[0]) );\\nOR2x2_ASAP7_75t_R U15 ( .A(sine[3]), .B(n2), .Y(out[3]) );\\nassign out[7] = sine[7];\\nINVxp33_ASAP7_75t_R U11 ( .A(sine[7]), .Y(n2) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 840,
+      "renaming": {},
+      "structural_id": "d490c1f6e5f47c108cbd6c28642b1cf6e453996f3612183676320ffa1cac2ddb"
+    },
+    {
+      "netlist": {
+        "doc_id": "257171b9566ff42e",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001 );\ninput [7:0] net_0000;\noutput [7:0] net_0001;\nwire   net_0002;\nOR2x2_ASAP7_75t_R gate_0003 ( .A(net_0000[5]), .B(net_0002), .Y(net_0001[5]) );\nOR2x2_ASAP7_75t_R gate_0006 ( .A(net_0000[6]), .B(net_0002), .Y(net_0001[6]) );\nOR2x2_ASAP7_75t_R gate_0007 ( .A(net_0000[2]), .B(net_0002), .Y(net_0001[2]) );\nOR2x2_ASAP7_75t_R gate_0004 ( .A(net_0000[4]), .B(net_0002), .Y(net_0001[4]) );\nOR2x2_ASAP7_75t_R gate_0008 ( .A(net_0000[1]), .B(net_0002), .Y(net_0001[1]) );\nOR2x2_ASAP7_75t_R gate_0002 ( .A(net_0000[0]), .B(net_0002), .Y(net_0001[0]) );\nOR2x2_ASAP7_75t_R gate_0005 ( .A(net_0000[3]), .B(net_0002), .Y(net_0001[3]) );\nassign net_0001[7] = net_0000[7];\nINVxp33_ASAP7_75t_R gate_0001 ( .A(net_0000[7]), .Y(net_0002) );\nendmodule"
+      },
+      "fault": "sa1 net_0002",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "0a860d396e458c00136d6c66a08e7f85a135a244576df66f24a0624ca28b2d1b",
+      "variant": "renamed_reordered",
+      "comparison_id": "0a860d396e458c00136d6c66a08e7f85a135a244576df66f24a0624ca28b2d1b:renamed_reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa1 net_0002\" in this netlist:\n{'doc_id': '257171b9566ff42e', 'netlist': 'module circuit_anonymous ( net_0000, net_0001 );\\ninput [7:0] net_0000;\\noutput [7:0] net_0001;\\nwire   net_0002;\\nOR2x2_ASAP7_75t_R gate_0003 ( .A(net_0000[5]), .B(net_0002), .Y(net_0001[5]) );\\nOR2x2_ASAP7_75t_R gate_0006 ( .A(net_0000[6]), .B(net_0002), .Y(net_0001[6]) );\\nOR2x2_ASAP7_75t_R gate_0007 ( .A(net_0000[2]), .B(net_0002), .Y(net_0001[2]) );\\nOR2x2_ASAP7_75t_R gate_0004 ( .A(net_0000[4]), .B(net_0002), .Y(net_0001[4]) );\\nOR2x2_ASAP7_75t_R gate_0008 ( .A(net_0000[1]), .B(net_0002), .Y(net_0001[1]) );\\nOR2x2_ASAP7_75t_R gate_0002 ( .A(net_0000[0]), .B(net_0002), .Y(net_0001[0]) );\\nOR2x2_ASAP7_75t_R gate_0005 ( .A(net_0000[3]), .B(net_0002), .Y(net_0001[3]) );\\nassign net_0001[7] = net_0000[7];\\nINVxp33_ASAP7_75t_R gate_0001 ( .A(net_0000[7]), .Y(net_0002) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 932,
+      "renaming": {
+        "sine": "net_0000",
+        "out": "net_0001",
+        "n2": "net_0002"
+      },
+      "structural_id": "d490c1f6e5f47c108cbd6c28642b1cf6e453996f3612183676320ffa1cac2ddb"
+    },
+    {
+      "netlist": {
+        "doc_id": "3f55b6755437bc99",
+        "netlist": "module multiple_module_opt2 ( a, b, c, d, y );\ninput a, b, c, d;\noutput y;\nTIELOx1_ASAP7_75t_R U3 ( .L(y) );\nendmodule"
+      },
+      "fault": "sa1 y",
+      "module_name": "multiple_module_opt2",
+      "source_circuit_id": "3f55b6755437bc9927481a4cb94f2256f2e11b9ebac9179168f7a0acfb7658f5",
+      "variant": "original",
+      "comparison_id": "3f55b6755437bc9927481a4cb94f2256f2e11b9ebac9179168f7a0acfb7658f5:original",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"multiple_module_opt2\" to detect \"sa1 y\" in this netlist:\n{'doc_id': '3f55b6755437bc99', 'netlist': 'module multiple_module_opt2 ( a, b, c, d, y );\\ninput a, b, c, d;\\noutput y;\\nTIELOx1_ASAP7_75t_R U3 ( .L(y) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 543,
+      "renaming": {},
+      "structural_id": "49f4d85a2356801e845b26f51efcc930ec95e528d86e16306cae669fc5cceaa5"
+    },
+    {
+      "netlist": {
+        "doc_id": "fb5ec4fefbc5c204",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001, net_0002, net_0003, net_0004 );\ninput net_0000, net_0001, net_0002, net_0003;\noutput net_0004;\nTIELOx1_ASAP7_75t_R gate_0000 ( .L(net_0004) );\nendmodule"
+      },
+      "fault": "sa1 net_0004",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "3f55b6755437bc9927481a4cb94f2256f2e11b9ebac9179168f7a0acfb7658f5",
+      "variant": "renamed",
+      "comparison_id": "3f55b6755437bc9927481a4cb94f2256f2e11b9ebac9179168f7a0acfb7658f5:renamed",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa1 net_0004\" in this netlist:\n{'doc_id': 'fb5ec4fefbc5c204', 'netlist': 'module circuit_anonymous ( net_0000, net_0001, net_0002, net_0003, net_0004 );\\ninput net_0000, net_0001, net_0002, net_0003;\\noutput net_0004;\\nTIELOx1_ASAP7_75t_R gate_0000 ( .L(net_0004) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 576,
+      "renaming": {
+        "a": "net_0000",
+        "b": "net_0001",
+        "c": "net_0002",
+        "d": "net_0003",
+        "y": "net_0004"
+      },
+      "structural_id": "49f4d85a2356801e845b26f51efcc930ec95e528d86e16306cae669fc5cceaa5"
+    },
+    {
+      "netlist": {
+        "doc_id": "3f55b6755437bc99",
+        "netlist": "module multiple_module_opt2 ( a, b, c, d, y );\ninput a, b, c, d;\noutput y;\nTIELOx1_ASAP7_75t_R U3 ( .L(y) );\nendmodule"
+      },
+      "fault": "sa1 y",
+      "module_name": "multiple_module_opt2",
+      "source_circuit_id": "3f55b6755437bc9927481a4cb94f2256f2e11b9ebac9179168f7a0acfb7658f5",
+      "variant": "reordered",
+      "comparison_id": "3f55b6755437bc9927481a4cb94f2256f2e11b9ebac9179168f7a0acfb7658f5:reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"multiple_module_opt2\" to detect \"sa1 y\" in this netlist:\n{'doc_id': '3f55b6755437bc99', 'netlist': 'module multiple_module_opt2 ( a, b, c, d, y );\\ninput a, b, c, d;\\noutput y;\\nTIELOx1_ASAP7_75t_R U3 ( .L(y) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 543,
+      "renaming": {},
+      "structural_id": "49f4d85a2356801e845b26f51efcc930ec95e528d86e16306cae669fc5cceaa5"
+    },
+    {
+      "netlist": {
+        "doc_id": "fb5ec4fefbc5c204",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001, net_0002, net_0003, net_0004 );\ninput net_0000, net_0001, net_0002, net_0003;\noutput net_0004;\nTIELOx1_ASAP7_75t_R gate_0000 ( .L(net_0004) );\nendmodule"
+      },
+      "fault": "sa1 net_0004",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "3f55b6755437bc9927481a4cb94f2256f2e11b9ebac9179168f7a0acfb7658f5",
+      "variant": "renamed_reordered",
+      "comparison_id": "3f55b6755437bc9927481a4cb94f2256f2e11b9ebac9179168f7a0acfb7658f5:renamed_reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa1 net_0004\" in this netlist:\n{'doc_id': 'fb5ec4fefbc5c204', 'netlist': 'module circuit_anonymous ( net_0000, net_0001, net_0002, net_0003, net_0004 );\\ninput net_0000, net_0001, net_0002, net_0003;\\noutput net_0004;\\nTIELOx1_ASAP7_75t_R gate_0000 ( .L(net_0004) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 576,
+      "renaming": {
+        "a": "net_0000",
+        "b": "net_0001",
+        "c": "net_0002",
+        "d": "net_0003",
+        "y": "net_0004"
+      },
+      "structural_id": "49f4d85a2356801e845b26f51efcc930ec95e528d86e16306cae669fc5cceaa5"
+    },
+    {
+      "netlist": {
+        "doc_id": "4f296a8476b72777",
+        "netlist": "module dummy_generator ( clk, reset, address, out, load );\noutput [15:0] address;\noutput [15:0] out;\ninput clk, reset;\noutput load;\nwire   \\*Logic0* ;\nassign load = \\*Logic0* ;\nassign out[0] = \\*Logic0* ;\nassign out[1] = \\*Logic0* ;\nassign out[2] = \\*Logic0* ;\nassign out[3] = \\*Logic0* ;\nassign out[4] = \\*Logic0* ;\nassign out[5] = \\*Logic0* ;\nassign out[6] = \\*Logic0* ;\nassign out[7] = \\*Logic0* ;\nassign out[8] = \\*Logic0* ;\nassign out[9] = \\*Logic0* ;\nassign out[10] = \\*Logic0* ;\nassign out[11] = \\*Logic0* ;\nassign out[12] = \\*Logic0* ;\nassign out[13] = \\*Logic0* ;\nassign out[14] = \\*Logic0* ;\nassign out[15] = \\*Logic0* ;\nassign address[0] = \\*Logic0* ;\nassign address[1] = \\*Logic0* ;\nassign address[2] = \\*Logic0* ;\nassign address[3] = \\*Logic0* ;\nassign address[4] = \\*Logic0* ;\nassign address[5] = \\*Logic0* ;\nassign address[6] = \\*Logic0* ;\nassign address[7] = \\*Logic0* ;\nassign address[8] = \\*Logic0* ;\nassign address[9] = \\*Logic0* ;\nassign address[10] = \\*Logic0* ;\nassign address[11] = \\*Logic0* ;\nassign address[12] = \\*Logic0* ;\nassign address[13] = \\*Logic0* ;\nassign address[14] = \\*Logic0* ;\nassign address[15] = \\*Logic0* ;\nTIELOx1_ASAP7_75t_R U3 ( .L(\\*Logic0* ) );\nendmodule"
+      },
+      "fault": "sa1 load",
+      "module_name": "dummy_generator",
+      "source_circuit_id": "4f296a8476b727776f0b4c35a350c290c503b49bf89017e56a96bbc585e1ed67",
+      "variant": "original",
+      "comparison_id": "4f296a8476b727776f0b4c35a350c290c503b49bf89017e56a96bbc585e1ed67:original",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"dummy_generator\" to detect \"sa1 load\" in this netlist:\n{'doc_id': '4f296a8476b72777', 'netlist': 'module dummy_generator ( clk, reset, address, out, load );\\noutput [15:0] address;\\noutput [15:0] out;\\ninput clk, reset;\\noutput load;\\nwire   \\\\*Logic0* ;\\nassign load = \\\\*Logic0* ;\\nassign out[0] = \\\\*Logic0* ;\\nassign out[1] = \\\\*Logic0* ;\\nassign out[2] = \\\\*Logic0* ;\\nassign out[3] = \\\\*Logic0* ;\\nassign out[4] = \\\\*Logic0* ;\\nassign out[5] = \\\\*Logic0* ;\\nassign out[6] = \\\\*Logic0* ;\\nassign out[7] = \\\\*Logic0* ;\\nassign out[8] = \\\\*Logic0* ;\\nassign out[9] = \\\\*Logic0* ;\\nassign out[10] = \\\\*Logic0* ;\\nassign out[11] = \\\\*Logic0* ;\\nassign out[12] = \\\\*Logic0* ;\\nassign out[13] = \\\\*Logic0* ;\\nassign out[14] = \\\\*Logic0* ;\\nassign out[15] = \\\\*Logic0* ;\\nassign address[0] = \\\\*Logic0* ;\\nassign address[1] = \\\\*Logic0* ;\\nassign address[2] = \\\\*Logic0* ;\\nassign address[3] = \\\\*Logic0* ;\\nassign address[4] = \\\\*Logic0* ;\\nassign address[5] = \\\\*Logic0* ;\\nassign address[6] = \\\\*Logic0* ;\\nassign address[7] = \\\\*Logic0* ;\\nassign address[8] = \\\\*Logic0* ;\\nassign address[9] = \\\\*Logic0* ;\\nassign address[10] = \\\\*Logic0* ;\\nassign address[11] = \\\\*Logic0* ;\\nassign address[12] = \\\\*Logic0* ;\\nassign address[13] = \\\\*Logic0* ;\\nassign address[14] = \\\\*Logic0* ;\\nassign address[15] = \\\\*Logic0* ;\\nTIELOx1_ASAP7_75t_R U3 ( .L(\\\\*Logic0* ) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 1024,
+      "renaming": {},
+      "structural_id": "e0d88838d4f4b682443a92678ef8f27ba7febdb4a5f71b053865c1b826a7d9bd"
+    },
+    {
+      "netlist": {
+        "doc_id": "bf96cfd1f6261a9a",
+        "netlist": "module circuit_anonymous ( net_0002, net_0003, net_0000, net_0001, net_0004 );\noutput [15:0] net_0000;\noutput [15:0] net_0001;\ninput net_0002, net_0003;\noutput net_0004;\nwire   \\*Logic0*;\nassign net_0004 = \\*Logic0*;\nassign net_0001[0] = \\*Logic0*;\nassign net_0001[1] = \\*Logic0*;\nassign net_0001[2] = \\*Logic0*;\nassign net_0001[3] = \\*Logic0*;\nassign net_0001[4] = \\*Logic0*;\nassign net_0001[5] = \\*Logic0*;\nassign net_0001[6] = \\*Logic0*;\nassign net_0001[7] = \\*Logic0*;\nassign net_0001[8] = \\*Logic0*;\nassign net_0001[9] = \\*Logic0*;\nassign net_0001[10] = \\*Logic0*;\nassign net_0001[11] = \\*Logic0*;\nassign net_0001[12] = \\*Logic0*;\nassign net_0001[13] = \\*Logic0*;\nassign net_0001[14] = \\*Logic0*;\nassign net_0001[15] = \\*Logic0*;\nassign net_0000[0] = \\*Logic0*;\nassign net_0000[1] = \\*Logic0*;\nassign net_0000[2] = \\*Logic0*;\nassign net_0000[3] = \\*Logic0*;\nassign net_0000[4] = \\*Logic0*;\nassign net_0000[5] = \\*Logic0*;\nassign net_0000[6] = \\*Logic0*;\nassign net_0000[7] = \\*Logic0*;\nassign net_0000[8] = \\*Logic0*;\nassign net_0000[9] = \\*Logic0*;\nassign net_0000[10] = \\*Logic0*;\nassign net_0000[11] = \\*Logic0*;\nassign net_0000[12] = \\*Logic0*;\nassign net_0000[13] = \\*Logic0*;\nassign net_0000[14] = \\*Logic0*;\nassign net_0000[15] = \\*Logic0*;\nTIELOx1_ASAP7_75t_R gate_0033 ( .L(net_0005 ) );\nendmodule"
+      },
+      "fault": "sa1 net_0004",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "4f296a8476b727776f0b4c35a350c290c503b49bf89017e56a96bbc585e1ed67",
+      "variant": "renamed",
+      "comparison_id": "4f296a8476b727776f0b4c35a350c290c503b49bf89017e56a96bbc585e1ed67:renamed",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa1 net_0004\" in this netlist:\n{'doc_id': 'bf96cfd1f6261a9a', 'netlist': 'module circuit_anonymous ( net_0002, net_0003, net_0000, net_0001, net_0004 );\\noutput [15:0] net_0000;\\noutput [15:0] net_0001;\\ninput net_0002, net_0003;\\noutput net_0004;\\nwire   \\\\*Logic0*;\\nassign net_0004 = \\\\*Logic0*;\\nassign net_0001[0] = \\\\*Logic0*;\\nassign net_0001[1] = \\\\*Logic0*;\\nassign net_0001[2] = \\\\*Logic0*;\\nassign net_0001[3] = \\\\*Logic0*;\\nassign net_0001[4] = \\\\*Logic0*;\\nassign net_0001[5] = \\\\*Logic0*;\\nassign net_0001[6] = \\\\*Logic0*;\\nassign net_0001[7] = \\\\*Logic0*;\\nassign net_0001[8] = \\\\*Logic0*;\\nassign net_0001[9] = \\\\*Logic0*;\\nassign net_0001[10] = \\\\*Logic0*;\\nassign net_0001[11] = \\\\*Logic0*;\\nassign net_0001[12] = \\\\*Logic0*;\\nassign net_0001[13] = \\\\*Logic0*;\\nassign net_0001[14] = \\\\*Logic0*;\\nassign net_0001[15] = \\\\*Logic0*;\\nassign net_0000[0] = \\\\*Logic0*;\\nassign net_0000[1] = \\\\*Logic0*;\\nassign net_0000[2] = \\\\*Logic0*;\\nassign net_0000[3] = \\\\*Logic0*;\\nassign net_0000[4] = \\\\*Logic0*;\\nassign net_0000[5] = \\\\*Logic0*;\\nassign net_0000[6] = \\\\*Logic0*;\\nassign net_0000[7] = \\\\*Logic0*;\\nassign net_0000[8] = \\\\*Logic0*;\\nassign net_0000[9] = \\\\*Logic0*;\\nassign net_0000[10] = \\\\*Logic0*;\\nassign net_0000[11] = \\\\*Logic0*;\\nassign net_0000[12] = \\\\*Logic0*;\\nassign net_0000[13] = \\\\*Logic0*;\\nassign net_0000[14] = \\\\*Logic0*;\\nassign net_0000[15] = \\\\*Logic0*;\\nTIELOx1_ASAP7_75t_R gate_0033 ( .L(net_0005 ) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 1126,
+      "renaming": {
+        "address": "net_0000",
+        "out": "net_0001",
+        "clk": "net_0002",
+        "reset": "net_0003",
+        "load": "net_0004",
+        "\\*Logic0*": "net_0005"
+      },
+      "structural_id": "e0d88838d4f4b682443a92678ef8f27ba7febdb4a5f71b053865c1b826a7d9bd"
+    },
+    {
+      "netlist": {
+        "doc_id": "183a261774968433",
+        "netlist": "module dummy_generator ( clk, reset, address, out, load );\noutput [15:0] address;\noutput [15:0] out;\ninput clk, reset;\noutput load;\nwire   \\*Logic0*;\nassign out[4] = \\*Logic0*;\nassign address[2] = \\*Logic0*;\nassign address[3] = \\*Logic0*;\nassign out[11] = \\*Logic0*;\nassign address[7] = \\*Logic0*;\nassign address[11] = \\*Logic0*;\nassign out[14] = \\*Logic0*;\nassign out[9] = \\*Logic0*;\nassign out[15] = \\*Logic0*;\nassign out[10] = \\*Logic0*;\nassign address[9] = \\*Logic0*;\nassign out[13] = \\*Logic0*;\nassign address[8] = \\*Logic0*;\nassign out[8] = \\*Logic0*;\nassign out[7] = \\*Logic0*;\nassign address[12] = \\*Logic0*;\nassign out[5] = \\*Logic0*;\nassign address[5] = \\*Logic0*;\nassign load = \\*Logic0*;\nassign address[15] = \\*Logic0*;\nassign out[12] = \\*Logic0*;\nassign address[1] = \\*Logic0*;\nassign out[1] = \\*Logic0*;\nassign address[14] = \\*Logic0*;\nassign address[10] = \\*Logic0*;\nassign address[4] = \\*Logic0*;\nassign out[2] = \\*Logic0*;\nassign address[6] = \\*Logic0*;\nassign out[3] = \\*Logic0*;\nassign address[13] = \\*Logic0*;\nTIELOx1_ASAP7_75t_R U3 ( .L(\\*Logic0* ) );\nassign address[0] = \\*Logic0*;\nassign out[0] = \\*Logic0*;\nassign out[6] = \\*Logic0*;\nendmodule"
+      },
+      "fault": "sa1 load",
+      "module_name": "dummy_generator",
+      "source_circuit_id": "4f296a8476b727776f0b4c35a350c290c503b49bf89017e56a96bbc585e1ed67",
+      "variant": "reordered",
+      "comparison_id": "4f296a8476b727776f0b4c35a350c290c503b49bf89017e56a96bbc585e1ed67:reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"dummy_generator\" to detect \"sa1 load\" in this netlist:\n{'doc_id': '183a261774968433', 'netlist': 'module dummy_generator ( clk, reset, address, out, load );\\noutput [15:0] address;\\noutput [15:0] out;\\ninput clk, reset;\\noutput load;\\nwire   \\\\*Logic0*;\\nassign out[4] = \\\\*Logic0*;\\nassign address[2] = \\\\*Logic0*;\\nassign address[3] = \\\\*Logic0*;\\nassign out[11] = \\\\*Logic0*;\\nassign address[7] = \\\\*Logic0*;\\nassign address[11] = \\\\*Logic0*;\\nassign out[14] = \\\\*Logic0*;\\nassign out[9] = \\\\*Logic0*;\\nassign out[15] = \\\\*Logic0*;\\nassign out[10] = \\\\*Logic0*;\\nassign address[9] = \\\\*Logic0*;\\nassign out[13] = \\\\*Logic0*;\\nassign address[8] = \\\\*Logic0*;\\nassign out[8] = \\\\*Logic0*;\\nassign out[7] = \\\\*Logic0*;\\nassign address[12] = \\\\*Logic0*;\\nassign out[5] = \\\\*Logic0*;\\nassign address[5] = \\\\*Logic0*;\\nassign load = \\\\*Logic0*;\\nassign address[15] = \\\\*Logic0*;\\nassign out[12] = \\\\*Logic0*;\\nassign address[1] = \\\\*Logic0*;\\nassign out[1] = \\\\*Logic0*;\\nassign address[14] = \\\\*Logic0*;\\nassign address[10] = \\\\*Logic0*;\\nassign address[4] = \\\\*Logic0*;\\nassign out[2] = \\\\*Logic0*;\\nassign address[6] = \\\\*Logic0*;\\nassign out[3] = \\\\*Logic0*;\\nassign address[13] = \\\\*Logic0*;\\nTIELOx1_ASAP7_75t_R U3 ( .L(\\\\*Logic0* ) );\\nassign address[0] = \\\\*Logic0*;\\nassign out[0] = \\\\*Logic0*;\\nassign out[6] = \\\\*Logic0*;\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 988,
+      "renaming": {},
+      "structural_id": "e0d88838d4f4b682443a92678ef8f27ba7febdb4a5f71b053865c1b826a7d9bd"
+    },
+    {
+      "netlist": {
+        "doc_id": "cd4501da2ff29b26",
+        "netlist": "module circuit_anonymous ( net_0002, net_0003, net_0000, net_0001, net_0004 );\noutput [15:0] net_0000;\noutput [15:0] net_0001;\ninput net_0002, net_0003;\noutput net_0004;\nwire   \\*Logic0*;\nassign net_0001[4] = \\*Logic0*;\nassign net_0000[2] = \\*Logic0*;\nassign net_0000[3] = \\*Logic0*;\nassign net_0001[11] = \\*Logic0*;\nassign net_0000[7] = \\*Logic0*;\nassign net_0000[11] = \\*Logic0*;\nassign net_0001[14] = \\*Logic0*;\nassign net_0001[9] = \\*Logic0*;\nassign net_0001[15] = \\*Logic0*;\nassign net_0001[10] = \\*Logic0*;\nassign net_0000[9] = \\*Logic0*;\nassign net_0001[13] = \\*Logic0*;\nassign net_0000[8] = \\*Logic0*;\nassign net_0001[8] = \\*Logic0*;\nassign net_0001[7] = \\*Logic0*;\nassign net_0000[12] = \\*Logic0*;\nassign net_0001[5] = \\*Logic0*;\nassign net_0000[5] = \\*Logic0*;\nassign net_0004 = \\*Logic0*;\nassign net_0000[15] = \\*Logic0*;\nassign net_0001[12] = \\*Logic0*;\nassign net_0000[1] = \\*Logic0*;\nassign net_0001[1] = \\*Logic0*;\nassign net_0000[14] = \\*Logic0*;\nassign net_0000[10] = \\*Logic0*;\nassign net_0000[4] = \\*Logic0*;\nassign net_0001[2] = \\*Logic0*;\nassign net_0000[6] = \\*Logic0*;\nassign net_0001[3] = \\*Logic0*;\nassign net_0000[13] = \\*Logic0*;\nTIELOx1_ASAP7_75t_R gate_0033 ( .L(net_0005 ) );\nassign net_0000[0] = \\*Logic0*;\nassign net_0001[0] = \\*Logic0*;\nassign net_0001[6] = \\*Logic0*;\nendmodule"
+      },
+      "fault": "sa1 net_0004",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "4f296a8476b727776f0b4c35a350c290c503b49bf89017e56a96bbc585e1ed67",
+      "variant": "renamed_reordered",
+      "comparison_id": "4f296a8476b727776f0b4c35a350c290c503b49bf89017e56a96bbc585e1ed67:renamed_reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa1 net_0004\" in this netlist:\n{'doc_id': 'cd4501da2ff29b26', 'netlist': 'module circuit_anonymous ( net_0002, net_0003, net_0000, net_0001, net_0004 );\\noutput [15:0] net_0000;\\noutput [15:0] net_0001;\\ninput net_0002, net_0003;\\noutput net_0004;\\nwire   \\\\*Logic0*;\\nassign net_0001[4] = \\\\*Logic0*;\\nassign net_0000[2] = \\\\*Logic0*;\\nassign net_0000[3] = \\\\*Logic0*;\\nassign net_0001[11] = \\\\*Logic0*;\\nassign net_0000[7] = \\\\*Logic0*;\\nassign net_0000[11] = \\\\*Logic0*;\\nassign net_0001[14] = \\\\*Logic0*;\\nassign net_0001[9] = \\\\*Logic0*;\\nassign net_0001[15] = \\\\*Logic0*;\\nassign net_0001[10] = \\\\*Logic0*;\\nassign net_0000[9] = \\\\*Logic0*;\\nassign net_0001[13] = \\\\*Logic0*;\\nassign net_0000[8] = \\\\*Logic0*;\\nassign net_0001[8] = \\\\*Logic0*;\\nassign net_0001[7] = \\\\*Logic0*;\\nassign net_0000[12] = \\\\*Logic0*;\\nassign net_0001[5] = \\\\*Logic0*;\\nassign net_0000[5] = \\\\*Logic0*;\\nassign net_0004 = \\\\*Logic0*;\\nassign net_0000[15] = \\\\*Logic0*;\\nassign net_0001[12] = \\\\*Logic0*;\\nassign net_0000[1] = \\\\*Logic0*;\\nassign net_0001[1] = \\\\*Logic0*;\\nassign net_0000[14] = \\\\*Logic0*;\\nassign net_0000[10] = \\\\*Logic0*;\\nassign net_0000[4] = \\\\*Logic0*;\\nassign net_0001[2] = \\\\*Logic0*;\\nassign net_0000[6] = \\\\*Logic0*;\\nassign net_0001[3] = \\\\*Logic0*;\\nassign net_0000[13] = \\\\*Logic0*;\\nTIELOx1_ASAP7_75t_R gate_0033 ( .L(net_0005 ) );\\nassign net_0000[0] = \\\\*Logic0*;\\nassign net_0001[0] = \\\\*Logic0*;\\nassign net_0001[6] = \\\\*Logic0*;\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 1124,
+      "renaming": {
+        "address": "net_0000",
+        "out": "net_0001",
+        "clk": "net_0002",
+        "reset": "net_0003",
+        "load": "net_0004",
+        "\\*Logic0*": "net_0005"
+      },
+      "structural_id": "e0d88838d4f4b682443a92678ef8f27ba7febdb4a5f71b053865c1b826a7d9bd"
+    },
+    {
+      "netlist": {
+        "doc_id": "8d0fa1ca10731e4f",
+        "netlist": "module slave2 ( aclk, ready_out, resp_out, addr_in, data_in );\noutput [1:0] resp_out;\ninput [31:0] addr_in;\ninput [31:0] data_in;\ninput aclk;\noutput ready_out;\nwire   ready_out;\nassign resp_out[0] = ready_out;\nassign resp_out[1] = ready_out;\nTIEHIx1_ASAP7_75t_R U4 ( .H(ready_out) );\nendmodule"
+      },
+      "fault": "sa0 ready_out",
+      "module_name": "slave2",
+      "source_circuit_id": "8d0fa1ca10731e4f8a4ae57ad319bab2cb9a46d6c0c8b80896b8569c18953f2f",
+      "variant": "original",
+      "comparison_id": "8d0fa1ca10731e4f8a4ae57ad319bab2cb9a46d6c0c8b80896b8569c18953f2f:original",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"slave2\" to detect \"sa0 ready_out\" in this netlist:\n{'doc_id': '8d0fa1ca10731e4f', 'netlist': 'module slave2 ( aclk, ready_out, resp_out, addr_in, data_in );\\noutput [1:0] resp_out;\\ninput [31:0] addr_in;\\ninput [31:0] data_in;\\ninput aclk;\\noutput ready_out;\\nwire   ready_out;\\nassign resp_out[0] = ready_out;\\nassign resp_out[1] = ready_out;\\nTIEHIx1_ASAP7_75t_R U4 ( .H(ready_out) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 613,
+      "renaming": {},
+      "structural_id": "c67a8938e8e8c7d39b16a72a1a96dfe10b082f7a9c1a2ac5f451347654e15adb"
+    },
+    {
+      "netlist": {
+        "doc_id": "a64fd360371d3940",
+        "netlist": "module circuit_anonymous ( net_0003, net_0004, net_0000, net_0001, net_0002 );\noutput [1:0] net_0000;\ninput [31:0] net_0001;\ninput [31:0] net_0002;\ninput net_0003;\noutput net_0004;\nwire   net_0004;\nassign net_0000[0] = net_0004;\nassign net_0000[1] = net_0004;\nTIEHIx1_ASAP7_75t_R gate_0002 ( .H(net_0004) );\nendmodule"
+      },
+      "fault": "sa0 net_0004",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "8d0fa1ca10731e4f8a4ae57ad319bab2cb9a46d6c0c8b80896b8569c18953f2f",
+      "variant": "renamed",
+      "comparison_id": "8d0fa1ca10731e4f8a4ae57ad319bab2cb9a46d6c0c8b80896b8569c18953f2f:renamed",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0004\" in this netlist:\n{'doc_id': 'a64fd360371d3940', 'netlist': 'module circuit_anonymous ( net_0003, net_0004, net_0000, net_0001, net_0002 );\\noutput [1:0] net_0000;\\ninput [31:0] net_0001;\\ninput [31:0] net_0002;\\ninput net_0003;\\noutput net_0004;\\nwire   net_0004;\\nassign net_0000[0] = net_0004;\\nassign net_0000[1] = net_0004;\\nTIEHIx1_ASAP7_75t_R gate_0002 ( .H(net_0004) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 634,
+      "renaming": {
+        "resp_out": "net_0000",
+        "addr_in": "net_0001",
+        "data_in": "net_0002",
+        "aclk": "net_0003",
+        "ready_out": "net_0004"
+      },
+      "structural_id": "c67a8938e8e8c7d39b16a72a1a96dfe10b082f7a9c1a2ac5f451347654e15adb"
+    },
+    {
+      "netlist": {
+        "doc_id": "07e01cd68d0275e8",
+        "netlist": "module slave2 ( aclk, ready_out, resp_out, addr_in, data_in );\noutput [1:0] resp_out;\ninput [31:0] addr_in;\ninput [31:0] data_in;\ninput aclk;\noutput ready_out;\nwire   ready_out;\nassign resp_out[1] = ready_out;\nassign resp_out[0] = ready_out;\nTIEHIx1_ASAP7_75t_R U4 ( .H(ready_out) );\nendmodule"
+      },
+      "fault": "sa0 ready_out",
+      "module_name": "slave2",
+      "source_circuit_id": "8d0fa1ca10731e4f8a4ae57ad319bab2cb9a46d6c0c8b80896b8569c18953f2f",
+      "variant": "reordered",
+      "comparison_id": "8d0fa1ca10731e4f8a4ae57ad319bab2cb9a46d6c0c8b80896b8569c18953f2f:reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"slave2\" to detect \"sa0 ready_out\" in this netlist:\n{'doc_id': '07e01cd68d0275e8', 'netlist': 'module slave2 ( aclk, ready_out, resp_out, addr_in, data_in );\\noutput [1:0] resp_out;\\ninput [31:0] addr_in;\\ninput [31:0] data_in;\\ninput aclk;\\noutput ready_out;\\nwire   ready_out;\\nassign resp_out[1] = ready_out;\\nassign resp_out[0] = ready_out;\\nTIEHIx1_ASAP7_75t_R U4 ( .H(ready_out) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 612,
+      "renaming": {},
+      "structural_id": "c67a8938e8e8c7d39b16a72a1a96dfe10b082f7a9c1a2ac5f451347654e15adb"
+    },
+    {
+      "netlist": {
+        "doc_id": "2c892217dd11d35f",
+        "netlist": "module circuit_anonymous ( net_0003, net_0004, net_0000, net_0001, net_0002 );\noutput [1:0] net_0000;\ninput [31:0] net_0001;\ninput [31:0] net_0002;\ninput net_0003;\noutput net_0004;\nwire   net_0004;\nassign net_0000[1] = net_0004;\nassign net_0000[0] = net_0004;\nTIEHIx1_ASAP7_75t_R gate_0002 ( .H(net_0004) );\nendmodule"
+      },
+      "fault": "sa0 net_0004",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "8d0fa1ca10731e4f8a4ae57ad319bab2cb9a46d6c0c8b80896b8569c18953f2f",
+      "variant": "renamed_reordered",
+      "comparison_id": "8d0fa1ca10731e4f8a4ae57ad319bab2cb9a46d6c0c8b80896b8569c18953f2f:renamed_reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0004\" in this netlist:\n{'doc_id': '2c892217dd11d35f', 'netlist': 'module circuit_anonymous ( net_0003, net_0004, net_0000, net_0001, net_0002 );\\noutput [1:0] net_0000;\\ninput [31:0] net_0001;\\ninput [31:0] net_0002;\\ninput net_0003;\\noutput net_0004;\\nwire   net_0004;\\nassign net_0000[1] = net_0004;\\nassign net_0000[0] = net_0004;\\nTIEHIx1_ASAP7_75t_R gate_0002 ( .H(net_0004) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 636,
+      "renaming": {
+        "resp_out": "net_0000",
+        "addr_in": "net_0001",
+        "data_in": "net_0002",
+        "aclk": "net_0003",
+        "ready_out": "net_0004"
+      },
+      "structural_id": "c67a8938e8e8c7d39b16a72a1a96dfe10b082f7a9c1a2ac5f451347654e15adb"
+    },
+    {
+      "netlist": {
+        "doc_id": "920b6c68ccf90057",
+        "netlist": "module pc_sel ( inst, control );\ninput [31:0] inst;\noutput [1:0] control;\nwire   n4, n5, n6;\nNAND4xp25_ASAP7_75t_R U8 ( .A(inst[1]), .B(inst[0]), .C(inst[6]), .D(inst[5]), .Y(n4) );\nNOR3xp33_ASAP7_75t_R U9 ( .A(inst[2]), .B(inst[3]), .C(n4), .Y(control[0])\n);\nINVxp33_ASAP7_75t_R U10 ( .A(inst[4]), .Y(n6) );\nINVxp33_ASAP7_75t_R U11 ( .A(n4), .Y(n5) );\nAO32x1_ASAP7_75t_R U12 ( .A1(inst[2]), .A2(n6), .A3(n5), .B1(inst[4]), .B2(\ncontrol[0]), .Y(control[1]) );\nendmodule"
+      },
+      "fault": "sa0 n4",
+      "module_name": "pc_sel",
+      "source_circuit_id": "920b6c68ccf9005784459839e38f772fad5d194cec04c73006c413575c240f84",
+      "variant": "original",
+      "comparison_id": "920b6c68ccf9005784459839e38f772fad5d194cec04c73006c413575c240f84:original",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"pc_sel\" to detect \"sa0 n4\" in this netlist:\n{'doc_id': '920b6c68ccf90057', 'netlist': 'module pc_sel ( inst, control );\\ninput [31:0] inst;\\noutput [1:0] control;\\nwire   n4, n5, n6;\\nNAND4xp25_ASAP7_75t_R U8 ( .A(inst[1]), .B(inst[0]), .C(inst[6]), .D(inst[5]), .Y(n4) );\\nNOR3xp33_ASAP7_75t_R U9 ( .A(inst[2]), .B(inst[3]), .C(n4), .Y(control[0])\\n);\\nINVxp33_ASAP7_75t_R U10 ( .A(inst[4]), .Y(n6) );\\nINVxp33_ASAP7_75t_R U11 ( .A(n4), .Y(n5) );\\nAO32x1_ASAP7_75t_R U12 ( .A1(inst[2]), .A2(n6), .A3(n5), .B1(inst[4]), .B2(\\ncontrol[0]), .Y(control[1]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 751,
+      "renaming": {},
+      "structural_id": "57a8d78f80e0162de3199e409a13c51b013594c6acb883aff877a6f97dfdc326"
+    },
+    {
+      "netlist": {
+        "doc_id": "0f387e8cccd79862",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001 );\ninput [31:0] net_0000;\noutput [1:0] net_0001;\nwire   net_0002, net_0003, net_0004;\nNAND4xp25_ASAP7_75t_R gate_0000 ( .A(net_0000[1]), .B(net_0000[0]), .C(net_0000[6]), .D(net_0000[5]), .Y(net_0002) );\nNOR3xp33_ASAP7_75t_R gate_0001 ( .A(net_0000[2]), .B(net_0000[3]), .C(net_0002), .Y(net_0001[0])\n);\nINVxp33_ASAP7_75t_R gate_0002 ( .A(net_0000[4]), .Y(net_0004) );\nINVxp33_ASAP7_75t_R gate_0003 ( .A(net_0002), .Y(net_0003) );\nAO32x1_ASAP7_75t_R gate_0004 ( .A1(net_0000[2]), .A2(net_0004), .A3(net_0003), .B1(net_0000[4]), .B2(\nnet_0001[0]), .Y(net_0001[1]) );\nendmodule"
+      },
+      "fault": "sa0 net_0002",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "920b6c68ccf9005784459839e38f772fad5d194cec04c73006c413575c240f84",
+      "variant": "renamed",
+      "comparison_id": "920b6c68ccf9005784459839e38f772fad5d194cec04c73006c413575c240f84:renamed",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0002\" in this netlist:\n{'doc_id': '0f387e8cccd79862', 'netlist': 'module circuit_anonymous ( net_0000, net_0001 );\\ninput [31:0] net_0000;\\noutput [1:0] net_0001;\\nwire   net_0002, net_0003, net_0004;\\nNAND4xp25_ASAP7_75t_R gate_0000 ( .A(net_0000[1]), .B(net_0000[0]), .C(net_0000[6]), .D(net_0000[5]), .Y(net_0002) );\\nNOR3xp33_ASAP7_75t_R gate_0001 ( .A(net_0000[2]), .B(net_0000[3]), .C(net_0002), .Y(net_0001[0])\\n);\\nINVxp33_ASAP7_75t_R gate_0002 ( .A(net_0000[4]), .Y(net_0004) );\\nINVxp33_ASAP7_75t_R gate_0003 ( .A(net_0002), .Y(net_0003) );\\nAO32x1_ASAP7_75t_R gate_0004 ( .A1(net_0000[2]), .A2(net_0004), .A3(net_0003), .B1(net_0000[4]), .B2(\\nnet_0001[0]), .Y(net_0001[1]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 832,
+      "renaming": {
+        "inst": "net_0000",
+        "control": "net_0001",
+        "n4": "net_0002",
+        "n5": "net_0003",
+        "n6": "net_0004"
+      },
+      "structural_id": "57a8d78f80e0162de3199e409a13c51b013594c6acb883aff877a6f97dfdc326"
+    },
+    {
+      "netlist": {
+        "doc_id": "71471b158ddeb3c2",
+        "netlist": "module pc_sel ( inst, control );\ninput [31:0] inst;\noutput [1:0] control;\nwire   n4, n5, n6;\nINVxp33_ASAP7_75t_R U11 ( .A(n4), .Y(n5) );\nNOR3xp33_ASAP7_75t_R U9 ( .A(inst[2]), .B(inst[3]), .C(n4), .Y(control[0])\n);\nINVxp33_ASAP7_75t_R U10 ( .A(inst[4]), .Y(n6) );\nAO32x1_ASAP7_75t_R U12 ( .A1(inst[2]), .A2(n6), .A3(n5), .B1(inst[4]), .B2(\ncontrol[0]), .Y(control[1]) );\nNAND4xp25_ASAP7_75t_R U8 ( .A(inst[1]), .B(inst[0]), .C(inst[6]), .D(inst[5]), .Y(n4) );\nendmodule"
+      },
+      "fault": "sa0 n4",
+      "module_name": "pc_sel",
+      "source_circuit_id": "920b6c68ccf9005784459839e38f772fad5d194cec04c73006c413575c240f84",
+      "variant": "reordered",
+      "comparison_id": "920b6c68ccf9005784459839e38f772fad5d194cec04c73006c413575c240f84:reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"pc_sel\" to detect \"sa0 n4\" in this netlist:\n{'doc_id': '71471b158ddeb3c2', 'netlist': 'module pc_sel ( inst, control );\\ninput [31:0] inst;\\noutput [1:0] control;\\nwire   n4, n5, n6;\\nINVxp33_ASAP7_75t_R U11 ( .A(n4), .Y(n5) );\\nNOR3xp33_ASAP7_75t_R U9 ( .A(inst[2]), .B(inst[3]), .C(n4), .Y(control[0])\\n);\\nINVxp33_ASAP7_75t_R U10 ( .A(inst[4]), .Y(n6) );\\nAO32x1_ASAP7_75t_R U12 ( .A1(inst[2]), .A2(n6), .A3(n5), .B1(inst[4]), .B2(\\ncontrol[0]), .Y(control[1]) );\\nNAND4xp25_ASAP7_75t_R U8 ( .A(inst[1]), .B(inst[0]), .C(inst[6]), .D(inst[5]), .Y(n4) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 751,
+      "renaming": {},
+      "structural_id": "57a8d78f80e0162de3199e409a13c51b013594c6acb883aff877a6f97dfdc326"
+    },
+    {
+      "netlist": {
+        "doc_id": "011fab30f80dc478",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001 );\ninput [31:0] net_0000;\noutput [1:0] net_0001;\nwire   net_0002, net_0003, net_0004;\nINVxp33_ASAP7_75t_R gate_0003 ( .A(net_0002), .Y(net_0003) );\nNOR3xp33_ASAP7_75t_R gate_0001 ( .A(net_0000[2]), .B(net_0000[3]), .C(net_0002), .Y(net_0001[0])\n);\nINVxp33_ASAP7_75t_R gate_0002 ( .A(net_0000[4]), .Y(net_0004) );\nAO32x1_ASAP7_75t_R gate_0004 ( .A1(net_0000[2]), .A2(net_0004), .A3(net_0003), .B1(net_0000[4]), .B2(\nnet_0001[0]), .Y(net_0001[1]) );\nNAND4xp25_ASAP7_75t_R gate_0000 ( .A(net_0000[1]), .B(net_0000[0]), .C(net_0000[6]), .D(net_0000[5]), .Y(net_0002) );\nendmodule"
+      },
+      "fault": "sa0 net_0002",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "920b6c68ccf9005784459839e38f772fad5d194cec04c73006c413575c240f84",
+      "variant": "renamed_reordered",
+      "comparison_id": "920b6c68ccf9005784459839e38f772fad5d194cec04c73006c413575c240f84:renamed_reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0002\" in this netlist:\n{'doc_id': '011fab30f80dc478', 'netlist': 'module circuit_anonymous ( net_0000, net_0001 );\\ninput [31:0] net_0000;\\noutput [1:0] net_0001;\\nwire   net_0002, net_0003, net_0004;\\nINVxp33_ASAP7_75t_R gate_0003 ( .A(net_0002), .Y(net_0003) );\\nNOR3xp33_ASAP7_75t_R gate_0001 ( .A(net_0000[2]), .B(net_0000[3]), .C(net_0002), .Y(net_0001[0])\\n);\\nINVxp33_ASAP7_75t_R gate_0002 ( .A(net_0000[4]), .Y(net_0004) );\\nAO32x1_ASAP7_75t_R gate_0004 ( .A1(net_0000[2]), .A2(net_0004), .A3(net_0003), .B1(net_0000[4]), .B2(\\nnet_0001[0]), .Y(net_0001[1]) );\\nNAND4xp25_ASAP7_75t_R gate_0000 ( .A(net_0000[1]), .B(net_0000[0]), .C(net_0000[6]), .D(net_0000[5]), .Y(net_0002) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 830,
+      "renaming": {
+        "inst": "net_0000",
+        "control": "net_0001",
+        "n4": "net_0002",
+        "n5": "net_0003",
+        "n6": "net_0004"
+      },
+      "structural_id": "57a8d78f80e0162de3199e409a13c51b013594c6acb883aff877a6f97dfdc326"
+    },
+    {
+      "netlist": {
+        "doc_id": "a6aa9594168b8f70",
+        "netlist": "module minus_8 ( data_in, data_out );\ninput [5:0] data_in;\noutput [5:0] data_out;\nwire   n3, n4;\nassign data_out[2] = data_in[2];\nassign data_out[1] = data_in[1];\nassign data_out[0] = data_in[0];\nINVxp33_ASAP7_75t_R U8 ( .A(data_in[3]), .Y(data_out[3]) );\nOAI21xp33_ASAP7_75t_R U9 ( .A1(data_in[3]), .A2(data_in[4]), .B(data_in[5]),\n.Y(n3) );\nOAI31xp33_ASAP7_75t_R U10 ( .A1(data_in[3]), .A2(data_in[5]), .A3(data_in[4]), .B(n3), .Y(data_out[5]) );\nINVxp33_ASAP7_75t_R U11 ( .A(data_in[4]), .Y(n4) );\nAOI22xp33_ASAP7_75t_R U12 ( .A1(data_in[3]), .A2(n4), .B1(data_in[4]), .B2(\ndata_out[3]), .Y(data_out[4]) );\nendmodule"
+      },
+      "fault": "sa0 n4",
+      "module_name": "minus_8",
+      "source_circuit_id": "a6aa9594168b8f702ab1f963b2f84795617dbdd9b324f46931201b9fa6faf179",
+      "variant": "original",
+      "comparison_id": "a6aa9594168b8f702ab1f963b2f84795617dbdd9b324f46931201b9fa6faf179:original",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"minus_8\" to detect \"sa0 n4\" in this netlist:\n{'doc_id': 'a6aa9594168b8f70', 'netlist': 'module minus_8 ( data_in, data_out );\\ninput [5:0] data_in;\\noutput [5:0] data_out;\\nwire   n3, n4;\\nassign data_out[2] = data_in[2];\\nassign data_out[1] = data_in[1];\\nassign data_out[0] = data_in[0];\\nINVxp33_ASAP7_75t_R U8 ( .A(data_in[3]), .Y(data_out[3]) );\\nOAI21xp33_ASAP7_75t_R U9 ( .A1(data_in[3]), .A2(data_in[4]), .B(data_in[5]),\\n.Y(n3) );\\nOAI31xp33_ASAP7_75t_R U10 ( .A1(data_in[3]), .A2(data_in[5]), .A3(data_in[4]), .B(n3), .Y(data_out[5]) );\\nINVxp33_ASAP7_75t_R U11 ( .A(data_in[4]), .Y(n4) );\\nAOI22xp33_ASAP7_75t_R U12 ( .A1(data_in[3]), .A2(n4), .B1(data_in[4]), .B2(\\ndata_out[3]), .Y(data_out[4]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 834,
+      "renaming": {},
+      "structural_id": "3cad74a0915e06d1e60a0414c4c0e7e0bd1a896495fcc4ad6e47b7a381bfa913"
+    },
+    {
+      "netlist": {
+        "doc_id": "4dc930f2cff737bd",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001 );\ninput [5:0] net_0000;\noutput [5:0] net_0001;\nwire   net_0002, net_0003;\nassign net_0001[2] = net_0000[2];\nassign net_0001[1] = net_0000[1];\nassign net_0001[0] = net_0000[0];\nINVxp33_ASAP7_75t_R gate_0003 ( .A(net_0000[3]), .Y(net_0001[3]) );\nOAI21xp33_ASAP7_75t_R gate_0004 ( .A1(net_0000[3]), .A2(net_0000[4]), .B(net_0000[5]),\n.Y(net_0002) );\nOAI31xp33_ASAP7_75t_R gate_0005 ( .A1(net_0000[3]), .A2(net_0000[5]), .A3(net_0000[4]), .B(net_0002), .Y(net_0001[5]) );\nINVxp33_ASAP7_75t_R gate_0006 ( .A(net_0000[4]), .Y(net_0003) );\nAOI22xp33_ASAP7_75t_R gate_0007 ( .A1(net_0000[3]), .A2(net_0003), .B1(net_0000[4]), .B2(\nnet_0001[3]), .Y(net_0001[4]) );\nendmodule"
+      },
+      "fault": "sa0 net_0003",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "a6aa9594168b8f702ab1f963b2f84795617dbdd9b324f46931201b9fa6faf179",
+      "variant": "renamed",
+      "comparison_id": "a6aa9594168b8f702ab1f963b2f84795617dbdd9b324f46931201b9fa6faf179:renamed",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0003\" in this netlist:\n{'doc_id': '4dc930f2cff737bd', 'netlist': 'module circuit_anonymous ( net_0000, net_0001 );\\ninput [5:0] net_0000;\\noutput [5:0] net_0001;\\nwire   net_0002, net_0003;\\nassign net_0001[2] = net_0000[2];\\nassign net_0001[1] = net_0000[1];\\nassign net_0001[0] = net_0000[0];\\nINVxp33_ASAP7_75t_R gate_0003 ( .A(net_0000[3]), .Y(net_0001[3]) );\\nOAI21xp33_ASAP7_75t_R gate_0004 ( .A1(net_0000[3]), .A2(net_0000[4]), .B(net_0000[5]),\\n.Y(net_0002) );\\nOAI31xp33_ASAP7_75t_R gate_0005 ( .A1(net_0000[3]), .A2(net_0000[5]), .A3(net_0000[4]), .B(net_0002), .Y(net_0001[5]) );\\nINVxp33_ASAP7_75t_R gate_0006 ( .A(net_0000[4]), .Y(net_0003) );\\nAOI22xp33_ASAP7_75t_R gate_0007 ( .A1(net_0000[3]), .A2(net_0003), .B1(net_0000[4]), .B2(\\nnet_0001[3]), .Y(net_0001[4]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 882,
+      "renaming": {
+        "data_in": "net_0000",
+        "data_out": "net_0001",
+        "n3": "net_0002",
+        "n4": "net_0003"
+      },
+      "structural_id": "3cad74a0915e06d1e60a0414c4c0e7e0bd1a896495fcc4ad6e47b7a381bfa913"
+    },
+    {
+      "netlist": {
+        "doc_id": "768cf1250306621e",
+        "netlist": "module minus_8 ( data_in, data_out );\ninput [5:0] data_in;\noutput [5:0] data_out;\nwire   n3, n4;\nINVxp33_ASAP7_75t_R U8 ( .A(data_in[3]), .Y(data_out[3]) );\nOAI21xp33_ASAP7_75t_R U9 ( .A1(data_in[3]), .A2(data_in[4]), .B(data_in[5]),\n.Y(n3) );\nINVxp33_ASAP7_75t_R U11 ( .A(data_in[4]), .Y(n4) );\nAOI22xp33_ASAP7_75t_R U12 ( .A1(data_in[3]), .A2(n4), .B1(data_in[4]), .B2(\ndata_out[3]), .Y(data_out[4]) );\nassign data_out[0] = data_in[0];\nOAI31xp33_ASAP7_75t_R U10 ( .A1(data_in[3]), .A2(data_in[5]), .A3(data_in[4]), .B(n3), .Y(data_out[5]) );\nassign data_out[2] = data_in[2];\nassign data_out[1] = data_in[1];\nendmodule"
+      },
+      "fault": "sa0 n4",
+      "module_name": "minus_8",
+      "source_circuit_id": "a6aa9594168b8f702ab1f963b2f84795617dbdd9b324f46931201b9fa6faf179",
+      "variant": "reordered",
+      "comparison_id": "a6aa9594168b8f702ab1f963b2f84795617dbdd9b324f46931201b9fa6faf179:reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"minus_8\" to detect \"sa0 n4\" in this netlist:\n{'doc_id': '768cf1250306621e', 'netlist': 'module minus_8 ( data_in, data_out );\\ninput [5:0] data_in;\\noutput [5:0] data_out;\\nwire   n3, n4;\\nINVxp33_ASAP7_75t_R U8 ( .A(data_in[3]), .Y(data_out[3]) );\\nOAI21xp33_ASAP7_75t_R U9 ( .A1(data_in[3]), .A2(data_in[4]), .B(data_in[5]),\\n.Y(n3) );\\nINVxp33_ASAP7_75t_R U11 ( .A(data_in[4]), .Y(n4) );\\nAOI22xp33_ASAP7_75t_R U12 ( .A1(data_in[3]), .A2(n4), .B1(data_in[4]), .B2(\\ndata_out[3]), .Y(data_out[4]) );\\nassign data_out[0] = data_in[0];\\nOAI31xp33_ASAP7_75t_R U10 ( .A1(data_in[3]), .A2(data_in[5]), .A3(data_in[4]), .B(n3), .Y(data_out[5]) );\\nassign data_out[2] = data_in[2];\\nassign data_out[1] = data_in[1];\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 832,
+      "renaming": {},
+      "structural_id": "3cad74a0915e06d1e60a0414c4c0e7e0bd1a896495fcc4ad6e47b7a381bfa913"
+    },
+    {
+      "netlist": {
+        "doc_id": "6b7b95a6bb7d3539",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001 );\ninput [5:0] net_0000;\noutput [5:0] net_0001;\nwire   net_0002, net_0003;\nINVxp33_ASAP7_75t_R gate_0003 ( .A(net_0000[3]), .Y(net_0001[3]) );\nOAI21xp33_ASAP7_75t_R gate_0004 ( .A1(net_0000[3]), .A2(net_0000[4]), .B(net_0000[5]),\n.Y(net_0002) );\nINVxp33_ASAP7_75t_R gate_0006 ( .A(net_0000[4]), .Y(net_0003) );\nAOI22xp33_ASAP7_75t_R gate_0007 ( .A1(net_0000[3]), .A2(net_0003), .B1(net_0000[4]), .B2(\nnet_0001[3]), .Y(net_0001[4]) );\nassign net_0001[0] = net_0000[0];\nOAI31xp33_ASAP7_75t_R gate_0005 ( .A1(net_0000[3]), .A2(net_0000[5]), .A3(net_0000[4]), .B(net_0002), .Y(net_0001[5]) );\nassign net_0001[2] = net_0000[2];\nassign net_0001[1] = net_0000[1];\nendmodule"
+      },
+      "fault": "sa0 net_0003",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "a6aa9594168b8f702ab1f963b2f84795617dbdd9b324f46931201b9fa6faf179",
+      "variant": "renamed_reordered",
+      "comparison_id": "a6aa9594168b8f702ab1f963b2f84795617dbdd9b324f46931201b9fa6faf179:renamed_reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0003\" in this netlist:\n{'doc_id': '6b7b95a6bb7d3539', 'netlist': 'module circuit_anonymous ( net_0000, net_0001 );\\ninput [5:0] net_0000;\\noutput [5:0] net_0001;\\nwire   net_0002, net_0003;\\nINVxp33_ASAP7_75t_R gate_0003 ( .A(net_0000[3]), .Y(net_0001[3]) );\\nOAI21xp33_ASAP7_75t_R gate_0004 ( .A1(net_0000[3]), .A2(net_0000[4]), .B(net_0000[5]),\\n.Y(net_0002) );\\nINVxp33_ASAP7_75t_R gate_0006 ( .A(net_0000[4]), .Y(net_0003) );\\nAOI22xp33_ASAP7_75t_R gate_0007 ( .A1(net_0000[3]), .A2(net_0003), .B1(net_0000[4]), .B2(\\nnet_0001[3]), .Y(net_0001[4]) );\\nassign net_0001[0] = net_0000[0];\\nOAI31xp33_ASAP7_75t_R gate_0005 ( .A1(net_0000[3]), .A2(net_0000[5]), .A3(net_0000[4]), .B(net_0002), .Y(net_0001[5]) );\\nassign net_0001[2] = net_0000[2];\\nassign net_0001[1] = net_0000[1];\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 886,
+      "renaming": {
+        "data_in": "net_0000",
+        "data_out": "net_0001",
+        "n3": "net_0002",
+        "n4": "net_0003"
+      },
+      "structural_id": "3cad74a0915e06d1e60a0414c4c0e7e0bd1a896495fcc4ad6e47b7a381bfa913"
+    },
+    {
+      "netlist": {
+        "doc_id": "bd070049c4b87d05",
+        "netlist": "module dimc_macro_add_3u_82_4 ( in1, out1 );\ninput [2:0] in1;\noutput [2:0] out1;\nwire   n4;\nINVxp33_ASAP7_75t_R U6 ( .A(in1[0]), .Y(out1[0]) );\nNAND2xp33_ASAP7_75t_R U7 ( .A(in1[0]), .B(in1[1]), .Y(n4) );\nOA21x2_ASAP7_75t_R U8 ( .A1(in1[0]), .A2(in1[1]), .B(n4), .Y(out1[1]) );\nHAxp5_ASAP7_75t_R U9 ( .A(in1[2]), .B(n4), .SN(out1[2]) );\nendmodule"
+      },
+      "fault": "sa0 n4",
+      "module_name": "dimc_macro_add_3u_82_4",
+      "source_circuit_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912",
+      "variant": "original",
+      "comparison_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912:original",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"dimc_macro_add_3u_82_4\" to detect \"sa0 n4\" in this netlist:\n{'doc_id': 'bd070049c4b87d05', 'netlist': 'module dimc_macro_add_3u_82_4 ( in1, out1 );\\ninput [2:0] in1;\\noutput [2:0] out1;\\nwire   n4;\\nINVxp33_ASAP7_75t_R U6 ( .A(in1[0]), .Y(out1[0]) );\\nNAND2xp33_ASAP7_75t_R U7 ( .A(in1[0]), .B(in1[1]), .Y(n4) );\\nOA21x2_ASAP7_75t_R U8 ( .A1(in1[0]), .A2(in1[1]), .B(n4), .Y(out1[1]) );\\nHAxp5_ASAP7_75t_R U9 ( .A(in1[2]), .B(n4), .SN(out1[2]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 709,
+      "renaming": {},
+      "structural_id": "760abcf5dab635ff8b4fbecb328ffa7b78436ae26db340506545bc9de26bc75d"
+    },
+    {
+      "netlist": {
+        "doc_id": "9859e3f7f352f77e",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001 );\ninput [2:0] net_0000;\noutput [2:0] net_0001;\nwire   net_0002;\nINVxp33_ASAP7_75t_R gate_0000 ( .A(net_0000[0]), .Y(net_0001[0]) );\nNAND2xp33_ASAP7_75t_R gate_0001 ( .A(net_0000[0]), .B(net_0000[1]), .Y(net_0002) );\nOA21x2_ASAP7_75t_R gate_0002 ( .A1(net_0000[0]), .A2(net_0000[1]), .B(net_0002), .Y(net_0001[1]) );\nHAxp5_ASAP7_75t_R gate_0003 ( .A(net_0000[2]), .B(net_0002), .SN(net_0001[2]) );\nendmodule"
+      },
+      "fault": "sa0 net_0002",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912",
+      "variant": "renamed",
+      "comparison_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912:renamed",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0002\" in this netlist:\n{'doc_id': '9859e3f7f352f77e', 'netlist': 'module circuit_anonymous ( net_0000, net_0001 );\\ninput [2:0] net_0000;\\noutput [2:0] net_0001;\\nwire   net_0002;\\nINVxp33_ASAP7_75t_R gate_0000 ( .A(net_0000[0]), .Y(net_0001[0]) );\\nNAND2xp33_ASAP7_75t_R gate_0001 ( .A(net_0000[0]), .B(net_0000[1]), .Y(net_0002) );\\nOA21x2_ASAP7_75t_R gate_0002 ( .A1(net_0000[0]), .A2(net_0000[1]), .B(net_0002), .Y(net_0001[1]) );\\nHAxp5_ASAP7_75t_R gate_0003 ( .A(net_0000[2]), .B(net_0002), .SN(net_0001[2]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 735,
+      "renaming": {
+        "in1": "net_0000",
+        "out1": "net_0001",
+        "n4": "net_0002"
+      },
+      "structural_id": "760abcf5dab635ff8b4fbecb328ffa7b78436ae26db340506545bc9de26bc75d"
+    },
+    {
+      "netlist": {
+        "doc_id": "f97df3324c94684e",
+        "netlist": "module dimc_macro_add_3u_82_4 ( in1, out1 );\ninput [2:0] in1;\noutput [2:0] out1;\nwire   n4;\nOA21x2_ASAP7_75t_R U8 ( .A1(in1[0]), .A2(in1[1]), .B(n4), .Y(out1[1]) );\nNAND2xp33_ASAP7_75t_R U7 ( .A(in1[0]), .B(in1[1]), .Y(n4) );\nHAxp5_ASAP7_75t_R U9 ( .A(in1[2]), .B(n4), .SN(out1[2]) );\nINVxp33_ASAP7_75t_R U6 ( .A(in1[0]), .Y(out1[0]) );\nendmodule"
+      },
+      "fault": "sa0 n4",
+      "module_name": "dimc_macro_add_3u_82_4",
+      "source_circuit_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912",
+      "variant": "reordered",
+      "comparison_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912:reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"dimc_macro_add_3u_82_4\" to detect \"sa0 n4\" in this netlist:\n{'doc_id': 'f97df3324c94684e', 'netlist': 'module dimc_macro_add_3u_82_4 ( in1, out1 );\\ninput [2:0] in1;\\noutput [2:0] out1;\\nwire   n4;\\nOA21x2_ASAP7_75t_R U8 ( .A1(in1[0]), .A2(in1[1]), .B(n4), .Y(out1[1]) );\\nNAND2xp33_ASAP7_75t_R U7 ( .A(in1[0]), .B(in1[1]), .Y(n4) );\\nHAxp5_ASAP7_75t_R U9 ( .A(in1[2]), .B(n4), .SN(out1[2]) );\\nINVxp33_ASAP7_75t_R U6 ( .A(in1[0]), .Y(out1[0]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 708,
+      "renaming": {},
+      "structural_id": "760abcf5dab635ff8b4fbecb328ffa7b78436ae26db340506545bc9de26bc75d"
+    },
+    {
+      "netlist": {
+        "doc_id": "3ad2088b7c12f4a8",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001 );\ninput [2:0] net_0000;\noutput [2:0] net_0001;\nwire   net_0002;\nOA21x2_ASAP7_75t_R gate_0002 ( .A1(net_0000[0]), .A2(net_0000[1]), .B(net_0002), .Y(net_0001[1]) );\nNAND2xp33_ASAP7_75t_R gate_0001 ( .A(net_0000[0]), .B(net_0000[1]), .Y(net_0002) );\nHAxp5_ASAP7_75t_R gate_0003 ( .A(net_0000[2]), .B(net_0002), .SN(net_0001[2]) );\nINVxp33_ASAP7_75t_R gate_0000 ( .A(net_0000[0]), .Y(net_0001[0]) );\nendmodule"
+      },
+      "fault": "sa0 net_0002",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912",
+      "variant": "renamed_reordered",
+      "comparison_id": "bd070049c4b87d05a1a9beabcc51df1c5d8587cfa0f73a7070bcea070f530912:renamed_reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0002\" in this netlist:\n{'doc_id': '3ad2088b7c12f4a8', 'netlist': 'module circuit_anonymous ( net_0000, net_0001 );\\ninput [2:0] net_0000;\\noutput [2:0] net_0001;\\nwire   net_0002;\\nOA21x2_ASAP7_75t_R gate_0002 ( .A1(net_0000[0]), .A2(net_0000[1]), .B(net_0002), .Y(net_0001[1]) );\\nNAND2xp33_ASAP7_75t_R gate_0001 ( .A(net_0000[0]), .B(net_0000[1]), .Y(net_0002) );\\nHAxp5_ASAP7_75t_R gate_0003 ( .A(net_0000[2]), .B(net_0002), .SN(net_0001[2]) );\\nINVxp33_ASAP7_75t_R gate_0000 ( .A(net_0000[0]), .Y(net_0001[0]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 736,
+      "renaming": {
+        "in1": "net_0000",
+        "out1": "net_0001",
+        "n4": "net_0002"
+      },
+      "structural_id": "760abcf5dab635ff8b4fbecb328ffa7b78436ae26db340506545bc9de26bc75d"
+    },
+    {
+      "netlist": {
+        "doc_id": "f9691a3f81874239",
+        "netlist": "module ar_rxd_2 ( clk, in1, in0, sr_adr, sr_dat, ce_wr );\noutput [7:0] sr_adr;\noutput [22:0] sr_dat;\ninput clk, in1, in0;\noutput ce_wr;\nwire   ce_wr;\nassign sr_adr[7] = ce_wr;\nassign sr_adr[6] = ce_wr;\nassign sr_adr[5] = ce_wr;\nassign sr_adr[4] = ce_wr;\nassign sr_adr[3] = ce_wr;\nassign sr_adr[2] = ce_wr;\nassign sr_adr[1] = ce_wr;\nassign sr_adr[0] = ce_wr;\nassign sr_dat[22] = ce_wr;\nassign sr_dat[21] = ce_wr;\nassign sr_dat[20] = ce_wr;\nassign sr_dat[19] = ce_wr;\nassign sr_dat[18] = ce_wr;\nassign sr_dat[17] = ce_wr;\nassign sr_dat[16] = ce_wr;\nassign sr_dat[15] = ce_wr;\nassign sr_dat[14] = ce_wr;\nassign sr_dat[13] = ce_wr;\nassign sr_dat[12] = ce_wr;\nassign sr_dat[11] = ce_wr;\nassign sr_dat[10] = ce_wr;\nassign sr_dat[9] = ce_wr;\nassign sr_dat[8] = ce_wr;\nassign sr_dat[7] = ce_wr;\nassign sr_dat[6] = ce_wr;\nassign sr_dat[5] = ce_wr;\nassign sr_dat[4] = ce_wr;\nassign sr_dat[3] = ce_wr;\nassign sr_dat[2] = ce_wr;\nassign sr_dat[1] = ce_wr;\nassign sr_dat[0] = ce_wr;\nTIEHIx1_ASAP7_75t_R U99 ( .H(ce_wr) );\nendmodule"
+      },
+      "fault": "sa0 ce_wr",
+      "module_name": "ar_rxd_2",
+      "source_circuit_id": "f9691a3f81874239f9dfe76e69677a70848001360877ed4405cf51bd1ed9b93f",
+      "variant": "original",
+      "comparison_id": "f9691a3f81874239f9dfe76e69677a70848001360877ed4405cf51bd1ed9b93f:original",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"ar_rxd_2\" to detect \"sa0 ce_wr\" in this netlist:\n{'doc_id': 'f9691a3f81874239', 'netlist': 'module ar_rxd_2 ( clk, in1, in0, sr_adr, sr_dat, ce_wr );\\noutput [7:0] sr_adr;\\noutput [22:0] sr_dat;\\ninput clk, in1, in0;\\noutput ce_wr;\\nwire   ce_wr;\\nassign sr_adr[7] = ce_wr;\\nassign sr_adr[6] = ce_wr;\\nassign sr_adr[5] = ce_wr;\\nassign sr_adr[4] = ce_wr;\\nassign sr_adr[3] = ce_wr;\\nassign sr_adr[2] = ce_wr;\\nassign sr_adr[1] = ce_wr;\\nassign sr_adr[0] = ce_wr;\\nassign sr_dat[22] = ce_wr;\\nassign sr_dat[21] = ce_wr;\\nassign sr_dat[20] = ce_wr;\\nassign sr_dat[19] = ce_wr;\\nassign sr_dat[18] = ce_wr;\\nassign sr_dat[17] = ce_wr;\\nassign sr_dat[16] = ce_wr;\\nassign sr_dat[15] = ce_wr;\\nassign sr_dat[14] = ce_wr;\\nassign sr_dat[13] = ce_wr;\\nassign sr_dat[12] = ce_wr;\\nassign sr_dat[11] = ce_wr;\\nassign sr_dat[10] = ce_wr;\\nassign sr_dat[9] = ce_wr;\\nassign sr_dat[8] = ce_wr;\\nassign sr_dat[7] = ce_wr;\\nassign sr_dat[6] = ce_wr;\\nassign sr_dat[5] = ce_wr;\\nassign sr_dat[4] = ce_wr;\\nassign sr_dat[3] = ce_wr;\\nassign sr_dat[2] = ce_wr;\\nassign sr_dat[1] = ce_wr;\\nassign sr_dat[0] = ce_wr;\\nTIEHIx1_ASAP7_75t_R U99 ( .H(ce_wr) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 991,
+      "renaming": {},
+      "structural_id": "51e8af19821dc40e7a0326a7ac824c4956a57a6b089a7a751bfd1f0fc78c4cc3"
+    },
+    {
+      "netlist": {
+        "doc_id": "cea786f704bd60b4",
+        "netlist": "module circuit_anonymous ( net_0002, net_0003, net_0004, net_0000, net_0001, net_0005 );\noutput [7:0] net_0000;\noutput [22:0] net_0001;\ninput net_0002, net_0003, net_0004;\noutput net_0005;\nwire   net_0005;\nassign net_0000[7] = net_0005;\nassign net_0000[6] = net_0005;\nassign net_0000[5] = net_0005;\nassign net_0000[4] = net_0005;\nassign net_0000[3] = net_0005;\nassign net_0000[2] = net_0005;\nassign net_0000[1] = net_0005;\nassign net_0000[0] = net_0005;\nassign net_0001[22] = net_0005;\nassign net_0001[21] = net_0005;\nassign net_0001[20] = net_0005;\nassign net_0001[19] = net_0005;\nassign net_0001[18] = net_0005;\nassign net_0001[17] = net_0005;\nassign net_0001[16] = net_0005;\nassign net_0001[15] = net_0005;\nassign net_0001[14] = net_0005;\nassign net_0001[13] = net_0005;\nassign net_0001[12] = net_0005;\nassign net_0001[11] = net_0005;\nassign net_0001[10] = net_0005;\nassign net_0001[9] = net_0005;\nassign net_0001[8] = net_0005;\nassign net_0001[7] = net_0005;\nassign net_0001[6] = net_0005;\nassign net_0001[5] = net_0005;\nassign net_0001[4] = net_0005;\nassign net_0001[3] = net_0005;\nassign net_0001[2] = net_0005;\nassign net_0001[1] = net_0005;\nassign net_0001[0] = net_0005;\nTIEHIx1_ASAP7_75t_R gate_0031 ( .H(net_0005) );\nendmodule"
+      },
+      "fault": "sa0 net_0005",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "f9691a3f81874239f9dfe76e69677a70848001360877ed4405cf51bd1ed9b93f",
+      "variant": "renamed",
+      "comparison_id": "f9691a3f81874239f9dfe76e69677a70848001360877ed4405cf51bd1ed9b93f:renamed",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0005\" in this netlist:\n{'doc_id': 'cea786f704bd60b4', 'netlist': 'module circuit_anonymous ( net_0002, net_0003, net_0004, net_0000, net_0001, net_0005 );\\noutput [7:0] net_0000;\\noutput [22:0] net_0001;\\ninput net_0002, net_0003, net_0004;\\noutput net_0005;\\nwire   net_0005;\\nassign net_0000[7] = net_0005;\\nassign net_0000[6] = net_0005;\\nassign net_0000[5] = net_0005;\\nassign net_0000[4] = net_0005;\\nassign net_0000[3] = net_0005;\\nassign net_0000[2] = net_0005;\\nassign net_0000[1] = net_0005;\\nassign net_0000[0] = net_0005;\\nassign net_0001[22] = net_0005;\\nassign net_0001[21] = net_0005;\\nassign net_0001[20] = net_0005;\\nassign net_0001[19] = net_0005;\\nassign net_0001[18] = net_0005;\\nassign net_0001[17] = net_0005;\\nassign net_0001[16] = net_0005;\\nassign net_0001[15] = net_0005;\\nassign net_0001[14] = net_0005;\\nassign net_0001[13] = net_0005;\\nassign net_0001[12] = net_0005;\\nassign net_0001[11] = net_0005;\\nassign net_0001[10] = net_0005;\\nassign net_0001[9] = net_0005;\\nassign net_0001[8] = net_0005;\\nassign net_0001[7] = net_0005;\\nassign net_0001[6] = net_0005;\\nassign net_0001[5] = net_0005;\\nassign net_0001[4] = net_0005;\\nassign net_0001[3] = net_0005;\\nassign net_0001[2] = net_0005;\\nassign net_0001[1] = net_0005;\\nassign net_0001[0] = net_0005;\\nTIEHIx1_ASAP7_75t_R gate_0031 ( .H(net_0005) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 1072,
+      "renaming": {
+        "sr_adr": "net_0000",
+        "sr_dat": "net_0001",
+        "clk": "net_0002",
+        "in1": "net_0003",
+        "in0": "net_0004",
+        "ce_wr": "net_0005"
+      },
+      "structural_id": "51e8af19821dc40e7a0326a7ac824c4956a57a6b089a7a751bfd1f0fc78c4cc3"
+    },
+    {
+      "netlist": {
+        "doc_id": "d1af070a95d0a5c7",
+        "netlist": "module ar_rxd_2 ( clk, in1, in0, sr_adr, sr_dat, ce_wr );\noutput [7:0] sr_adr;\noutput [22:0] sr_dat;\ninput clk, in1, in0;\noutput ce_wr;\nwire   ce_wr;\nassign sr_dat[4] = ce_wr;\nassign sr_adr[2] = ce_wr;\nassign sr_dat[20] = ce_wr;\nassign sr_dat[15] = ce_wr;\nassign sr_dat[5] = ce_wr;\nassign sr_dat[19] = ce_wr;\nassign sr_dat[8] = ce_wr;\nassign sr_adr[1] = ce_wr;\nassign sr_dat[11] = ce_wr;\nassign sr_dat[18] = ce_wr;\nassign sr_dat[14] = ce_wr;\nassign sr_dat[21] = ce_wr;\nassign sr_dat[2] = ce_wr;\nassign sr_dat[16] = ce_wr;\nassign sr_dat[6] = ce_wr;\nassign sr_dat[10] = ce_wr;\nassign sr_dat[0] = ce_wr;\nassign sr_adr[6] = ce_wr;\nassign sr_dat[17] = ce_wr;\nassign sr_dat[12] = ce_wr;\nassign sr_adr[5] = ce_wr;\nassign sr_dat[13] = ce_wr;\nassign sr_dat[9] = ce_wr;\nassign sr_adr[4] = ce_wr;\nassign sr_dat[1] = ce_wr;\nassign sr_adr[3] = ce_wr;\nassign sr_dat[3] = ce_wr;\nTIEHIx1_ASAP7_75t_R U99 ( .H(ce_wr) );\nassign sr_dat[22] = ce_wr;\nassign sr_dat[7] = ce_wr;\nassign sr_adr[7] = ce_wr;\nassign sr_adr[0] = ce_wr;\nendmodule"
+      },
+      "fault": "sa0 ce_wr",
+      "module_name": "ar_rxd_2",
+      "source_circuit_id": "f9691a3f81874239f9dfe76e69677a70848001360877ed4405cf51bd1ed9b93f",
+      "variant": "reordered",
+      "comparison_id": "f9691a3f81874239f9dfe76e69677a70848001360877ed4405cf51bd1ed9b93f:reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"ar_rxd_2\" to detect \"sa0 ce_wr\" in this netlist:\n{'doc_id': 'd1af070a95d0a5c7', 'netlist': 'module ar_rxd_2 ( clk, in1, in0, sr_adr, sr_dat, ce_wr );\\noutput [7:0] sr_adr;\\noutput [22:0] sr_dat;\\ninput clk, in1, in0;\\noutput ce_wr;\\nwire   ce_wr;\\nassign sr_dat[4] = ce_wr;\\nassign sr_adr[2] = ce_wr;\\nassign sr_dat[20] = ce_wr;\\nassign sr_dat[15] = ce_wr;\\nassign sr_dat[5] = ce_wr;\\nassign sr_dat[19] = ce_wr;\\nassign sr_dat[8] = ce_wr;\\nassign sr_adr[1] = ce_wr;\\nassign sr_dat[11] = ce_wr;\\nassign sr_dat[18] = ce_wr;\\nassign sr_dat[14] = ce_wr;\\nassign sr_dat[21] = ce_wr;\\nassign sr_dat[2] = ce_wr;\\nassign sr_dat[16] = ce_wr;\\nassign sr_dat[6] = ce_wr;\\nassign sr_dat[10] = ce_wr;\\nassign sr_dat[0] = ce_wr;\\nassign sr_adr[6] = ce_wr;\\nassign sr_dat[17] = ce_wr;\\nassign sr_dat[12] = ce_wr;\\nassign sr_adr[5] = ce_wr;\\nassign sr_dat[13] = ce_wr;\\nassign sr_dat[9] = ce_wr;\\nassign sr_adr[4] = ce_wr;\\nassign sr_dat[1] = ce_wr;\\nassign sr_adr[3] = ce_wr;\\nassign sr_dat[3] = ce_wr;\\nTIEHIx1_ASAP7_75t_R U99 ( .H(ce_wr) );\\nassign sr_dat[22] = ce_wr;\\nassign sr_dat[7] = ce_wr;\\nassign sr_adr[7] = ce_wr;\\nassign sr_adr[0] = ce_wr;\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 994,
+      "renaming": {},
+      "structural_id": "51e8af19821dc40e7a0326a7ac824c4956a57a6b089a7a751bfd1f0fc78c4cc3"
+    },
+    {
+      "netlist": {
+        "doc_id": "c19d725fdfb35b21",
+        "netlist": "module circuit_anonymous ( net_0002, net_0003, net_0004, net_0000, net_0001, net_0005 );\noutput [7:0] net_0000;\noutput [22:0] net_0001;\ninput net_0002, net_0003, net_0004;\noutput net_0005;\nwire   net_0005;\nassign net_0001[4] = net_0005;\nassign net_0000[2] = net_0005;\nassign net_0001[20] = net_0005;\nassign net_0001[15] = net_0005;\nassign net_0001[5] = net_0005;\nassign net_0001[19] = net_0005;\nassign net_0001[8] = net_0005;\nassign net_0000[1] = net_0005;\nassign net_0001[11] = net_0005;\nassign net_0001[18] = net_0005;\nassign net_0001[14] = net_0005;\nassign net_0001[21] = net_0005;\nassign net_0001[2] = net_0005;\nassign net_0001[16] = net_0005;\nassign net_0001[6] = net_0005;\nassign net_0001[10] = net_0005;\nassign net_0001[0] = net_0005;\nassign net_0000[6] = net_0005;\nassign net_0001[17] = net_0005;\nassign net_0001[12] = net_0005;\nassign net_0000[5] = net_0005;\nassign net_0001[13] = net_0005;\nassign net_0001[9] = net_0005;\nassign net_0000[4] = net_0005;\nassign net_0001[1] = net_0005;\nassign net_0000[3] = net_0005;\nassign net_0001[3] = net_0005;\nTIEHIx1_ASAP7_75t_R gate_0031 ( .H(net_0005) );\nassign net_0001[22] = net_0005;\nassign net_0001[7] = net_0005;\nassign net_0000[7] = net_0005;\nassign net_0000[0] = net_0005;\nendmodule"
+      },
+      "fault": "sa0 net_0005",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "f9691a3f81874239f9dfe76e69677a70848001360877ed4405cf51bd1ed9b93f",
+      "variant": "renamed_reordered",
+      "comparison_id": "f9691a3f81874239f9dfe76e69677a70848001360877ed4405cf51bd1ed9b93f:renamed_reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0005\" in this netlist:\n{'doc_id': 'c19d725fdfb35b21', 'netlist': 'module circuit_anonymous ( net_0002, net_0003, net_0004, net_0000, net_0001, net_0005 );\\noutput [7:0] net_0000;\\noutput [22:0] net_0001;\\ninput net_0002, net_0003, net_0004;\\noutput net_0005;\\nwire   net_0005;\\nassign net_0001[4] = net_0005;\\nassign net_0000[2] = net_0005;\\nassign net_0001[20] = net_0005;\\nassign net_0001[15] = net_0005;\\nassign net_0001[5] = net_0005;\\nassign net_0001[19] = net_0005;\\nassign net_0001[8] = net_0005;\\nassign net_0000[1] = net_0005;\\nassign net_0001[11] = net_0005;\\nassign net_0001[18] = net_0005;\\nassign net_0001[14] = net_0005;\\nassign net_0001[21] = net_0005;\\nassign net_0001[2] = net_0005;\\nassign net_0001[16] = net_0005;\\nassign net_0001[6] = net_0005;\\nassign net_0001[10] = net_0005;\\nassign net_0001[0] = net_0005;\\nassign net_0000[6] = net_0005;\\nassign net_0001[17] = net_0005;\\nassign net_0001[12] = net_0005;\\nassign net_0000[5] = net_0005;\\nassign net_0001[13] = net_0005;\\nassign net_0001[9] = net_0005;\\nassign net_0000[4] = net_0005;\\nassign net_0001[1] = net_0005;\\nassign net_0000[3] = net_0005;\\nassign net_0001[3] = net_0005;\\nTIEHIx1_ASAP7_75t_R gate_0031 ( .H(net_0005) );\\nassign net_0001[22] = net_0005;\\nassign net_0001[7] = net_0005;\\nassign net_0000[7] = net_0005;\\nassign net_0000[0] = net_0005;\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 1073,
+      "renaming": {
+        "sr_adr": "net_0000",
+        "sr_dat": "net_0001",
+        "clk": "net_0002",
+        "in1": "net_0003",
+        "in0": "net_0004",
+        "ce_wr": "net_0005"
+      },
+      "structural_id": "51e8af19821dc40e7a0326a7ac824c4956a57a6b089a7a751bfd1f0fc78c4cc3"
+    },
+    {
+      "netlist": {
+        "doc_id": "ffcd53738c9ea3dc",
+        "netlist": "module adder ( a, b, sum, cout );\ninput [3:0] a;\ninput [3:0] b;\noutput [3:0] sum;\noutput [3:0] cout;\nwire   n5, n6, n7, n8;\nAND2x2_ASAP7_75t_R U13 ( .A(b[2]), .B(a[2]), .Y(cout[2]) );\nNOR2xp33_ASAP7_75t_R U14 ( .A(b[2]), .B(a[2]), .Y(n5) );\nNOR2xp33_ASAP7_75t_R U15 ( .A(cout[2]), .B(n5), .Y(sum[2]) );\nAND2x2_ASAP7_75t_R U16 ( .A(b[1]), .B(a[1]), .Y(cout[1]) );\nNOR2xp33_ASAP7_75t_R U17 ( .A(b[1]), .B(a[1]), .Y(n6) );\nNOR2xp33_ASAP7_75t_R U18 ( .A(cout[1]), .B(n6), .Y(sum[1]) );\nAND2x2_ASAP7_75t_R U19 ( .A(b[0]), .B(a[0]), .Y(cout[0]) );\nNOR2xp33_ASAP7_75t_R U20 ( .A(b[0]), .B(a[0]), .Y(n7) );\nNOR2xp33_ASAP7_75t_R U21 ( .A(cout[0]), .B(n7), .Y(sum[0]) );\nAND2x2_ASAP7_75t_R U22 ( .A(b[3]), .B(a[3]), .Y(cout[3]) );\nNOR2xp33_ASAP7_75t_R U23 ( .A(b[3]), .B(a[3]), .Y(n8) );\nNOR2xp33_ASAP7_75t_R U24 ( .A(cout[3]), .B(n8), .Y(sum[3]) );\nendmodule"
+      },
+      "fault": "sa0 n8",
+      "module_name": "adder",
+      "source_circuit_id": "ffcd53738c9ea3dc72f459fcf7bf219973f604fb2c57578b3478843de9f92b65",
+      "variant": "original",
+      "comparison_id": "ffcd53738c9ea3dc72f459fcf7bf219973f604fb2c57578b3478843de9f92b65:original",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"adder\" to detect \"sa0 n8\" in this netlist:\n{'doc_id': 'ffcd53738c9ea3dc', 'netlist': 'module adder ( a, b, sum, cout );\\ninput [3:0] a;\\ninput [3:0] b;\\noutput [3:0] sum;\\noutput [3:0] cout;\\nwire   n5, n6, n7, n8;\\nAND2x2_ASAP7_75t_R U13 ( .A(b[2]), .B(a[2]), .Y(cout[2]) );\\nNOR2xp33_ASAP7_75t_R U14 ( .A(b[2]), .B(a[2]), .Y(n5) );\\nNOR2xp33_ASAP7_75t_R U15 ( .A(cout[2]), .B(n5), .Y(sum[2]) );\\nAND2x2_ASAP7_75t_R U16 ( .A(b[1]), .B(a[1]), .Y(cout[1]) );\\nNOR2xp33_ASAP7_75t_R U17 ( .A(b[1]), .B(a[1]), .Y(n6) );\\nNOR2xp33_ASAP7_75t_R U18 ( .A(cout[1]), .B(n6), .Y(sum[1]) );\\nAND2x2_ASAP7_75t_R U19 ( .A(b[0]), .B(a[0]), .Y(cout[0]) );\\nNOR2xp33_ASAP7_75t_R U20 ( .A(b[0]), .B(a[0]), .Y(n7) );\\nNOR2xp33_ASAP7_75t_R U21 ( .A(cout[0]), .B(n7), .Y(sum[0]) );\\nAND2x2_ASAP7_75t_R U22 ( .A(b[3]), .B(a[3]), .Y(cout[3]) );\\nNOR2xp33_ASAP7_75t_R U23 ( .A(b[3]), .B(a[3]), .Y(n8) );\\nNOR2xp33_ASAP7_75t_R U24 ( .A(cout[3]), .B(n8), .Y(sum[3]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 1025,
+      "renaming": {},
+      "structural_id": "2b189a66c2190f17048356bad267c5995a98095090b7a52ece34fe5d826c11ba"
+    },
+    {
+      "netlist": {
+        "doc_id": "bb5c3a2b680c9b70",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001, net_0002, net_0003 );\ninput [3:0] net_0000;\ninput [3:0] net_0001;\noutput [3:0] net_0002;\noutput [3:0] net_0003;\nwire   net_0004, net_0005, net_0006, net_0007;\nAND2x2_ASAP7_75t_R gate_0000 ( .A(net_0001[2]), .B(net_0000[2]), .Y(net_0003[2]) );\nNOR2xp33_ASAP7_75t_R gate_0001 ( .A(net_0001[2]), .B(net_0000[2]), .Y(net_0004) );\nNOR2xp33_ASAP7_75t_R gate_0002 ( .A(net_0003[2]), .B(net_0004), .Y(net_0002[2]) );\nAND2x2_ASAP7_75t_R gate_0003 ( .A(net_0001[1]), .B(net_0000[1]), .Y(net_0003[1]) );\nNOR2xp33_ASAP7_75t_R gate_0004 ( .A(net_0001[1]), .B(net_0000[1]), .Y(net_0005) );\nNOR2xp33_ASAP7_75t_R gate_0005 ( .A(net_0003[1]), .B(net_0005), .Y(net_0002[1]) );\nAND2x2_ASAP7_75t_R gate_0006 ( .A(net_0001[0]), .B(net_0000[0]), .Y(net_0003[0]) );\nNOR2xp33_ASAP7_75t_R gate_0007 ( .A(net_0001[0]), .B(net_0000[0]), .Y(net_0006) );\nNOR2xp33_ASAP7_75t_R gate_0008 ( .A(net_0003[0]), .B(net_0006), .Y(net_0002[0]) );\nAND2x2_ASAP7_75t_R gate_0009 ( .A(net_0001[3]), .B(net_0000[3]), .Y(net_0003[3]) );\nNOR2xp33_ASAP7_75t_R gate_0010 ( .A(net_0001[3]), .B(net_0000[3]), .Y(net_0007) );\nNOR2xp33_ASAP7_75t_R gate_0011 ( .A(net_0003[3]), .B(net_0007), .Y(net_0002[3]) );\nendmodule"
+      },
+      "fault": "sa0 net_0007",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "ffcd53738c9ea3dc72f459fcf7bf219973f604fb2c57578b3478843de9f92b65",
+      "variant": "renamed",
+      "comparison_id": "ffcd53738c9ea3dc72f459fcf7bf219973f604fb2c57578b3478843de9f92b65:renamed",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0007\" in this netlist:\n{'doc_id': 'bb5c3a2b680c9b70', 'netlist': 'module circuit_anonymous ( net_0000, net_0001, net_0002, net_0003 );\\ninput [3:0] net_0000;\\ninput [3:0] net_0001;\\noutput [3:0] net_0002;\\noutput [3:0] net_0003;\\nwire   net_0004, net_0005, net_0006, net_0007;\\nAND2x2_ASAP7_75t_R gate_0000 ( .A(net_0001[2]), .B(net_0000[2]), .Y(net_0003[2]) );\\nNOR2xp33_ASAP7_75t_R gate_0001 ( .A(net_0001[2]), .B(net_0000[2]), .Y(net_0004) );\\nNOR2xp33_ASAP7_75t_R gate_0002 ( .A(net_0003[2]), .B(net_0004), .Y(net_0002[2]) );\\nAND2x2_ASAP7_75t_R gate_0003 ( .A(net_0001[1]), .B(net_0000[1]), .Y(net_0003[1]) );\\nNOR2xp33_ASAP7_75t_R gate_0004 ( .A(net_0001[1]), .B(net_0000[1]), .Y(net_0005) );\\nNOR2xp33_ASAP7_75t_R gate_0005 ( .A(net_0003[1]), .B(net_0005), .Y(net_0002[1]) );\\nAND2x2_ASAP7_75t_R gate_0006 ( .A(net_0001[0]), .B(net_0000[0]), .Y(net_0003[0]) );\\nNOR2xp33_ASAP7_75t_R gate_0007 ( .A(net_0001[0]), .B(net_0000[0]), .Y(net_0006) );\\nNOR2xp33_ASAP7_75t_R gate_0008 ( .A(net_0003[0]), .B(net_0006), .Y(net_0002[0]) );\\nAND2x2_ASAP7_75t_R gate_0009 ( .A(net_0001[3]), .B(net_0000[3]), .Y(net_0003[3]) );\\nNOR2xp33_ASAP7_75t_R gate_0010 ( .A(net_0001[3]), .B(net_0000[3]), .Y(net_0007) );\\nNOR2xp33_ASAP7_75t_R gate_0011 ( .A(net_0003[3]), .B(net_0007), .Y(net_0002[3]) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 1190,
+      "renaming": {
+        "a": "net_0000",
+        "b": "net_0001",
+        "sum": "net_0002",
+        "cout": "net_0003",
+        "n5": "net_0004",
+        "n6": "net_0005",
+        "n7": "net_0006",
+        "n8": "net_0007"
+      },
+      "structural_id": "2b189a66c2190f17048356bad267c5995a98095090b7a52ece34fe5d826c11ba"
+    },
+    {
+      "netlist": {
+        "doc_id": "52b1c271661738f9",
+        "netlist": "module adder ( a, b, sum, cout );\ninput [3:0] a;\ninput [3:0] b;\noutput [3:0] sum;\noutput [3:0] cout;\nwire   n5, n6, n7, n8;\nNOR2xp33_ASAP7_75t_R U20 ( .A(b[0]), .B(a[0]), .Y(n7) );\nNOR2xp33_ASAP7_75t_R U18 ( .A(cout[1]), .B(n6), .Y(sum[1]) );\nNOR2xp33_ASAP7_75t_R U15 ( .A(cout[2]), .B(n5), .Y(sum[2]) );\nNOR2xp33_ASAP7_75t_R U21 ( .A(cout[0]), .B(n7), .Y(sum[0]) );\nAND2x2_ASAP7_75t_R U22 ( .A(b[3]), .B(a[3]), .Y(cout[3]) );\nAND2x2_ASAP7_75t_R U19 ( .A(b[0]), .B(a[0]), .Y(cout[0]) );\nNOR2xp33_ASAP7_75t_R U24 ( .A(cout[3]), .B(n8), .Y(sum[3]) );\nAND2x2_ASAP7_75t_R U16 ( .A(b[1]), .B(a[1]), .Y(cout[1]) );\nNOR2xp33_ASAP7_75t_R U17 ( .A(b[1]), .B(a[1]), .Y(n6) );\nAND2x2_ASAP7_75t_R U13 ( .A(b[2]), .B(a[2]), .Y(cout[2]) );\nNOR2xp33_ASAP7_75t_R U14 ( .A(b[2]), .B(a[2]), .Y(n5) );\nNOR2xp33_ASAP7_75t_R U23 ( .A(b[3]), .B(a[3]), .Y(n8) );\nendmodule"
+      },
+      "fault": "sa0 n8",
+      "module_name": "adder",
+      "source_circuit_id": "ffcd53738c9ea3dc72f459fcf7bf219973f604fb2c57578b3478843de9f92b65",
+      "variant": "reordered",
+      "comparison_id": "ffcd53738c9ea3dc72f459fcf7bf219973f604fb2c57578b3478843de9f92b65:reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"adder\" to detect \"sa0 n8\" in this netlist:\n{'doc_id': '52b1c271661738f9', 'netlist': 'module adder ( a, b, sum, cout );\\ninput [3:0] a;\\ninput [3:0] b;\\noutput [3:0] sum;\\noutput [3:0] cout;\\nwire   n5, n6, n7, n8;\\nNOR2xp33_ASAP7_75t_R U20 ( .A(b[0]), .B(a[0]), .Y(n7) );\\nNOR2xp33_ASAP7_75t_R U18 ( .A(cout[1]), .B(n6), .Y(sum[1]) );\\nNOR2xp33_ASAP7_75t_R U15 ( .A(cout[2]), .B(n5), .Y(sum[2]) );\\nNOR2xp33_ASAP7_75t_R U21 ( .A(cout[0]), .B(n7), .Y(sum[0]) );\\nAND2x2_ASAP7_75t_R U22 ( .A(b[3]), .B(a[3]), .Y(cout[3]) );\\nAND2x2_ASAP7_75t_R U19 ( .A(b[0]), .B(a[0]), .Y(cout[0]) );\\nNOR2xp33_ASAP7_75t_R U24 ( .A(cout[3]), .B(n8), .Y(sum[3]) );\\nAND2x2_ASAP7_75t_R U16 ( .A(b[1]), .B(a[1]), .Y(cout[1]) );\\nNOR2xp33_ASAP7_75t_R U17 ( .A(b[1]), .B(a[1]), .Y(n6) );\\nAND2x2_ASAP7_75t_R U13 ( .A(b[2]), .B(a[2]), .Y(cout[2]) );\\nNOR2xp33_ASAP7_75t_R U14 ( .A(b[2]), .B(a[2]), .Y(n5) );\\nNOR2xp33_ASAP7_75t_R U23 ( .A(b[3]), .B(a[3]), .Y(n8) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 1026,
+      "renaming": {},
+      "structural_id": "2b189a66c2190f17048356bad267c5995a98095090b7a52ece34fe5d826c11ba"
+    },
+    {
+      "netlist": {
+        "doc_id": "14caacd142c8ec6a",
+        "netlist": "module circuit_anonymous ( net_0000, net_0001, net_0002, net_0003 );\ninput [3:0] net_0000;\ninput [3:0] net_0001;\noutput [3:0] net_0002;\noutput [3:0] net_0003;\nwire   net_0004, net_0005, net_0006, net_0007;\nNOR2xp33_ASAP7_75t_R gate_0007 ( .A(net_0001[0]), .B(net_0000[0]), .Y(net_0006) );\nNOR2xp33_ASAP7_75t_R gate_0005 ( .A(net_0003[1]), .B(net_0005), .Y(net_0002[1]) );\nNOR2xp33_ASAP7_75t_R gate_0002 ( .A(net_0003[2]), .B(net_0004), .Y(net_0002[2]) );\nNOR2xp33_ASAP7_75t_R gate_0008 ( .A(net_0003[0]), .B(net_0006), .Y(net_0002[0]) );\nAND2x2_ASAP7_75t_R gate_0009 ( .A(net_0001[3]), .B(net_0000[3]), .Y(net_0003[3]) );\nAND2x2_ASAP7_75t_R gate_0006 ( .A(net_0001[0]), .B(net_0000[0]), .Y(net_0003[0]) );\nNOR2xp33_ASAP7_75t_R gate_0011 ( .A(net_0003[3]), .B(net_0007), .Y(net_0002[3]) );\nAND2x2_ASAP7_75t_R gate_0003 ( .A(net_0001[1]), .B(net_0000[1]), .Y(net_0003[1]) );\nNOR2xp33_ASAP7_75t_R gate_0004 ( .A(net_0001[1]), .B(net_0000[1]), .Y(net_0005) );\nAND2x2_ASAP7_75t_R gate_0000 ( .A(net_0001[2]), .B(net_0000[2]), .Y(net_0003[2]) );\nNOR2xp33_ASAP7_75t_R gate_0001 ( .A(net_0001[2]), .B(net_0000[2]), .Y(net_0004) );\nNOR2xp33_ASAP7_75t_R gate_0010 ( .A(net_0001[3]), .B(net_0000[3]), .Y(net_0007) );\nendmodule"
+      },
+      "fault": "sa0 net_0007",
+      "module_name": "circuit_anonymous",
+      "source_circuit_id": "ffcd53738c9ea3dc72f459fcf7bf219973f604fb2c57578b3478843de9f92b65",
+      "variant": "renamed_reordered",
+      "comparison_id": "ffcd53738c9ea3dc72f459fcf7bf219973f604fb2c57578b3478843de9f92b65:renamed_reordered",
+      "comparison_messages": [
+        {
+          "role": "system",
+          "content": "You are an ATPG assistant for structural Verilog netlists. Return INPUT_VECTOR, EXPECTED_OUTPUT, and DETECTED_FAULTS as quoted assignments. EXPECTED_OUTPUT must describe the fault-free circuit."
+        },
+        {
+          "role": "user",
+          "content": "Create a test vector for the circuit \"circuit_anonymous\" to detect \"sa0 net_0007\" in this netlist:\n{'doc_id': '14caacd142c8ec6a', 'netlist': 'module circuit_anonymous ( net_0000, net_0001, net_0002, net_0003 );\\ninput [3:0] net_0000;\\ninput [3:0] net_0001;\\noutput [3:0] net_0002;\\noutput [3:0] net_0003;\\nwire   net_0004, net_0005, net_0006, net_0007;\\nNOR2xp33_ASAP7_75t_R gate_0007 ( .A(net_0001[0]), .B(net_0000[0]), .Y(net_0006) );\\nNOR2xp33_ASAP7_75t_R gate_0005 ( .A(net_0003[1]), .B(net_0005), .Y(net_0002[1]) );\\nNOR2xp33_ASAP7_75t_R gate_0002 ( .A(net_0003[2]), .B(net_0004), .Y(net_0002[2]) );\\nNOR2xp33_ASAP7_75t_R gate_0008 ( .A(net_0003[0]), .B(net_0006), .Y(net_0002[0]) );\\nAND2x2_ASAP7_75t_R gate_0009 ( .A(net_0001[3]), .B(net_0000[3]), .Y(net_0003[3]) );\\nAND2x2_ASAP7_75t_R gate_0006 ( .A(net_0001[0]), .B(net_0000[0]), .Y(net_0003[0]) );\\nNOR2xp33_ASAP7_75t_R gate_0011 ( .A(net_0003[3]), .B(net_0007), .Y(net_0002[3]) );\\nAND2x2_ASAP7_75t_R gate_0003 ( .A(net_0001[1]), .B(net_0000[1]), .Y(net_0003[1]) );\\nNOR2xp33_ASAP7_75t_R gate_0004 ( .A(net_0001[1]), .B(net_0000[1]), .Y(net_0005) );\\nAND2x2_ASAP7_75t_R gate_0000 ( .A(net_0001[2]), .B(net_0000[2]), .Y(net_0003[2]) );\\nNOR2xp33_ASAP7_75t_R gate_0001 ( .A(net_0001[2]), .B(net_0000[2]), .Y(net_0004) );\\nNOR2xp33_ASAP7_75t_R gate_0010 ( .A(net_0001[3]), .B(net_0000[3]), .Y(net_0007) );\\nendmodule'}"
+        }
+      ],
+      "prompt_tokens": 1187,
+      "renaming": {
+        "a": "net_0000",
+        "b": "net_0001",
+        "sum": "net_0002",
+        "cout": "net_0003",
+        "n5": "net_0004",
+        "n6": "net_0005",
+        "n7": "net_0006",
+        "n8": "net_0007"
+      },
+      "structural_id": "2b189a66c2190f17048356bad267c5995a98095090b7a52ece34fe5d826c11ba"
+    }
+  ],
+  "examples_sha256": "eb8a3a5845d499f69a632af846572ad603d170f59123de7ed941ba4283156722"
+}

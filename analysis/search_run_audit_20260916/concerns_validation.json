@@ -1,0 +1,2388 @@
+{
+  "runs": {
+    "mcts": {
+      "run": "run-20260915_104906-8rvdaqde",
+      "artifact_sha256": "2402ffb3d0a61bf3933769be2ca87df9034b6d16cab78ca9a6fcd8d7c7e35e60",
+      "config": {
+        "adapter": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b/checkpoint-50/policy",
+        "dataset": "chrivasileiou/asap7-language-of-test-v2",
+        "num_completions": 16,
+        "search_width": 4,
+        "k_values": [
+          1,
+          2,
+          4,
+          8,
+          16
+        ],
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_new_tokens": 16384,
+        "max_tool_rounds": 1,
+        "threshold_mode": "fault_detected",
+        "seed": 42,
+        "backend": "vllm",
+        "tp_size": 2,
+        "gpu_memory_utilization": 0.85,
+        "qlora": false,
+        "eval_prompt_batch_size": 64,
+        "generation_micro_batch_size": 16,
+        "sampling_method": "mcts",
+        "search_protocol_version": "conversation-search-v1",
+        "search_config": {
+          "max_generated_tokens": 32768,
+          "max_simulator_requests": 32,
+          "max_simulator_executions": 32,
+          "finalization_tokens": 1024,
+          "action_tokens": 2048,
+          "max_actions": 32,
+          "repair_limit": 1,
+          "infrastructure_retry_limit": 1,
+          "duplicate_limit": 3,
+          "max_children": 8,
+          "c_puct": 1.25,
+          "prior": "uniform",
+          "population_size": 6,
+          "seed_temperatures": [
+            0.5,
+            0.8,
+            1.0
+          ],
+          "mutation_temperature": 1.0,
+          "crossover_temperature": 0.7,
+          "operator_weights": [
+            0.5,
+            0.25,
+            0.15,
+            0.1
+          ],
+          "controller_edits": true,
+          "save_trace": false
+        }
+      },
+      "pass_at_k": {
+        "pass@1": 0.7567138671875,
+        "pass@2": 0.8678385416666675,
+        "pass@4": 0.9224351820054941,
+        "pass@8": 0.9478058833527582,
+        "pass@16": 0.96484375
+      },
+      "successes": 6199,
+      "solved": 494,
+      "usage": {
+        "attempts": 14857,
+        "generated_tokens": 31197147,
+        "prompt_tokens": 187754600,
+        "generation_requests": 31855,
+        "simulator_requests": 24544,
+        "simulator_executions": 10617,
+        "cache_hits": 13927,
+        "tool_calls": 10716,
+        "infrastructure_errors": 0,
+        "invalid_actions": 1471,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "time_seconds": 43791.95,
+      "full_accuracy": 0.130859375,
+      "unique_vectors_at_four_attempts": {
+        "2": 1503,
+        "1": 180,
+        "0": 82,
+        "3": 12
+      }
+    },
+    "best_of_n": {
+      "run": "run-20260915_160758-snqbdxoi",
+      "artifact_sha256": "c53a06b7f9e2cf5787f2e49619c18ac1682b02925075a251522e1d7c07418ab7",
+      "config": {
+        "adapter": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b/checkpoint-50/policy",
+        "dataset": "chrivasileiou/asap7-language-of-test-v2",
+        "num_completions": 16,
+        "search_width": 4,
+        "k_values": [
+          1,
+          2,
+          4,
+          8,
+          16
+        ],
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_new_tokens": 16384,
+        "max_tool_rounds": 1,
+        "threshold_mode": "fault_detected",
+        "seed": 42,
+        "backend": "vllm",
+        "tp_size": 2,
+        "gpu_memory_utilization": 0.85,
+        "qlora": false,
+        "eval_prompt_batch_size": 64,
+        "generation_micro_batch_size": 16,
+        "sampling_method": "best_of_n",
+        "search_protocol_version": "conversation-search-v1",
+        "search_config": {
+          "max_generated_tokens": 32768,
+          "max_simulator_requests": 32,
+          "max_simulator_executions": 32,
+          "finalization_tokens": 1024,
+          "action_tokens": 2048,
+          "max_actions": 32,
+          "repair_limit": 1,
+          "infrastructure_retry_limit": 1,
+          "duplicate_limit": 3,
+          "max_children": 8,
+          "c_puct": 1.25,
+          "prior": "uniform",
+          "population_size": 6,
+          "seed_temperatures": [
+            0.5,
+            0.8,
+            1.0
+          ],
+          "mutation_temperature": 1.0,
+          "crossover_temperature": 0.7,
+          "operator_weights": [
+            0.5,
+            0.25,
+            0.15,
+            0.1
+          ],
+          "controller_edits": true,
+          "save_trace": false
+        }
+      },
+      "pass_at_k": {
+        "pass@1": 0.851318359375,
+        "pass@2": 0.9214518229166673,
+        "pass@4": 0.9510312929258238,
+        "pass@8": 0.9685448232323233,
+        "pass@16": 0.98046875
+      },
+      "successes": 6974,
+      "solved": 502,
+      "usage": {
+        "attempts": 14292,
+        "generated_tokens": 35314665,
+        "prompt_tokens": 202283714,
+        "generation_requests": 35015,
+        "simulator_requests": 26752,
+        "simulator_executions": 13276,
+        "cache_hits": 13476,
+        "tool_calls": 13456,
+        "infrastructure_errors": 0,
+        "invalid_actions": 1653,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "time_seconds": 50164.15,
+      "full_accuracy": 0.145263671875,
+      "unique_vectors_at_four_attempts": {
+        "3": 241,
+        "4": 867,
+        "2": 75,
+        "0": 48,
+        "1": 27
+      }
+    },
+    "evolutionary": {
+      "run": "run-20260915_163135-ipt1fjf7",
+      "artifact_sha256": "a929d8ba2d15cf81c57c572449e2ea489cd21f63c64fe1fe86a074eba035e6d0",
+      "config": {
+        "adapter": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b/checkpoint-50/policy",
+        "dataset": "chrivasileiou/asap7-language-of-test-v2",
+        "num_completions": 16,
+        "search_width": 4,
+        "k_values": [
+          1,
+          2,
+          4,
+          8,
+          16
+        ],
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_new_tokens": 16384,
+        "max_tool_rounds": 1,
+        "threshold_mode": "fault_detected",
+        "seed": 42,
+        "backend": "vllm",
+        "tp_size": 2,
+        "gpu_memory_utilization": 0.85,
+        "qlora": false,
+        "eval_prompt_batch_size": 64,
+        "generation_micro_batch_size": 16,
+        "sampling_method": "evolutionary",
+        "search_protocol_version": "conversation-search-v1",
+        "search_config": {
+          "max_generated_tokens": 32768,
+          "max_simulator_requests": 32,
+          "max_simulator_executions": 32,
+          "finalization_tokens": 1024,
+          "action_tokens": 2048,
+          "max_actions": 32,
+          "repair_limit": 1,
+          "infrastructure_retry_limit": 1,
+          "duplicate_limit": 3,
+          "max_children": 8,
+          "c_puct": 1.25,
+          "prior": "uniform",
+          "population_size": 6,
+          "seed_temperatures": [
+            0.5,
+            0.8,
+            1.0
+          ],
+          "mutation_temperature": 1.0,
+          "crossover_temperature": 0.7,
+          "operator_weights": [
+            0.5,
+            0.25,
+            0.15,
+            0.1
+          ],
+          "controller_edits": true,
+          "save_trace": false
+        }
+      },
+      "pass_at_k": {
+        "pass@1": 0.8446044921875,
+        "pass@2": 0.9204427083333342,
+        "pass@4": 0.9542764852335156,
+        "pass@8": 0.9716192878302251,
+        "pass@16": 0.98046875
+      },
+      "successes": 6919,
+      "solved": 502,
+      "usage": {
+        "attempts": 14313,
+        "generated_tokens": 36469670,
+        "prompt_tokens": 215708820,
+        "generation_requests": 35613,
+        "simulator_requests": 26716,
+        "simulator_executions": 13267,
+        "cache_hits": 13449,
+        "tool_calls": 13445,
+        "infrastructure_errors": 0,
+        "invalid_actions": 1634,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "time_seconds": 53291.5,
+      "full_accuracy": 0.1563720703125,
+      "unique_vectors_at_four_attempts": {
+        "4": 877,
+        "3": 247,
+        "1": 29,
+        "2": 72,
+        "0": 53
+      }
+    },
+    "greedy": {
+      "run": "run-20260915_234409-dms52ruj",
+      "artifact_sha256": "58cbf60d32e500717f382d034b371f8cd8e3a9af3d380b7781f63d9f6cd8c3ed",
+      "config": {
+        "adapter": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b/checkpoint-50/policy",
+        "dataset": "chrivasileiou/asap7-language-of-test-v2",
+        "num_completions": 16,
+        "search_width": null,
+        "k_values": [
+          1,
+          2,
+          4,
+          8,
+          16
+        ],
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_new_tokens": 16384,
+        "max_tool_rounds": 1,
+        "threshold_mode": "fault_detected",
+        "seed": 42,
+        "backend": "vllm",
+        "tp_size": 2,
+        "gpu_memory_utilization": 0.85,
+        "qlora": false,
+        "eval_prompt_batch_size": 64,
+        "generation_micro_batch_size": 16,
+        "sampling_method": "greedy",
+        "search_protocol_version": "conversation-search-v1",
+        "search_config": {
+          "max_generated_tokens": 32768,
+          "max_simulator_requests": 32,
+          "max_simulator_executions": 32,
+          "finalization_tokens": 1024,
+          "action_tokens": 2048,
+          "max_actions": 32,
+          "repair_limit": 1,
+          "infrastructure_retry_limit": 1,
+          "duplicate_limit": 3,
+          "max_children": 8,
+          "c_puct": 1.25,
+          "prior": "uniform",
+          "population_size": 6,
+          "seed_temperatures": [
+            0.5,
+            0.8,
+            1.0
+          ],
+          "mutation_temperature": 1.0,
+          "crossover_temperature": 0.7,
+          "operator_weights": [
+            0.5,
+            0.25,
+            0.15,
+            0.1
+          ],
+          "controller_edits": true,
+          "save_trace": false
+        }
+      },
+      "pass_at_k": {
+        "pass@1": 0.605712890625,
+        "pass@2": 0.7646972656249996,
+        "pass@4": 0.8708555116758221,
+        "pass@8": 0.925643757284382,
+        "pass@16": 0.955078125
+      },
+      "successes": 4962,
+      "solved": 489,
+      "usage": {
+        "attempts": 8192,
+        "generated_tokens": 21592593,
+        "prompt_tokens": 131660505,
+        "generation_requests": 20745,
+        "simulator_requests": 15416,
+        "simulator_executions": 7767,
+        "cache_hits": 7649,
+        "tool_calls": 7753,
+        "infrastructure_errors": 0,
+        "invalid_actions": 791,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "time_seconds": 29437.88,
+      "full_accuracy": 0.107177734375,
+      "unique_vectors_at_four_attempts": {}
+    },
+    "random": {
+      "run": "run-20260916_124725-johktkni",
+      "artifact_sha256": "34e97ed1b63bb012e0873e0aca04a0e03c2b7699a9965f90fa5ad494c516d12b",
+      "config": {
+        "adapter": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b/checkpoint-50/policy",
+        "dataset": "chrivasileiou/asap7-language-of-test-v2",
+        "num_completions": 16,
+        "search_width": null,
+        "k_values": [
+          1,
+          2,
+          4,
+          8,
+          16
+        ],
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_new_tokens": 16384,
+        "max_tool_rounds": 1,
+        "threshold_mode": "fault_detected",
+        "seed": 42,
+        "backend": "vllm",
+        "tp_size": 1,
+        "gpu_memory_utilization": 0.85,
+        "qlora": false,
+        "eval_prompt_batch_size": 64,
+        "generation_micro_batch_size": 16,
+        "sampling_method": "random",
+        "search_protocol_version": "conversation-search-v1",
+        "search_config": {
+          "max_generated_tokens": 32768,
+          "max_simulator_requests": 32,
+          "max_simulator_executions": 32,
+          "finalization_tokens": 1024,
+          "action_tokens": 2048,
+          "max_actions": 32,
+          "repair_limit": 1,
+          "infrastructure_retry_limit": 1,
+          "duplicate_limit": 3,
+          "max_children": 8,
+          "c_puct": 1.25,
+          "prior": "uniform",
+          "population_size": 6,
+          "seed_temperatures": [
+            0.5,
+            0.8,
+            1.0
+          ],
+          "mutation_temperature": 1.0,
+          "crossover_temperature": 0.7,
+          "operator_weights": [
+            0.5,
+            0.25,
+            0.15,
+            0.1
+          ],
+          "controller_edits": true,
+          "save_trace": false
+        }
+      },
+      "pass_at_k": {
+        "pass@1": 0.6051025390625,
+        "pass@2": 0.750032552083333,
+        "pass@4": 0.8558250343406578,
+        "pass@8": 0.9045770202020198,
+        "pass@16": 0.923828125
+      },
+      "successes": 4957,
+      "solved": 473,
+      "usage": {
+        "attempts": 8192,
+        "generated_tokens": 0,
+        "prompt_tokens": 0,
+        "generation_requests": 0,
+        "simulator_requests": 8192,
+        "simulator_executions": 8192,
+        "cache_hits": 0,
+        "tool_calls": 0,
+        "infrastructure_errors": 0,
+        "invalid_actions": 0,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "time_seconds": 51.94,
+      "full_accuracy": 0.025146484375,
+      "unique_vectors_at_four_attempts": {}
+    },
+    "vector_evolutionary": {
+      "run": "run-20260916_125121-fkmhdl8w",
+      "artifact_sha256": "0438a0679ab563be97c09a4815fbc76054ac2fe5a0ebb44d06067a2a94229016",
+      "config": {
+        "adapter": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b/checkpoint-50/policy",
+        "dataset": "chrivasileiou/asap7-language-of-test-v2",
+        "num_completions": 16,
+        "search_width": 4,
+        "k_values": [
+          1,
+          2,
+          4,
+          8,
+          16
+        ],
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_new_tokens": 16384,
+        "max_tool_rounds": 1,
+        "threshold_mode": "fault_detected",
+        "seed": 42,
+        "backend": "vllm",
+        "tp_size": 1,
+        "gpu_memory_utilization": 0.85,
+        "qlora": false,
+        "eval_prompt_batch_size": 64,
+        "generation_micro_batch_size": 16,
+        "sampling_method": "vector_evolutionary",
+        "search_protocol_version": "conversation-search-v1",
+        "search_config": {
+          "max_generated_tokens": 32768,
+          "max_simulator_requests": 32,
+          "max_simulator_executions": 32,
+          "finalization_tokens": 1024,
+          "action_tokens": 2048,
+          "max_actions": 32,
+          "repair_limit": 1,
+          "infrastructure_retry_limit": 1,
+          "duplicate_limit": 3,
+          "max_children": 8,
+          "c_puct": 1.25,
+          "prior": "uniform",
+          "population_size": 6,
+          "seed_temperatures": [
+            0.5,
+            0.8,
+            1.0
+          ],
+          "mutation_temperature": 1.0,
+          "crossover_temperature": 0.7,
+          "operator_weights": [
+            0.5,
+            0.25,
+            0.15,
+            0.1
+          ],
+          "controller_edits": true,
+          "save_trace": false
+        }
+      },
+      "pass_at_k": {
+        "pass@1": 0.8492431640625,
+        "pass@2": 0.9029296875000007,
+        "pass@4": 0.926698789491758,
+        "pass@8": 0.9411277741355866,
+        "pass@16": 0.951171875
+      },
+      "successes": 6957,
+      "solved": 487,
+      "usage": {
+        "attempts": 15025,
+        "generated_tokens": 0,
+        "prompt_tokens": 0,
+        "generation_requests": 0,
+        "simulator_requests": 29506,
+        "simulator_executions": 14817,
+        "cache_hits": 14689,
+        "tool_calls": 0,
+        "infrastructure_errors": 128,
+        "invalid_actions": 0,
+        "discarded_tokens": 0,
+        "generation_usage_unknown": 0
+      },
+      "time_seconds": 86.85,
+      "full_accuracy": 0.8492431640625,
+      "unique_vectors_at_four_attempts": {
+        "4": 1374,
+        "3": 103,
+        "2": 29,
+        "1": 3
+      }
+    }
+  },
+  "independent_examples": {
+    "259": {
+      "mcts": {
+        "stats": {
+          "checked": 16,
+          "detected": 10,
+          "expected_output_correct": 2
+        },
+        "witness": {
+          "vector": {
+            "addr[0]": 0,
+            "addr[1]": 0,
+            "addr[2]": 1,
+            "addr[3]": 0,
+            "rd_ram_dat[0]": 0,
+            "rd_ram_dat[1]": 0,
+            "rd_ram_dat[2]": 0,
+            "rd_ram_dat[3]": 0,
+            "rd_ram_dat[4]": 0,
+            "rd_ram_dat[5]": 1,
+            "rd_ram_dat[6]": 1,
+            "rd_ram_dat[7]": 1,
+            "rd_ram_dat[8]": 1,
+            "rd_ram_dat[9]": 0,
+            "rd_ram_dat[10]": 1,
+            "rd_ram_dat[11]": 1,
+            "rd_ram_dat[12]": 0,
+            "rd_ram_dat[13]": 1,
+            "rd_ram_dat[14]": 0,
+            "rd_ram_dat[15]": 0,
+            "rd_ram_dat[16]": 1,
+            "rd_ram_dat[17]": 0,
+            "rd_ram_dat[18]": 0,
+            "rd_ram_dat[19]": 0,
+            "rd_ram_dat[20]": 1,
+            "rd_ram_dat[21]": 0,
+            "rd_ram_dat[22]": 1,
+            "rd_ram_dat[23]": 0,
+            "rd_ram_dat[24]": 1,
+            "rd_ram_dat[25]": 0,
+            "rd_ram_dat[26]": 1,
+            "rd_ram_dat[27]": 1,
+            "rd_ram_dat[28]": 0,
+            "rd_ram_dat[29]": 1,
+            "rd_ram_dat[30]": 0,
+            "rd_ram_dat[31]": 0,
+            "rd_io_dat[0]": 1,
+            "rd_io_dat[1]": 1,
+            "rd_io_dat[2]": 1,
+            "rd_io_dat[3]": 0,
+            "rd_io_dat[4]": 1,
+            "rd_io_dat[5]": 0,
+            "rd_io_dat[6]": 1,
+            "rd_io_dat[7]": 0,
+            "rd_io_dat[8]": 1,
+            "rd_io_dat[9]": 0,
+            "rd_io_dat[10]": 1,
+            "rd_io_dat[11]": 1,
+            "rd_io_dat[12]": 0,
+            "rd_io_dat[13]": 0,
+            "rd_io_dat[14]": 1,
+            "rd_io_dat[15]": 0,
+            "rd_io_dat[16]": 0,
+            "rd_io_dat[17]": 1,
+            "rd_io_dat[18]": 0,
+            "rd_io_dat[19]": 1,
+            "rd_io_dat[20]": 0,
+            "rd_io_dat[21]": 1,
+            "rd_io_dat[22]": 0,
+            "rd_io_dat[23]": 1,
+            "rd_io_dat[24]": 0,
+            "rd_io_dat[25]": 1,
+            "rd_io_dat[26]": 0,
+            "rd_io_dat[27]": 1,
+            "rd_io_dat[28]": 1,
+            "rd_io_dat[29]": 0,
+            "rd_io_dat[30]": 1,
+            "rd_io_dat[31]": 0,
+            "ram_or_io_wr": 0
+          },
+          "good_outputs": {
+            "rd_ram_or_io_dat[0]": 1,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 1,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 1,
+            "rd_ram_or_io_dat[5]": 0,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 0,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 0,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 1,
+            "rd_ram_or_io_dat[18]": 0,
+            "rd_ram_or_io_dat[19]": 1,
+            "rd_ram_or_io_dat[20]": 0,
+            "rd_ram_or_io_dat[21]": 1,
+            "rd_ram_or_io_dat[22]": 0,
+            "rd_ram_or_io_dat[23]": 1,
+            "rd_ram_or_io_dat[24]": 0,
+            "rd_ram_or_io_dat[25]": 1,
+            "rd_ram_or_io_dat[26]": 0,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 0,
+            "rd_ram_or_io_dat[30]": 1,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 0
+          },
+          "faulty_outputs": {
+            "rd_ram_or_io_dat[0]": 1,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 1,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 1,
+            "rd_ram_or_io_dat[5]": 0,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 0,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 0,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 1,
+            "rd_ram_or_io_dat[18]": 0,
+            "rd_ram_or_io_dat[19]": 1,
+            "rd_ram_or_io_dat[20]": 0,
+            "rd_ram_or_io_dat[21]": 1,
+            "rd_ram_or_io_dat[22]": 0,
+            "rd_ram_or_io_dat[23]": 1,
+            "rd_ram_or_io_dat[24]": 0,
+            "rd_ram_or_io_dat[25]": 1,
+            "rd_ram_or_io_dat[26]": 0,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 0,
+            "rd_ram_or_io_dat[30]": 1,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 1
+          },
+          "reported_outputs": {
+            "rd_ram_or_io_dat[0]": 0,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 0,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 0,
+            "rd_ram_or_io_dat[5]": 1,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 1,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 1,
+            "rd_ram_or_io_dat[14]": 0,
+            "rd_ram_or_io_dat[15]": 0,
+            "rd_ram_or_io_dat[16]": 1,
+            "rd_ram_or_io_dat[17]": 0,
+            "rd_ram_or_io_dat[18]": 0,
+            "rd_ram_or_io_dat[19]": 0,
+            "rd_ram_or_io_dat[20]": 1,
+            "rd_ram_or_io_dat[21]": 0,
+            "rd_ram_or_io_dat[22]": 1,
+            "rd_ram_or_io_dat[23]": 0,
+            "rd_ram_or_io_dat[24]": 1,
+            "rd_ram_or_io_dat[25]": 0,
+            "rd_ram_or_io_dat[26]": 1,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 0,
+            "rd_ram_or_io_dat[29]": 1,
+            "rd_ram_or_io_dat[30]": 0,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 0
+          }
+        }
+      },
+      "best_of_n": {
+        "stats": {
+          "checked": 16,
+          "detected": 11,
+          "expected_output_correct": 2
+        },
+        "witness": {
+          "vector": {
+            "addr[0]": 0,
+            "addr[1]": 0,
+            "addr[2]": 1,
+            "addr[3]": 0,
+            "rd_ram_dat[0]": 0,
+            "rd_ram_dat[1]": 0,
+            "rd_ram_dat[2]": 0,
+            "rd_ram_dat[3]": 0,
+            "rd_ram_dat[4]": 0,
+            "rd_ram_dat[5]": 1,
+            "rd_ram_dat[6]": 1,
+            "rd_ram_dat[7]": 1,
+            "rd_ram_dat[8]": 1,
+            "rd_ram_dat[9]": 0,
+            "rd_ram_dat[10]": 1,
+            "rd_ram_dat[11]": 1,
+            "rd_ram_dat[12]": 0,
+            "rd_ram_dat[13]": 1,
+            "rd_ram_dat[14]": 0,
+            "rd_ram_dat[15]": 0,
+            "rd_ram_dat[16]": 1,
+            "rd_ram_dat[17]": 0,
+            "rd_ram_dat[18]": 0,
+            "rd_ram_dat[19]": 0,
+            "rd_ram_dat[20]": 1,
+            "rd_ram_dat[21]": 0,
+            "rd_ram_dat[22]": 1,
+            "rd_ram_dat[23]": 0,
+            "rd_ram_dat[24]": 1,
+            "rd_ram_dat[25]": 0,
+            "rd_ram_dat[26]": 1,
+            "rd_ram_dat[27]": 1,
+            "rd_ram_dat[28]": 0,
+            "rd_ram_dat[29]": 1,
+            "rd_ram_dat[30]": 0,
+            "rd_ram_dat[31]": 0,
+            "rd_io_dat[0]": 1,
+            "rd_io_dat[1]": 1,
+            "rd_io_dat[2]": 1,
+            "rd_io_dat[3]": 0,
+            "rd_io_dat[4]": 1,
+            "rd_io_dat[5]": 0,
+            "rd_io_dat[6]": 1,
+            "rd_io_dat[7]": 0,
+            "rd_io_dat[8]": 1,
+            "rd_io_dat[9]": 0,
+            "rd_io_dat[10]": 1,
+            "rd_io_dat[11]": 1,
+            "rd_io_dat[12]": 0,
+            "rd_io_dat[13]": 0,
+            "rd_io_dat[14]": 1,
+            "rd_io_dat[15]": 0,
+            "rd_io_dat[16]": 0,
+            "rd_io_dat[17]": 1,
+            "rd_io_dat[18]": 0,
+            "rd_io_dat[19]": 1,
+            "rd_io_dat[20]": 0,
+            "rd_io_dat[21]": 1,
+            "rd_io_dat[22]": 0,
+            "rd_io_dat[23]": 1,
+            "rd_io_dat[24]": 0,
+            "rd_io_dat[25]": 1,
+            "rd_io_dat[26]": 0,
+            "rd_io_dat[27]": 1,
+            "rd_io_dat[28]": 1,
+            "rd_io_dat[29]": 0,
+            "rd_io_dat[30]": 1,
+            "rd_io_dat[31]": 0,
+            "ram_or_io_wr": 0
+          },
+          "good_outputs": {
+            "rd_ram_or_io_dat[0]": 1,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 1,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 1,
+            "rd_ram_or_io_dat[5]": 0,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 0,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 0,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 1,
+            "rd_ram_or_io_dat[18]": 0,
+            "rd_ram_or_io_dat[19]": 1,
+            "rd_ram_or_io_dat[20]": 0,
+            "rd_ram_or_io_dat[21]": 1,
+            "rd_ram_or_io_dat[22]": 0,
+            "rd_ram_or_io_dat[23]": 1,
+            "rd_ram_or_io_dat[24]": 0,
+            "rd_ram_or_io_dat[25]": 1,
+            "rd_ram_or_io_dat[26]": 0,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 0,
+            "rd_ram_or_io_dat[30]": 1,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 0
+          },
+          "faulty_outputs": {
+            "rd_ram_or_io_dat[0]": 1,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 1,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 1,
+            "rd_ram_or_io_dat[5]": 0,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 0,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 0,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 1,
+            "rd_ram_or_io_dat[18]": 0,
+            "rd_ram_or_io_dat[19]": 1,
+            "rd_ram_or_io_dat[20]": 0,
+            "rd_ram_or_io_dat[21]": 1,
+            "rd_ram_or_io_dat[22]": 0,
+            "rd_ram_or_io_dat[23]": 1,
+            "rd_ram_or_io_dat[24]": 0,
+            "rd_ram_or_io_dat[25]": 1,
+            "rd_ram_or_io_dat[26]": 0,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 0,
+            "rd_ram_or_io_dat[30]": 1,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 1
+          },
+          "reported_outputs": {
+            "rd_ram_or_io_dat[0]": 0,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 0,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 0,
+            "rd_ram_or_io_dat[5]": 1,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 1,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 1,
+            "rd_ram_or_io_dat[14]": 0,
+            "rd_ram_or_io_dat[15]": 0,
+            "rd_ram_or_io_dat[16]": 1,
+            "rd_ram_or_io_dat[17]": 0,
+            "rd_ram_or_io_dat[18]": 0,
+            "rd_ram_or_io_dat[19]": 0,
+            "rd_ram_or_io_dat[20]": 1,
+            "rd_ram_or_io_dat[21]": 0,
+            "rd_ram_or_io_dat[22]": 1,
+            "rd_ram_or_io_dat[23]": 0,
+            "rd_ram_or_io_dat[24]": 1,
+            "rd_ram_or_io_dat[25]": 0,
+            "rd_ram_or_io_dat[26]": 1,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 0,
+            "rd_ram_or_io_dat[29]": 1,
+            "rd_ram_or_io_dat[30]": 0,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 0
+          }
+        }
+      },
+      "evolutionary": {
+        "stats": {
+          "checked": 16,
+          "detected": 11,
+          "expected_output_correct": 5
+        },
+        "witness": {
+          "vector": {
+            "addr[0]": 0,
+            "addr[1]": 0,
+            "addr[2]": 1,
+            "addr[3]": 0,
+            "rd_ram_dat[0]": 0,
+            "rd_ram_dat[1]": 1,
+            "rd_ram_dat[2]": 0,
+            "rd_ram_dat[3]": 0,
+            "rd_ram_dat[4]": 0,
+            "rd_ram_dat[5]": 0,
+            "rd_ram_dat[6]": 0,
+            "rd_ram_dat[7]": 0,
+            "rd_ram_dat[8]": 1,
+            "rd_ram_dat[9]": 0,
+            "rd_ram_dat[10]": 1,
+            "rd_ram_dat[11]": 1,
+            "rd_ram_dat[12]": 0,
+            "rd_ram_dat[13]": 1,
+            "rd_ram_dat[14]": 1,
+            "rd_ram_dat[15]": 1,
+            "rd_ram_dat[16]": 1,
+            "rd_ram_dat[17]": 0,
+            "rd_ram_dat[18]": 1,
+            "rd_ram_dat[19]": 1,
+            "rd_ram_dat[20]": 0,
+            "rd_ram_dat[21]": 1,
+            "rd_ram_dat[22]": 0,
+            "rd_ram_dat[23]": 1,
+            "rd_ram_dat[24]": 0,
+            "rd_ram_dat[25]": 1,
+            "rd_ram_dat[26]": 0,
+            "rd_ram_dat[27]": 1,
+            "rd_ram_dat[28]": 0,
+            "rd_ram_dat[29]": 1,
+            "rd_ram_dat[30]": 1,
+            "rd_ram_dat[31]": 0,
+            "rd_io_dat[0]": 1,
+            "rd_io_dat[1]": 1,
+            "rd_io_dat[2]": 0,
+            "rd_io_dat[3]": 1,
+            "rd_io_dat[4]": 1,
+            "rd_io_dat[5]": 0,
+            "rd_io_dat[6]": 1,
+            "rd_io_dat[7]": 0,
+            "rd_io_dat[8]": 1,
+            "rd_io_dat[9]": 0,
+            "rd_io_dat[10]": 1,
+            "rd_io_dat[11]": 0,
+            "rd_io_dat[12]": 1,
+            "rd_io_dat[13]": 0,
+            "rd_io_dat[14]": 1,
+            "rd_io_dat[15]": 1,
+            "rd_io_dat[16]": 0,
+            "rd_io_dat[17]": 1,
+            "rd_io_dat[18]": 1,
+            "rd_io_dat[19]": 0,
+            "rd_io_dat[20]": 1,
+            "rd_io_dat[21]": 0,
+            "rd_io_dat[22]": 1,
+            "rd_io_dat[23]": 0,
+            "rd_io_dat[24]": 1,
+            "rd_io_dat[25]": 0,
+            "rd_io_dat[26]": 1,
+            "rd_io_dat[27]": 0,
+            "rd_io_dat[28]": 1,
+            "rd_io_dat[29]": 0,
+            "rd_io_dat[30]": 1,
+            "rd_io_dat[31]": 1,
+            "ram_or_io_wr": 0
+          },
+          "good_outputs": {
+            "rd_ram_or_io_dat[0]": 1,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 0,
+            "rd_ram_or_io_dat[3]": 1,
+            "rd_ram_or_io_dat[4]": 1,
+            "rd_ram_or_io_dat[5]": 0,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 0,
+            "rd_ram_or_io_dat[12]": 1,
+            "rd_ram_or_io_dat[13]": 0,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 1,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 1,
+            "rd_ram_or_io_dat[18]": 1,
+            "rd_ram_or_io_dat[19]": 0,
+            "rd_ram_or_io_dat[20]": 1,
+            "rd_ram_or_io_dat[21]": 0,
+            "rd_ram_or_io_dat[22]": 1,
+            "rd_ram_or_io_dat[23]": 0,
+            "rd_ram_or_io_dat[24]": 1,
+            "rd_ram_or_io_dat[25]": 0,
+            "rd_ram_or_io_dat[26]": 1,
+            "rd_ram_or_io_dat[27]": 0,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 0,
+            "rd_ram_or_io_dat[30]": 1,
+            "rd_ram_or_io_dat[31]": 1,
+            "ram_wr": 0,
+            "io_wr": 0
+          },
+          "faulty_outputs": {
+            "rd_ram_or_io_dat[0]": 1,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 0,
+            "rd_ram_or_io_dat[3]": 1,
+            "rd_ram_or_io_dat[4]": 1,
+            "rd_ram_or_io_dat[5]": 0,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 0,
+            "rd_ram_or_io_dat[12]": 1,
+            "rd_ram_or_io_dat[13]": 0,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 1,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 1,
+            "rd_ram_or_io_dat[18]": 1,
+            "rd_ram_or_io_dat[19]": 0,
+            "rd_ram_or_io_dat[20]": 1,
+            "rd_ram_or_io_dat[21]": 0,
+            "rd_ram_or_io_dat[22]": 1,
+            "rd_ram_or_io_dat[23]": 0,
+            "rd_ram_or_io_dat[24]": 1,
+            "rd_ram_or_io_dat[25]": 0,
+            "rd_ram_or_io_dat[26]": 1,
+            "rd_ram_or_io_dat[27]": 0,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 0,
+            "rd_ram_or_io_dat[30]": 1,
+            "rd_ram_or_io_dat[31]": 1,
+            "ram_wr": 0,
+            "io_wr": 1
+          },
+          "reported_outputs": {
+            "rd_ram_or_io_dat[0]": 0,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 0,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 1,
+            "rd_ram_or_io_dat[5]": 0,
+            "rd_ram_or_io_dat[6]": 0,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 1,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 1,
+            "rd_ram_or_io_dat[16]": 1,
+            "rd_ram_or_io_dat[17]": 0,
+            "rd_ram_or_io_dat[18]": 1,
+            "rd_ram_or_io_dat[19]": 1,
+            "rd_ram_or_io_dat[20]": 0,
+            "rd_ram_or_io_dat[21]": 1,
+            "rd_ram_or_io_dat[22]": 0,
+            "rd_ram_or_io_dat[23]": 1,
+            "rd_ram_or_io_dat[24]": 0,
+            "rd_ram_or_io_dat[25]": 1,
+            "rd_ram_or_io_dat[26]": 0,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 0,
+            "rd_ram_or_io_dat[29]": 1,
+            "rd_ram_or_io_dat[30]": 1,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 0
+          }
+        }
+      },
+      "greedy": {
+        "stats": {
+          "checked": 16,
+          "detected": 10,
+          "expected_output_correct": 2
+        },
+        "witness": {
+          "vector": {
+            "addr[0]": 0,
+            "addr[1]": 0,
+            "addr[2]": 1,
+            "addr[3]": 0,
+            "rd_ram_dat[0]": 0,
+            "rd_ram_dat[1]": 0,
+            "rd_ram_dat[2]": 0,
+            "rd_ram_dat[3]": 0,
+            "rd_ram_dat[4]": 0,
+            "rd_ram_dat[5]": 1,
+            "rd_ram_dat[6]": 1,
+            "rd_ram_dat[7]": 1,
+            "rd_ram_dat[8]": 1,
+            "rd_ram_dat[9]": 0,
+            "rd_ram_dat[10]": 1,
+            "rd_ram_dat[11]": 1,
+            "rd_ram_dat[12]": 0,
+            "rd_ram_dat[13]": 1,
+            "rd_ram_dat[14]": 0,
+            "rd_ram_dat[15]": 0,
+            "rd_ram_dat[16]": 1,
+            "rd_ram_dat[17]": 0,
+            "rd_ram_dat[18]": 0,
+            "rd_ram_dat[19]": 0,
+            "rd_ram_dat[20]": 1,
+            "rd_ram_dat[21]": 0,
+            "rd_ram_dat[22]": 1,
+            "rd_ram_dat[23]": 0,
+            "rd_ram_dat[24]": 1,
+            "rd_ram_dat[25]": 0,
+            "rd_ram_dat[26]": 1,
+            "rd_ram_dat[27]": 1,
+            "rd_ram_dat[28]": 0,
+            "rd_ram_dat[29]": 1,
+            "rd_ram_dat[30]": 0,
+            "rd_ram_dat[31]": 0,
+            "rd_io_dat[0]": 1,
+            "rd_io_dat[1]": 1,
+            "rd_io_dat[2]": 1,
+            "rd_io_dat[3]": 0,
+            "rd_io_dat[4]": 1,
+            "rd_io_dat[5]": 0,
+            "rd_io_dat[6]": 1,
+            "rd_io_dat[7]": 0,
+            "rd_io_dat[8]": 1,
+            "rd_io_dat[9]": 0,
+            "rd_io_dat[10]": 1,
+            "rd_io_dat[11]": 1,
+            "rd_io_dat[12]": 0,
+            "rd_io_dat[13]": 0,
+            "rd_io_dat[14]": 1,
+            "rd_io_dat[15]": 0,
+            "rd_io_dat[16]": 0,
+            "rd_io_dat[17]": 1,
+            "rd_io_dat[18]": 0,
+            "rd_io_dat[19]": 1,
+            "rd_io_dat[20]": 0,
+            "rd_io_dat[21]": 1,
+            "rd_io_dat[22]": 0,
+            "rd_io_dat[23]": 1,
+            "rd_io_dat[24]": 0,
+            "rd_io_dat[25]": 1,
+            "rd_io_dat[26]": 0,
+            "rd_io_dat[27]": 1,
+            "rd_io_dat[28]": 1,
+            "rd_io_dat[29]": 0,
+            "rd_io_dat[30]": 1,
+            "rd_io_dat[31]": 0,
+            "ram_or_io_wr": 0
+          },
+          "good_outputs": {
+            "rd_ram_or_io_dat[0]": 1,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 1,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 1,
+            "rd_ram_or_io_dat[5]": 0,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 0,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 0,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 1,
+            "rd_ram_or_io_dat[18]": 0,
+            "rd_ram_or_io_dat[19]": 1,
+            "rd_ram_or_io_dat[20]": 0,
+            "rd_ram_or_io_dat[21]": 1,
+            "rd_ram_or_io_dat[22]": 0,
+            "rd_ram_or_io_dat[23]": 1,
+            "rd_ram_or_io_dat[24]": 0,
+            "rd_ram_or_io_dat[25]": 1,
+            "rd_ram_or_io_dat[26]": 0,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 0,
+            "rd_ram_or_io_dat[30]": 1,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 0
+          },
+          "faulty_outputs": {
+            "rd_ram_or_io_dat[0]": 1,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 1,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 1,
+            "rd_ram_or_io_dat[5]": 0,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 0,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 0,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 1,
+            "rd_ram_or_io_dat[18]": 0,
+            "rd_ram_or_io_dat[19]": 1,
+            "rd_ram_or_io_dat[20]": 0,
+            "rd_ram_or_io_dat[21]": 1,
+            "rd_ram_or_io_dat[22]": 0,
+            "rd_ram_or_io_dat[23]": 1,
+            "rd_ram_or_io_dat[24]": 0,
+            "rd_ram_or_io_dat[25]": 1,
+            "rd_ram_or_io_dat[26]": 0,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 0,
+            "rd_ram_or_io_dat[30]": 1,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 1
+          },
+          "reported_outputs": {
+            "rd_ram_or_io_dat[0]": 0,
+            "rd_ram_or_io_dat[1]": 1,
+            "rd_ram_or_io_dat[2]": 0,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 0,
+            "rd_ram_or_io_dat[5]": 1,
+            "rd_ram_or_io_dat[6]": 1,
+            "rd_ram_or_io_dat[7]": 1,
+            "rd_ram_or_io_dat[8]": 1,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 1,
+            "rd_ram_or_io_dat[14]": 0,
+            "rd_ram_or_io_dat[15]": 0,
+            "rd_ram_or_io_dat[16]": 1,
+            "rd_ram_or_io_dat[17]": 0,
+            "rd_ram_or_io_dat[18]": 0,
+            "rd_ram_or_io_dat[19]": 0,
+            "rd_ram_or_io_dat[20]": 1,
+            "rd_ram_or_io_dat[21]": 0,
+            "rd_ram_or_io_dat[22]": 1,
+            "rd_ram_or_io_dat[23]": 0,
+            "rd_ram_or_io_dat[24]": 1,
+            "rd_ram_or_io_dat[25]": 0,
+            "rd_ram_or_io_dat[26]": 1,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 0,
+            "rd_ram_or_io_dat[29]": 1,
+            "rd_ram_or_io_dat[30]": 0,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 0
+          }
+        }
+      },
+      "random": {
+        "stats": {
+          "checked": 16,
+          "detected": 0,
+          "expected_output_correct": 0
+        },
+        "witness": null
+      },
+      "vector_evolutionary": {
+        "stats": {
+          "checked": 16,
+          "detected": 3,
+          "expected_output_correct": 16
+        },
+        "witness": {
+          "vector": {
+            "addr[0]": 0,
+            "addr[1]": 0,
+            "addr[2]": 1,
+            "addr[3]": 0,
+            "rd_ram_dat[0]": 1,
+            "rd_ram_dat[1]": 1,
+            "rd_ram_dat[2]": 0,
+            "rd_ram_dat[3]": 1,
+            "rd_ram_dat[4]": 0,
+            "rd_ram_dat[5]": 1,
+            "rd_ram_dat[6]": 1,
+            "rd_ram_dat[7]": 1,
+            "rd_ram_dat[8]": 1,
+            "rd_ram_dat[9]": 0,
+            "rd_ram_dat[10]": 0,
+            "rd_ram_dat[11]": 0,
+            "rd_ram_dat[12]": 0,
+            "rd_ram_dat[13]": 1,
+            "rd_ram_dat[14]": 1,
+            "rd_ram_dat[15]": 1,
+            "rd_ram_dat[16]": 0,
+            "rd_ram_dat[17]": 1,
+            "rd_ram_dat[18]": 1,
+            "rd_ram_dat[19]": 0,
+            "rd_ram_dat[20]": 1,
+            "rd_ram_dat[21]": 1,
+            "rd_ram_dat[22]": 0,
+            "rd_ram_dat[23]": 0,
+            "rd_ram_dat[24]": 1,
+            "rd_ram_dat[25]": 0,
+            "rd_ram_dat[26]": 1,
+            "rd_ram_dat[27]": 0,
+            "rd_ram_dat[28]": 0,
+            "rd_ram_dat[29]": 0,
+            "rd_ram_dat[30]": 0,
+            "rd_ram_dat[31]": 0,
+            "rd_io_dat[0]": 0,
+            "rd_io_dat[1]": 0,
+            "rd_io_dat[2]": 1,
+            "rd_io_dat[3]": 0,
+            "rd_io_dat[4]": 0,
+            "rd_io_dat[5]": 1,
+            "rd_io_dat[6]": 0,
+            "rd_io_dat[7]": 0,
+            "rd_io_dat[8]": 0,
+            "rd_io_dat[9]": 0,
+            "rd_io_dat[10]": 1,
+            "rd_io_dat[11]": 1,
+            "rd_io_dat[12]": 0,
+            "rd_io_dat[13]": 1,
+            "rd_io_dat[14]": 1,
+            "rd_io_dat[15]": 1,
+            "rd_io_dat[16]": 0,
+            "rd_io_dat[17]": 0,
+            "rd_io_dat[18]": 1,
+            "rd_io_dat[19]": 1,
+            "rd_io_dat[20]": 1,
+            "rd_io_dat[21]": 0,
+            "rd_io_dat[22]": 0,
+            "rd_io_dat[23]": 1,
+            "rd_io_dat[24]": 1,
+            "rd_io_dat[25]": 0,
+            "rd_io_dat[26]": 1,
+            "rd_io_dat[27]": 1,
+            "rd_io_dat[28]": 1,
+            "rd_io_dat[29]": 1,
+            "rd_io_dat[30]": 0,
+            "rd_io_dat[31]": 0,
+            "ram_or_io_wr": 0
+          },
+          "good_outputs": {
+            "rd_ram_or_io_dat[0]": 0,
+            "rd_ram_or_io_dat[1]": 0,
+            "rd_ram_or_io_dat[2]": 1,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 0,
+            "rd_ram_or_io_dat[5]": 1,
+            "rd_ram_or_io_dat[6]": 0,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 0,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 1,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 1,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 0,
+            "rd_ram_or_io_dat[18]": 1,
+            "rd_ram_or_io_dat[19]": 1,
+            "rd_ram_or_io_dat[20]": 1,
+            "rd_ram_or_io_dat[21]": 0,
+            "rd_ram_or_io_dat[22]": 0,
+            "rd_ram_or_io_dat[23]": 1,
+            "rd_ram_or_io_dat[24]": 1,
+            "rd_ram_or_io_dat[25]": 0,
+            "rd_ram_or_io_dat[26]": 1,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 1,
+            "rd_ram_or_io_dat[30]": 0,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 0
+          },
+          "faulty_outputs": {
+            "rd_ram_or_io_dat[0]": 0,
+            "rd_ram_or_io_dat[1]": 0,
+            "rd_ram_or_io_dat[2]": 1,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 0,
+            "rd_ram_or_io_dat[5]": 1,
+            "rd_ram_or_io_dat[6]": 0,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 0,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 1,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 1,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 0,
+            "rd_ram_or_io_dat[18]": 1,
+            "rd_ram_or_io_dat[19]": 1,
+            "rd_ram_or_io_dat[20]": 1,
+            "rd_ram_or_io_dat[21]": 0,
+            "rd_ram_or_io_dat[22]": 0,
+            "rd_ram_or_io_dat[23]": 1,
+            "rd_ram_or_io_dat[24]": 1,
+            "rd_ram_or_io_dat[25]": 0,
+            "rd_ram_or_io_dat[26]": 1,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 1,
+            "rd_ram_or_io_dat[30]": 0,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 1
+          },
+          "reported_outputs": {
+            "rd_ram_or_io_dat[0]": 0,
+            "rd_ram_or_io_dat[1]": 0,
+            "rd_ram_or_io_dat[2]": 1,
+            "rd_ram_or_io_dat[3]": 0,
+            "rd_ram_or_io_dat[4]": 0,
+            "rd_ram_or_io_dat[5]": 1,
+            "rd_ram_or_io_dat[6]": 0,
+            "rd_ram_or_io_dat[7]": 0,
+            "rd_ram_or_io_dat[8]": 0,
+            "rd_ram_or_io_dat[9]": 0,
+            "rd_ram_or_io_dat[10]": 1,
+            "rd_ram_or_io_dat[11]": 1,
+            "rd_ram_or_io_dat[12]": 0,
+            "rd_ram_or_io_dat[13]": 1,
+            "rd_ram_or_io_dat[14]": 1,
+            "rd_ram_or_io_dat[15]": 1,
+            "rd_ram_or_io_dat[16]": 0,
+            "rd_ram_or_io_dat[17]": 0,
+            "rd_ram_or_io_dat[18]": 1,
+            "rd_ram_or_io_dat[19]": 1,
+            "rd_ram_or_io_dat[20]": 1,
+            "rd_ram_or_io_dat[21]": 0,
+            "rd_ram_or_io_dat[22]": 0,
+            "rd_ram_or_io_dat[23]": 1,
+            "rd_ram_or_io_dat[24]": 1,
+            "rd_ram_or_io_dat[25]": 0,
+            "rd_ram_or_io_dat[26]": 1,
+            "rd_ram_or_io_dat[27]": 1,
+            "rd_ram_or_io_dat[28]": 1,
+            "rd_ram_or_io_dat[29]": 1,
+            "rd_ram_or_io_dat[30]": 0,
+            "rd_ram_or_io_dat[31]": 0,
+            "ram_wr": 0,
+            "io_wr": 0
+          }
+        }
+      }
+    },
+    "419": {
+      "mcts": {
+        "stats": {
+          "checked": 16,
+          "detected": 14,
+          "expected_output_correct": 3
+        },
+        "witness": {
+          "vector": {
+            "r0out": 0,
+            "r1out": 0,
+            "r2out": 0,
+            "r3out": 0,
+            "r4out": 1,
+            "r5out": 0,
+            "r6out": 0,
+            "r7out": 0,
+            "r8out": 0,
+            "r9out": 0,
+            "r10out": 0,
+            "r11out": 0,
+            "r12out": 0,
+            "r13out": 0,
+            "r14out": 0,
+            "r15out": 1,
+            "hiout": 0,
+            "lowout": 0,
+            "zhighout": 0,
+            "zlowout": 0,
+            "pcout": 0,
+            "mdrout": 0,
+            "inportout": 0,
+            "cout": 0
+          },
+          "good_outputs": {
+            "s3": 1,
+            "s2": 1,
+            "s1": 1,
+            "s0": 1,
+            "s4": 0
+          },
+          "faulty_outputs": {
+            "s3": 0,
+            "s2": 1,
+            "s1": 0,
+            "s0": 0,
+            "s4": 0
+          },
+          "reported_outputs": {
+            "s0": 1,
+            "s1": 1,
+            "s2": 1,
+            "s3": 1,
+            "s4": 1
+          }
+        }
+      },
+      "best_of_n": {
+        "stats": {
+          "checked": 16,
+          "detected": 14,
+          "expected_output_correct": 5
+        },
+        "witness": {
+          "vector": {
+            "r0out": 0,
+            "r1out": 0,
+            "r2out": 0,
+            "r3out": 0,
+            "r4out": 0,
+            "r5out": 0,
+            "r6out": 1,
+            "r7out": 0,
+            "r8out": 0,
+            "r9out": 0,
+            "r10out": 0,
+            "r11out": 0,
+            "r12out": 0,
+            "r13out": 0,
+            "r14out": 0,
+            "r15out": 1,
+            "hiout": 0,
+            "lowout": 0,
+            "zhighout": 0,
+            "zlowout": 0,
+            "pcout": 1,
+            "mdrout": 0,
+            "inportout": 0,
+            "cout": 0
+          },
+          "good_outputs": {
+            "s3": 1,
+            "s2": 1,
+            "s1": 1,
+            "s0": 1,
+            "s4": 1
+          },
+          "faulty_outputs": {
+            "s3": 0,
+            "s2": 1,
+            "s1": 1,
+            "s0": 0,
+            "s4": 1
+          },
+          "reported_outputs": {
+            "s0": 1,
+            "s1": 1,
+            "s2": 1,
+            "s3": 1,
+            "s4": 1
+          }
+        }
+      },
+      "evolutionary": {
+        "stats": {
+          "checked": 16,
+          "detected": 16,
+          "expected_output_correct": 4
+        },
+        "witness": {
+          "vector": {
+            "r0out": 1,
+            "r1out": 0,
+            "r2out": 0,
+            "r3out": 0,
+            "r4out": 1,
+            "r5out": 0,
+            "r6out": 0,
+            "r7out": 0,
+            "r8out": 1,
+            "r9out": 0,
+            "r10out": 0,
+            "r11out": 0,
+            "r12out": 0,
+            "r13out": 0,
+            "r14out": 0,
+            "r15out": 1,
+            "hiout": 0,
+            "lowout": 0,
+            "zhighout": 0,
+            "zlowout": 0,
+            "pcout": 0,
+            "mdrout": 0,
+            "inportout": 0,
+            "cout": 0
+          },
+          "good_outputs": {
+            "s3": 1,
+            "s2": 1,
+            "s1": 1,
+            "s0": 1,
+            "s4": 0
+          },
+          "faulty_outputs": {
+            "s3": 1,
+            "s2": 1,
+            "s1": 0,
+            "s0": 0,
+            "s4": 0
+          },
+          "reported_outputs": {
+            "s0": 1,
+            "s1": 1,
+            "s2": 1,
+            "s3": 1,
+            "s4": 1
+          }
+        }
+      },
+      "greedy": {
+        "stats": {
+          "checked": 16,
+          "detected": 11,
+          "expected_output_correct": 5
+        },
+        "witness": {
+          "vector": {
+            "r0out": 0,
+            "r1out": 0,
+            "r2out": 0,
+            "r3out": 0,
+            "r4out": 0,
+            "r5out": 0,
+            "r6out": 1,
+            "r7out": 0,
+            "r8out": 0,
+            "r9out": 0,
+            "r10out": 0,
+            "r11out": 0,
+            "r12out": 0,
+            "r13out": 0,
+            "r14out": 0,
+            "r15out": 1,
+            "hiout": 0,
+            "lowout": 0,
+            "zhighout": 0,
+            "zlowout": 0,
+            "pcout": 1,
+            "mdrout": 0,
+            "inportout": 0,
+            "cout": 0
+          },
+          "good_outputs": {
+            "s3": 1,
+            "s2": 1,
+            "s1": 1,
+            "s0": 1,
+            "s4": 1
+          },
+          "faulty_outputs": {
+            "s3": 0,
+            "s2": 1,
+            "s1": 1,
+            "s0": 0,
+            "s4": 1
+          },
+          "reported_outputs": {
+            "s0": 1,
+            "s1": 1,
+            "s2": 1,
+            "s3": 1,
+            "s4": 1
+          }
+        }
+      },
+      "random": {
+        "stats": {
+          "checked": 16,
+          "detected": 0,
+          "expected_output_correct": 2
+        },
+        "witness": null
+      },
+      "vector_evolutionary": {
+        "stats": {
+          "checked": 16,
+          "detected": 0,
+          "expected_output_correct": 16
+        },
+        "witness": null
+      }
+    },
+    "508": {
+      "mcts": {
+        "stats": {
+          "checked": 16,
+          "detected": 10,
+          "expected_output_correct": 7
+        },
+        "witness": {
+          "vector": {
+            "p1a": 1,
+            "p1b": 0,
+            "p1c": 1,
+            "p1d": 1,
+            "p2a": 0,
+            "p2b": 1,
+            "p2c": 1,
+            "p2d": 1
+          },
+          "good_outputs": {
+            "p1y": 1,
+            "p2y": 1
+          },
+          "faulty_outputs": {
+            "p1y": 0,
+            "p2y": 1
+          },
+          "reported_outputs": {
+            "p1y": 1,
+            "p2y": 1
+          }
+        }
+      },
+      "best_of_n": {
+        "stats": {
+          "checked": 16,
+          "detected": 15,
+          "expected_output_correct": 6
+        },
+        "witness": {
+          "vector": {
+            "p1a": 1,
+            "p1b": 0,
+            "p1c": 1,
+            "p1d": 1,
+            "p2a": 0,
+            "p2b": 1,
+            "p2c": 1,
+            "p2d": 0
+          },
+          "good_outputs": {
+            "p1y": 1,
+            "p2y": 1
+          },
+          "faulty_outputs": {
+            "p1y": 0,
+            "p2y": 1
+          },
+          "reported_outputs": {
+            "p1y": 1,
+            "p2y": 1
+          }
+        }
+      },
+      "evolutionary": {
+        "stats": {
+          "checked": 16,
+          "detected": 15,
+          "expected_output_correct": 3
+        },
+        "witness": {
+          "vector": {
+            "p1a": 1,
+            "p1b": 0,
+            "p1c": 1,
+            "p1d": 1,
+            "p2a": 1,
+            "p2b": 1,
+            "p2c": 0,
+            "p2d": 1
+          },
+          "good_outputs": {
+            "p1y": 1,
+            "p2y": 1
+          },
+          "faulty_outputs": {
+            "p1y": 0,
+            "p2y": 1
+          },
+          "reported_outputs": {
+            "p1y": 1,
+            "p2y": 1
+          }
+        }
+      },
+      "greedy": {
+        "stats": {
+          "checked": 16,
+          "detected": 9,
+          "expected_output_correct": 7
+        },
+        "witness": {
+          "vector": {
+            "p1a": 1,
+            "p1b": 0,
+            "p1c": 1,
+            "p1d": 1,
+            "p2a": 1,
+            "p2b": 1,
+            "p2c": 1,
+            "p2d": 1
+          },
+          "good_outputs": {
+            "p1y": 1,
+            "p2y": 0
+          },
+          "faulty_outputs": {
+            "p1y": 0,
+            "p2y": 0
+          },
+          "reported_outputs": {
+            "p1y": 0,
+            "p2y": 1
+          }
+        }
+      },
+      "random": {
+        "stats": {
+          "checked": 16,
+          "detected": 0,
+          "expected_output_correct": 5
+        },
+        "witness": null
+      },
+      "vector_evolutionary": {
+        "stats": {
+          "checked": 16,
+          "detected": 3,
+          "expected_output_correct": 16
+        },
+        "witness": {
+          "vector": {
+            "p1a": 1,
+            "p1b": 0,
+            "p1c": 1,
+            "p1d": 1,
+            "p2a": 1,
+            "p2b": 1,
+            "p2c": 0,
+            "p2d": 1
+          },
+          "good_outputs": {
+            "p1y": 1,
+            "p2y": 1
+          },
+          "faulty_outputs": {
+            "p1y": 0,
+            "p2y": 1
+          },
+          "reported_outputs": {
+            "p1y": 1,
+            "p2y": 1
+          }
+        }
+      }
+    }
+  },
+  "comparisons": {
+    "greedy-random@1": {
+      "delta_pp": 0.06103515625,
+      "ci95_pp": [
+        -2.03857421875,
+        2.1728515625
+      ],
+      "wins_ties_losses": [
+        190,
+        90,
+        232
+      ]
+    },
+    "greedy-random@4": {
+      "delta_pp": 1.5030477335164831,
+      "ci95_pp": [
+        -0.2183448875343407,
+        3.2636128519917573
+      ],
+      "wins_ties_losses": [
+        174,
+        173,
+        165
+      ]
+    },
+    "greedy-random@16": {
+      "delta_pp": 3.125,
+      "ci95_pp": [
+        0.9765625,
+        5.46875
+      ],
+      "wins_ties_losses": [
+        25,
+        478,
+        9
+      ]
+    },
+    "best_of_n-vector_evolutionary@1": {
+      "delta_pp": 0.20751953125,
+      "ci95_pp": [
+        -1.3427734375,
+        1.8069458007812456
+      ],
+      "wins_ties_losses": [
+        135,
+        209,
+        168
+      ]
+    },
+    "best_of_n-vector_evolutionary@4": {
+      "delta_pp": 2.4332503434065935,
+      "ci95_pp": [
+        0.991447029532967,
+        4.0361623240041204
+      ],
+      "wins_ties_losses": [
+        60,
+        392,
+        60
+      ]
+    },
+    "best_of_n-vector_evolutionary@16": {
+      "delta_pp": 2.9296875,
+      "ci95_pp": [
+        1.171875,
+        4.6875
+      ],
+      "wins_ties_losses": [
+        19,
+        489,
+        4
+      ]
+    },
+    "evolutionary-vector_evolutionary@1": {
+      "delta_pp": -0.4638671875,
+      "ci95_pp": [
+        -2.0751953125,
+        1.1965942382812456
+      ],
+      "wins_ties_losses": [
+        131,
+        191,
+        190
+      ]
+    },
+    "evolutionary-vector_evolutionary@4": {
+      "delta_pp": 2.757769574175824,
+      "ci95_pp": [
+        1.3244521591689564,
+        4.3065574562156606
+      ],
+      "wins_ties_losses": [
+        59,
+        388,
+        65
+      ]
+    },
+    "evolutionary-vector_evolutionary@16": {
+      "delta_pp": 2.9296875,
+      "ci95_pp": [
+        1.171875,
+        4.6875
+      ],
+      "wins_ties_losses": [
+        18,
+        491,
+        3
+      ]
+    },
+    "mcts-best_of_n@1": {
+      "delta_pp": -9.46044921875,
+      "ci95_pp": [
+        -10.65673828125,
+        -8.33740234375
+      ],
+      "wins_ties_losses": [
+        40,
+        184,
+        288
+      ]
+    },
+    "mcts-best_of_n@4": {
+      "delta_pp": -2.8596110920329667,
+      "ci95_pp": [
+        -3.800818810096154,
+        -1.9830201536744512
+      ],
+      "wins_ties_losses": [
+        12,
+        321,
+        179
+      ]
+    },
+    "mcts-best_of_n@16": {
+      "delta_pp": -1.5625,
+      "ci95_pp": [
+        -2.9296875,
+        -0.390625
+      ],
+      "wins_ties_losses": [
+        1,
+        502,
+        9
+      ]
+    }
+  },
+  "strata": {
+    "nonbus": {
+      "n": 508,
+      "pass_at_1": {
+        "mcts": 0.7607037401574803,
+        "best_of_n": 0.8558070866141733,
+        "evolutionary": 0.8491633858267716,
+        "greedy": 0.609128937007874,
+        "random": 0.6060531496062992,
+        "vector_evolutionary": 0.8559301181102362
+      },
+      "greedy_minus_random": {
+        "delta_pp": 0.3075787401574803,
+        "ci95_pp": [
+          -1.710445374015748,
+          2.3868110236220472
+        ],
+        "wins_ties_losses": [
+          189,
+          89,
+          230
+        ]
+      }
+    },
+    "hard_nonbus": {
+      "n": 44,
+      "pass_at_1": {
+        "mcts": 0.2215909090909091,
+        "best_of_n": 0.3196022727272727,
+        "evolutionary": 0.34375,
+        "greedy": 0.1534090909090909,
+        "random": 0.026988636363636364,
+        "vector_evolutionary": 0.09375
+      },
+      "greedy_minus_random": {
+        "delta_pp": 12.642045454545455,
+        "ci95_pp": [
+          6.25,
+          19.886363636363637
+        ],
+        "wins_ties_losses": [
+          22,
+          18,
+          4
+        ]
+      }
+    },
+    "hard_neither_constant_nonbus": {
+      "n": 26,
+      "pass_at_1": {
+        "mcts": 0.16105769230769232,
+        "best_of_n": 0.2283653846153846,
+        "evolutionary": 0.2548076923076923,
+        "greedy": 0.11538461538461539,
+        "random": 0.03365384615384615,
+        "vector_evolutionary": 0.11538461538461539
+      },
+      "greedy_minus_random": {
+        "delta_pp": 8.173076923076923,
+        "ci95_pp": [
+          1.201923076923077,
+          16.58653846153846
+        ],
+        "wins_ties_losses": [
+          10,
+          13,
+          3
+        ]
+      }
+    },
+    "hard_neither_constant_nonpi_nonbus": {
+      "n": 19,
+      "pass_at_1": {
+        "mcts": 0.09868421052631579,
+        "best_of_n": 0.1513157894736842,
+        "evolutionary": 0.17105263157894737,
+        "greedy": 0.046052631578947366,
+        "random": 0.046052631578947366,
+        "vector_evolutionary": 0.12171052631578948
+      },
+      "greedy_minus_random": {
+        "delta_pp": 0.0,
+        "ci95_pp": [
+          -2.631578947368421,
+          2.631578947368421
+        ],
+        "wins_ties_losses": [
+          4,
+          12,
+          3
+        ]
+      }
+    },
+    "neither_constant_nonbus": {
+      "n": 92,
+      "pass_at_1": {
+        "mcts": 0.468070652173913,
+        "best_of_n": 0.6168478260869565,
+        "evolutionary": 0.6127717391304348,
+        "greedy": 0.3186141304347826,
+        "random": 0.30095108695652173,
+        "vector_evolutionary": 0.6046195652173914
+      },
+      "greedy_minus_random": {
+        "delta_pp": 1.766304347826087,
+        "ci95_pp": [
+          -3.3288043478260874,
+          6.5896739130434785
+        ],
+        "wins_ties_losses": [
+          40,
+          18,
+          34
+        ]
+      }
+    },
+    "recorded_grpo_holdout_nonbus": {
+      "n": 71,
+      "pass_at_1": {
+        "mcts": 0.7640845070422535,
+        "best_of_n": 0.8494718309859155,
+        "evolutionary": 0.8485915492957746,
+        "greedy": 0.6285211267605634,
+        "random": 0.6258802816901409,
+        "vector_evolutionary": 0.8767605633802817
+      },
+      "greedy_minus_random": {
+        "delta_pp": 0.2640845070422535,
+        "ci95_pp": [
+          -5.105633802816902,
+          5.545774647887324
+        ],
+        "wins_ties_losses": [
+          27,
+          13,
+          31
+        ]
+      }
+    },
+    "outside_recorded_grpo_holdout_nonbus": {
+      "n": 437,
+      "pass_at_1": {
+        "mcts": 0.7601544622425629,
+        "best_of_n": 0.8568363844393593,
+        "evolutionary": 0.8492562929061785,
+        "greedy": 0.6059782608695652,
+        "random": 0.6028318077803204,
+        "vector_evolutionary": 0.852545766590389
+      },
+      "greedy_minus_random": {
+        "delta_pp": 0.3146453089244851,
+        "ci95_pp": [
+          -1.9736842105263157,
+          2.560068649885584
+        ],
+        "wins_ties_losses": [
+          162,
+          76,
+          199
+        ]
+      }
+    }
+  },
+  "checkpoint_holdout": {
+    "protocol": {
+      "dataset": "chrivasileiou/asap7-language-of-test-v2",
+      "split": "test",
+      "size": 72,
+      "seed": 1729,
+      "candidate_pool_size": 576,
+      "tokenizer_vocab_sha256": "256cfb53b9e049f0c155a08563faadb8f17e17c763d9f4e72213fd25eb9fa4a8",
+      "special_tokens_sha256": "7f86b27a702a10f380d427b4c862165b61696fd29d7c8da3b33f224605260505",
+      "chat_template_sha256": "ea31e9c11edfcd877d6d28b16ecfe023e9e547db21f062159c1b0c9823afd741",
+      "max_prompt_length": 4096,
+      "max_completion_length": 12288,
+      "max_model_len": 16384,
+      "generations": 3,
+      "per_device_batch_size": 1,
+      "world_size": 3,
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "fault_sim_backend": "fast",
+      "prompt_pipeline": "single_generation_prefix_v1",
+      "training_holdout_policy": "exclude_evaluation_circuits"
+    },
+    "manifest_checksum_verified": true,
+    "matching_circuit_indices": [
+      17,
+      18,
+      22,
+      38,
+      40,
+      41,
+      46,
+      48,
+      51,
+      55,
+      69,
+      71,
+      73,
+      77,
+      90,
+      96,
+      101,
+      107,
+      108,
+      110,
+      124,
+      131,
+      132,
+      135,
+      139,
+      141,
+      156,
+      160,
+      171,
+      173,
+      181,
+      183,
+      184,
+      199,
+      215,
+      218,
+      232,
+      234,
+      237,
+      240,
+      241,
+      244,
+      245,
+      247,
+      248,
+      253,
+      260,
+      264,
+      266,
+      267,
+      272,
+      273,
+      285,
+      286,
+      292,
+      293,
+      298,
+      299,
+      308,
+      309,
+      310,
+      315,
+      322,
+      323,
+      329,
+      345,
+      346,
+      354,
+      356,
+      358,
+      366,
+      369
+    ],
+    "matching_circuit_fault_indices": [
+      17,
+      22,
+      41,
+      46,
+      48,
+      55,
+      71,
+      77,
+      107,
+      108,
+      124,
+      131,
+      132,
+      135,
+      141,
+      156,
+      160,
+      171,
+      173,
+      181,
+      183,
+      184,
+      199,
+      215,
+      234,
+      237,
+      240,
+      241,
+      244,
+      245,
+      247,
+      248,
+      253,
+      260,
+      264,
+      266,
+      267,
+      272,
+      273,
+      285,
+      286,
+      292,
+      293,
+      298,
+      299,
+      308,
+      309,
+      310,
+      315,
+      322,
+      323,
+      329,
+      345,
+      346,
+      354,
+      356,
+      358,
+      366,
+      369
+    ],
+    "caveat": "Recorded GRPO exclusion policy plus matching source code; actual buffer fingerprint and prior SFT exposure not reconstructed."
+  },
+  "independent_exact_uniform_probabilities": {
+    "259": 0.0625,
+    "419": 0.004584550857543945,
+    "508": 0.0625
+  },
+  "cached_training_overlap": {
+    "rows": 762517,
+    "unique_netlists": 2848,
+    "matching_netlists": 512,
+    "matching_netlist_fault_pairs": 461,
+    "caveat": "Local cached training split; actual checkpoint exposure remains unverified."
+  }
+}

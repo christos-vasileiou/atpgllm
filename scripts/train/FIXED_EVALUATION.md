@@ -70,10 +70,10 @@ Both long-run configs use:
 ```text
 FIXED_EVAL_SIZE=72
 FIXED_EVAL_SPLIT=test
-FIXED_EVAL_MANIFEST=runs/grpo_granite_4.2_8b/fixed_eval_manifest.json
+FIXED_EVAL_MANIFEST=runs/grpo_granite_4.2_8b_bon32/fixed_eval_manifest.json
 FIXED_EVAL_SEED=1729
 FIXED_EVAL_STEPS=5
-FIXED_EVAL_GENERATIONS=3
+FIXED_EVAL_GENERATIONS=1
 FIXED_EVAL_BATCH_SIZE=1
 ```
 
@@ -116,8 +116,8 @@ Trainer history uses `eval_fixed/*`; Transformers rewrites these names to
 **`eval/fixed/*` in W&B**. The W&B x-axis is `eval/fixed/global_step`, which
 continues the optimizer-step numbering across allocations. Use:
 
-- `eval/fixed/detection`: raw simulator detections / all completions (sampled pass@1).
-- `eval/fixed/solved_at_k`: faults detected by at least one of the three samples.
+- `eval/fixed/detection`: raw simulator detections / all completions (greedy pass@1).
+- `eval/fixed/solved_at_k`: faults detected by the single greedy completion (`k=1`).
 - `eval/fixed/activation_without_detection` and `all_fail_fraction`.
 - `eval/fixed/simulation_valid_fraction` and `simulator_error_fraction`.
 - `eval/fixed/pi_complete_fraction` and `expected_output_exact_fraction`.
@@ -143,10 +143,61 @@ records are preserved. These files remain together even when resumed jobs have
 separate W&B run IDs. Counts are checked across ranks; missing or duplicated
 samples fail rather than silently biasing a metric.
 
-Evaluation holds temperature 1, top-p 1, three samples per fault and request seeds
-fixed. Python/NumPy/Torch RNG state, generation kwargs, completion logs and model
+Evaluation uses temperature 0, top-p 1, one greedy completion per fault, and
+fixed request seeds, including tool continuations. Training temperature remains 1.
+Use `eval/fixed/detection` in W&B (`eval_fixed/detection` in trainer history)
+as the greedy quality curve. TRL group-standard-deviation
+diagnostics are undefined for one completion and are not evaluation quality metrics.
+The evaluation kwargs are scoped to `evaluate()` and restored even on failure.
+Old stochastic evaluation manifests are incompatible: begin a new experiment
+with a new output/manifest path; full-state resumes must retain the saved protocol.
+The main/repaired/TetraMAX configs use separate `_bon32` output directories.
+Do not compare the old sampled pass@3 directly with the new greedy detection curve.
+Python/NumPy/Torch RNG state, generation kwargs, completion logs and model
 mode are restored afterward. Fixed seeds/settings do not guarantee bitwise
 identity across different hardware or policies. Compare fixed evaluation over
 several checkpoints and report uncertainty; 72 faults are useful for catching
 large regressions but not establishing very small improvements. Evaluation
 consumes time inside each Slurm allocation.
+
+**Training best-of-N (independent of fixed evaluation)**
+
+The main, repaired, TetraMAX, and main resume configs set:
+
+```text
+NUM_GENERATIONS=16
+TRAIN_BEST_OF_N=32
+```
+
+For each training prompt, sample 32 trajectories at temperature 1, finish all
+tool calls, score using the configured simulator, and retain the highest-reward
+16. `NUM_GENERATIONS` continues to control the optimizer group and batch layout.
+`TRAIN_BEST_OF_N=0` (the CLI default), or setting N equal to G, retains ordinary
+i.i.d. sampling. N must be a multiple of G and at least G; G must be at least 2.
+The candidate pool is expanded before generation, so N/G increases rollout memory,
+generation work, and simulator requests; policy/reference forwards only see G.
+The shared TetraMAX worker/license limit is unchanged.
+
+Ranking uses raw reward objectives and their configured weights, before GDPO
+normalization, with stable ties. Log-only diagnostics are excluded. The native
+reward profile controls available objectives; simulator infrastructure errors
+still abort, and a group with fewer than G finite scores fails explicitly.
+Selected trajectories are redistributed in global prompt-group order, including
+groups spanning ranks. Tokens, tool masks, log probabilities, and extra fields
+move together. Selected rows are scored again through the normal reward path
+(which can reuse simulator caches), and GDPO normalizes only the retained group.
+Generation/token counters include candidates; the DAPO denominator counts only
+retained model tokens. Both adapter trainers use this path.
+
+This is reward-selected GRPO/GDPO, not an unbiased estimator of ordinary on-policy
+GRPO. Existing vLLM importance ratios correct model/engine log-probability
+differences; they do not correct the reward-selection distribution. Selecting
+only high scores can reduce within-group variation and therefore the learning
+signal. Keep G >= 2, monitor group degeneracy and greedy fixed evaluation, and
+compare against `TRAIN_BEST_OF_N=0` before treating this as an improvement.
+
+`sampling/best_of_n/` logs candidate count, retained count, candidate raw reward
+mean, and selected raw reward mean. The launcher snapshot and W&B config record
+`TRAIN_BEST_OF_N`; keep it unchanged across full-state resumes. This is implemented
+in the trainer, rather than vLLM's `best_of` option: selection requires the final
+simulator reward after tool execution.

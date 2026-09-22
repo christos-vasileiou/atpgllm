@@ -1,0 +1,28 @@
+{
+  "sft": {
+    "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/sft_granite_4.2_8b/checkpoint-200",
+    "files": {
+      "adapter_config.json": {
+        "bytes": 729,
+        "sha256": "4f392296a4af13a3ba41a929fa0256092600083c0dda4e3c7a884314685099a0"
+      },
+      "adapter_model.safetensors": {
+        "bytes": 197994512,
+        "sha256": "685dd4f45e5384234e8540044300df287c9da7c2c8f44d5ac73eeb3244dfa9ef"
+      }
+    }
+  },
+  "grpo": {
+    "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b/checkpoint-50/policy",
+    "files": {
+      "adapter_config.json": {
+        "bytes": 729,
+        "sha256": "60b53d4c37ab0f0cac4233274afe1ce478e002dc1ff99e74ba1ba50a8419a57f"
+      },
+      "adapter_model.safetensors": {
+        "bytes": 395912984,
+        "sha256": "ccdd44be6a9cd4f120e62282e0d5c7d0b3a58f8d8c039e12f7779b152f941af9"
+      }
+    }
+  }
+}

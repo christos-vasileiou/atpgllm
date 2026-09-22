@@ -1,0 +1,141 @@
+{
+  "versions": {
+    "torch": "2.9.0+cu128"
+  },
+  "probes": {
+    "cell_collisions": [
+      {
+        "cells": [
+          "MAJx2_ASAP7_75t_R",
+          "MAJIxp5_ASAP7_75t_R"
+        ],
+        "same_features": true,
+        "functions": [
+          {
+            "Y": "(A & B) | (A & C) | (B & C)"
+          },
+          {
+            "Y": "(~A & ~B) | (~A & ~C) | (~B & ~C)"
+          }
+        ]
+      },
+      {
+        "cells": [
+          "AO211x2_ASAP7_75t_R",
+          "AO22x1_ASAP7_75t_R"
+        ],
+        "same_features": true,
+        "functions": [
+          {
+            "Y": "(A1 & A2) | (B) | (C)"
+          },
+          {
+            "Y": "(A1 & A2) | (B1 & B2)"
+          }
+        ]
+      }
+    ],
+    "pin_role_collision": {
+      "encoder_inputs_equal": true,
+      "prefix_max_abs_difference": 0.0,
+      "input_assignment": {
+        "a": 0,
+        "b": 0,
+        "c": 1
+      },
+      "correct_good_outputs": [
+        1,
+        0
+      ],
+      "sa0_y_detected": [
+        true,
+        false
+      ]
+    },
+    "primary_input_fault_collision": {
+      "sa0_a_vs_sa0_b_same_encoder_inputs": true
+    },
+    "bus_indices": {
+      "declared": "[7:4] a",
+      "parsed": [
+        "a[0]",
+        "a[1]",
+        "a[2]",
+        "a[3]"
+      ]
+    },
+    "ansi_ports": {
+      "parsed_inputs": [
+        "a"
+      ]
+    },
+    "assign_alias": {
+      "edge_index": [
+        [],
+        []
+      ]
+    },
+    "frozen_module_drift": {
+      "encoder_training_mode": true,
+      "trainable_encoder_parameters": 0,
+      "changed_buffers": [
+        "dag_gin.layers.0.gin_fwd.nn.1.running_mean",
+        "dag_gin.layers.0.gin_fwd.nn.1.running_var",
+        "dag_gin.layers.0.gin_fwd.nn.1.num_batches_tracked",
+        "dag_gin.layers.0.gin_fwd.nn.4.running_mean",
+        "dag_gin.layers.0.gin_fwd.nn.4.running_var",
+        "dag_gin.layers.0.gin_fwd.nn.4.num_batches_tracked",
+        "dag_gin.layers.0.gin_bwd.nn.1.running_mean",
+        "dag_gin.layers.0.gin_bwd.nn.1.running_var",
+        "dag_gin.layers.0.gin_bwd.nn.1.num_batches_tracked",
+        "dag_gin.layers.0.gin_bwd.nn.4.running_mean",
+        "dag_gin.layers.0.gin_bwd.nn.4.running_var",
+        "dag_gin.layers.0.gin_bwd.nn.4.num_batches_tracked",
+        "dag_gin.layers.0.fuse.1.running_mean",
+        "dag_gin.layers.0.fuse.1.running_var",
+        "dag_gin.layers.0.fuse.1.num_batches_tracked"
+      ],
+      "prefix_max_abs_difference": 0.14369824528694153
+    },
+    "single_gate_training": {
+      "error": "Expected more than 1 value per channel when training, got input size torch.Size([1, 8])"
+    },
+    "real_causal_decoder_gradient": {
+      "loss": 3.4414825439453125,
+      "projector_gradient_l1": 1.4276847876608372,
+      "encoder_gradient_l1": 1.3424361699944711
+    },
+    "exact_answer_budget": {
+      "ids": [
+        3,
+        4,
+        5,
+        9
+      ],
+      "answer_start": 0
+    },
+    "truncated_answer_budget": {
+      "ids": [
+        3,
+        4,
+        5
+      ],
+      "answer_start": 0
+    },
+    "singleton_matching": {
+      "same_positive_negative": true,
+      "labels": [
+        1.0,
+        0.0
+      ]
+    },
+    "zero_cross_attention_configuration": {
+      "outputs_identical": true
+    },
+    "granite_chat_boundary": {
+      "prompt_tail": "ONTEXT>'}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "answer_head": "<think>Find a vector.\nI'll perform a fault simulat",
+      "opens_think_twice": true
+    }
+  }
+}

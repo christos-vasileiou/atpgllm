@@ -1,0 +1,480 @@
+{
+  "groups": {
+    "base_ctx8192_tools0_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 68,
+        "expected_output": 61,
+        "valid_final": 69,
+        "bit_scored_finals": 69,
+        "output_bits": 785,
+        "correct_bits": 774,
+        "pattern_bit_accuracy_sum": 65.5
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 36,
+        "expected_output": 29,
+        "valid_final": 37,
+        "bit_scored_finals": 37,
+        "output_bits": 243,
+        "correct_bits": 232,
+        "pattern_bit_accuracy_sum": 33.5
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 32,
+        "expected_output": 32,
+        "valid_final": 32,
+        "bit_scored_finals": 32,
+        "output_bits": 542,
+        "correct_bits": 542,
+        "pattern_bit_accuracy_sum": 32.0
+      }
+    },
+    "sft_ctx8192_tools0_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 68,
+        "expected_output": 26,
+        "valid_final": 79,
+        "bit_scored_finals": 79,
+        "output_bits": 976,
+        "correct_bits": 750,
+        "pattern_bit_accuracy_sum": 46.09943181818181
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 23,
+        "expected_output": 7,
+        "valid_final": 34,
+        "bit_scored_finals": 34,
+        "output_bits": 192,
+        "correct_bits": 124,
+        "pattern_bit_accuracy_sum": 21.499999999999996
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 45,
+        "expected_output": 19,
+        "valid_final": 45,
+        "bit_scored_finals": 45,
+        "output_bits": 784,
+        "correct_bits": 626,
+        "pattern_bit_accuracy_sum": 24.59943181818182
+      }
+    },
+    "grpo_ctx8192_tools0_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 60,
+        "expected_output": 31,
+        "valid_final": 74,
+        "bit_scored_finals": 74,
+        "output_bits": 1036,
+        "correct_bits": 872,
+        "pattern_bit_accuracy_sum": 45.083333333333336
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 12,
+        "expected_output": 6,
+        "valid_final": 26,
+        "bit_scored_finals": 26,
+        "output_bits": 154,
+        "correct_bits": 96,
+        "pattern_bit_accuracy_sum": 15.791666666666666
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 48,
+        "expected_output": 25,
+        "valid_final": 48,
+        "bit_scored_finals": 48,
+        "output_bits": 882,
+        "correct_bits": 776,
+        "pattern_bit_accuracy_sum": 29.291666666666664
+      }
+    },
+    "base_ctx8192_tools1_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 59,
+        "expected_output": 58,
+        "valid_final": 59,
+        "bit_scored_finals": 59,
+        "output_bits": 366,
+        "correct_bits": 365,
+        "pattern_bit_accuracy_sum": 58.666666666666664,
+        "final_matches_tool_input": 48,
+        "copied_requested_output": 32,
+        "wrong_requested_output": 16,
+        "corrected_wrong_request": 16,
+        "copied_wrong_request": 0
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 39,
+        "expected_output": 38,
+        "valid_final": 39,
+        "bit_scored_finals": 39,
+        "output_bits": 218,
+        "correct_bits": 217,
+        "pattern_bit_accuracy_sum": 38.66666666666667,
+        "final_matches_tool_input": 34,
+        "copied_requested_output": 18,
+        "wrong_requested_output": 16,
+        "corrected_wrong_request": 16,
+        "copied_wrong_request": 0
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 20,
+        "expected_output": 20,
+        "valid_final": 20,
+        "bit_scored_finals": 20,
+        "output_bits": 148,
+        "correct_bits": 148,
+        "pattern_bit_accuracy_sum": 20.0,
+        "final_matches_tool_input": 14,
+        "copied_requested_output": 14,
+        "wrong_requested_output": 0,
+        "corrected_wrong_request": 0,
+        "copied_wrong_request": 0
+      }
+    },
+    "sft_ctx8192_tools1_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 85,
+        "expected_output": 35,
+        "valid_final": 113,
+        "bit_scored_finals": 113,
+        "output_bits": 1331,
+        "correct_bits": 892,
+        "pattern_bit_accuracy_sum": 66.2689393939394,
+        "final_matches_tool_input": 111,
+        "copied_requested_output": 109,
+        "wrong_requested_output": 78,
+        "corrected_wrong_request": 2,
+        "copied_wrong_request": 76
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 30,
+        "expected_output": 11,
+        "valid_final": 58,
+        "bit_scored_finals": 58,
+        "output_bits": 312,
+        "correct_bits": 197,
+        "pattern_bit_accuracy_sum": 34.75,
+        "final_matches_tool_input": 57,
+        "copied_requested_output": 57,
+        "wrong_requested_output": 46,
+        "corrected_wrong_request": 0,
+        "copied_wrong_request": 46
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 55,
+        "expected_output": 24,
+        "valid_final": 55,
+        "bit_scored_finals": 55,
+        "output_bits": 1019,
+        "correct_bits": 695,
+        "pattern_bit_accuracy_sum": 31.51893939393939,
+        "final_matches_tool_input": 54,
+        "copied_requested_output": 52,
+        "wrong_requested_output": 32,
+        "corrected_wrong_request": 2,
+        "copied_wrong_request": 30
+      }
+    },
+    "grpo_ctx8192_tools1_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 94,
+        "expected_output": 41,
+        "valid_final": 118,
+        "bit_scored_finals": 118,
+        "output_bits": 1364,
+        "correct_bits": 998,
+        "pattern_bit_accuracy_sum": 71.39867424242425,
+        "final_matches_tool_input": 118,
+        "copied_requested_output": 114,
+        "wrong_requested_output": 81,
+        "corrected_wrong_request": 4,
+        "copied_wrong_request": 77
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 38,
+        "expected_output": 9,
+        "valid_final": 62,
+        "bit_scored_finals": 62,
+        "output_bits": 340,
+        "correct_bits": 206,
+        "pattern_bit_accuracy_sum": 33.25,
+        "final_matches_tool_input": 62,
+        "copied_requested_output": 62,
+        "wrong_requested_output": 53,
+        "corrected_wrong_request": 0,
+        "copied_wrong_request": 53
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 56,
+        "expected_output": 32,
+        "valid_final": 56,
+        "bit_scored_finals": 56,
+        "output_bits": 1024,
+        "correct_bits": 792,
+        "pattern_bit_accuracy_sum": 38.14867424242424,
+        "final_matches_tool_input": 56,
+        "copied_requested_output": 52,
+        "wrong_requested_output": 28,
+        "corrected_wrong_request": 4,
+        "copied_wrong_request": 24
+      }
+    },
+    "base_ctx16384_tools0_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 131,
+        "expected_output": 118,
+        "valid_final": 137,
+        "bit_scored_finals": 137,
+        "output_bits": 1443,
+        "correct_bits": 1417,
+        "pattern_bit_accuracy_sum": 129.83333333333331
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 69,
+        "expected_output": 56,
+        "valid_final": 75,
+        "bit_scored_finals": 75,
+        "output_bits": 405,
+        "correct_bits": 379,
+        "pattern_bit_accuracy_sum": 67.83333333333334
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 62,
+        "expected_output": 62,
+        "valid_final": 62,
+        "bit_scored_finals": 62,
+        "output_bits": 1038,
+        "correct_bits": 1038,
+        "pattern_bit_accuracy_sum": 62.0
+      }
+    },
+    "sft_ctx16384_tools0_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 77,
+        "expected_output": 31,
+        "valid_final": 97,
+        "bit_scored_finals": 97,
+        "output_bits": 1195,
+        "correct_bits": 922,
+        "pattern_bit_accuracy_sum": 59.12594696969696
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 28,
+        "expected_output": 9,
+        "valid_final": 48,
+        "bit_scored_finals": 48,
+        "output_bits": 279,
+        "correct_bits": 194,
+        "pattern_bit_accuracy_sum": 31.416666666666675
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 49,
+        "expected_output": 22,
+        "valid_final": 49,
+        "bit_scored_finals": 49,
+        "output_bits": 916,
+        "correct_bits": 728,
+        "pattern_bit_accuracy_sum": 27.7092803030303
+      }
+    },
+    "grpo_ctx16384_tools0_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 87,
+        "expected_output": 42,
+        "valid_final": 107,
+        "bit_scored_finals": 107,
+        "output_bits": 1219,
+        "correct_bits": 968,
+        "pattern_bit_accuracy_sum": 68.37973484848484
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 33,
+        "expected_output": 10,
+        "valid_final": 53,
+        "bit_scored_finals": 53,
+        "output_bits": 288,
+        "correct_bits": 181,
+        "pattern_bit_accuracy_sum": 31.374999999999996
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 54,
+        "expected_output": 32,
+        "valid_final": 54,
+        "bit_scored_finals": 54,
+        "output_bits": 931,
+        "correct_bits": 787,
+        "pattern_bit_accuracy_sum": 37.004734848484844
+      }
+    },
+    "base_ctx16384_tools1_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 129,
+        "expected_output": 127,
+        "valid_final": 129,
+        "bit_scored_finals": 129,
+        "output_bits": 1408,
+        "correct_bits": 1374,
+        "pattern_bit_accuracy_sum": 127.83333333333333,
+        "final_matches_tool_input": 117,
+        "copied_requested_output": 74,
+        "wrong_requested_output": 43,
+        "corrected_wrong_request": 43,
+        "copied_wrong_request": 0
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 69,
+        "expected_output": 68,
+        "valid_final": 69,
+        "bit_scored_finals": 69,
+        "output_bits": 374,
+        "correct_bits": 373,
+        "pattern_bit_accuracy_sum": 68.83333333333334,
+        "final_matches_tool_input": 63,
+        "copied_requested_output": 40,
+        "wrong_requested_output": 23,
+        "corrected_wrong_request": 23,
+        "copied_wrong_request": 0
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 60,
+        "expected_output": 59,
+        "valid_final": 60,
+        "bit_scored_finals": 60,
+        "output_bits": 1034,
+        "correct_bits": 1001,
+        "pattern_bit_accuracy_sum": 59.0,
+        "final_matches_tool_input": 54,
+        "copied_requested_output": 34,
+        "wrong_requested_output": 20,
+        "corrected_wrong_request": 20,
+        "copied_wrong_request": 0
+      }
+    },
+    "sft_ctx16384_tools1_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 90,
+        "expected_output": 42,
+        "valid_final": 113,
+        "bit_scored_finals": 113,
+        "output_bits": 1275,
+        "correct_bits": 943,
+        "pattern_bit_accuracy_sum": 71.7471590909091,
+        "final_matches_tool_input": 107,
+        "copied_requested_output": 102,
+        "wrong_requested_output": 72,
+        "corrected_wrong_request": 5,
+        "copied_wrong_request": 67
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 38,
+        "expected_output": 10,
+        "valid_final": 61,
+        "bit_scored_finals": 61,
+        "output_bits": 319,
+        "correct_bits": 204,
+        "pattern_bit_accuracy_sum": 34.208333333333336,
+        "final_matches_tool_input": 56,
+        "copied_requested_output": 56,
+        "wrong_requested_output": 47,
+        "corrected_wrong_request": 0,
+        "copied_wrong_request": 47
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 52,
+        "expected_output": 32,
+        "valid_final": 52,
+        "bit_scored_finals": 52,
+        "output_bits": 956,
+        "correct_bits": 739,
+        "pattern_bit_accuracy_sum": 37.53882575757576,
+        "final_matches_tool_input": 51,
+        "copied_requested_output": 46,
+        "wrong_requested_output": 25,
+        "corrected_wrong_request": 5,
+        "copied_wrong_request": 20
+      }
+    },
+    "grpo_ctx16384_tools1_seed42": {
+      "all": {
+        "slots": 144,
+        "detection": 98,
+        "expected_output": 49,
+        "valid_final": 133,
+        "bit_scored_finals": 133,
+        "output_bits": 1473,
+        "correct_bits": 1043,
+        "pattern_bit_accuracy_sum": 84.16193181818181,
+        "final_matches_tool_input": 127,
+        "copied_requested_output": 123,
+        "wrong_requested_output": 84,
+        "corrected_wrong_request": 4,
+        "copied_wrong_request": 80
+      },
+      "observed_variable_outputs": {
+        "slots": 80,
+        "detection": 38,
+        "expected_output": 14,
+        "valid_final": 73,
+        "bit_scored_finals": 73,
+        "output_bits": 410,
+        "correct_bits": 270,
+        "pattern_bit_accuracy_sum": 43.791666666666664,
+        "final_matches_tool_input": 71,
+        "copied_requested_output": 71,
+        "wrong_requested_output": 57,
+        "corrected_wrong_request": 0,
+        "copied_wrong_request": 57
+      },
+      "observed_constant_outputs": {
+        "slots": 64,
+        "detection": 60,
+        "expected_output": 35,
+        "valid_final": 60,
+        "bit_scored_finals": 60,
+        "output_bits": 1063,
+        "correct_bits": 773,
+        "pattern_bit_accuracy_sum": 40.370265151515156,
+        "final_matches_tool_input": 56,
+        "copied_requested_output": 52,
+        "wrong_requested_output": 27,
+        "corrected_wrong_request": 4,
+        "copied_wrong_request": 23
+      }
+    }
+  },
+  "score_disagreements": [],
+  "caveat": "Five circuits with observed varying outputs and four with constant outputs; source circuits, not variants, are the independent units. Bit scores condition on valid final inputs. Copy/correction denominators additionally require final input equal to the last tool input. Production parsing and gate tables are shared with the offline executor."
+}

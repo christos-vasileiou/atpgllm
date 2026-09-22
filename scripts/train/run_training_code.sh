@@ -13,10 +13,10 @@
 # The #SBATCH resource directives above are DEFAULTS for a direct
 #   sbatch run_training_code.sh <config>
 # For multi-node runs prefer submit_training_code.sh: it reads PARTITION,
-# NUM_NODES, GPUS_PER_NODE, CPUS_PER_TASK, MEM, and TIME_LIMIT from the config
-# file and passes them to sbatch as CLI overrides (which take precedence over the
-# #SBATCH lines here). That keeps this file's directives static while the
-# topology is driven entirely by the config.
+# NODELIST, NUM_NODES, GPUS_PER_NODE, CPUS_PER_TASK, MEM, and TIME_LIMIT from
+# the config file and passes them to sbatch as CLI overrides (which take
+# precedence over the #SBATCH lines here). That keeps this file's directives
+# static while the topology is driven entirely by the config.
 # ---------------------------------------------------------------------------
 
 # Export the exact path of the Slurm log so Python can find it
@@ -120,6 +120,11 @@ esac
 echo "Loading configuration from: $CONFIG_FILE"
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
+# Simulator settings in sourced configs must reach every Python/DDP child.
+export FAULT_SIM_BACKEND TMAX_SERVER_FILE TMAX_SERVER_URL TMAX_SERVER_TOKEN
+export TMAX_BIN CELL_LIBS_VERILOG LIB_VARIANT PVT_CORNER TMAX_LOCK_DIR
+export TMAX_MAX_CONCURRENT TMAX_TIMEOUT_S TMAX_ACQUIRE_TIMEOUT_S
+export TMAX_RESULT_CACHE_SIZE TMAX_REWARD_PROFILE TMAX_KEEP_ARTIFACTS TMAX_PIPELINED_TOOLS
 
 METHOD=${METHOD:-sft}
 
@@ -246,15 +251,17 @@ write_launch_config_snapshot() {
         PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS MAX_STEPS REPORT_TO
         MAX_MODEL_LEN MAX_PROMPT_LENGTH MAX_COMPLETION_LENGTH
         SFT_CIRCUIT_VALIDATION SFT_EVAL_STEPS SFT_EVAL_PER_CIRCUIT
-        ASSISTANT_ONLY_LOSS BUFFER_SIZE NUM_GENERATIONS STEPS_PER_GENERATION
+        ASSISTANT_ONLY_LOSS BUFFER_SIZE NUM_GENERATIONS TRAIN_BEST_OF_N STEPS_PER_GENERATION
         NETLIST_DIVERSITY_STRATEGY DISABLE_DROPOUT VLLM_IMPORTANCE_SAMPLING_MODE
         GRPO_LEARNING_RATE GRPO_WARMUP_STEPS FIXED_EVAL_SIZE FIXED_EVAL_SPLIT
         FIXED_EVAL_MANIFEST FIXED_EVAL_SEED FIXED_EVAL_STEPS
         FIXED_EVAL_GENERATIONS FIXED_EVAL_BATCH_SIZE
         USE_DUAL_ADAPTER USE_DDP USE_VLLM VLLM_MODE PORT
         TENSOR_PARALLEL_SIZE DATA_PARALLEL_SIZE VLLM_GPU_MEM_UTIL
-        PARTITION NUM_NODES GPUS_PER_NODE CPUS_PER_TASK MEM
+        PARTITION NODELIST NUM_NODES GPUS_PER_NODE CPUS_PER_TASK MEM
         LORA_RANK LORA_ALPHA LORA_TARGET_MODULES QWEN_MOE TUNE_MOE_ROUTER MOE_MAX_MEMORY_GIB
+        FAULT_SIM_BACKEND TMAX_SERVER_FILE TMAX_SERVER_URL TMAX_MAX_CONCURRENT
+        TMAX_TIMEOUT_S TMAX_ACQUIRE_TIMEOUT_S TMAX_RESULT_CACHE_SIZE TMAX_REWARD_PROFILE TMAX_PIPELINED_TOOLS
         WANDB_PROJECT DRY_RUN
     )
     _snap_stamp="$(date +%Y%m%d_%H%M%S)"
@@ -436,6 +443,7 @@ build_cmd_args() {
         CMD_ARGS+=(
             --buffer_size "$BUFFER_SIZE"
             --num_generations "$NUM_GENERATIONS"
+            --train_best_of_n "${TRAIN_BEST_OF_N:-0}"
             --steps_per_generation "$STEPS_PER_GENERATION"
             --max_completion_length "$MAX_COMPLETION_LENGTH"
             --vllm_importance_sampling_mode "${VLLM_IMPORTANCE_SAMPLING_MODE:-token_truncate}"
@@ -448,7 +456,7 @@ build_cmd_args() {
                 --fixed_eval_split "${FIXED_EVAL_SPLIT:-test}"
                 --fixed_eval_seed "${FIXED_EVAL_SEED:-1729}"
                 --fixed_eval_steps "${FIXED_EVAL_STEPS:-5}"
-                --fixed_eval_generations "${FIXED_EVAL_GENERATIONS:-3}"
+                --fixed_eval_generations "${FIXED_EVAL_GENERATIONS:-1}"
                 --fixed_eval_batch_size "${FIXED_EVAL_BATCH_SIZE:-1}"
             )
             if [ -n "${FIXED_EVAL_MANIFEST:-}" ]; then
@@ -717,7 +725,7 @@ trap cleanup EXIT INT TERM
 echo ""
 echo "=============================================="
 echo "Launch mode: $([ "$MULTINODE" == "true" ] && echo MULTI-NODE || echo SINGLE-NODE)"
-echo "PARTITION=$PARTITION NUM_NODES=$NUM_NODES GPUS_PER_NODE=${GPUS_PER_NODE:-'(local detect)'}"
+echo "PARTITION=$PARTITION NODELIST=${NODELIST:-'(scheduler selected)'} NUM_NODES=$NUM_NODES GPUS_PER_NODE=${GPUS_PER_NODE:-'(local detect)'}"
 echo "=============================================="
 
 if [ "$MULTINODE" == "true" ]; then

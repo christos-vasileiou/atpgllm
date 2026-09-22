@@ -1,0 +1,11 @@
+{
+  "counts": {
+    "final_detection_labels_checked": 463,
+    "final_output_labels_checked": 463,
+    "correct_final_outputs": 226,
+    "incorrect_final_outputs": 237,
+    "tool_output_tables_checked": 494
+  },
+  "mismatches": [],
+  "scope": "Hand-derived half_wave (INV/OR), adder (four independent half adders), and multiple_module_opt2 (tie low). Checks all completed variants and checkpoints; does not validate every circuit in the pilot."
+}

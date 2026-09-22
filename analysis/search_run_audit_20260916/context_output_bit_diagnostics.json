@@ -1,0 +1,35 @@
+{
+  "scope": "FINAL slots whose selected vector matches the last tool observation; missing output bits count as incorrect. Conditioning excludes invalid finals and changed vectors. Length is confounded with output width and circuit difficulty.",
+  "groups": {
+    "initial_2049_4096": {
+      "slots": 3494,
+      "output_bits": 122542,
+      "correct_bits": 83623,
+      "exact": 328,
+      "pattern_bit_accuracy_sum": 2306.547107997921,
+      "micro_bit_accuracy": 0.6824027680305528,
+      "macro_pattern_bit_accuracy": 0.660145136805358,
+      "mean_output_bits": 35.07212364052662
+    },
+    "initial_le_2048": {
+      "slots": 3454,
+      "output_bits": 40311,
+      "correct_bits": 26819,
+      "exact": 885,
+      "pattern_bit_accuracy_sum": 2272.6040127313645,
+      "micro_bit_accuracy": 0.6653022748133264,
+      "macro_pattern_bit_accuracy": 0.6579629452030586,
+      "mean_output_bits": 11.670816444701796
+    },
+    "initial_gt_4096": {
+      "slots": 653,
+      "output_bits": 31570,
+      "correct_bits": 20031,
+      "exact": 37,
+      "pattern_bit_accuracy_sum": 398.65705954779776,
+      "micro_bit_accuracy": 0.6344947735191637,
+      "macro_pattern_bit_accuracy": 0.6105008568878986,
+      "mean_output_bits": 48.34609494640122
+    }
+  }
+}

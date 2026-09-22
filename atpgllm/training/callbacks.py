@@ -1579,7 +1579,7 @@ class SFTStoppingCallback(TrainerCallback):
                 if not tool_call:
                     continue
 
-                tool_call["arguments"].update({"netlist": ToolHelper.get_netlist(prompts[prompt_index_map[idx]])})
+                tool_call["arguments"].update(ToolHelper.context(prompts[prompt_index_map[idx]]))
                 tool_result = self._execute_tool_call(tool_call)
 
                 try:
@@ -1746,7 +1746,7 @@ class SFTStoppingCallback(TrainerCallback):
 
         for idx, ft in enumerate(first_turns):
             tool_call = self._parse_tool_call(ft)
-            tool_call["arguments"].update({"netlist": ToolHelper.get_netlist(prompts[prompt_index_map[idx]])})
+            tool_call["arguments"].update(ToolHelper.context(prompts[prompt_index_map[idx]]))
             tool_result = self._execute_tool_call(tool_call)
             
             try:
@@ -1961,7 +1961,7 @@ class SFTStoppingCallback(TrainerCallback):
                     tool_call = self._parse_tool_call(completion_text)
                     if tool_call is not None:
                         # Get the netlist from the current input
-                        tool_call["arguments"].update({"netlist": ToolHelper.get_netlist(states[i]["current_input"])})
+                        tool_call["arguments"].update(ToolHelper.context(states[i]["current_input"]))
                         
                         # Execute tool synchronously for this specific path
                         tool_result = self._execute_tool_call(tool_call)

@@ -62,7 +62,8 @@ echo "  meta:     ${FROZEN}.meta"
 # Build sbatch resource overrides from the (frozen) config.
 #
 # #SBATCH directives inside run_training_code.sh are static, so the topology
-# (partition, node count, GPUs/node, CPUs, memory, wall time) is driven here instead:
+# (partition, optional node list, node count, GPUs/node, CPUs, memory, wall time)
+# is driven here instead:
 # sbatch CLI flags take precedence over #SBATCH lines. This is what makes the
 # SAME launcher work for single-node (4xH100: PARTITION=h100, NUM_NODES=1,
 # GPUS_PER_NODE=4) and multi-node (H200: NUM_NODES=2/3, GPUS_PER_NODE=2).
@@ -70,6 +71,7 @@ echo "  meta:     ${FROZEN}.meta"
 # shellcheck source=/dev/null
 source "$FROZEN"
 PARTITION="${PARTITION:-h200}"
+NODELIST="${NODELIST:-}"
 NUM_NODES="${NUM_NODES:-1}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-32}"
@@ -87,6 +89,12 @@ SBATCH_FLAGS=(
     --time="$TIME_LIMIT"
     --job-name="$JOB_NAME"
 )
+
+if [ -n "$NODELIST" ]; then
+    SBATCH_FLAGS+=(--nodelist="$NODELIST")
+else
+    echo "No node list specified; Slurm will choose the node(s)"
+fi
 
 RESERVATION="${RESERVATION:-}"
 if [ -n "$RESERVATION" ]; then

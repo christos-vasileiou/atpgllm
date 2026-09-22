@@ -81,6 +81,7 @@ from atpgllm.training.gdpo import (
     select_objective_columns,
 )
 from atpgllm.training.grpo_loss import GenerationBatchLossMixin
+from atpgllm.training.best_of_n import BestOfNTrainingMixin
 
 # Adapter name constants
 REFERENCE_ADAPTER_NAME = "reference"
@@ -98,7 +99,7 @@ from trl.models import unwrap_model_for_generation
 from vllm import SamplingParams
 from vllm.sampling_params import GuidedDecodingParams
 
-class DualAdapterGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
+class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRPOTrainer):
     """
     GRPOTrainer variant that uses a dual-adapter (LoRA-on-LoRA) approach.
 
@@ -744,6 +745,13 @@ class DualAdapterGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
           - list[float] / list of numeric scalars (legacy)
           - list[dict[str, float]] from :func:`test_generation_grpo_reward` (via factory)
         """
+        from atpgllm.llm.reward_funcs import using_native_simulator
+        if using_native_simulator():
+            from atpgllm.training.tools import abort_on_simulator_failure
+            abort_on_simulator_failure(self, any(
+                isinstance(row, dict) and row.get("simulator_error_logonly", 0)
+                for row in output_reward_func
+            ))
         return reward_output_to_tensors(
             output_reward_func,
             device,
@@ -782,6 +790,8 @@ class DualAdapterGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
         Keys ending with ``REWARD_LOGONLY_SUFFIX`` are logged under the same name with that
         suffix removed so dashboards stay aligned with historical run keys.
         """
+        if getattr(self, "_ranking_candidates", False):
+            return
         if comp_mat is None or not keys:
             return
         metrics_root = getattr(self, "_metrics", None)
@@ -808,7 +818,7 @@ class DualAdapterGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
         """
         Phase-0 GRPO sampling diagnostic (inline; logged to W&B via ``self._metrics``).
 
-        Quantifies whether i.i.d. best-of-N group sampling is starving GRPO of
+        Quantifies whether retained group sampling is starving GRPO of
         gradient. A group (the ``num_generations`` completions for one prompt) is
         *degenerate* when all its completions receive the same training scalar, so
         the within-group advantage is zero and the prompt contributes no gradient.
@@ -828,6 +838,8 @@ class DualAdapterGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
         Gathered in rank order before grouping, so groups split across ranks
         during evaluation and global training statistics are both correct.
         """
+        if getattr(self, "_ranking_candidates", False):
+            return
         if comp_mat is None or not comp_keys:
             return
         detect_key = "fault_detected_by_pred_input_vector_acc_logonly"
@@ -935,6 +947,8 @@ class DualAdapterGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
         All ranks enter this method once per generation batch. Rank-ordered
         gathering makes the rolling window match the global effective batch.
         """
+        if getattr(self, "_ranking_candidates", False):
+            return
         if not self.model.training or not inputs:
             return
         metrics_root = getattr(self, "_metrics", None)
@@ -1146,6 +1160,8 @@ class DualAdapterGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
 
         # Gather across DDP ranks — rewards must be global for per-group normalisation
         rewards_per_func = gather(rewards_per_func)
+        if getattr(self, "_ranking_candidates", False):
+            return rewards_per_func
         mode = "train" if self.model.training else "eval"
         for index, name in enumerate(self.reward_func_names):
             self._metrics[mode].setdefault(f"rewards/{name}/raw_mean", []).append(
@@ -1193,6 +1209,9 @@ class DualAdapterGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
           (prompt_ids, completion_ids, tool_mask, completions,
            total_completion_tokens, logprobs, extra_fields)
         """
+        if getattr(self, "_best_of_inputs", None) is not None and not getattr(self, "_ranking_candidates", False):
+            return self._generate_best_of_n(prompts)
+
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
         generation_start_time = time.perf_counter()
@@ -1370,240 +1389,221 @@ class DualAdapterGRPOTrainer(GenerationBatchLossMixin, GRPOTrainer):
         else:
             max_model_len = getattr(self.model.config, 'max_position_embeddings', 4096)
 
-        while True:
-            # ==================================================================
-            # Phase 1 (local): execute tools, check overlong
-            # ==================================================================
-            prompts_for_gen = []
-            local_max_tokens = self.max_completion_length
+        from atpgllm.training.tools import ToolScheduler, abort_on_simulator_failure
+        with ToolScheduler(self.tool_functions) as scheduler:
+            while True:
+                # ==================================================================
+                # Phase 1 (local): execute tools, check overlong
+                # ==================================================================
+                prompts_for_gen = []
+                local_max_tokens = self.max_completion_length
 
-            if idxs_with_tool:
-                prompt_completion_tools = []
-                for i, idx in enumerate(idxs_with_tool):
-                    if is_conversational({"prompt": prompts[idx]}):
-                        conv = copy.deepcopy(prompts[idx])
-                    else:
-                        conv = [{"role": "user", "content": prompts[idx]}]
+                tool_calls, idxs_with_tool, batch_outcomes = scheduler.take(
+                    self, tool_calls, idxs_with_tool, prompts
+                )
+                abort_on_simulator_failure(self, any(failed for _, failed in batch_outcomes))
 
-                    if isinstance(completions[idx], list):
-                        for msg in completions[idx]:
-                            conv.append(msg)
-                    else:
-                        conv.append({"role": "assistant", "content": completions[idx]})
+                if idxs_with_tool:
+                    prompt_completion_tools = []
+                    for i, idx in enumerate(idxs_with_tool):
+                        if is_conversational({"prompt": prompts[idx]}):
+                            conv = copy.deepcopy(prompts[idx])
+                        else:
+                            conv = [{"role": "user", "content": prompts[idx]}]
 
-                    prompt_completion_tools.append(conv)
+                        if isinstance(completions[idx], list):
+                            for msg in completions[idx]:
+                                conv.append(msg)
+                        else:
+                            conv.append({"role": "assistant", "content": completions[idx]})
 
-                for i, idx in enumerate(idxs_with_tool):
-                    tool_call = tool_calls[i]
-                    tool_name = tool_call.get("name")
-                    tool_args = tool_call.get("arguments", {})
-                    if isinstance(tool_args, str):
-                        try:
-                            tool_args = json.loads(tool_args)
-                        except json.JSONDecodeError:
-                            tool_args = None
-                    if not isinstance(tool_args, dict):
-                        tool_failure_count += 1
-                        result = f"Tool execution failed: invalid 'arguments' (expected object, got {type(tool_call.get('arguments')).__name__})"
-                        tool_message = {"role": "tool", "name": tool_name, "content": str(result)}
+                        prompt_completion_tools.append(conv)
+
+                    for i, idx in enumerate(idxs_with_tool):
+                        tool_name = tool_calls[i].get("name")
+                        result, _ = batch_outcomes[i]
+                        tool_call_count += 1
+                        tool_failure_count += int(result.startswith("Tool execution failed:"))
+                        tool_message = {"role": "tool", "name": tool_name, "content": result}
                         prompt_completion_tools[i].append(tool_message)
                         if isinstance(completions[idx], list):
                             completions[idx].append(tool_message)
+                        else:
+                            completions[idx] = [
+                                {'role': 'assistant', 'content': completions[idx]}, tool_message
+                            ]
+
+                    tokenized_convs = [
+                        self.processing_class.apply_chat_template(
+                            conv, tokenize=True, tools=self.tools, add_generation_prompt=True,
+                        )
+                        for conv in prompt_completion_tools
+                    ]
+                    pct_ids = [t if isinstance(t, list) else t["input_ids"] for t in tokenized_convs]
+
+                    overlong = [len(pct) >= max_model_len for pct in pct_ids]
+
+                    for i, idx in enumerate(idxs_with_tool):
+                        if overlong[i]:
+                            prompt_length = len(prompt_ids[idx])
+                            ct = pct_ids[i][prompt_length : prompt_length + self.max_completion_length]
+                            completion_ids[idx] = ct
+                            current_mask_len = len(tool_mask[idx])
+                            if len(ct) > current_mask_len:
+                                tool_mask[idx] += [0] * (len(ct) - current_mask_len)
+                            elif len(ct) < current_mask_len:
+                                tool_mask[idx] = tool_mask[idx][: len(ct)]
+                            if logprobs is not None:
+                                current_logprobs_len = len(logprobs[idx])
+                                if len(ct) > current_logprobs_len:
+                                    logprobs[idx] += [0.0] * (len(ct) - current_logprobs_len)
+                                elif len(ct) < current_logprobs_len:
+                                    logprobs[idx] = logprobs[idx][: len(ct)]
+
+                    surviving_indices = [i for i, o in enumerate(overlong) if not o]
+                    idxs_with_tool = [idxs_with_tool[i] for i in surviving_indices]
+                    prompt_completion_tools = [prompt_completion_tools[i] for i in surviving_indices]
+                    pct_ids = [pct_ids[i] for i in surviving_indices]
+
+                    if idxs_with_tool:
+                        prompts_for_gen = prompt_completion_tools
+
+                # ==================================================================
+                # Phase 2 (DDP sync): decide whether to continue
+                # ==================================================================
+                # All ranks vote: does *any* rank still have prompts needing a
+                # continuation?  If not, every rank breaks out together.
+                local_has_gen = len(prompts_for_gen) > 0
+                if self.accelerator.num_processes > 1:
+                    sync_tensor = torch.tensor([1 if local_has_gen else 0], device=device)
+                    any_has_gen = self.accelerator.gather(sync_tensor).sum().item() > 0
+                else:
+                    any_has_gen = local_has_gen
+
+                if not any_has_gen:
+                    pending = torch.tensor([bool(scheduler.pending)], device=device)
+                    if self.accelerator.num_processes > 1:
+                        pending = self.accelerator.gather(pending)
+                    if pending.any().item():
+                        tool_calls, idxs_with_tool = [], []
                         continue
-                    tool_args["netlist"] = ToolHelper.get_netlist(prompts[idx][1]["content"])
-
-                    if tool_name in self.tool_functions:
-                        tool_call_count += 1
-                        try:
-                            func = self.tool_functions[tool_name]
-                            if asyncio.iscoroutinefunction(func):
-                                if self._has_async_reward_funcs:
-                                    future = asyncio.run_coroutine_threadsafe(
-                                        func(**tool_args), self.async_reward_loop
-                                    )
-                                    result = future.result(timeout=60)
-                                else:
-                                    result = asyncio.get_event_loop().run_until_complete(func(**tool_args))
-                            else:
-                                result = func(**tool_args)
-                        except Exception as e:
-                            tool_failure_count += 1
-                            result = f"Tool execution failed: {e}"
-                    else:
-                        tool_failure_count += 1
-                        result = f"Unknown tool: {tool_name}. Available tools: {list(self.tool_functions.keys())}"
-
-                    tool_message = {"role": "tool", "name": tool_name, "content": str(result)}
-                    prompt_completion_tools[i].append(tool_message)
-
-                    if isinstance(completions[idx], list):
-                        completions[idx].append(tool_message)
-
-                tokenized_convs = [
-                    self.processing_class.apply_chat_template(
-                        conv, tokenize=True, tools=self.tools, add_generation_prompt=True,
-                    )
-                    for conv in prompt_completion_tools
-                ]
-                pct_ids = [t if isinstance(t, list) else t["input_ids"] for t in tokenized_convs]
-
-                overlong = [len(pct) >= max_model_len for pct in pct_ids]
-
-                for i, idx in enumerate(idxs_with_tool):
-                    if overlong[i]:
-                        prompt_length = len(prompt_ids[idx])
-                        ct = pct_ids[i][prompt_length : prompt_length + self.max_completion_length]
-                        completion_ids[idx] = ct
-                        current_mask_len = len(tool_mask[idx])
-                        if len(ct) > current_mask_len:
-                            tool_mask[idx] += [0] * (len(ct) - current_mask_len)
-                        elif len(ct) < current_mask_len:
-                            tool_mask[idx] = tool_mask[idx][: len(ct)]
-                        if logprobs is not None:
-                            current_logprobs_len = len(logprobs[idx])
-                            if len(ct) > current_logprobs_len:
-                                logprobs[idx] += [0.0] * (len(ct) - current_logprobs_len)
-                            elif len(ct) < current_logprobs_len:
-                                logprobs[idx] = logprobs[idx][: len(ct)]
-
-                surviving_indices = [i for i, o in enumerate(overlong) if not o]
-                idxs_with_tool = [idxs_with_tool[i] for i in surviving_indices]
-                prompt_completion_tools = [prompt_completion_tools[i] for i in surviving_indices]
-                pct_ids = [pct_ids[i] for i in surviving_indices]
-
-                if idxs_with_tool:
-                    prompts_for_gen = prompt_completion_tools
-
-            # ==================================================================
-            # Phase 2 (DDP sync): decide whether to continue
-            # ==================================================================
-            # All ranks vote: does *any* rank still have prompts needing a
-            # continuation?  If not, every rank breaks out together.
-            local_has_gen = len(prompts_for_gen) > 0
-            if self.accelerator.num_processes > 1:
-                sync_tensor = torch.tensor([1 if local_has_gen else 0], device=device)
-                any_has_gen = self.accelerator.gather(sync_tensor).sum().item() > 0
-            else:
-                any_has_gen = local_has_gen
-
-            if not any_has_gen:
-                break
-
-            # ==================================================================
-            # Phase 3 (DDP collective): generate tool-call continuations
-            # ==================================================================
-            # All ranks enter _generate_tool_continuation together (even those
-            # with empty prompt lists) so the internal gather/broadcast ops
-            # don't deadlock.
-            #
-            # max_tokens is set to max_completion_length for all prompts.
-            # vLLM internally caps each completion to
-            # min(max_tokens, max_model_len - prompt_length), so short prompts
-            # get the full budget while long prompts are naturally limited.
-            # Phase 1's overlong check already removed prompts that exceed
-            # max_model_len, so no request can cause a vLLM rejection.
-            prompt_completion_tool_ids, post_tool_ids, post_tool_logprobs, _ = (
-                self._generate_tool_continuation(prompts_for_gen)
-            )
-
-            # ==================================================================
-            # Phase 4 (local): stitch results, parse next tool calls
-            # ==================================================================
-            # Ranks that had no prompts in this iteration skip straight to the
-            # top of the loop (their idxs_with_tool stays empty for the next
-            # Phase 2 vote).
-            if not idxs_with_tool:
-                continue
-
-            # 4a. Sanity check: the re-tokenised conversation should still
-            #     start with the original prompt tokens (prefix-preserving).
-            for i, idx in enumerate(idxs_with_tool):
-                pct = prompt_completion_tool_ids[i]
-                orig_prompt = prompt_ids[idx]
-                if pct[:len(orig_prompt)] != orig_prompt:
-                    warnings.warn(
-                        "The chat template may not be prefix-preserving. This could affect training quality."
-                    )
                     break
 
-            # 4b. Truncate if (old_completion + tool_result + new_completion)
-            #     exceeds max_completion_length.  Trim from the tail of the
-            #     new model output first, then the tool-result prefix.
-            for i, idx in enumerate(idxs_with_tool):
-                prompt_len = len(prompt_ids[idx])
-                completion_tool_ids = prompt_completion_tool_ids[i][prompt_len:]
-                excess_length = len(completion_tool_ids) + len(post_tool_ids[i]) - self.max_completion_length
+                # ==================================================================
+                # Phase 3 (DDP collective): generate tool-call continuations
+                # ==================================================================
+                # All ranks enter _generate_tool_continuation together (even those
+                # with empty prompt lists) so the internal gather/broadcast ops
+                # don't deadlock.
+                #
+                # max_tokens is set to max_completion_length for all prompts.
+                # vLLM internally caps each completion to
+                # min(max_tokens, max_model_len - prompt_length), so short prompts
+                # get the full budget while long prompts are naturally limited.
+                # Phase 1's overlong check already removed prompts that exceed
+                # max_model_len, so no request can cause a vLLM rejection.
+                prompt_completion_tool_ids, post_tool_ids, post_tool_logprobs, _ = (
+                    self._generate_tool_continuation(prompts_for_gen)
+                )
 
-                if excess_length > 0:
-                    if len(post_tool_ids[i]) > excess_length:
-                        post_tool_ids[i] = post_tool_ids[i][:-excess_length]
+                # ==================================================================
+                # Phase 4 (local): stitch results, parse next tool calls
+                # ==================================================================
+                # Ranks that had no prompts in this iteration skip straight to the
+                # top of the loop (their idxs_with_tool stays empty for the next
+                # Phase 2 vote).
+                if not idxs_with_tool:
+                    continue
+
+                # 4a. Sanity check: the re-tokenised conversation should still
+                #     start with the original prompt tokens (prefix-preserving).
+                for i, idx in enumerate(idxs_with_tool):
+                    pct = prompt_completion_tool_ids[i]
+                    orig_prompt = prompt_ids[idx]
+                    if pct[:len(orig_prompt)] != orig_prompt:
+                        warnings.warn(
+                            "The chat template may not be prefix-preserving. This could affect training quality."
+                        )
+                        break
+
+                # 4b. Truncate if (old_completion + tool_result + new_completion)
+                #     exceeds max_completion_length.  Trim from the tail of the
+                #     new model output first, then the tool-result prefix.
+                for i, idx in enumerate(idxs_with_tool):
+                    prompt_len = len(prompt_ids[idx])
+                    completion_tool_ids = prompt_completion_tool_ids[i][prompt_len:]
+                    excess_length = len(completion_tool_ids) + len(post_tool_ids[i]) - self.max_completion_length
+
+                    if excess_length > 0:
+                        if len(post_tool_ids[i]) > excess_length:
+                            post_tool_ids[i] = post_tool_ids[i][:-excess_length]
+                            if post_tool_logprobs is not None and post_tool_logprobs[i]:
+                                post_tool_logprobs[i] = post_tool_logprobs[i][:-excess_length]
+                        else:
+                            remaining_excess = excess_length - len(post_tool_ids[i])
+                            post_tool_ids[i] = []
+                            if post_tool_logprobs is not None:
+                                post_tool_logprobs[i] = []
+                            if remaining_excess > 0:
+                                prompt_completion_tool_ids[i] = prompt_completion_tool_ids[i][:-remaining_excess]
+
+                # 4c. Stitch: concatenate old_completion + tool_tokens + new_output
+                #     and update tool_mask / logprobs to match.
+                #     tool_mask: 0 for injected tool-result tokens, 1 for model tokens.
+                #     logprobs:  0.0 placeholders for non-model tokens.
+                for i, idx in enumerate(idxs_with_tool):
+                    prompt_length = len(prompt_ids[idx])
+                    old_completion_length = len(completion_ids[idx])
+
+                    new_completion = prompt_completion_tool_ids[i][prompt_length:] + post_tool_ids[i]
+
+                    pct_completion_len = len(prompt_completion_tool_ids[i]) - prompt_length
+                    tool_result_length = pct_completion_len - old_completion_length
+                    post_tool_length = len(post_tool_ids[i])
+
+                    tool_mask[idx] = tool_mask[idx] + [0] * tool_result_length + [1] * post_tool_length
+                    completion_ids[idx] = new_completion
+
+                    if logprobs is not None:
+                        logprobs[idx] = logprobs[idx] + [0.0] * tool_result_length
                         if post_tool_logprobs is not None and post_tool_logprobs[i]:
-                            post_tool_logprobs[i] = post_tool_logprobs[i][:-excess_length]
-                    else:
-                        remaining_excess = excess_length - len(post_tool_ids[i])
-                        post_tool_ids[i] = []
-                        if post_tool_logprobs is not None:
-                            post_tool_logprobs[i] = []
-                        if remaining_excess > 0:
-                            prompt_completion_tool_ids[i] = prompt_completion_tool_ids[i][:-remaining_excess]
+                            logprobs[idx] = logprobs[idx] + post_tool_logprobs[i]
+                        else:
+                            logprobs[idx] = logprobs[idx] + [0.0] * post_tool_length
 
-            # 4c. Stitch: concatenate old_completion + tool_tokens + new_output
-            #     and update tool_mask / logprobs to match.
-            #     tool_mask: 0 for injected tool-result tokens, 1 for model tokens.
-            #     logprobs:  0.0 placeholders for non-model tokens.
-            for i, idx in enumerate(idxs_with_tool):
-                prompt_length = len(prompt_ids[idx])
-                old_completion_length = len(completion_ids[idx])
+                # 4d. Decode the new model output and check for further tool calls.
+                post_tool_texts = self.processing_class.batch_decode(post_tool_ids, skip_special_tokens=True)
 
-                new_completion = prompt_completion_tool_ids[i][prompt_length:] + post_tool_ids[i]
+                for i, idx in enumerate(idxs_with_tool):
+                    if post_tool_texts[i]:
+                        post_tool_msg = revert_assistant_completion(
+                            restore_generation_prefix(post_tool_texts[i], self.processing_class,
+                                                      self.chat_template_kwargs),
+                            tokenizer=self.processing_class
+                        )
+                        if isinstance(completions[idx], list):
+                            if isinstance(post_tool_msg, list) and isinstance(post_tool_msg[0], dict):
+                                completions[idx] += post_tool_msg
+                            elif isinstance(post_tool_msg, dict):
+                                completions[idx].append(post_tool_msg)
+                        else:
+                            completions[idx] = [
+                                {"role": "assistant", "content": completions[idx]},
+                                post_tool_msg,
+                            ]
 
-                pct_completion_len = len(prompt_completion_tool_ids[i]) - prompt_length
-                tool_result_length = pct_completion_len - old_completion_length
-                post_tool_length = len(post_tool_ids[i])
+                new_tool_calls = [self._parse_tool_call(text) for text in post_tool_texts]
+                new_idxs_with_tool = []
+                new_tool_calls_filtered = []
+                for i, idx in enumerate(idxs_with_tool):
+                    if new_tool_calls[i] is not None:
+                        new_idxs_with_tool.append(idx)
+                        new_tool_calls_filtered.append(new_tool_calls[i])
 
-                tool_mask[idx] = tool_mask[idx] + [0] * tool_result_length + [1] * post_tool_length
-                completion_ids[idx] = new_completion
-
-                if logprobs is not None:
-                    logprobs[idx] = logprobs[idx] + [0.0] * tool_result_length
-                    if post_tool_logprobs is not None and post_tool_logprobs[i]:
-                        logprobs[idx] = logprobs[idx] + post_tool_logprobs[i]
-                    else:
-                        logprobs[idx] = logprobs[idx] + [0.0] * post_tool_length
-
-            # 4d. Decode the new model output and check for further tool calls.
-            post_tool_texts = self.processing_class.batch_decode(post_tool_ids, skip_special_tokens=True)
-
-            for i, idx in enumerate(idxs_with_tool):
-                if post_tool_texts[i]:
-                    post_tool_msg = revert_assistant_completion(
-                        restore_generation_prefix(post_tool_texts[i], self.processing_class,
-                                                  self.chat_template_kwargs),
-                        tokenizer=self.processing_class
-                    )
-                    if isinstance(completions[idx], list):
-                        if isinstance(post_tool_msg, list) and isinstance(post_tool_msg[0], dict):
-                            completions[idx] += post_tool_msg
-                        elif isinstance(post_tool_msg, dict):
-                            completions[idx].append(post_tool_msg)
-                    else:
-                        completions[idx] = [
-                            {"role": "assistant", "content": completions[idx]},
-                            post_tool_msg,
-                        ]
-
-            new_tool_calls = [self._parse_tool_call(text) for text in post_tool_texts]
-            new_idxs_with_tool = []
-            new_tool_calls_filtered = []
-            for i, idx in enumerate(idxs_with_tool):
-                if new_tool_calls[i] is not None:
-                    new_idxs_with_tool.append(idx)
-                    new_tool_calls_filtered.append(new_tool_calls[i])
-
-            idxs_with_tool = new_idxs_with_tool
-            tool_calls = new_tool_calls_filtered
-        
-        # Log tool call metrics
+                idxs_with_tool = new_idxs_with_tool
+                tool_calls = new_tool_calls_filtered
+            
+            # Log tool call metrics
         mode = "train" if self.model.training else "eval"
         if tool_call_count > 0:
             self._metrics[mode]["tools/call_count"].append(tool_call_count)

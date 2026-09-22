@@ -1,0 +1,90 @@
+{
+  "manifest_sha256": "7d61c8ce33fc76530bd93c4fdea5958ca069edf3041fea9611fa5a0d7fe122e0",
+  "jobs": [
+    {
+      "job": "base_ctx8192_tools0_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/base_ctx8192_tools0_seed42.json",
+      "sha256": "54de7da77f94ece3b500f0c168e7fb7a78be4fbd69ef0056a7efdf426400a8a3",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "sft_ctx8192_tools0_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/sft_ctx8192_tools0_seed42.json",
+      "sha256": "b7475a97a50255762d647ff3d0853bf285445f6f3984071bb02b2839c4270e0b",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "grpo_ctx8192_tools0_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/grpo_ctx8192_tools0_seed42.json",
+      "sha256": "23e604be26ba94460434d816621685481b8140800f6f97e92908a6344941b1d7",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "base_ctx8192_tools1_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/base_ctx8192_tools1_seed42.json",
+      "sha256": "b9d8829718afc8185f12346160fa512c1e5eda2e478520fd1ef7e147fbd4cad9",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "sft_ctx8192_tools1_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/sft_ctx8192_tools1_seed42.json",
+      "sha256": "6fe2623426bc5a367e8410bb94d34ec836c4d17b6af7510a6503cee13037749d",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "grpo_ctx8192_tools1_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/grpo_ctx8192_tools1_seed42.json",
+      "sha256": "d1220002f6a68e83b11f14bf7802092f8073da5268dfc8faef9f6c1a504618e3",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "base_ctx16384_tools0_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/base_ctx16384_tools0_seed42.json",
+      "sha256": "a9913b77008a8f6aa188f28aa5d9caa20869d14453c71fc79f1b392b1e02466b",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "sft_ctx16384_tools0_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/sft_ctx16384_tools0_seed42.json",
+      "sha256": "a922c0e1465bd84ea5a317e5cbd489720eedfed9fd70447bd89c5c012e299a72",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "grpo_ctx16384_tools0_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/grpo_ctx16384_tools0_seed42.json",
+      "sha256": "247dfbe534f2b05911018e0d520e9d970b8a0de0c40a1ff172775b74e516fce3",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "base_ctx16384_tools1_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/base_ctx16384_tools1_seed42.json",
+      "sha256": "8aba31ad2b5c107dee6527c98c2dfe33d27b05f53c0d87340e3a4e80d3f443e0",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "sft_ctx16384_tools1_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/sft_ctx16384_tools1_seed42.json",
+      "sha256": "999497a7618170e31ba105abee300679322b2918afa06752cb4e020e34b819d4",
+      "problems": 36,
+      "slots": 144
+    },
+    {
+      "job": "grpo_ctx16384_tools1_seed42",
+      "path": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/circuit_comparison_explicit_20260916/grpo_ctx16384_tools1_seed42.json",
+      "sha256": "b40bf3dad30694594e9f09ef44015bcd16cc04aa435cd4451acb0c9c10d0e6f2",
+      "problems": 36,
+      "slots": 144
+    }
+  ],
+  "slots": 1728
+}

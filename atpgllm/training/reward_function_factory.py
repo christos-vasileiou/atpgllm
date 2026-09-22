@@ -1,3 +1,4 @@
+import os
 import regex as re
 import json
 import codecs
@@ -12,10 +13,12 @@ import hashlib
 from atpgllm.training._paths import ensure_data_preprocessing_on_path, resolve_sim_config_path
 ensure_data_preprocessing_on_path()
 
-from fault_sim import OptimizedNetlist, resolve_fault_sim_runner
+from fault_sim import OptimizedNetlist, prepare_netlist, resolve_fault_sim_runner
 from atpgllm.llm.reward_funcs import (
     ATPG_GDPO_OBJECTIVE_KEYS,
     ATPG_GDPO_OBJECTIVE_WEIGHTS,
+    active_reward_objectives,
+    using_native_simulator,
     extract_json_tool_response_and_convert_to_df,
     extract_markdown_table,
     markdown_table_to_dataframe,
@@ -218,7 +221,7 @@ class RewardFunctionFactory:
                     oldest_key = next(iter(self._netlist_cache))
                     del self._netlist_cache[oldest_key]
                 
-                self._netlist_cache[cache_key] = OptimizedNetlist(
+                self._netlist_cache[cache_key] = prepare_netlist(
                     netlist_str, 
                     self.gate_funcs, 
                     self.DECL_RE, 
@@ -348,6 +351,11 @@ class RewardFunctionFactory:
                 ]
             except Exception as e:
                 print(f"Warning: Failed to parse some netlists: {e}")
+                if using_native_simulator():
+                    if not return_component_dicts:
+                        raise
+                    return [dict.fromkeys(active_reward_objectives()[0], 0.0) |
+                            {'simulator_error_logonly': 1.0} for _ in prompts]
                 return [0.0] * len(prompts)
             
             # Run the reward calculation
@@ -362,14 +370,19 @@ class RewardFunctionFactory:
                 print(f"Warning: Reward calculation failed: {e}")
                 import traceback
                 traceback.print_exc()
-                ret_rewards = [0.0] * len(prompts)
+                if using_native_simulator():
+                    if not return_component_dicts:
+                        raise
+                    ret_rewards = [dict.fromkeys(active_reward_objectives()[0], 0.0) |
+                                   {'simulator_error_logonly': 1.0} for _ in prompts]
+                else:
+                    ret_rewards = [0.0] * len(prompts)
             
             return ret_rewards
 
         if return_component_dicts:
             # Trainer-side GDPO uses this explicit order. Attaching metadata to
             # the callable avoids treating every diagnostic key as an objective.
-            reward_fn.gdpo_objective_keys = ATPG_GDPO_OBJECTIVE_KEYS
-            reward_fn.gdpo_objective_weights = ATPG_GDPO_OBJECTIVE_WEIGHTS
+            reward_fn.gdpo_objective_keys, reward_fn.gdpo_objective_weights = active_reward_objectives()
         
         return reward_fn
