@@ -30,6 +30,20 @@ def test_latest_uses_completed_save_time_and_skips_incomplete(tmp_path):
     assert latest_complete_checkpoint(tmp_path) == current
 
 
+def test_deepspeed_checkpoint_needs_one_optimizer_shard_per_rank(tmp_path):
+    path = checkpoint(tmp_path, 7, 100)
+    (path / "optimizer.pt").unlink()
+    (path / "latest").write_text("global_step7")
+    shards = path / "global_step7"
+    shards.mkdir()
+    for rank in range(2):
+        (shards / f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt").write_bytes(b"fixture")
+    with pytest.raises(ValueError, match="No completed resumable"):
+        latest_complete_checkpoint(tmp_path)
+    (shards / "bf16_zero_pp_rank_2_mp_rank_00_optim_states.pt").write_bytes(b"fixture")
+    assert latest_complete_checkpoint(tmp_path) == path
+
+
 def test_no_complete_checkpoint_fails_instead_of_selecting_partial(tmp_path):
     with pytest.raises(ValueError, match="No completed resumable"):
         latest_complete_checkpoint(tmp_path)

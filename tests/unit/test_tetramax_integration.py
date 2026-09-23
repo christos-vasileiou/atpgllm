@@ -26,17 +26,32 @@ def test_tool_binding_uses_user_context():
         asyncio.run(fault_simulation_tool_handler(**dict(CALL['arguments'],doc_id='spoof'),**context))
 
 
+@pytest.mark.parametrize('field,value',[
+    ('input_vector',[1]), ('input_vector',None), ('input_vector',{'a':2}),
+    ('input_vector','a: 2'), ('input_vector',{'a':'2'}), ('output_vector',[0]),
+    ('fault','sa2 y'),
+])
+def test_malformed_model_vectors_are_tool_errors_not_infrastructure(field,value):
+    from atpgllm.training.tools import fault_simulation_tool_handler
+    call=dict(CALL,arguments=dict(CALL['arguments'],**{field:value}))
+    [(message,infrastructure)]=execute_tool_batch([call],[PROMPT],{'fault_simulation_tool':fault_simulation_tool_handler})
+    assert message.startswith('Tool execution failed') and infrastructure is False
+
+
 def test_tool_batch_preserves_order_and_classifies_failures():
     from tetramax_seats import SimulationError
     def handler(**kwargs):
         if kwargs['doc_id']=='invalid': raise ValueError('invalid')
         if kwargs['doc_id']=='failure': raise SimulationError('offline')
+        if kwargs['doc_id']=='simulator_bug': raise IndexError('list index out of range')
         return kwargs['expected_fault']
-    calls=[dict(CALL,arguments=dict(CALL['arguments'],doc_id=doc)) for doc in ('doc','failure','invalid')]
-    results=execute_tool_batch(calls,[PROMPT]*3,{'fault_simulation_tool':handler})
+    docs=('doc','failure','invalid','simulator_bug')
+    calls=[dict(CALL,arguments=dict(CALL['arguments'],doc_id=doc)) for doc in docs]
+    results=execute_tool_batch(calls,[PROMPT]*len(docs),{'fault_simulation_tool':handler})
     assert results[0]==('sa0 y',False)
     assert results[1][1] is True
     assert results[2][1] is False
+    assert results[3]==('Tool execution failed: list index out of range',False)
 
 
 def test_pipeline_ready_trajectory_advances_while_another_waits(monkeypatch):

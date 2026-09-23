@@ -547,6 +547,7 @@ def train_with_grpo(
     max_prompt_length: int = 4096,
     use_dual_adapter: bool = True,
     use_ddp: bool = False,
+    deepspeed: str | None = None,
     lora_rank: int = 8,
     lora_alpha: int = 16,
     lora_target_modules: list[str] | None = None,
@@ -631,6 +632,10 @@ def train_with_grpo(
     use_ddp : bool
         If *True*, use Distributed Data Parallel (DDP) mode.  See
         :func:`train_with_sft` for details.
+    deepspeed : str, optional
+        DeepSpeed JSON config passed to ``GRPOConfig(deepspeed=...)``.
+        Each rank still loads the 4-bit model on its own GPU, so this
+        requires ``use_ddp``.
     lora_rank, lora_alpha, lora_target_modules
         LoRA hyper-parameters for new adapters / policy adapter
         (:func:`model_utils.get_lora_config`).  When loading from
@@ -683,6 +688,8 @@ def train_with_grpo(
         raise ValueError("GRPO learning rate must be positive and warmup steps nonnegative")
     if fixed_eval_size and not (use_dual_adapter and use_vllm and vllm_mode == "server" and resume_from):
         raise ValueError("Fixed evaluation currently requires dual adapters, an SFT/GRPO checkpoint, and vLLM server mode")
+    if deepspeed and not use_ddp:
+        raise ValueError("--deepspeed requires --use_ddp (one 4-bit model copy per rank)")
 
     # Determine device_map: per-GPU for DDP, "auto" otherwise
     device_map = _get_device_map(use_ddp)
@@ -908,6 +915,7 @@ def train_with_grpo(
         save_steps=1,
         logging_first_step=True,
         bf16=True,
+        deepspeed=deepspeed,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to=report_to,
@@ -1057,6 +1065,7 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "steps_per_generation",
     "max_completion_length",
     "use_dual_adapter",
+    "deepspeed",
     "use_vllm",
     "vllm_mode",
     "vllm_server_url",
@@ -1245,6 +1254,9 @@ def main() -> None:
                         help="Use dual-adapter mode (keeps SFT adapter isolated, avoids merge). Default: True")
     parser.add_argument("--use_ddp", action="store_true", default=_env('USE_DDP', '0').lower() in ('1', 'true', 'yes'),
                         help="Use Distributed Data Parallelization. It's recommended for SFT training.")
+    parser.add_argument("--deepspeed", type=str, default=_env('DEEPSPEED_CONFIG', None) or None,
+                        help="GRPO: DeepSpeed JSON config (e.g. configs/ds_zero2.json). Requires --use_ddp. "
+                             "Env: DEEPSPEED_CONFIG")
     parser.add_argument(
         "--lora_rank",
         type=int,

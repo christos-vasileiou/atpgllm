@@ -166,6 +166,21 @@ if [ -n "${RESUME_FROM:-}" ] && [ "$RESUME_FROM" != "None" ] && [ "$RESUME_FROM"
     fi
 fi
 
+# Resolve DEEPSPEED_CONFIG relative to repo root or scripts/train.
+if [ -n "${DEEPSPEED_CONFIG:-}" ]; then
+    for _ds in "$DEEPSPEED_CONFIG" "$_REPO_ROOT/$DEEPSPEED_CONFIG" "$_SCRIPT_DIR/$DEEPSPEED_CONFIG"; do
+        if [ -f "$_ds" ]; then
+            DEEPSPEED_CONFIG="$(cd "$(dirname "$_ds")" && pwd)/$(basename "$_ds")"
+            break
+        fi
+    done
+    if [ ! -f "$DEEPSPEED_CONFIG" ]; then
+        echo "ERROR: DEEPSPEED_CONFIG not found: $DEEPSPEED_CONFIG"
+        exit 1
+    fi
+    echo "Resolved DEEPSPEED_CONFIG -> $DEEPSPEED_CONFIG"
+fi
+
 # GRPO dual-adapter / quantization resume preflight (single- and multi-node).
 # Runs before the W&B snapshot so resolved RESUME_FROM / derived MODEL are recorded.
 validate_grpo_resume() {
@@ -256,7 +271,7 @@ write_launch_config_snapshot() {
         GRPO_LEARNING_RATE GRPO_WARMUP_STEPS FIXED_EVAL_SIZE FIXED_EVAL_SPLIT
         FIXED_EVAL_MANIFEST FIXED_EVAL_SEED FIXED_EVAL_STEPS
         FIXED_EVAL_GENERATIONS FIXED_EVAL_BATCH_SIZE
-        USE_DUAL_ADAPTER USE_DDP USE_VLLM VLLM_MODE PORT
+        USE_DUAL_ADAPTER USE_DDP DEEPSPEED_CONFIG USE_VLLM VLLM_MODE PORT
         TENSOR_PARALLEL_SIZE DATA_PARALLEL_SIZE VLLM_GPU_MEM_UTIL
         PARTITION NODELIST NUM_NODES GPUS_PER_NODE CPUS_PER_TASK MEM
         LORA_RANK LORA_ALPHA LORA_TARGET_MODULES QWEN_MOE TUNE_MOE_ROUTER MOE_MAX_MEMORY_GIB
@@ -343,6 +358,17 @@ fi
 # multi-node overrides it with the dedicated vLLM node's IP inside run_multi_node.
 VLLM_HOST="${VLLM_HOST:-localhost}"
 
+# Single-node server mode: the last TP*DP local GPUs serve vLLM; the rest train.
+select_vllm_gpus() {
+    local n_vllm=$(( ${TENSOR_PARALLEL_SIZE:-1} * ${DATA_PARALLEL_SIZE:-1} ))
+    if [ "$n_vllm" -ge "${#GPU_ARRAY[@]}" ]; then
+        echo "ERROR: vLLM needs TP(${TENSOR_PARALLEL_SIZE:-1}) x DP(${DATA_PARALLEL_SIZE:-1}) = $n_vllm GPUs," \
+             "but only ${#GPU_ARRAY[@]} are visible; no GPU would be left for training."
+        exit 1
+    fi
+    VLLM_GPU="$(IFS=,; echo "${GPU_ARRAY[*]: -$n_vllm}")"
+}
+
 # =============================================================================
 # Build Command Arguments
 # =============================================================================
@@ -373,19 +399,19 @@ build_cmd_args() {
             if [ "$METHOD" == "sft" ]; then
                 PORT=$PORT
                 CMD_ARGS+=(--vllm_server_url "http://${VLLM_HOST:-localhost}:$PORT")
-                # Single-node only: pick the last local GPU for vLLM. GPU_ARRAY is
+                # Single-node only: pick the last TP*DP local GPUs for vLLM. GPU_ARRAY is
                 # unset in the multi-node path (dedicated vLLM node), so guard it.
                 if [ "$VLLM_MODE" == "server" ] && [ "${#GPU_ARRAY[@]}" -gt 0 ]; then
-                    VLLM_GPU=${GPU_ARRAY[-1]}
+                    select_vllm_gpus
                 fi
             elif [ "$METHOD" == "grpo" ]; then
                 PORT=$PORT
                 CMD_ARGS+=(--vllm_server_url "http://${VLLM_HOST:-localhost}:$PORT")
                 CMD_ARGS+=(--vllm_mode "$VLLM_MODE")
-                # Single-node only: pick the last local GPU for vLLM. GPU_ARRAY is
+                # Single-node only: pick the last TP*DP local GPUs for vLLM. GPU_ARRAY is
                 # unset in the multi-node path (dedicated vLLM node), so guard it.
                 if [ "$VLLM_MODE" == "server" ] && [ "${#GPU_ARRAY[@]}" -gt 0 ]; then
-                    VLLM_GPU=${GPU_ARRAY[-1]}
+                    select_vllm_gpus
                 fi
             fi
         fi
@@ -476,6 +502,9 @@ build_cmd_args() {
         if [ -n "$USE_DUAL_ADAPTER" ] && [ "$USE_DUAL_ADAPTER" == "True" ]; then
             CMD_ARGS+=(--use_dual_adapter)
         fi
+        if [ -n "${DEEPSPEED_CONFIG:-}" ]; then
+            CMD_ARGS+=(--deepspeed "$DEEPSPEED_CONFIG")
+        fi
     fi
     echo "=============================================="
     echo "Command Arguments"
@@ -498,6 +527,7 @@ build_cmd_args() {
     echo "*VLLM_GPU: ${VLLM_GPU:-(auto)} (set when vLLM server mode is used, single-node)"
     echo "USE_DUAL_ADAPTER: $USE_DUAL_ADAPTER"
     echo "USE_DDP: $USE_DDP"
+    echo "DEEPSPEED_CONFIG: ${DEEPSPEED_CONFIG:-(none)}"
     echo "LORA_RANK: $LORA_RANK"
     echo "LORA_ALPHA: $LORA_ALPHA"
     echo "LORA_TARGET_MODULES: ${LORA_TARGET_MODULES:-'(default: q/k/v/o_proj + gate/up/down_proj)'}"
@@ -714,6 +744,9 @@ cleanup() {
             kill "$VLLM_PID" 2>/dev/null || true
             wait "$VLLM_PID" 2>/dev/null || true
         fi
+        # vLLM's engine core and TP workers outlive the API server; single-node
+        # starts them under setsid, so their process group id is VLLM_PID.
+        kill -KILL -- -"$VLLM_PID" 2>/dev/null || true
     fi
 }
 
@@ -865,7 +898,7 @@ else
             echo "=============================================="
             echo "$METHOD vLLM Server Setup"
             echo "=============================================="
-            echo "vLLM server GPU: $VLLM_GPU (last GPU)"
+            echo "vLLM server GPU(s): $VLLM_GPU (last TP x DP GPUs)"
             echo "Starting vLLM server on GPU $VLLM_GPU (port $PORT)..."
             echo "DATA_PARALLEL_SIZE: $DATA_PARALLEL_SIZE"
             echo "TENSOR_PARALLEL_SIZE: $TENSOR_PARALLEL_SIZE"
@@ -875,6 +908,9 @@ else
             echo "=============================================="
             echo "Running: CUDA_VISIBLE_DEVICES=$VLLM_GPU trl vllm-serve --model $MODEL --port $PORT --gpu_memory_utilization $VLLM_GPU_MEM_UTIL --data-parallel-size $DATA_PARALLEL_SIZE --tensor-parallel-size $TENSOR_PARALLEL_SIZE --max-model-len $VLLM_MAX_MODEL_LEN &"
             if [ "$DRY_RUN" != "True" ]; then
+                # Expandable segments break the CUDA IPC buffers of vLLM's TP>1 custom all-reduce.
+                # setsid gives vLLM its own process group so cleanup() can reap the engine core.
+                setsid env -u PYTORCH_CUDA_ALLOC_CONF \
                 CUDA_VISIBLE_DEVICES=$VLLM_GPU \
                 trl vllm-serve \
                     --model $MODEL \

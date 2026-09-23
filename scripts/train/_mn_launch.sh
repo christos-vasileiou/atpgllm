@@ -56,6 +56,8 @@ case "$ROLE" in
     # the custom weight-sync endpoints (/get_world_size, /init_communicator,
     # /update_named_param, /reset_prefix_cache). --host 0.0.0.0 so the training
     # nodes can reach this server across the cluster network.
+    # Expandable segments break the CUDA IPC buffers of vLLM's TP>1 custom all-reduce.
+    unset PYTORCH_CUDA_ALLOC_CONF
     exec trl vllm-serve \
         --model "$MN_MODEL" \
         --host 0.0.0.0 \

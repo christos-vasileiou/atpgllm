@@ -24,7 +24,11 @@ def latest_complete_checkpoint(output_dir):
             if not all(path.is_file() for path in required):
                 continue
             if not any((directory / name).is_file() for name in ("optimizer.pt", "optimizer.safetensors")):
-                continue
+                tag = directory / "latest"
+                ds_shards = (list((directory / tag.read_text().strip()).glob("*optim_states.pt"))
+                             if tag.is_file() else [])
+                if len(ds_shards) != world:
+                    continue
             # on_save publishes this summary after optimizer/scheduler/RNG and
             # fixed-evaluation metadata. Numeric steps can belong to older runs
             # when a directory has been reused; publication time is authoritative.

@@ -83,6 +83,18 @@ _OPTIMIZER_FILES = ("optimizer.pt", "optimizer.safetensors")
 _SCHEDULER_FILE = "scheduler.pt"
 _RNG_STATE_PREFIX = "rng_state"
 
+
+def _has_optimizer_state(checkpoint_dir: str) -> bool:
+    """HF optimizer file, or DeepSpeed ZeRO shards under the ``latest`` tag."""
+    if any(os.path.exists(os.path.join(checkpoint_dir, f)) for f in _OPTIMIZER_FILES):
+        return True
+    try:
+        with open(os.path.join(checkpoint_dir, "latest")) as fh:
+            tag_dir = os.path.join(checkpoint_dir, fh.read().strip())
+        return any(name.endswith("optim_states.pt") for name in os.listdir(tag_dir))
+    except OSError:
+        return False
+
 # =====================================================================
 # Regex patterns for format checking (mirrors RewardFunctionFactory)
 # =====================================================================
@@ -587,10 +599,7 @@ class TrainingStateCheckpointCallback(TrainerCallback):
         has_trainer_state = os.path.exists(
             os.path.join(checkpoint_dir, _TRAINER_STATE_FILE)
         )
-        has_optimizer = any(
-            os.path.exists(os.path.join(checkpoint_dir, f))
-            for f in _OPTIMIZER_FILES
-        )
+        has_optimizer = _has_optimizer_state(checkpoint_dir)
         has_scheduler = os.path.exists(
             os.path.join(checkpoint_dir, _SCHEDULER_FILE)
         )
@@ -645,7 +654,7 @@ class TrainingStateCheckpointCallback(TrainerCallback):
             if not has_trainer_state:
                 missing.append(_TRAINER_STATE_FILE)
             if not has_optimizer:
-                missing.append("optimizer.pt/.safetensors")
+                missing.append("optimizer.pt/.safetensors or DeepSpeed global_step*/")
             if not has_scheduler:
                 missing.append(_SCHEDULER_FILE)
             if not has_rng:
@@ -769,14 +778,11 @@ def validate_training_state_checkpoint(checkpoint_dir: str) -> None:
             f"Contents of '{checkpoint_dir}': "
             f"{os.listdir(checkpoint_dir) if os.path.isdir(checkpoint_dir) else 'NOT A DIRECTORY'}"
         )
-    has_optimizer = any(
-        os.path.exists(os.path.join(checkpoint_dir, f))
-        for f in _OPTIMIZER_FILES
-    )
-    if not has_optimizer:
+    if not _has_optimizer_state(checkpoint_dir):
         raise FileNotFoundError(
             f"Cannot resume training state: no optimizer file found in "
-            f"'{checkpoint_dir}'.\nExpected one of: {_OPTIMIZER_FILES}"
+            f"'{checkpoint_dir}'.\nExpected one of: {_OPTIMIZER_FILES}, "
+            f"or a DeepSpeed 'latest' tag with global_step*/ optimizer shards"
         )
     if not os.path.exists(os.path.join(checkpoint_dir, _SCHEDULER_FILE)):
         logger.warning(

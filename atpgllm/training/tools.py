@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from atpgllm.training._paths import ensure_data_preprocessing_on_path, resolve_sim_config_path
 ensure_data_preprocessing_on_path()
 
-from fault_sim import prepare_netlist, resolve_fault_sim_runner
+from fault_sim import convert_string_to_dict, prepare_netlist, resolve_fault_sim_runner
 from tetramax_seats import SimulationError, acquire_timeout_s, per_run_timeout_s
 
 
@@ -39,6 +39,20 @@ FAULT_SIMULATION_TOOL = get_json_schema(fault_simulation_tool)
 TOOLS = [FAULT_SIMULATION_TOOL]
 
 
+def _require_bit_mapping(name, vector):
+    """Model-authored vectors must be caught as tool errors: the simulator raises
+    AttributeError/IndexError on them, which would abort training as infrastructure."""
+    if isinstance(vector, str):
+        vector = convert_string_to_dict(vector, sep=':' if ':' in vector else '=')
+    if not isinstance(vector, dict):
+        raise TypeError(f"{name} must map net names to 0/1")
+    bad = [net for net, bit in vector.items()
+           if not isinstance(bit, bool) and str(bit).strip().lstrip('-').isdigit()
+           and int(bit) not in (0, 1)]
+    if bad:
+        raise ValueError(f"{name} has non-binary values for nets {bad[:5]}")
+
+
 async def fault_simulation_tool_handler(input_vector, output_vector, fault, doc_id, netlist,
                                         expected_doc_id=None, expected_fault=None, cancel=None) -> str:
     """Execute off the event loop; cancellation waits for supervised cleanup."""
@@ -46,6 +60,8 @@ async def fault_simulation_tool_handler(input_vector, output_vector, fault, doc_
         raise ValueError("Tool document does not match the authoritative problem")
     if expected_fault is not None and fault.strip() != expected_fault.strip():
         raise ValueError("Tool fault does not match the authoritative problem")
+    _require_bit_mapping("input_vector", input_vector)
+    _require_bit_mapping("output_vector", output_vector)
     cancelled = cancel if cancel is not None else threading.Event()
     def execute():
         runner = resolve_fault_sim_runner()
@@ -99,8 +115,13 @@ def _execute_tool(item, functions, cancelled):
         return str(value), False
     except (ValueError, TypeError, SyntaxError) as exc:
         return f'Tool execution failed: {exc}', False
-    except Exception as exc:
+    except (SimulationError, OSError, MemoryError) as exc:
         return f'Tool infrastructure failed: {exc}', True
+    except Exception as exc:
+        # Other errors come from simulating model-authored arguments; aborting
+        # every rank on them would let one malformed sample end the run.
+        print(f'[tools] {type(exc).__name__} treated as a tool error: {exc}', flush=True)
+        return f'Tool execution failed: {exc}', False
 
 def execute_tool_batch(calls, prompts, functions):
     """Concurrent independent tools, preserving order and infrastructure failures."""
