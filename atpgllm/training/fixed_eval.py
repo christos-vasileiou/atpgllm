@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import random
 import uuid
@@ -193,9 +194,8 @@ def summarize_records(records: list[dict], example_ids: list[str], generations: 
         grouped[row["example_id"]].append(row["components"])
     components = [row["components"] for row in records]
     n = len(components)
-    return {
+    metrics = {
         "detection": sum(c["detection"] for c in components) / n,
-        "activation_without_detection": sum(c["activation"] > 0 and c["detection"] == 0 for c in components) / n,
         "solved_at_k": sum(any(c["detection"] > 0 for c in group) for group in grouped.values()) / len(grouped),
         "all_fail_fraction": sum(all(c["detection"] == 0 for c in group) for group in grouped.values()) / len(grouped),
         "simulation_valid_fraction": sum(c["simulation_valid_logonly"] for c in components) / n,
@@ -204,6 +204,18 @@ def summarize_records(records: list[dict], example_ids: list[str], generations: 
         "expected_output_exact_fraction": sum(c["expected_output_acc_logonly"] for c in components) / n,
         "num_faults": len(grouped), "num_completions": n, "k": generations,
     }
+    # Native po/detection profiles omit the activation training objective but
+    # retain its diagnostic. Fall back to the objective for older records.
+    activation = [c.get("fault_site_activated_acc_logonly", c.get("activation")) for c in components]
+    available = [value is not None and math.isfinite(value) for value in activation]
+    metrics["activation_available_fraction"] = sum(available) / n
+    # Keep the original all-completions denominator. An unavailable measurement
+    # is not zero activation; omit this optional metric if any value is unknown.
+    if all(available):
+        metrics["activation_without_detection"] = sum(
+            value > 0 and c["detection"] == 0 for value, c in zip(activation, components)
+        ) / n
+    return metrics
 
 
 class FixedEvaluationMixin:

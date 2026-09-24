@@ -26,6 +26,22 @@ def test_tool_binding_uses_user_context():
         asyncio.run(fault_simulation_tool_handler(**dict(CALL['arguments'],doc_id='spoof'),**context))
 
 
+def test_reward_factory_accepts_escaped_wire_beside_bus_bit(monkeypatch):
+    from atpgllm.training.reward_function_factory import RewardFunctionFactory
+    monkeypatch.setenv('FAULT_SIM_BACKEND', 'tetramax')
+    fixture = Path(__file__).resolve().parents[3] / 'data_preprocessing/tests/fixtures/tetramax_neuron_ram.v'
+    document = {'doc_id':'neuron-fixture', 'netlist':fixture.read_text()}
+    prompt = 'Generate a vector for sa0 loaded using the netlist ' + repr(document)
+    factory = RewardFunctionFactory.__new__(RewardFunctionFactory)
+    factory._netlist_cache = {}
+    factory._max_cache_size = 4
+    factory.gate_funcs = {}
+    model = factory.validate_and_get_netlist_from_prompt(prompt, document)
+    assert model is not None
+    assert model.native_names[r'\weights_out[15]'] != model.native_names['weights_out[15]']
+    assert factory.validate_and_get_netlist_from_prompt(prompt, document) is model
+
+
 @pytest.mark.parametrize('field,value',[
     ('input_vector',[1]), ('input_vector',None), ('input_vector',{'a':2}),
     ('input_vector','a: 2'), ('input_vector',{'a':'2'}), ('output_vector',[0]),
@@ -38,11 +54,11 @@ def test_malformed_model_vectors_are_tool_errors_not_infrastructure(field,value)
     assert message.startswith('Tool execution failed') and infrastructure is False
 
 
-def test_tool_batch_preserves_order_and_classifies_failures():
+def test_tool_batch_preserves_order_and_classifies_failures(capsys):
     from tetramax_seats import SimulationError
     def handler(**kwargs):
         if kwargs['doc_id']=='invalid': raise ValueError('invalid')
-        if kwargs['doc_id']=='failure': raise SimulationError('offline')
+        if kwargs['doc_id']=='failure': raise SimulationError('offline; diagnostics: /test/request_123')
         if kwargs['doc_id']=='simulator_bug': raise IndexError('list index out of range')
         return kwargs['expected_fault']
     docs=('doc','failure','invalid','simulator_bug')
@@ -52,6 +68,7 @@ def test_tool_batch_preserves_order_and_classifies_failures():
     assert results[1][1] is True
     assert results[2][1] is False
     assert results[3]==('Tool execution failed: list index out of range',False)
+    assert '[tools] SimulationError: offline; diagnostics: /test/request_123' in capsys.readouterr().out
 
 
 def test_pipeline_ready_trajectory_advances_while_another_waits(monkeypatch):

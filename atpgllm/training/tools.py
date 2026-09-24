@@ -116,6 +116,9 @@ def _execute_tool(item, functions, cancelled):
     except (ValueError, TypeError, SyntaxError) as exc:
         return f'Tool execution failed: {exc}', False
     except (SimulationError, OSError, MemoryError) as exc:
+        # The synchronized abort only carries a boolean across ranks. Preserve
+        # the original cause and diagnostics path in this rank's training log.
+        print(f'[tools] {type(exc).__name__}: {exc}', flush=True)
         return f'Tool infrastructure failed: {exc}', True
     except Exception as exc:
         # Other errors come from simulating model-authored arguments; aborting

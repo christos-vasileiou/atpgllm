@@ -140,6 +140,31 @@ class FixedEvalTests(unittest.TestCase):
             fixed.capture_rewards(lambda **kw: [0.0], [])(
                 prompts=["p"], completions=["c"], _fixed_eval_id=["a"])
 
+    def test_summary_uses_activation_diagnostic_without_training_objective(self):
+        records = []
+        for key, detected, activated in [("a", 1, 1), ("a", 0, 1), ("b", 0, 0), ("b", 0, 1)]:
+            row = components(detected, activated)
+            row["fault_site_activated_acc_logonly"] = row.pop("activation")
+            records.append({"example_id": key, "components": row})
+        metrics = fixed.summarize_records(records, ["a", "b"], 2)
+        self.assertEqual(metrics["detection"], 0.25)
+        self.assertEqual(metrics["activation_without_detection"], 0.5)
+        self.assertEqual(metrics["activation_available_fraction"], 1.0)
+
+    def test_unknown_activation_is_not_reported_as_zero(self):
+        for unknown in (None, float("nan")):
+            row = components(0)
+            row.pop("activation")
+            if unknown is not None:
+                row["fault_site_activated_acc_logonly"] = unknown
+            metrics = fixed.summarize_records([
+                {"example_id": "a", "components": components(0)},
+                {"example_id": "b", "components": row},
+            ], ["a", "b"], 1)
+            self.assertNotIn("activation_without_detection", metrics)
+            self.assertEqual(metrics["activation_available_fraction"], 0.5)
+            self.assertEqual(metrics["detection"], 0.0)
+
     def test_evaluation_restores_state_on_success_and_failure(self):
         class Base:
             def evaluate(self):
@@ -151,8 +176,11 @@ class FixedEvalTests(unittest.TestCase):
                 assert self.temperature == 1.0
                 if self.fail_eval:
                     raise RuntimeError("generation failed")
+                row = components(1)
+                if self.profile != "full":
+                    row["fault_site_activated_acc_logonly"] = row.pop("activation")
                 self.fixed_eval_records.extend([
-                    {"example_id": "a", "components": components(1)}])
+                    {"example_id": "a", "components": row}])
                 return {}
             def log(self, metrics):
                 self.logged = metrics
@@ -168,7 +196,7 @@ class FixedEvalTests(unittest.TestCase):
                 default_generator=SimpleNamespace(manual_seed=lambda seed: None))),
             "accelerate.utils": SimpleNamespace(gather_object=lambda rows: list(rows)),
         }
-        for fail in (False, True):
+        for fail, profile in [(False, "full"), (False, "po"), (False, "detection"), (True, "po")]:
             with tempfile.TemporaryDirectory() as folder, patch.dict(sys.modules, fake_modules):
                 trainer = Trainer()
                 trainer.model = SimpleNamespace(training=True)
@@ -182,6 +210,7 @@ class FixedEvalTests(unittest.TestCase):
                 trainer._logs = {"completion": deque(["train"])}
                 original_logs = trainer._logs
                 trainer.fail_eval = fail
+                trainer.profile = profile
                 manifest = {"protocol": {"seed": 9}, "examples": [{"_fixed_eval_id": "a"}], "examples_sha256": "digest"}
                 trainer.configure_fixed_evaluation(manifest, [], folder, "sft/checkpoint-200")
                 rng_state = random.getstate()
@@ -191,7 +220,11 @@ class FixedEvalTests(unittest.TestCase):
                 else:
                     result = trainer.evaluate()
                     self.assertEqual(result["eval_fixed/detection"], 1.0)
-                    self.assertTrue((Path(folder) / "fixed_eval/step-000000.json").exists())
+                    self.assertEqual(result["eval_fixed/activation_without_detection"], 0.0)
+                    artifact = json.loads((Path(folder) / "fixed_eval/step-000000.json").read_text())
+                    self.assertEqual(artifact["metrics"]["activation_available_fraction"], 1.0)
+                    if profile != "full":
+                        self.assertNotIn("activation", artifact["records"][0]["components"])
                 self.assertEqual(random.getstate(), rng_state)
                 self.assertIs(trainer._logs, original_logs)
                 self.assertEqual(list(trainer._logs["completion"]), ["train"])

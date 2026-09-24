@@ -277,6 +277,8 @@ write_launch_config_snapshot() {
         LORA_RANK LORA_ALPHA LORA_TARGET_MODULES QWEN_MOE TUNE_MOE_ROUTER MOE_MAX_MEMORY_GIB
         FAULT_SIM_BACKEND TMAX_SERVER_FILE TMAX_SERVER_URL TMAX_MAX_CONCURRENT
         TMAX_TIMEOUT_S TMAX_ACQUIRE_TIMEOUT_S TMAX_RESULT_CACHE_SIZE TMAX_REWARD_PROFILE TMAX_PIPELINED_TOOLS
+        TMAX_MANAGE_SERVICE TMAX_LOCK_DIR TMAX_SERVICE_WORKERS TMAX_SERVICE_PORT
+        TMAX_SERVICE_STARTUP_TIMEOUT_S TMAX_SERVICE_MODULE TMAX_SERVICE_ADVERTISE_HOST
         WANDB_PROJECT DRY_RUN
     )
     _snap_stamp="$(date +%Y%m%d_%H%M%S)"
@@ -299,7 +301,6 @@ write_launch_config_snapshot() {
     export LAUNCH_CONFIG_FROZEN_FILE="$CONFIG_FILE"
     echo "Launch config snapshot for W&B: $_snap_path"
 }
-write_launch_config_snapshot
 
 # =============================================================================
 # Validate Required Configuration
@@ -709,7 +710,9 @@ run_multi_node() {
     if [ "$DRY_RUN" != "True" ]; then
         srun --overlap --nodes="$num_train_nodes" --nodelist="$train_nodelist" \
              --ntasks="$num_train_nodes" --ntasks-per-node=1 \
-             "$_SCRIPT_DIR/_mn_launch.sh" train "${CMD_ARGS[@]}"
+             "$_SCRIPT_DIR/_mn_launch.sh" train "${CMD_ARGS[@]}" &
+        TRAIN_PID=$!
+        wait_for_training
         rc=$?
     fi
     return $rc
@@ -719,6 +722,19 @@ run_multi_node() {
 # vLLM lifecycle (shared) + cleanup
 # =============================================================================
 VLLM_PID=""
+TRAIN_PID=""
+TRAIN_PROCESS_GROUP=false
+# shellcheck source=_tetramax_lifecycle.sh
+source "$_SCRIPT_DIR/_tetramax_lifecycle.sh"
+
+# Backgrounding the child lets Bash handle TERM/INT while waiting for training.
+wait_for_training() {
+    local rc
+    wait "$TRAIN_PID"
+    rc=$?
+    TRAIN_PID=""
+    return "$rc"
+}
 
 find_vllm_pid_for_port() {
     local port="$1"
@@ -738,6 +754,16 @@ find_vllm_pid_for_port() {
 # In multi-node runs VLLM_PID is the backgrounded `srun ... _mn_launch.sh vllm`
 # step; killing it tears down the remote server too.
 cleanup() {
+    if [ -n "$TRAIN_PID" ]; then
+        echo "Stopping training (PID: $TRAIN_PID)..."
+        if [ "$TRAIN_PROCESS_GROUP" == true ]; then
+            kill -- -"$TRAIN_PID" 2>/dev/null || true
+        else
+            # Terminating srun cancels its remote training step.
+            kill "$TRAIN_PID" 2>/dev/null || true
+        fi
+    fi
+    stop_tetramax_service
     if [ -n "$VLLM_PID" ]; then
         echo "Stopping vLLM server (PID: $VLLM_PID)..."
         if kill -0 "$VLLM_PID" 2>/dev/null; then
@@ -750,7 +776,14 @@ cleanup() {
     fi
 }
 
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Fail before GPU/model startup if the simulator is unavailable. Submission
+# wrappers invoke this same launcher once the allocation begins.
+start_tetramax_service || exit 1
+write_launch_config_snapshot
 
 # =============================================================================
 # Dispatch: multi-node vs single-node
@@ -963,17 +996,23 @@ else
         echo "Command: accelerate launch --multi_gpu --num_processes $NUM_GPUS --mixed_precision bf16 $_TRAIN_PY ${CMD_ARGS[*]}"
         echo ""
         if [ "$DRY_RUN" != "True" ]; then
-            accelerate launch \
+            setsid accelerate launch \
                 --multi_gpu \
                 --num_processes $NUM_GPUS \
                 --mixed_precision bf16 \
-                "$_TRAIN_PY" "${CMD_ARGS[@]}"
+                "$_TRAIN_PY" "${CMD_ARGS[@]}" &
+            TRAIN_PID=$!
+            TRAIN_PROCESS_GROUP=true
+            wait_for_training
         fi
     else
         echo "Command: python $_TRAIN_PY ${CMD_ARGS[*]}"
         echo ""
         if [ "$DRY_RUN" != "True" ]; then
-            python "$_TRAIN_PY" "${CMD_ARGS[@]}"
+            setsid python "$_TRAIN_PY" "${CMD_ARGS[@]}" &
+            TRAIN_PID=$!
+            TRAIN_PROCESS_GROUP=true
+            wait_for_training
         fi
     fi
     EXIT_CODE=$?
