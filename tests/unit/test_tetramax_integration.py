@@ -113,6 +113,38 @@ def test_native_rewards_mask_unknowns_and_exclude_internal_objective(monkeypatch
         assert not reward['simulator_error_logonly']
 
 
+@pytest.mark.parametrize('failure', ['exception', 'error_frame', 'empty_frame', 'invalid_request'])
+def test_reward_failure_reports_cause_without_hiding_infrastructure(monkeypatch, capsys, failure):
+    from tetramax_seats import SimulationError
+    monkeypatch.setenv('FAULT_SIM_BACKEND', 'tetramax')
+    monkeypatch.setenv('TMAX_REWARD_PROFILE', 'po')
+
+    def simulator(*args, **kwargs):
+        if failure == 'exception':
+            raise SimulationError('TetraMAX service request failed: Connection reset by peer')
+        if failure == 'empty_frame':
+            return pd.DataFrame(), {}
+        return pd.DataFrame([{'error': 'request rejected'}]), {'invalid_request': failure == 'invalid_request'}
+
+    reward = score(['sa0 y'], ['answer'],
+        netlists=[SimpleNamespace(input_nets=['a'], output_nets=['y'])],
+        module_name=['design'], fault_fn=lambda *a, **k: [('sa0', 'y')],
+        simulation_fn=lambda _: [], input_vector_fn=lambda _: ['a:1'],
+        expected_output_fn=lambda _: ['y:1'], detected_faults_fn=lambda _: ['sa0 y'],
+        fault_sim=simulator)[0]
+    log = capsys.readouterr().err
+    assert reward['detection'] == 0
+    assert reward['simulator_error_logonly'] == float(failure != 'invalid_request')
+    if failure == 'invalid_request':
+        assert not log  # A malformed model answer remains an ordinary negative reward.
+    else:
+        assert "module='design', fault=sa0 y" in log
+        expected = {'exception': 'Connection reset by peer',
+                    'error_frame': 'request rejected',
+                    'empty_frame': 'empty or invalid result'}[failure]
+        assert expected in log
+
+
 def test_reward_profile_resume_guard(tmp_path,monkeypatch):
     from atpgllm.training import simulator_provenance as module
     provenance={'backend':'tetramax','profile':'po'}

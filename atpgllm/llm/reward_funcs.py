@@ -454,17 +454,30 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
                 return_rewards=True,
             )
             fault_simulation, _fault_sim_rewards = result
-        except Exception:
+        except Exception as exc:
+            # Both DDP ranks abort after scoring. Preserve the original cause
+            # here, before it is reduced to a numeric infrastructure flag.
+            print(f"[rewards] Simulator failure for module={mod_name!r}, "
+                  f"fault={fault} {net}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc()
             out["simulator_error_logonly"] = 1.0
             rewards.append(out)
             continue
 
         if not isinstance(fault_simulation, pd.DataFrame) or fault_simulation.empty:
+            print(f"[rewards] Simulator returned an empty or invalid result for "
+                  f"module={mod_name!r}, fault={fault} {net}", file=sys.stderr, flush=True)
             out["simulator_error_logonly"] = 1.0
             rewards.append(out)
             continue
         if "error" in fault_simulation.columns:
             out["simulator_error_logonly"] = float(not _fault_sim_rewards.get('invalid_request', False))
+            if out["simulator_error_logonly"]:
+                print(f"[rewards] Simulator failure for module={mod_name!r}, "
+                      f"fault={fault} {net}: {fault_simulation['error'].tolist()}",
+                      file=sys.stderr, flush=True)
             rewards.append(out)
             continue
         out["simulation_valid_logonly"] = 1.0
