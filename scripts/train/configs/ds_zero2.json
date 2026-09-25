@@ -6,8 +6,8 @@
     "stage": 2,
     "overlap_comm": true,
     "contiguous_gradients": true,
-    "reduce_bucket_size": "auto",
-    "allgather_bucket_size": 500000000
+    "reduce_bucket_size": 16777216,
+    "allgather_bucket_size": 16777216
   },
   "gradient_accumulation_steps": "auto",
   "gradient_clipping": "auto",
