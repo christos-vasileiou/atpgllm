@@ -233,7 +233,7 @@ def test_real_local_tokenizer_renders_complete_tool_history(relative):
     assert runner.render(runner.initial(original, [messages[0]])) == original
 
 
-@pytest.mark.parametrize('method', ['greedy', 'mcts', 'evolutionary', 'vector_evolutionary'])
+@pytest.mark.parametrize('method', ['single_completion', 'mcts', 'evolutionary', 'vector_evolutionary'])
 def test_evaluator_writes_versioned_metrics_and_all_slots(tmp_path, monkeypatch, method):
     import importlib.util
     from test_conversation_search import Generator, Tokenizer, PROMPT, answer
@@ -266,7 +266,7 @@ def test_evaluator_writes_versioned_metrics_and_all_slots(tmp_path, monkeypatch,
     (checkpoint / 'adapter_config.json').write_text(json.dumps({'base_model_name_or_path': 'local-test'}))
     output = tmp_path / 'metrics.json'
     evaluator.evaluate(checkpoint, num_completions=2, k_values=[1, 2], sampling_method=method,
-                       budget=None if method == 'greedy' else 8, max_tool_rounds=0,
+                       budget=None if method == 'single_completion' else 8, max_tool_rounds=0,
                        output_file=str(output))
     metrics = json.loads(output.read_text())
     slots = [json.loads(line) for line in output.with_suffix('.slots.jsonl').read_text().splitlines()]
@@ -278,3 +278,47 @@ def test_evaluator_writes_versioned_metrics_and_all_slots(tmp_path, monkeypatch,
     assert all(s['usage']['attempts'] == 0 for s in slots[2:])
     # Missing/failed slots must not disappear from component denominators.
     assert metrics['accuracy_metrics']['fault_detected_by_pred_input_vector_acc'] <= 0.5
+
+
+def _load_evaluator(name):
+    import importlib.util
+    path = Path(__file__).resolve().parents[2] / 'scripts/eval/evaluate_model.py'
+    spec = importlib.util.spec_from_file_location(name, path)
+    evaluator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evaluator)
+    return evaluator
+
+
+def test_greedy_tool_calls_decode_only_the_call_body_at_temperature_zero():
+    from test_conversation_search import Generator, Verifier, answer, call, job
+    from atpgllm.training.completion_runner import CompletionRunner
+    evaluator = _load_evaluator('eval_greedy_tool_calls')
+    body = call(1, 1)[len('<tool_call>'):]
+
+    def respond(req, i):
+        if '<tool_call>' in req.stop:
+            return answer() if 'OBS:' in req.prompt else 'thinking <tool_call>'
+        assert req.temperature == 0.0 and req.prompt.endswith('<tool_call>')
+        return body
+
+    gen = Generator(respond)
+    runner = CompletionRunner(evaluator.GreedyToolCallGenerator(gen), Verifier(), max_tool_rounds=1)
+    j = job(runner)
+    (state, _), = runner.complete_many([j])
+    assert state.status == 'FINAL'
+    assert [r.temperature for r in gen.requests] == [0.7, 0.0, 0.7]
+    assert runner.verifier.tool_vectors == [{'a': 1, 'b': 1}]
+    assert j[2].usage.generation_requests == 2  # the split is invisible to the runner
+    assert j[2].usage.generated_tokens == len('thinking <tool_call>' + body) + len(answer())
+
+
+def test_greedy_tool_calls_continue_greedily_after_budget_ends_at_opening_tag():
+    from test_conversation_search import Generator
+    from atpgllm.training.search_types import GenerationRequest
+    evaluator = _load_evaluator('eval_greedy_tool_calls_budget')
+    gen = Generator(lambda req, i: 'ab<tool_call>' if i == 1 else '{"x": 1}</tool_call>')
+    wrapped = evaluator.GreedyToolCallGenerator(gen)
+    first, = wrapped.generate_requests([GenerationRequest('p', len('ab<tool_call>'), 0.7, 0.95, 1)])
+    assert first.finish_reason == 'length' and len(gen.requests) == 1
+    wrapped.generate_requests([GenerationRequest('p' + first.text, 50, 0.7, 0.95, 1)])
+    assert gen.requests[-1].temperature == 0.0

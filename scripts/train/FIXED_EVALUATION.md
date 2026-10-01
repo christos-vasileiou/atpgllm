@@ -170,8 +170,11 @@ TRAIN_BEST_OF_N=32
 ```
 
 For each training prompt, sample 32 trajectories at temperature 1, finish all
-tool calls, score using the configured simulator, and retain the highest-reward
-16. `NUM_GENERATIONS` continues to control the optimizer group and batch layout.
+tool calls, score using the configured simulator, and retain the 16 whose rewards
+have maximal variance (PODS max-variance down-sampling; Xu et al., 2025). That
+subset is the top k plus bottom 16-k rewards; every k is tried, and variance ties
+prefer the most balanced split, then the larger k.
+`NUM_GENERATIONS` continues to control the optimizer group and batch layout.
 `TRAIN_BEST_OF_N=0` (the CLI default), or setting N equal to G, retains ordinary
 i.i.d. sampling. N must be a multiple of G and at least G; G must be at least 2.
 The candidate pool is expanded before generation, so N/G increases rollout memory,
@@ -191,9 +194,10 @@ retained model tokens. Both adapter trainers use this path.
 
 This is reward-selected GRPO/GDPO, not an unbiased estimator of ordinary on-policy
 GRPO. Existing vLLM importance ratios correct model/engine log-probability
-differences; they do not correct the reward-selection distribution. Selecting
-only high scores can reduce within-group variation and therefore the learning
-signal. Keep G >= 2, monitor group degeneracy and greedy fixed evaluation, and
+differences; they do not correct the reward-selection distribution. Keeping
+reward extremes maximizes within-group variation, so clearly bad
+trajectories still receive negative advantages, but middle-ranked candidates
+never enter the update. Monitor group degeneracy and greedy fixed evaluation, and
 compare against `TRAIN_BEST_OF_N=0` before treating this as an improvement.
 
 `sampling/best_of_n/` logs candidate count, retained count, candidate raw reward

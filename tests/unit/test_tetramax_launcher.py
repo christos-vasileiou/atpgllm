@@ -122,6 +122,62 @@ def test_service_startup_failure_prevents_training(launcher):
     assert not launcher.credentials.exists()
 
 
+@pytest.mark.parametrize('timeout', [None, 7200])
+def test_grpo_timeout_forwarded_by_launcher(launcher, timeout):
+    launcher.append('METHOD=grpo\nDRY_RUN=True')
+    if timeout is not None:
+        launcher.append(f'DDP_TIMEOUT={timeout}')
+    result = launcher.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f'--ddp_timeout {timeout or 3600}' in result.stdout
+
+
+@pytest.mark.parametrize('mode', ['matching', 'mismatch', 'reviewed_transition', 'wrong_transition'])
+def test_resume_provenance_checked_before_training_and_service_cleaned_up(launcher, mode):
+    import json
+    package = launcher.repo / 'atpgllm'
+    training = package / 'training'
+    llm = package / 'llm'
+    for directory in (package, training, llm):
+        directory.mkdir(exist_ok=True)
+        (directory / '__init__.py').write_text('')
+    shutil.copy(ROOT / 'atpgllm/training/simulator_provenance.py', training)
+    (training / '_paths.py').write_text(
+        f'import sys\ndef ensure_data_preprocessing_on_path(): sys.path.insert(0, {str(launcher.backend)!r})\n')
+    (launcher.repo / 'transformers.py').write_text('class TrainerCallback: pass\n')
+    (launcher.backend / 'fault_sim.py').write_text(
+        'def tetramax_fault_sim(): pass\ndef resolve_fault_sim_runner(): return tetramax_fault_sim\n')
+    (llm / 'reward_funcs.py').write_text(
+        "def active_reward_objectives(): return ('detection',), (1.0,)\n")
+    checkpoint = launcher.repo / 'checkpoint-3'
+    checkpoint.mkdir()
+    (checkpoint / 'trainer_state.json').write_text('{}')
+    provenance = {'backend': 'tetramax', 'reward_contract': 'atpg-rewards-v2',
+                  'objectives': ['detection'], 'weights': [1.0], 'profile': 'po',
+                  'simulator': {'schema': 'test', 'tool_version': 'test-version',
+                                'fingerprint': 'test-fingerprint' if mode == 'matching' else 'old-fingerprint'}}
+    path = checkpoint / 'simulator_provenance.json'
+    original = json.dumps(provenance)
+    path.write_text(original)
+    launcher.append(f'METHOD=grpo\nRESUME_FROM={checkpoint}\nRESUME_TRAINING_STATE=True\nUSE_DUAL_ADAPTER=False')
+    if mode in ('reviewed_transition', 'wrong_transition'):
+        target = 'test-fingerprint' if mode == 'reviewed_transition' else 'wrong-fingerprint'
+        launcher.append(f'TMAX_RESUME_FINGERPRINT_TRANSITION=old-fingerprint:{target}')
+    result = launcher.run()
+    matching = mode in ('matching', 'reviewed_transition')
+    assert result.returncode == (0 if matching else 1), result.stdout + result.stderr
+    assert (launcher.repo / 'training-started').exists() == matching
+    assert not launcher.credentials.exists()
+    assert path.read_text() == original
+    if not matching:
+        assert 'simulator.fingerprint' in result.stderr
+        assert 'RESUME_TRAINING_STATE=False' in result.stderr
+    if mode == 'reviewed_transition':
+        assert 'restoring full training state' in result.stdout
+        snapshot = next((launcher.repo / 'jobs/launch_configs/snapshots').glob('*.env'))
+        assert 'TMAX_RESUME_FINGERPRINT_TRANSITION=old-fingerprint:test-fingerprint' in snapshot.read_text()
+
+
 def test_service_readiness_timeout_stops_child(launcher):
     (launcher.backend / 'tetramax_service.py').write_text('import time; time.sleep(60)\n')
     launcher.append('TMAX_SERVICE_STARTUP_TIMEOUT_S=1')

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from atpgllm.training.best_of_n import (
-    BestOfNTrainingMixin, select_best_indices, select_rollouts, validate_best_of_n,
+    BestOfNTrainingMixin, select_spread_indices, select_rollouts, validate_best_of_n,
 )
 
 
@@ -20,8 +20,8 @@ def bundle(ids):
 
 def test_selection_crosses_rank_boundaries_and_preserves_trajectory_alignment():
     # Two prompt groups of six, partitioned into three ranks of four.
-    indices = select_best_indices([0, 8, 1, 9, 2, 3, 7, 0, 6, 1, 5, 2], 6, 2)
-    assert indices == [3, 1, 6, 8]
+    indices = select_spread_indices([0, 8, 1, 9, 2, 3, 7, 0, 6, 1, 5, 2], 6, 2)
+    assert indices == [3, 0, 6, 7]
     result = select_rollouts([bundle(range(0, 4)), bundle(range(4, 8)), bundle(range(8, 12))], indices)
     assert result[1] == [[i, i] for i in indices]
     assert result[2] == [[1, 0]] * 4
@@ -31,17 +31,29 @@ def test_selection_crosses_rank_boundaries_and_preserves_trajectory_alignment():
     assert result[6] == {"candidate": indices}
 
 
+def test_keeps_max_variance_top_k_plus_bottom_subset_of_each_group():
+    # PODS max-variance down-sampling: top-k plus bottom-(G-k), k maximizing variance.
+    scores = [3, 7, 0, 5, 1, 6, 2, 4]
+    assert select_spread_indices(scores, 8, 4) == [1, 5, 4, 2]
+    assert select_spread_indices(scores * 2, 8, 2) == [1, 2, 9, 10]
+    # A high outlier makes k=1 (variance 1951.25) beat the even split k=2 (1905.25).
+    assert select_spread_indices([100, 3, 2, 1, 0, -1, -2, -3], 8, 4) == [0, 5, 6, 7]
+    # Odd G; k=1 and k=2 tie on variance and balance, so the larger k wins.
+    assert select_spread_indices([0, 1, 2, 3, 4, 5], 6, 3) == [5, 4, 0]
+
+
 def test_ties_missing_rewards_and_invalid_groups():
-    assert select_best_indices([1, 1, float("nan"), 0], 4, 2) == [0, 1]
+    assert select_spread_indices([1, 1, float("nan"), 0], 4, 2) == [0, 3]
     with pytest.raises(ValueError, match="finite"):
-        select_best_indices([float("nan"), float("inf"), 1, float("nan")], 4, 2)
+        select_spread_indices([float("nan"), float("inf"), 1, float("nan")], 4, 2)
     with pytest.raises(ValueError, match="complete"):
-        select_best_indices([1, 2, 3], 4, 2)
+        select_spread_indices([1, 2, 3], 4, 2)
     for n, g in [(-1, 2), (3, 2), (2, 4), (4, 1)]:
         with pytest.raises(ValueError):
             validate_best_of_n(n, g)
     validate_best_of_n(0, 16)
     validate_best_of_n(32, 16)
+    validate_best_of_n(6, 3)
 
 
 class Parent:
@@ -79,7 +91,7 @@ def test_selects_before_parent_forwards_and_bypasses_eval(monkeypatch):
     trainer = Trainer()
     inputs = [{"prompt": "p", "fault": "sa0"}] * 2
     result = trainer._generate_and_score_completions(inputs)
-    assert result[1] == [[1, 1], [2, 2]]
+    assert result[1] == [[1, 1], [0, 0]]
     assert result[4].item() == 2
     assert trainer.calls == [(4, 4)]
     assert trainer.num_generations == 2

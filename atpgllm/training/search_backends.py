@@ -20,7 +20,7 @@ class VLLMGenerator:
         params = [self._SamplingParams(
             n=1, temperature=float(r.temperature), top_p=float(r.top_p), max_tokens=int(r.max_tokens),
             seed=int(r.seed), stop_token_ids=list(self._base.stop_token_ids or []),
-            stop=["</tool_call>"], include_stop_str_in_output=True,
+            stop=["</tool_call>", *r.stop], include_stop_str_in_output=True,
             logprobs=0 if r.logprobs else None,
         ) for r in requests]
         try:
@@ -59,11 +59,12 @@ class HFGenerator:
         tokenizer = self.tokenizer
         stop_window = max(32, len(tokenizer.encode("</tool_call>", add_special_tokens=False)) + 8)
         class ToolStop(StoppingCriteria):
-            def __init__(self, prompt_length):
-                self.prompt_length = prompt_length
+            def __init__(self, prompt_length, stops):
+                self.prompt_length, self.stops = prompt_length, stops
             def __call__(self, input_ids, scores, **kwargs):
                 start = max(self.prompt_length, input_ids.shape[1] - stop_window)
-                return "</tool_call>" in tokenizer.decode(input_ids[0, start:], skip_special_tokens=True)
+                tail = tokenizer.decode(input_ids[0, start:], skip_special_tokens=True)
+                return any(stop in tail for stop in self.stops)
 
         device = next(self.model.parameters()).device
         devices = list(range(torch.cuda.device_count())) if device.type == "cuda" else []
@@ -86,12 +87,12 @@ class HFGenerator:
                     if devices:
                         torch.cuda.manual_seed_all(req.seed)
                     output = self.model.generate(**enc, generation_config=cfg,
-                        stopping_criteria=StoppingCriteriaList([ToolStop(prompt_len)]))
+                        stopping_criteria=StoppingCriteriaList([ToolStop(prompt_len, ("</tool_call>", *req.stop))]))
                 ids = tuple(output.sequences[0, prompt_len:].tolist())
                 text = tokenizer.decode(ids, skip_special_tokens=True)
                 eos = cfg.eos_token_id
                 eos = eos if isinstance(eos, list) else [eos]
-                finished = bool(ids and ids[-1] in eos) or "</tool_call>" in text
+                finished = bool(ids and ids[-1] in eos) or any(stop in text for stop in ("</tool_call>", *req.stop))
                 logp = None
                 if req.logprobs and output.scores:
                     transitions = self.model.compute_transition_scores(output.sequences, output.scores, normalize_logits=True)

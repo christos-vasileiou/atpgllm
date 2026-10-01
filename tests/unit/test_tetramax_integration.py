@@ -157,6 +157,82 @@ def test_reward_profile_resume_guard(tmp_path,monkeypatch):
     assert json.loads((tmp_path/'checkpoint-1/simulator_provenance.json').read_text())==provenance
 
 
+@pytest.mark.parametrize('field,value', [
+    ('simulator', {'fingerprint': 'fixed-adapter', 'tool_version': 'O-2018.06-SP1'}),
+    ('profile', 'full'), ('weights', [1.0]), ('backend', 'fast'),
+])
+def test_resume_error_identifies_change_and_preserves_checkpoint(tmp_path, monkeypatch, field, value):
+    from atpgllm.training import simulator_provenance as module
+    previous = {'backend': 'tetramax', 'profile': 'po', 'weights': [1.0, 0.2, 0.05],
+                'simulator': {'fingerprint': 'old-adapter', 'tool_version': 'O-2018.06-SP1'}}
+    path = tmp_path / 'simulator_provenance.json'
+    original = json.dumps(previous)
+    path.write_text(original)
+    current = dict(previous, **{field: value})
+    monkeypatch.setattr(module, 'runtime_provenance', lambda: current)
+    with pytest.raises(ValueError) as error:
+        SimulatorProvenanceCallback(tmp_path)
+    message = str(error.value)
+    assert ('simulator.fingerprint' if field == 'simulator' else field) in message
+    assert 'RESUME_TRAINING_STATE=False' in message
+    assert 'OUTPUT_DIR' in message and 'FIXED_EVAL_MANIFEST' in message
+    assert path.read_text() == original
+    # Weights-only initialization records current provenance without trying to
+    # restore the old optimizer or alter its checkpoint.
+    assert SimulatorProvenanceCallback().provenance == current
+
+
+def test_reviewed_adapter_transition_preserves_full_state_and_history(tmp_path, monkeypatch):
+    from atpgllm.training import simulator_provenance as module
+    previous = {'backend': 'tetramax', 'profile': 'po', 'weights': [1.0, 0.2, 0.05],
+                'simulator': {'fingerprint': 'old-adapter', 'tool_version': 'O-2018.06-SP1'}}
+    current = dict(previous, simulator=dict(previous['simulator'], fingerprint='fixed-adapter'))
+    source = tmp_path / 'checkpoint-3'
+    source.mkdir()
+    (source / 'simulator_provenance.json').write_text(json.dumps(previous))
+    # The callback must not mutate the checkpoint or its training-state files.
+    for name in ('optimizer.pt', 'scheduler.pt', 'rng_state.pth', 'trainer_state.json'):
+        (source / name).write_bytes(b'original state')
+    original = {p.name: p.read_bytes() for p in source.iterdir()}
+    monkeypatch.setattr(module, 'runtime_provenance', lambda: current)
+    monkeypatch.setenv('TMAX_RESUME_FINGERPRINT_TRANSITION', 'old-adapter:fixed-adapter')
+    callback = SimulatorProvenanceCallback(source)
+    assert callback.resume_history == [{'checkpoint': str(source.resolve()), 'previous': previous,
+                                        'current': current, 'authorization': 'TMAX_RESUME_FINGERPRINT_TRANSITION'}]
+    state = SimpleNamespace(global_step=4, is_world_process_zero=True)
+    args = SimpleNamespace(output_dir=str(tmp_path))
+    callback.on_train_begin(args, state, None)
+    callback.on_save(args, state, None)
+    assert {p.name: p.read_bytes() for p in source.iterdir()} == original
+    destination = tmp_path / 'checkpoint-4'
+    assert json.loads((destination / 'simulator_provenance.json').read_text()) == current
+    monkeypatch.delenv('TMAX_RESUME_FINGERPRINT_TRANSITION')
+    recovered = SimulatorProvenanceCallback(destination)
+    assert recovered.resume_history == callback.resume_history
+    recovered.on_save(args, SimpleNamespace(global_step=5, is_world_process_zero=True), None)
+    assert json.loads((tmp_path / 'checkpoint-5/simulator_resume_history.json').read_text()) == callback.resume_history
+
+
+@pytest.mark.parametrize('change', ['old_hash', 'new_hash', 'backend', 'profile', 'weights',
+                                  'objectives', 'reward_contract', 'tool_version', 'schema'])
+def test_adapter_transition_cannot_bypass_other_incompatibilities(tmp_path, monkeypatch, change):
+    from atpgllm.training import simulator_provenance as module
+    previous = {'backend': 'tetramax', 'profile': 'po', 'weights': [1.0],
+                'objectives': ['detection'], 'reward_contract': 'v2',
+                'simulator': {'fingerprint': 'old', 'tool_version': '2018', 'schema': 'v1'}}
+    current = dict(previous, simulator=dict(previous['simulator'], fingerprint='new'))
+    if change in ('tool_version', 'schema'):
+        current['simulator'][change] = 'changed'
+    elif change not in ('old_hash', 'new_hash'):
+        current[change] = 'changed'
+    transition = {'old_hash': 'wrong:new', 'new_hash': 'old:wrong'}.get(change, 'old:new')
+    monkeypatch.setenv('TMAX_RESUME_FINGERPRINT_TRANSITION', transition)
+    monkeypatch.setattr(module, 'runtime_provenance', lambda: current)
+    (tmp_path / 'simulator_provenance.json').write_text(json.dumps(previous))
+    with pytest.raises(ValueError, match='differs'):
+        SimulatorProvenanceCallback(tmp_path)
+
+
 @pytest.mark.parametrize('trainer_module,class_name',[
     ('tool_calling_grpo_trainer','ToolCallingGRPOTrainer'),
     ('dual_adapter_grpo_trainer','DualAdapterGRPOTrainer'),

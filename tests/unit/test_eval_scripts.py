@@ -52,6 +52,24 @@ def captured_args(tmp_path):
     return [json.loads(log.read_text()) for log in sorted((tmp_path / "results").glob("*.log"))]
 
 
+def test_grpo_failure_preserves_stderr_and_exit_status(launcher, tmp_path):
+    repo, run = launcher
+    policy = adapter(repo / "runs" / "experiment" / "checkpoint-1" / "policy")
+    (tmp_path / "bin" / "python").write_text(
+        '#!/usr/bin/env python3\nimport sys\n'
+        'print("engine startup")\n'
+        'print("worker root cause", file=sys.stderr)\n'
+        'sys.exit(7)\n'
+    )
+    result = run("grpo", policy)
+    assert result.returncode == 7
+    log, = (tmp_path / "results").glob("*.log")
+    assert "engine startup" in log.read_text()
+    assert "worker root cause" in log.read_text()
+    assert "worker root cause" in result.stderr
+    assert "Done." not in result.stdout
+
+
 @pytest.mark.parametrize("model", ["ibm-granite/granite-4.2-8b", "Qwen/Qwen2.5-32B-Instruct"])
 @pytest.mark.parametrize("path_mode", ["absolute", "repo_relative", "runs_relative", "environment"])
 def test_sft_checkpoint_paths_and_model_independence(launcher, tmp_path, model, path_mode):
@@ -127,6 +145,20 @@ def test_sampling_and_logging_overrides(launcher, tmp_path, method, flag, width)
     assert 'csv1' in args[args.index('--output_file') + 1]
 
 
+@pytest.mark.parametrize("kind", ["sft", "grpo"])
+def test_greedy_tool_calls_flag_and_output_tag(launcher, tmp_path, kind):
+    repo, run = launcher
+    checkpoint = repo / "checkpoint-1"
+    adapter(checkpoint / "policy" if kind == "grpo" else checkpoint)
+    assert run(kind, checkpoint, MERGE_DEQUANT="0").returncode == 0
+    assert run(kind, checkpoint, MERGE_DEQUANT="0", GREEDY_TOOL_CALLS="1").returncode == 0
+    runs = {"_gtc" in args[args.index("--output_file") + 1]: args for args in captured_args(tmp_path)}
+    assert set(runs) == {False, True}  # separate result files
+    assert "--greedy_tool_calls" not in runs[False]
+    assert "--greedy_tool_calls" in runs[True]
+    assert run(kind, checkpoint, GREEDY_TOOL_CALLS="yes").returncode != 0
+
+
 def test_dry_run_and_validation(launcher, tmp_path):
     repo, run = launcher
     checkpoint = adapter(repo / "checkpoint-1")
@@ -138,3 +170,18 @@ def test_dry_run_and_validation(launcher, tmp_path):
                       {"BEST_OF_N_WIDTH": "3"}, {"PASS_AT_K": "0"},
                       {"SAMPLING_METHOD": "invalid"}):
         assert run("sft", checkpoint, **overrides).returncode != 0
+
+
+def test_grpo_difficulty_flags_and_frozen_manifest(launcher, tmp_path):
+    repo, run = launcher
+    policy = adapter(repo / 'runs' / 'experiment' / 'checkpoint-1' / 'policy')
+    manifest = str(tmp_path / 'shared faults.json')
+    result = run('grpo', policy, EVAL_SELECTION='stratified', EVAL_CANDIDATE_POOL='2048',
+                 EVAL_MANIFEST=manifest, DIFFICULTY_RANDOM_SAMPLES='8192',
+                 DIFFICULTY_EXACT_MAX_INPUTS='10', DIFFICULTY_SEED='19')
+    assert result.returncode == 0, result.stderr
+    args, = captured_args(tmp_path)
+    for flag, value in [('--eval_selection','stratified'),('--eval_candidate_pool','2048'),
+                        ('--eval_manifest',manifest),('--difficulty_random_samples','8192'),
+                        ('--difficulty_exact_max_inputs','10'),('--difficulty_seed','19')]:
+        assert args[args.index(flag)+1] == value

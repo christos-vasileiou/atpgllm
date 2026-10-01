@@ -9,6 +9,27 @@ import torch
 SOURCE = Path(__file__).resolve().parents[2] / "atpgllm/training/dual_adapter_grpo_trainer.py"
 
 
+@pytest.mark.parametrize('timeout', [0, -1, True, 1.5, '3600'])
+def test_invalid_distributed_timeout_is_rejected(timeout):
+    from atpgllm.training.distributed_runtime import initialize_grpo_distributed
+    with pytest.raises(ValueError, match='positive integer'):
+        initialize_grpo_distributed(timeout)
+
+
+def test_distributed_timeout_reaches_first_state_initialization(monkeypatch):
+    from datetime import timedelta
+    import accelerate
+    from atpgllm.training.distributed_runtime import initialize_grpo_distributed
+    calls = []
+    state = SimpleNamespace(num_processes=2, print=lambda message: None)
+    def create_state(**kwargs):
+        calls.append(kwargs)
+        return state
+    monkeypatch.setattr(accelerate, 'PartialState', create_state)
+    assert initialize_grpo_distributed(7200) is state
+    assert calls == [{'timeout': timedelta(seconds=7200)}]
+
+
 def method(name, **scope):
     tree = ast.parse(SOURCE.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DualAdapterGRPOTrainer")

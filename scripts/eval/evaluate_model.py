@@ -18,7 +18,7 @@ This module evaluates a model trained through SFT → GRPO by:
 Sampling methods (``--sampling_method`` / ``SAMPLING_METHOD``):
 
   Model-based (LLM):
-    * ``greedy`` (default) — primary i.i.d. LLM generation + tool calling
+    * ``single_completion`` (default) — primary i.i.d. LLM generation + tool calling
     * ``best_of_n`` / ``mcts`` / ``evolutionary`` — search (see
       ``sampling_strategies.py``)
 
@@ -64,7 +64,7 @@ import time
 import warnings
 import random as py_random
 from collections import defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -86,7 +86,7 @@ from atpgllm.training.dataset_utils import buffer_streaming_dataset
 from atpgllm.training.reward_function_factory import RewardFunctionFactory
 from atpgllm.training.tools import TOOLS, FAULT_SIMULATION_TOOL, fault_simulation_tool, fault_simulation_tool_handler, ToolHelper
 from atpgllm.training.revert_template import parse_tool_call, revert_chat_template
-from atpgllm.training.search_types import SearchConfig, PROTOCOL_VERSION, Usage, accepted
+from atpgllm.training.search_types import SearchConfig, PROTOCOL_VERSION, Usage, accepted, GenerationResult
 from atpgllm.training.sampling_strategies import (
     Verifier,
     MODEL_FREE_STRATEGY_NAMES,
@@ -578,6 +578,65 @@ def generate_batch_n_completions_hf(
 # PROMPT FORMATTING
 # =============================================================================
 
+class GreedyToolCallGenerator:
+    """
+    Wrap a search generator so every ``<tool_call>`` body is decoded greedily.
+
+    Text before ``<tool_call>`` and after the simulator's response is sampled
+    at the configured temperature; only the arguments sent to the external
+    fault simulator are deterministic (temperature 0). Each request is split
+    at ``<tool_call>`` and the continuation is merged back into one result, so
+    the conversation runner and its token accounting see a single action.
+    """
+
+    OPEN, CLOSE = "<tool_call>", "</tool_call>"
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def generate_requests(self, requests):
+        # A prompt ending inside an unclosed call (token-limit continuation)
+        # is already in the call body: decode it greedily.
+        requests = [
+            replace(r, temperature=0.0)
+            if r.prompt.rfind(self.OPEN) > r.prompt.rfind(self.CLOSE)
+            else replace(r, stop=(*r.stop, self.OPEN))
+            for r in requests
+        ]
+        results = list(self.inner.generate_requests(requests))
+        split = [i for i, (r, res) in enumerate(zip(requests, results))
+                 if self.OPEN in r.stop and not res.error and res.text.endswith(self.OPEN)]
+        follow = []
+        for i in split:
+            r, res = requests[i], results[i]
+            remaining = r.max_tokens - len(res.token_ids)
+            if remaining <= 0:
+                # Budget ran out at the opening tag; let the runner continue.
+                results[i] = replace(res, finish_reason="length")
+            else:
+                follow.append((i, replace(r, prompt=r.prompt + res.text, max_tokens=remaining,
+                                          temperature=0.0, stop=())))
+        if not follow:
+            return results
+        outputs = self.inner.generate_requests([r for _, r in follow])
+        if len(outputs) != len(follow):
+            raise RuntimeError("Generator returned a different number of results than requests")
+        for (i, _), tail in zip(follow, outputs):
+            head = results[i]
+            n1, n2 = len(head.token_ids), len(tail.token_ids)
+            mean = None
+            if head.mean_logprob is not None and tail.mean_logprob is not None and n1 + n2:
+                mean = (head.mean_logprob * n1 + tail.mean_logprob * n2) / (n1 + n2)
+            results[i] = GenerationResult(
+                head.text + tail.text, tuple(head.token_ids) + tuple(tail.token_ids),
+                tail.finish_reason, mean, head.prompt_tokens + tail.prompt_tokens, tail.error,
+            )
+        return results
+
+
 def _eval_record_as_dict(record: Any) -> Dict[str, Any]:
     """Normalize a single dataset row to a plain dict (HuggingFace row or mapping)."""
     if isinstance(record, dict):
@@ -899,11 +958,18 @@ def evaluate(
     eval_prompt_batch_size: int = 8,
     generation_micro_batch_size: int = 8,
     wandb_run_name: Optional[str] = None,
-    sampling_method: str = "greedy",
+    sampling_method: str = "single_completion",
     merge_dequant: bool = False,
     budget: Optional[int] = None,
     best_of_n_width: Optional[int] = None,
     search_config: Optional[str] = None,
+    eval_selection: str = "uniform_faults",
+    eval_candidate_pool: int = 4096,
+    eval_manifest: Optional[str] = None,
+    difficulty_random_samples: int = 4096,
+    difficulty_exact_max_inputs: int = 12,
+    difficulty_seed: int = 1729,
+    greedy_tool_calls: bool = False,
 ) -> Dict[str, Any]:
     """
     Main evaluation function.
@@ -960,7 +1026,10 @@ def evaluate(
     best_of_n_width : int, optional
         Per-completion width (B) for ``best_of_n`` only: i.i.d. LLM samples
         drawn per completion, of which the best is kept (``1`` ≈ model-based
-        i.i.d. like ``greedy``, not model-free ``random``).
+        i.i.d. like ``single_completion``, not model-free ``random``).
+    greedy_tool_calls : bool
+        Decode ``<tool_call>`` bodies (the fault simulator's arguments) with
+        temperature 0; everything else keeps ``temperature``.
 
     Returns
     -------
@@ -985,7 +1054,7 @@ def evaluate(
 
     # ``budget`` (mcts/evolutionary) and ``best_of_n_width`` (best_of_n) are the
     # same concept — the per-completion search width (B) — under different flag
-    # names; ``greedy`` / ``random`` take neither. Normalize to a single ``width``.
+    # names; ``single_completion`` / ``random`` take neither. Normalize to a single ``width``.
     if sampling_method in ("mcts", "evolutionary", "vector_evolutionary"):
         if budget is None:
             raise ValueError(
@@ -1010,7 +1079,7 @@ def evaluate(
                 "best_of_n"
             )
         width = best_of_n_width
-    else:  # greedy | random
+    else:  # single_completion | random
         if budget is not None or best_of_n_width is not None:
             raise ValueError(
                 "--budget / --n do not apply to the "
@@ -1042,6 +1111,54 @@ def evaluate(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # For generation
     
+    # =========================================================================
+    # 2. Load Dataset
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("LOADING DATASET")
+    print("=" * 70)
+
+    from fault_difficulty import (
+        Analyzer, select_records, save_manifest, load_manifest, identity,
+        outcome_counts, summarize as summarize_difficulty, write_report,
+    )
+    from atpgllm.training._paths import resolve_sim_config_path
+    difficulty_analyzer = Analyzer(resolve_sim_config_path(config_path),
+        samples=difficulty_random_samples, exact_max_inputs=difficulty_exact_max_inputs,
+        seed=difficulty_seed)
+    def eligible(record):
+        # Filter the actual inference prompt, including chat-template overhead.
+        try:
+            prompt = format_eval_prompt(record.copy(), tokenizer)
+            return len(tokenizer.encode(prompt, add_special_tokens=False)) <= max_prompt_length
+        except (ValueError, TypeError, KeyError):
+            return False
+    manifest_path = eval_manifest or (str(Path(output_file).with_suffix(".manifest.json")) if output_file else None)
+    if manifest_path and Path(manifest_path).exists():
+        eval_records, selection_audit = load_manifest(manifest_path)
+        # Frozen membership wins over selection flags; never silently filter it.
+        if not all(eligible(r) for r in eval_records):
+            raise ValueError("Frozen manifest contains a prompt incompatible with this tokenizer/length limit")
+        print(f"Reusing {len(eval_records)} frozen problems from {manifest_path}")
+    else:
+        eval_dataset = load_dataset(dataset_path, split="test", streaming=True)
+        eval_records, selection_audit = select_records(eval_dataset, max_eval_samples,
+            mode=eval_selection, seed=seed, pool_size=eval_candidate_pool,
+            eligible=eligible, analyzer=difficulty_analyzer)
+        selection_audit.update(dataset=dataset_path, split="test", tokenizer=base_model_name,
+                               max_prompt_length=max_prompt_length,
+                               difficulty=difficulty_analyzer.provenance())
+        if manifest_path:
+            save_manifest(manifest_path, eval_records, selection_audit)
+            print(f"Frozen evaluation problems saved to {manifest_path}")
+    difficulty_rows = [r.get("_difficulty") or difficulty_analyzer.analyze(r) for r in eval_records]
+    selection_audit["selected_distribution"] = summarize_difficulty(difficulty_rows)["by"]
+    print(f"Problem selection: {selection_audit['mode']}; "
+          f"characterized {sum(r['status'] == 'ok' for r in difficulty_rows)}/{len(difficulty_rows)}")
+
+    print(f"Loaded {len(eval_records)} eval samples from '{dataset_path}' (eval split)")
+
+
     model = None
     lora_request = None
     generation_config = None
@@ -1049,6 +1166,11 @@ def evaluate(
     if sampling_method in MODEL_FREE_STRATEGY_NAMES:
         print(f"Sampling method '{sampling_method}': skipping LLM/vLLM load.")
     elif backend == "vllm":
+        # vLLM's default fork can inherit CUDA state from model preparation
+        # or engine imports, leaving TP workers unable to initialize CUDA.
+        # Set this before importing vLLM so both engine and workers spawn.
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        print("[vllm] Using spawn for CUDA-safe engine and worker startup.")
         from vllm import LLM, SamplingParams
         from vllm.lora.request import LoRARequest
         if merge_dequant:
@@ -1129,20 +1251,6 @@ def evaluate(
         print(f"Model loaded via Transformers/PEFT from: {adapter.as_posix()}")
 
     # =========================================================================
-    # 2. Load Dataset
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("LOADING DATASET")
-    print("=" * 70)
-    
-    eval_dataset = load_dataset(dataset_path, split="test", streaming=True)
-    
-    # Buffer the streaming dataset
-    eval_records = buffer_streaming_dataset(eval_dataset, buffer_size=max_eval_samples, shuffle=False, unique_by="netlist", tokenizer=tokenizer, max_prompt_length=max_prompt_length)
-    
-    print(f"Loaded {len(eval_records)} eval samples from '{dataset_path}' (eval split)")
-    
-    # =========================================================================
     # 3. Initialize Reward Factory
     # =========================================================================
     print("\n" + "=" * 70)
@@ -1177,6 +1285,7 @@ def evaluate(
                     "top_p": top_p,
                     "max_new_tokens": max_new_tokens,
                     "max_tool_rounds": max_tool_rounds,
+                    "greedy_tool_calls": greedy_tool_calls,
                     "threshold_mode": threshold_mode,
                     "num_eval_samples": len(eval_records),
                     "seed": seed,
@@ -1217,6 +1326,10 @@ def evaluate(
     else:
         generator = make_hf_generator(model, tokenizer, generation_config,
                                       micro_batch_size=generation_micro_batch_size)
+    if generator is not None and greedy_tool_calls:
+        generator = GreedyToolCallGenerator(generator)
+        print("Tool-call bodies decoded greedily (temperature 0); "
+              f"other text sampled at temperature={temperature}.")
     strategy = make_strategy(
         sampling_method, generator, verifier, num_completions=num_completions,
         width=width, use_tools=max_tool_rounds >= 1, max_tool_rounds=max_tool_rounds,
@@ -1332,9 +1445,24 @@ def evaluate(
                     "num_correct": 0,
                     "num_completions": num_completions,
                 }
+            result = chunk_problem_result[slot]
+            difficulty = dict(difficulty_rows[global_indices[slot]])
+            difficulty["num_completions"] = num_completions
+            difficulty["outcomes"] = outcome_counts(chunk_rewards[slot] or [], num_completions)
+            difficulty["saved_search_usage"] = {key: sum(s.get("usage", {}).get(key, 0)
+                for s in result.get("search_slots", [])) for key in
+                ("attempts", "simulator_requests", "simulator_executions", "generated_tokens")}
+            result["problem_id"] = identity(chunk[slot])
+            result["circuit_id"] = difficulty["circuit_id"]
+            result["difficulty"] = difficulty
+            result["component_rewards"] = chunk_rewards[slot]
+            # Detection remains detection even under full_accuracy/positive_reward.
+            if "rewards_summary" in result:
+                result["rewards_summary"]["threshold_success_rate"] = chunk_num_correct[slot] / num_completions
+                result["rewards_summary"]["fault_detection_rate"] = difficulty["outcomes"]["D"] / num_completions
             all_num_correct.append(chunk_num_correct[slot])
             all_rewards.append(chunk_rewards[slot])
-            all_results.append(chunk_problem_result[slot])
+            all_results.append(result)
         
         last_idx = global_indices[-1]
         if wandb_run and (last_idx + 1) % 10 == 0:
@@ -1460,12 +1588,22 @@ def evaluate(
     # =========================================================================
     results = {
         "pass_at_k": pass_at_k_results,
+        "difficulty_analysis": summarize_difficulty([r["difficulty"] for r in all_results], k_values),
+        "difficulty_provenance": {**difficulty_analyzer.provenance(),
+            "scoring": "D only: simulated good/faulty difference at at least one primary output; expected-output claims are not scored by difficulty analysis"},
+        "selection_audit": selection_audit,
         "aggregate_metrics": aggregate_metrics,
         "avg_component_metrics": avg_component_metrics,
         "accuracy_metrics": accuracy_metrics,
         "config": {
             "adapter": str(adapter),
             "dataset": dataset_path,
+            "eval_selection": eval_selection,
+            "eval_manifest": manifest_path,
+            "eval_candidate_pool": eval_candidate_pool,
+            "difficulty_random_samples": difficulty_random_samples,
+            "difficulty_exact_max_inputs": difficulty_exact_max_inputs,
+            "difficulty_seed": difficulty_seed,
             "num_completions": num_completions,
             "search_width": width,
             "k_values": k_values,
@@ -1473,6 +1611,7 @@ def evaluate(
             "top_p": top_p,
             "max_new_tokens": max_new_tokens,
             "max_tool_rounds": max_tool_rounds,
+            "greedy_tool_calls": greedy_tool_calls,
             "threshold_mode": threshold_mode,
             "seed": seed,
             "backend": backend,
@@ -1496,11 +1635,18 @@ def evaluate(
         os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
         with open(output_file, "w") as f:
             json.dump(detailed_output, f, indent=2, default=str)
+        difficulty_prefix = str(Path(output_file).with_suffix("")) + ".difficulty"
+        write_report(difficulty_prefix + ".json", [r["difficulty"] for r in all_results],
+                     {**results["difficulty_provenance"], "selection": selection_audit,
+                      "model_simulator": simulator_provenance}, k_values)
         slots_path = str(Path(output_file).with_suffix(".slots.jsonl"))
         with open(slots_path, "w") as f:
             for problem_result in all_results:
                 for slot_index, slot_result in enumerate(problem_result.get("search_slots", [])):
                     row = {**slot_result, "problem_index": problem_result["idx"],
+                           "evaluation_problem_id": problem_result["problem_id"],
+                           "circuit_id": problem_result["circuit_id"],
+                           "fault": problem_result["fault"],
                            "config": results["config"],
                            "completion": problem_result["completions"][slot_index]}
                     f.write(json.dumps(row, default=str) + "\n")
@@ -2421,10 +2567,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic evaluation with pass@1 (greedy: model-based LLM i.i.d. + tools)
+  # Basic evaluation with pass@1 (single_completion: model-based LLM i.i.d. + tools)
   python evaluate_model.py --adapter ./sft_finetuned_model/ --num_completions 1 --k 1
 
-  # Full evaluation with pass@1,5,10 (greedy: model-based default)
+  # Full evaluation with pass@1,5,10 (single_completion: model-based default)
   python evaluate_model.py \\
       --adapter ./finetuned_model/combined/policy/ \\
       --backend vllm \\
@@ -2432,7 +2578,7 @@ Examples:
       --temperature 0.6 \\
       --output eval_results.json
 
-  # random: model-free uniform PI/PO bitvectors (no LLM; ≠ greedy)
+  # random: model-free uniform PI/PO bitvectors (no LLM; ≠ single_completion)
   python evaluate_model.py \\
       --adapter ./finetuned_model/combined/policy/ \\
       --sampling_method random --num_completions 20 --k 1 5 10
@@ -2522,6 +2668,15 @@ Examples:
         default=int(_env("MAX_EVAL_SAMPLES", "-1")), 
         help="Maximum eval samples (-1 for all)",
     )
+    parser.add_argument("--eval_selection", choices=["uniform_faults", "stratified", "legacy_prefix"],
+                        default=_env("EVAL_SELECTION", "uniform_faults"),
+                        help="Problem selection: full-stream uniform circuit/fault pairs (default), balanced difficulty, or old prefix")
+    parser.add_argument("--eval_candidate_pool", type=int, default=int(_env("EVAL_CANDIDATE_POOL", "4096")))
+    parser.add_argument("--eval_manifest", default=_env("EVAL_MANIFEST"),
+                        help="Create/reuse a checksummed frozen problem set; existing membership overrides sample count")
+    parser.add_argument("--difficulty_random_samples", type=int, default=int(_env("DIFFICULTY_RANDOM_SAMPLES", "4096")))
+    parser.add_argument("--difficulty_exact_max_inputs", type=int, default=int(_env("DIFFICULTY_EXACT_MAX_INPUTS", "12")))
+    parser.add_argument("--difficulty_seed", type=int, default=int(_env("DIFFICULTY_SEED", "1729")))
     parser.add_argument(
         "--max_tool_rounds", 
         type=int, 
@@ -2593,6 +2748,14 @@ Examples:
         help="Use if the base model is a BitsAndBytes quantized model (4-bit/8-bit)."
     )
     parser.add_argument(
+        "--greedy_tool_calls",
+        action=argparse.BooleanOptionalAction,
+        default=_env("GREEDY_TOOL_CALLS", "0").lower() in ("1", "true", "yes"),
+        help="Decode <tool_call> bodies (the external fault simulator's "
+             "arguments) greedily with temperature 0; reasoning and the final "
+             "answer keep --temperature. Use --no-greedy_tool_calls to disable.",
+    )
+    parser.add_argument(
         "--merge_dequant",
         action="store_true",
         help="vLLM backend: serve the QLoRA-faithful merged bf16 model "
@@ -2618,10 +2781,10 @@ Examples:
     parser.add_argument(
         "--sampling_method",
         type=str,
-        default=_env("SAMPLING_METHOD", "greedy"),
-        choices=["greedy"] + list_available_strategies(),
+        default=_env("SAMPLING_METHOD", "single_completion"),
+        choices=["single_completion"] + list_available_strategies(),
         help=(
-            "Sampling method. Model-based: 'greedy' (default) = LLM i.i.d. "
+            "Sampling method. Model-based: 'single_completion' (default) = LLM i.i.d. "
             "generation with tool calling; 'best_of_n' / 'mcts' / "
             "'evolutionary' = search (sampling_strategies.py). Model-free: "
             "'random' = uniform PI/PO bitvectors; 'vector_evolutionary' = "
@@ -2778,6 +2941,13 @@ Examples:
             budget=args.budget,
             best_of_n_width=args.n,
             search_config=args.search_config,
+            eval_selection=args.eval_selection,
+            eval_candidate_pool=args.eval_candidate_pool,
+            eval_manifest=args.eval_manifest,
+            difficulty_random_samples=args.difficulty_random_samples,
+            difficulty_exact_max_inputs=args.difficulty_exact_max_inputs,
+            difficulty_seed=args.difficulty_seed,
+            greedy_tool_calls=args.greedy_tool_calls,
         )
 
 if __name__ == "__main__":

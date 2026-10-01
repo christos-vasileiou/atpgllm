@@ -11,14 +11,16 @@
 # Choices separated by "|" in comments mean select ONE value, not a shell pipe.
 #
 # Sampling and pass@k:
-# export SAMPLING_METHOD=greedy          # greedy|random|best_of_n|mcts|evolutionary|vector_evolutionary
+# export SAMPLING_METHOD=single_completion          # single_completion|random|best_of_n|mcts|evolutionary|vector_evolutionary
 # export NUM_COMPLETIONS=50             # Integer >= 1; independent completions per problem
 # export PASS_AT_K="1 2 4 8 16"          # Space-separated integers: 1 <= k <= NUM_COMPLETIONS
 # export TEMPERATURE=0.7                # Float >= 0; 0 = deterministic token selection
 # export TOP_P=0.95                     # Float: 0 < TOP_P <= 1; 1 disables nucleus filtering
 # export THRESHOLD_MODE=fault_detected   # fault_detected|positive_reward|full_accuracy
+# export GREEDY_TOOL_CALLS=0            # 0|1; 1 = <tool_call> bodies (simulator arguments) at
+#                                      #      temperature 0, all other text at TEMPERATURE
 #
-# greedy = independent LLM generations with optional tool calls (temperature applies).
+# single_completion = independent LLM generations with optional tool calls (temperature applies).
 # random = model-free, uniformly sampled PI/PO bitvectors; skips loading the LLM.
 # best_of_n = retain the best of N candidates per independent completion.
 # mcts/evolutionary = search with a separate budget per independent completion.
@@ -67,7 +69,7 @@
 # unset BEST_OF_N_WIDTH
 #
 # Return to the default sampling strategy:
-# export SAMPLING_METHOD=greedy         # greedy|random
+# export SAMPLING_METHOD=single_completion         # single_completion|random
 # unset SEARCH_BUDGET BEST_OF_N_WIDTH
 #
 # Legacy aliases (optional; no defaults for paths):
@@ -132,13 +134,14 @@ fi
 # Preserve the existing evaluation defaults across all models.
 DRY_RUN="${DRY_RUN:-0}"
 EVAL_RESULTS_DIR="${EVAL_RESULTS_DIR:-$REPO_ROOT/runs/eval_results_${EXPERIMENT}_policy}"
-SAMPLING_METHOD="${SAMPLING_METHOD:-greedy}"
+SAMPLING_METHOD="${SAMPLING_METHOD:-single_completion}"
 NUM_COMPLETIONS="${NUM_COMPLETIONS:-${NUM_SAMPLES:-50}}"
 PASS_AT_K="${PASS_AT_K:-1 2 4 8 16}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.95}"
 EVAL_PROMPT_BATCH_SIZE="${EVAL_PROMPT_BATCH_SIZE:-16}"
 MERGE_DEQUANT="${MERGE_DEQUANT:-1}"
+GREEDY_TOOL_CALLS="${GREEDY_TOOL_CALLS:-0}"
 read -ra K_VALUES <<< "$PASS_AT_K"
 
 positive_integer() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
@@ -149,9 +152,10 @@ for k in "${K_VALUES[@]}"; do
   [[ "$k" -le "$NUM_COMPLETIONS" ]] || die "pass@$k requires NUM_COMPLETIONS >= $k"
 done
 [[ "$MERGE_DEQUANT" == 0 || "$MERGE_DEQUANT" == 1 ]] || die "MERGE_DEQUANT must be 0 or 1"
+[[ "$GREEDY_TOOL_CALLS" == 0 || "$GREEDY_TOOL_CALLS" == 1 ]] || die "GREEDY_TOOL_CALLS must be 0 or 1"
 case "$SAMPLING_METHOD" in
-  greedy|random|best_of_n|mcts|evolutionary|vector_evolutionary) ;;
-  *) die "SAMPLING_METHOD must be greedy|random|best_of_n|mcts|evolutionary|vector_evolutionary" ;;
+  single_completion|random|best_of_n|mcts|evolutionary|vector_evolutionary) ;;
+  *) die "SAMPLING_METHOD must be single_completion|random|best_of_n|mcts|evolutionary|vector_evolutionary" ;;
 esac
 if [[ -n "${SEARCH_BUDGET:-}" && "$SAMPLING_METHOD" != mcts && "$SAMPLING_METHOD" != evolutionary && "$SAMPLING_METHOD" != vector_evolutionary ]]; then
   die "SEARCH_BUDGET applies only to mcts/evolutionary/vector_evolutionary"
@@ -175,6 +179,8 @@ case "$SAMPLING_METHOD" in
     OUT_TAG+="_bon${BEST_OF_N_WIDTH}"
     ;;
 esac
+# Keep greedy-tool-call results from overwriting sampled-tool-call results.
+[[ "$GREEDY_TOOL_CALLS" != 1 ]] || OUT_TAG+="_gtc"
 
 # Explicit TP_SIZE wins; otherwise use the visible GPUs. Dry runs need no GPU.
 if [[ -z "${TP_SIZE:-}" ]]; then
@@ -240,6 +246,7 @@ for checkpoint in "${CHECKPOINTS[@]}"; do
     "${SEARCH_ARGS[@]}"
   )
   [[ "$MERGE_DEQUANT" != 1 ]] || cmd+=(--merge_dequant)
+  [[ "$GREEDY_TOOL_CALLS" != 1 ]] || cmd+=(--greedy_tool_calls)
   echo "Evaluating: $adapter (tp_size=$TP_SIZE)"
   if [[ "$DRY_RUN" == 1 ]]; then
     printf '%q ' "${cmd[@]}"

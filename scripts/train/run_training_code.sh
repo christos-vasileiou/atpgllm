@@ -125,6 +125,7 @@ export FAULT_SIM_BACKEND TMAX_SERVER_FILE TMAX_SERVER_URL TMAX_SERVER_TOKEN
 export TMAX_BIN CELL_LIBS_VERILOG LIB_VARIANT PVT_CORNER TMAX_LOCK_DIR
 export TMAX_MAX_CONCURRENT TMAX_TIMEOUT_S TMAX_ACQUIRE_TIMEOUT_S
 export TMAX_RESULT_CACHE_SIZE TMAX_REWARD_PROFILE TMAX_KEEP_ARTIFACTS TMAX_PIPELINED_TOOLS
+export TMAX_RESUME_FINGERPRINT_TRANSITION
 
 METHOD=${METHOD:-sft}
 
@@ -268,6 +269,7 @@ write_launch_config_snapshot() {
         SFT_CIRCUIT_VALIDATION SFT_EVAL_STEPS SFT_EVAL_PER_CIRCUIT
         ASSISTANT_ONLY_LOSS BUFFER_SIZE NUM_GENERATIONS TRAIN_BEST_OF_N STEPS_PER_GENERATION
         NETLIST_DIVERSITY_STRATEGY DISABLE_DROPOUT VLLM_IMPORTANCE_SAMPLING_MODE
+        DDP_TIMEOUT
         GRPO_LEARNING_RATE GRPO_WARMUP_STEPS FIXED_EVAL_SIZE FIXED_EVAL_SPLIT
         FIXED_EVAL_MANIFEST FIXED_EVAL_SEED FIXED_EVAL_STEPS
         FIXED_EVAL_GENERATIONS FIXED_EVAL_BATCH_SIZE
@@ -277,6 +279,7 @@ write_launch_config_snapshot() {
         LORA_RANK LORA_ALPHA LORA_TARGET_MODULES QWEN_MOE TUNE_MOE_ROUTER MOE_MAX_MEMORY_GIB
         FAULT_SIM_BACKEND TMAX_SERVER_FILE TMAX_SERVER_URL TMAX_MAX_CONCURRENT
         TMAX_TIMEOUT_S TMAX_ACQUIRE_TIMEOUT_S TMAX_RESULT_CACHE_SIZE TMAX_REWARD_PROFILE TMAX_PIPELINED_TOOLS
+        TMAX_RESUME_FINGERPRINT_TRANSITION
         TMAX_MANAGE_SERVICE TMAX_LOCK_DIR TMAX_SERVICE_WORKERS TMAX_SERVICE_PORT
         TMAX_SERVICE_STARTUP_TIMEOUT_S TMAX_SERVICE_MODULE TMAX_SERVICE_ADVERTISE_HOST
         WANDB_PROJECT DRY_RUN
@@ -474,6 +477,7 @@ build_cmd_args() {
             --steps_per_generation "$STEPS_PER_GENERATION"
             --max_completion_length "$MAX_COMPLETION_LENGTH"
             --vllm_importance_sampling_mode "${VLLM_IMPORTANCE_SAMPLING_MODE:-token_truncate}"
+            --ddp_timeout "${DDP_TIMEOUT:-3600}"
             --grpo_learning_rate "${GRPO_LEARNING_RATE:-5e-6}"
             --grpo_warmup_steps "${GRPO_WARMUP_STEPS:-10}"
             --fixed_eval_size "${FIXED_EVAL_SIZE:-0}"
@@ -549,6 +553,7 @@ build_cmd_args() {
         echo "NETLIST_DIVERSITY_STRATEGY: ${NETLIST_DIVERSITY_STRATEGY:-even_spacing}"
         echo "DISABLE_DROPOUT: ${DISABLE_DROPOUT:-True}"
         echo "VLLM_IMPORTANCE_SAMPLING_MODE: ${VLLM_IMPORTANCE_SAMPLING_MODE:-token_truncate}"
+        echo "DDP_TIMEOUT: ${DDP_TIMEOUT:-3600} seconds (includes generation waits)"
     fi
     echo "=============================================="
     echo "CMD_ARGS: ${CMD_ARGS[*]}"
@@ -783,6 +788,10 @@ trap 'exit 143' TERM
 # Fail before GPU/model startup if the simulator is unavailable. Submission
 # wrappers invoke this same launcher once the allocation begins.
 start_tetramax_service || exit 1
+if [ "$METHOD" == grpo ] && [ "${RESUME_TRAINING_STATE:-False}" == True ] && [ "${DRY_RUN:-False}" != True ]; then
+    # Compare against the ready service before spending time loading vLLM/models.
+    python -m atpgllm.training.simulator_provenance "$RESUME_FROM" || exit 1
+fi
 write_launch_config_snapshot
 
 # =============================================================================

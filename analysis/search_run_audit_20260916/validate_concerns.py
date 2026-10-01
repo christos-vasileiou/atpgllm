@@ -26,7 +26,7 @@ RUNS = {
     "mcts": "run-20260915_104906-8rvdaqde",
     "best_of_n": "run-20260915_160758-snqbdxoi",
     "evolutionary": "run-20260915_163135-ipt1fjf7",
-    "greedy": "run-20260915_234409-dms52ruj",
+    "single_completion": "run-20260915_234409-dms52ruj",
     "random": "run-20260916_124725-johktkni",
     "vector_evolutionary": "run-20260916_125121-fkmhdl8w",
 }
@@ -164,7 +164,7 @@ def main(scan_training=False):
                     witness = dict(vector=v, good_outputs=good, faulty_outputs=bad,
                                    reported_outputs=assignment(f["EXPECTED_OUTPUT"]))
             result["independent_examples"].setdefault(str(idx), {})[method] = dict(stats=stats, witness=witness)
-        if method == "greedy":
+        if method == "single_completion":
             for i, row in enumerate(rows):
                 raw_text = raw_netlist(row)
                 eval_hashes[hashlib.sha256(raw_text.encode()).hexdigest()] = (i, row["fault"])
@@ -177,7 +177,7 @@ def main(scan_training=False):
         manifest_checksum_verified=True, matching_circuit_indices=holdout_indices,
         matching_circuit_fault_indices=holdout_pair_indices,
         caveat="Recorded GRPO exclusion policy plus matching source code; actual buffer fingerprint and prior SFT exposure not reconstructed.")
-    for a, b in [("greedy", "random"), ("best_of_n", "vector_evolutionary"),
+    for a, b in [("single_completion", "random"), ("best_of_n", "vector_evolutionary"),
                  ("evolutionary", "vector_evolutionary"), ("mcts", "best_of_n")]:
         for k in [1, 4, 16]:
             delta = [passk(ca, k)-passk(cb, k) for ca, cb in zip(counts[a], counts[b])]
@@ -194,7 +194,7 @@ def main(scan_training=False):
         subset = [d for d in detail if select(d)]
         result["strata"][name] = dict(n=len(subset),
             pass_at_1={m:sum(float(d[m]) for d in subset)/len(subset) for m in RUNS},
-            greedy_minus_random=interval([float(d["greedy"])-float(d["random"]) for d in subset], rng))
+            single_completion_minus_random=interval([float(d["single_completion"])-float(d["random"]) for d in subset], rng))
     result["independent_exact_uniform_probabilities"] = {"259": 1/16, "419": exact_bus_probability(), "508": 1/16}
     if scan_training:
         import pyarrow as pa

@@ -18,7 +18,7 @@ checkpoints still need to be run; implementation does not establish a quality ga
 | Independent random and vector-only genetic baselines | [`sampling_strategies.py`](../../atpgllm/training/sampling_strategies.py) |
 | Backend finish reasons, request seeds, token counts, stopping at tool calls | [`search_backends.py`](../../atpgllm/training/search_backends.py) |
 
-`greedy`, `best_of_n`, `mcts`, and `evolutionary` all use the common runner in
+`single_completion`, `best_of_n`, `mcts`, and `evolutionary` all use the common runner in
 pass@k evaluation. Existing SFT stopping-criteria helpers and training tool loops
 keep their separate paths. Training reward parsing is unchanged; the new
 evaluation verifier supplies the final answer and its matching observation to

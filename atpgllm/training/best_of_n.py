@@ -1,5 +1,8 @@
-"""Reward-ranked training rollouts, selected before policy/reference forwards.
+"""Reward-spread training rollouts, selected before policy/reference forwards.
 
+Each group keeps the G candidates with maximal reward variance: PODS max-variance
+down-sampling (Xu et al., 2025, "Not All Rollouts are Useful"). That subset is
+always the top-k plus bottom-(G-k) rewards for some k, so trying every k is exact.
 This is a biased rollout-selection variant of GRPO, not an importance-corrected
 estimator of the ordinary on-policy objective. vLLM's likelihood ranking is not
 used: candidates finish their tool trajectories and are scored by the configured
@@ -10,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import math
+import statistics
 
 
 def validate_best_of_n(candidates: int, retained: int) -> None:
@@ -19,8 +23,8 @@ def validate_best_of_n(candidates: int, retained: int) -> None:
         raise ValueError("TRAIN_BEST_OF_N must be 0 or a multiple of NUM_GENERATIONS >= NUM_GENERATIONS")
 
 
-def select_best_indices(scores, candidates: int, retained: int) -> list[int]:
-    """Stable top-G per contiguous prompt group, including groups spanning ranks."""
+def select_spread_indices(scores, candidates: int, retained: int) -> list[int]:
+    """Max-variance top-k plus bottom-(G-k) per contiguous prompt group, including groups spanning ranks."""
     validate_best_of_n(candidates, retained)
     if not candidates or not scores or len(scores) % candidates:
         raise ValueError("Best-of-N requires complete candidate groups")
@@ -29,7 +33,13 @@ def select_best_indices(scores, candidates: int, retained: int) -> list[int]:
         valid = [i for i in range(start, start + candidates) if math.isfinite(scores[i])]
         if len(valid) < retained:
             raise ValueError("Best-of-N group has fewer than G finite simulator rewards")
-        selected.extend(sorted(valid, key=lambda i: -scores[i])[:retained])
+        ranked = sorted(valid, key=lambda i: -scores[i])
+        splits = [ranked[:k] + ranked[len(ranked) - retained + k:] for k in range(retained + 1)]
+        # pvariance is exact on floats, so ties are real; prefer the most
+        # balanced split, then the larger top share.
+        best = max(range(retained + 1), key=lambda k: (
+            statistics.pvariance([scores[i] for i in splits[k]]), -abs(2 * k - retained), k))
+        selected.extend(splits[best])
     return selected
 
 
@@ -98,7 +108,7 @@ class BestOfNTrainingMixin:
             self.num_generations = retained
             self._ranking_candidates = False
 
-        indices = select_best_indices(scores, candidates, retained)
+        indices = select_spread_indices(scores, candidates, retained)
         # Accelerator's object gather flattens lists, hence the one-item wrapper.
         # The candidate token total may be a CUDA scalar; selection recomputes
         # its denominator, so do not serialize that device tensor across ranks.

@@ -14,7 +14,7 @@ ensure_data_preprocessing_on_path()
 from fault_sim import OptimizedNetlist
 from .reward_function_factory import RewardFunctionFactory
 from .search_types import CompletionScore, SamplingResult, SearchConfig, PROTOCOL_VERSION, stable_seed
-from .search_verifier import Verifier
+from .search_verifier import Verifier, assignment, final_fields
 from .search_backends import HFGenerator, VLLMGenerator, make_hf_generator, make_vllm_generator
 from .search_policies import SamplingStrategy, BestOfNStrategy, MCTSStrategy, EvolutionaryStrategy
 
@@ -115,22 +115,22 @@ class RandomStrategy:
                 last_failure = self.verifier.failure("EXHAUSTED")
                 while context.begin_attempt():
                     rng = context.rng
-                    vector = {k: rng.getrandbits(1) for k in problem.input_nets}
-                    if self.name == "vector_evolutionary" and len(population) >= min(self.config.population_size, self.budget):
-                        ranked = sorted(population, key=lambda pair: pair[1].rank(self.mode), reverse=True)
-                        vector = dict(rng.choice(ranked[:max(1, len(ranked) // 2)])[0])
-                        if len(ranked) > 1 and rng.random() < 0.5:
-                            donor = rng.choice(ranked)[0]
-                            vector = {k: donor[k] if rng.random() < 0.5 else v for k, v in vector.items()}
-                        if vector:
-                            bit = rng.choice(list(vector))
-                            vector[bit] ^= 1
-                    if tuple(vector.items()) in seen and self.name == "vector_evolutionary":
-                        continue
-                    seen.add(tuple(vector.items()))
-                    expected = {k: rng.getrandbits(1) for k in problem.output_nets}
-                    text = format_vector_answer(vector, expected, problem.fault)
                     if self.name == "vector_evolutionary":
+                        if len(population) >= min(self.config.population_size, self.budget):
+                            ranked = sorted(population, key=lambda pair: pair[1].rank(self.mode), reverse=True)
+                            vector = dict(rng.choice(ranked[:max(1, len(ranked) // 2)])[0])
+                            if len(ranked) > 1 and rng.random() < 0.5:
+                                donor = rng.choice(ranked)[0]
+                                vector = {k: donor[k] if rng.random() < 0.5 else v for k, v in vector.items()}
+                            if vector:
+                                bit = rng.choice(list(vector))
+                                vector[bit] ^= 1
+                        else:
+                            bits = sample_bit_string(len(problem.input_nets), rng)
+                            vector = {net: int(bit) for net, bit in zip(problem.input_nets, bits)}
+                        if tuple(vector.items()) in seen:
+                            continue
+                        seen.add(tuple(vector.items()))
                         try:
                             frame, _ = self.verifier.simulate(problem, vector, context)
                             expected = {k: int(frame.loc[k, "Good Machine"]) for k in problem.output_nets}
@@ -147,10 +147,15 @@ class RandomStrategy:
                                 context.stop_reason = "infrastructure_retry_limit"
                                 break
                             continue
+                    else:
+                        text = format_random_answer(problem.input_nets, problem.output_nets, problem.fault, rng)
+                        vector = assignment(final_fields(text)["INPUT_VECTOR"], problem.input_nets) if problem.input_nets else {}
+                        seen.add(tuple(vector.items()))
                     state = ConversationState(status="FINAL", final_answer=text, readable=text)
                     score, actual_vector = self.verifier.score_state(problem, state, context)
-                    population.append((actual_vector or vector, score))
-                    population = sorted(population, key=lambda pair: pair[1].rank(self.mode), reverse=True)[:self.config.population_size]
+                    if self.name == "vector_evolutionary":
+                        population.append((actual_vector or vector, score))
+                        population = sorted(population, key=lambda pair: pair[1].rank(self.mode), reverse=True)[:self.config.population_size]
                     if best is None or score.rank(self.mode) > best[1].rank(self.mode):
                         best = (text, score)
                     if accepted(score.components, self.mode):
@@ -200,15 +205,15 @@ def make_strategy(name, generator, verifier, *, num_completions, width=None,
         return STRATEGY_REGISTRY[name](verifier, num_completions=num_completions, seed=seed,
             budget=width if name == "vector_evolutionary" else 1,
             threshold_mode=threshold_mode, search_config=search_config)
-    if name not in STRATEGY_REGISTRY and name != "greedy":
+    if name not in STRATEGY_REGISTRY and name != "single_completion":
         raise ValueError(f"Unknown sampling strategy: {name}")
     if generator is None:
         raise ValueError(f"{name} requires a model generator")
-    if name != "greedy" and (width is None or width < 1):
+    if name != "single_completion" and (width is None or width < 1):
         raise ValueError(f"{name} requires a positive search width")
-    cls = SamplingStrategy if name == "greedy" else STRATEGY_REGISTRY[name]
+    cls = SamplingStrategy if name == "single_completion" else STRATEGY_REGISTRY[name]
     return cls(generator, verifier, num_completions=num_completions,
-               budget=1 if name == "greedy" else width, use_tools=use_tools,
+               budget=1 if name == "single_completion" else width, use_tools=use_tools,
                max_tool_rounds=max_tool_rounds, seed=seed,
                threshold_mode=threshold_mode, search_config=search_config)
 

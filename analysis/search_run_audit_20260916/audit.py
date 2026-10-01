@@ -42,7 +42,7 @@ from atpgllm.training.reward_function_factory import (
 from atpgllm.training.search_verifier import Verifier, final_fields, assignment
 from atpgllm.training.search_types import stable_seed
 
-METHODS = ["random", "greedy", "mcts", "best_of_n", "evolutionary", "vector_evolutionary"]
+METHODS = ["random", "single_completion", "mcts", "best_of_n", "evolutionary", "vector_evolutionary"]
 DATA = ROOT / "runs/eval_results_grpo_granite_4.2_8b_policy"
 
 
@@ -138,7 +138,7 @@ def main():
     rng = np.random.default_rng(20260916)
     bootstrap = rng.integers(0, 512, size=(10000, 512))
     comparisons = []
-    for a, b in [("greedy", "random"), ("best_of_n", "vector_evolutionary"),
+    for a, b in [("single_completion", "random"), ("best_of_n", "vector_evolutionary"),
                  ("evolutionary", "vector_evolutionary"), ("mcts", "best_of_n")]:
         for k in [1, 4, 16]:
             x = np.array([passk(r["num_correct"], k) for r in rows[a]])
@@ -155,7 +155,7 @@ def main():
     details, replay_mismatches, missing_po, net_hashes = [], collections.Counter(), [], []
     problems = []
     hybrid_counts, hybrid_cost = [], 0
-    for i, r in enumerate(rows["greedy"]):
+    for i, r in enumerate(rows["single_completion"]):
         prompt = next(x["content"] for x in r["search_slots"][0]["messages"] if x["role"] == "user")
         doc, raw = parse_doc_id_and_netlist_from_prompt(prompt)
         problem = verifier.problem(prompt, dict(netlist=dict(doc_id=doc, netlist=raw), fault=r["fault"], module_name=r["module_name"]))
@@ -246,9 +246,9 @@ def main():
         axes[0].plot([1,2,4,8,16],[summary[m][f"pass@{k}"]*100 for k in [1,2,4,8,16]],marker="o",label=m)
     axes[0].set(xlabel="Returned search completions k",ylabel="Fault detection pass@k (%)",xticks=[1,2,4,8,16])
     axes[0].legend(fontsize=8);axes[0].grid(alpha=.2)
-    axes[1].scatter([d["uniform_detection"]*100 for d in details],[d["greedy"]*100 for d in details],s=12,alpha=.35)
+    axes[1].scatter([d["uniform_detection"]*100 for d in details],[d["single_completion"]*100 for d in details],s=12,alpha=.35)
     axes[1].plot([0,100],[0,100],"--",color="black",linewidth=1)
-    axes[1].set(xlabel="Uniform-vector detection probability (%)",ylabel="Greedy observed detection (%)")
+    axes[1].set(xlabel="Uniform-vector detection probability (%)",ylabel="single_completion observed detection (%)")
     axes[1].grid(alpha=.2)
     fig.suptitle("512 matched circuits; 16 slots per circuit; detection-only scoring")
     fig.savefig(OUT/"performance.png",dpi=180)

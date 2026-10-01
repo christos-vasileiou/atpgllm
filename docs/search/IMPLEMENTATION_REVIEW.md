@@ -25,7 +25,7 @@ CLI options.
 
 | Method | Current behavior per returned completion |
 | --- | --- |
-| `greedy` | One model trajectory through the evaluator's generation/tool loop. The name does not imply temperature zero. |
+| `single_completion` | One model trajectory through the evaluator's generation/tool loop. The name does not imply temperature zero. |
 | `best_of_n` | Generate B model trajectories; select by detection, then scalar reward. |
 | `mcts` | Run up to B selection iterations over text prefixes, score rollouts, return the best observed completion. |
 | `evolutionary` | Seed candidates, choose elites, generate modified children, score up to B candidates, return the best. |
@@ -95,7 +95,7 @@ another source is linked.
 | C6 | [`reward_funcs.py`](../../atpgllm/llm/reward_funcs.py), `test_generation_grpo_reward`, selects `[0]` from all extracted answer fields. Its tool-table helpers also select the first matching response. | If a later assistant turn corrects an earlier vector, the verifier can score the earlier field. Tool fidelity can compare the final vector with an earlier, unrelated observation. |
 | C7 | MCTS and evolution stop on `score.detected`; [`is_completion_correct`](../../scripts/eval/evaluate_model.py) also supports `full_accuracy`. | A detecting vector with an incorrect predicted output can stop search before satisfying the requested evaluation criterion. The search never receives that criterion. |
 
-C1 is specific to the shared search tool loop. The evaluator's existing greedy
+C1 is specific to the shared search tool loop. The evaluator's existing single_completion
 loops reconstruct from their current input instead; do not assume the same
 history-loss mechanism applies to them. They still need parity tests when a
 common runner replaces the separate implementations.
@@ -116,7 +116,7 @@ common runner replaces the separate implementations.
 
 Both tool loops parse only the first supported call from an assistant segment.
 Malformed or multiple calls do not have an explicit transition policy. The
-search tool loop also lacks the greedy vLLM loop's output-count check, so a
+search tool loop also lacks the single_completion vLLM loop's output-count check, so a
 backend cardinality mismatch can silently leave paths incomplete.
 
 ### The reward has less guidance than the comments suggest

@@ -163,6 +163,8 @@ class GenerationRequest:
     top_p: float
     seed: int
     logprobs: bool = False
+    # Extra stop strings on top of the backends' built-in "</tool_call>".
+    stop: tuple = ()
 
 
 @dataclass(frozen=True)

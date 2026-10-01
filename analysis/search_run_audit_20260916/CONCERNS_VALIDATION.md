@@ -11,25 +11,25 @@ All runs evaluate the same 512 problem IDs, with 16 returned search slots per pr
 | Method | Maximum attempts per slot | Detection pass@1 | Detection pass@16 | Targets solved /512 | Observed evaluation time | Simulator executions |
 |---|---:|---:|---:|---:|---:|---:|
 | random | 1 | 60.51% | 92.38% | 473 | 51.94 s | 8,192 |
-| greedy | 1 | 60.57% | 95.51% | 489 | 8.18 h | 7,767 |
+| single_completion | 1 | 60.57% | 95.51% | 489 | 8.18 h | 7,767 |
 | mcts | 4 | 75.67% | 96.48% | 494 | 12.16 h | 10,617 |
 | best_of_n | 4 | 85.13% | 98.05% | 502 | 13.93 h | 13,276 |
 | evolutionary | 4 | 84.46% | 98.05% | 502 | 14.80 h | 13,267 |
 | vector_evolutionary | 4 | 84.92% | 95.12% | 487 | 86.85 s | 14,817 |
 
-Here `greedy` is a policy name: its decoder uses temperature 0.7 and top-p 0.95. It is one stochastic trajectory, which may include a simulator call and finalization. Search pass@1 means one selected result after up to four attempts; search pass@16 permits up to 64 attempts per target. Attempts also have different meanings/work in MCTS and best-of-N. This is not an equal-compute comparison. Observed wall times are not a controlled hardware benchmark.
+Here `single_completion` is a policy name: its decoder uses temperature 0.7 and top-p 0.95. It is one stochastic trajectory, which may include a simulator call and finalization. Search pass@1 means one selected result after up to four attempts; search pass@16 permits up to 64 attempts per target. Attempts also have different meanings/work in MCTS and best-of-N. This is not an equal-compute comparison. Observed wall times are not a controlled hardware benchmark.
 
 The recomputation uses `1 - C(16-c,k)/C(16,k)`, matching the [HumanEval reference estimator](https://raw.githubusercontent.com/openai/human-eval/master/human_eval/evaluation.py). That formula does not make the different policies' returned samples equally expensive. Final W&B `pass@k` agrees with the artifacts; `running_pass@k` is an earlier prefix and must not be substituted.
 
-**Why uniform random can match greedy**
+**Why uniform random can match single_completion**
 
 An n-bit vector is sampled from 0 through `2^n-1`. Success requires any detecting assignment, not one particular assignment. For circuit i, the relevant quantity is `p_i = detecting assignments / 2^n`. Many irrelevant inputs can vary freely, and many selected faults are easy to activate and observe.
 
-The prior audit's exhaustive/Monte Carlo probes predict mean uniform detection of 60.08%, close to the recorded random result of 60.51%. These probe measurements are inherited from [analysis.json](analysis.json), not newly independent circuit simulations in this follow-up. The recorded greedy advantage is only **0.061 percentage points**, with a paired circuit-bootstrap 95% interval of **−2.04 to +2.17 points**. There is no demonstrated aggregate single-slot advantage. This interval is not a formal equivalence test.
+The prior audit's exhaustive/Monte Carlo probes predict mean uniform detection of 60.08%, close to the recorded random result of 60.51%. These probe measurements are inherited from [analysis.json](analysis.json), not newly independent circuit simulations in this follow-up. The recorded single_completion advantage is only **0.061 percentage points**, with a paired circuit-bootstrap 95% interval of **−2.04 to +2.17 points**. There is no demonstrated aggregate single-slot advantage. This interval is not a formal equivalence test.
 
-The model's proposal distribution is different, however. Across 44 circuits with estimated uniform detection at most 10%, excluding four parser-affected rows, greedy reaches 15.34%, versus random's 2.70%. On the 26 of these where neither constant vector works, greedy reaches 11.54%, versus 3.37%; the exploratory paired difference is +8.17 points, CI +1.20 to +16.59. Thus the hard-case advantage is not entirely an all-zero/all-one effect.
+The model's proposal distribution is different, however. Across 44 circuits with estimated uniform detection at most 10%, excluding four parser-affected rows, single_completion reaches 15.34%, versus random's 2.70%. On the 26 of these where neither constant vector works, single_completion reaches 11.54%, versus 3.37%; the exploratory paired difference is +8.17 points, CI +1.20 to +16.59. Thus the hard-case advantage is not entirely an all-zero/all-one effect.
 
-There is an important limitation to that positive result: restricting the latter group further to the 19 targets that are not primary inputs gives **greedy = random = 4.61%**. Best-of-N reaches 15.13%, vector search 12.17%. These small, exploratory strata do not prove absence of reasoning; they show that the strongest evidence here is concentrated in simpler cases, particularly direct primary-input fault sensitization.
+There is an important limitation to that positive result: restricting the latter group further to the 19 targets that are not primary inputs gives **single_completion = random = 4.61%**. Best-of-N reaches 15.13%, vector search 12.17%. These small, exploratory strata do not prove absence of reasoning; they show that the strongest evidence here is concentrated in simpler cases, particularly direct primary-input fault sensitization.
 
 **Why the two evolutionary methods resemble sampling**
 
@@ -49,7 +49,7 @@ The counters support that explanation: MCTS uses 14,857 attempts versus best-of-
 
 I translated three saved Verilog circuits into direct Boolean equations in [validate_concerns.py](validate_concerns.py), without the production parser, truth tables, or simulator. All **288 saved final detection labels** across the six methods and three circuits agree with these equations. Both successes and failures were checked.
 
-| Circuit / target | Exact uniform detection probability | Greedy successes | Random successes | Best-of-N successes |
+| Circuit / target | Exact uniform detection probability | single_completion successes | Random successes | Best-of-N successes |
 |---|---:|---:|---:|---:|
 | `ram_io_mux`, `sa1 ram_or_io_wr` (259) | 6.25% | 10/16 | 0/16 | 11/16 |
 | `busencoder`, `sa0 r15out` (419) | 0.458455% | 11/16 | 0/16 | 14/16 |
@@ -65,9 +65,9 @@ Crucially, one detecting NAND answer reports `p1y=0, p2y=1` for a vector whose c
 
 **What the output fidelity says about intelligence**
 
-The detection predicate ignores expected-output correctness. On the selected answers, the existing full-accuracy predicate—detection plus correct complete PI/PO assignments and target-fault mention—passes only **10.72% for greedy, 13.09% for MCTS, 14.53% for best-of-N, and 15.64% for evolution**. This does not evaluate a rerun that searches under full-accuracy acceptance, nor verify an exhaustive claimed fault set.
+The detection predicate ignores expected-output correctness. On the selected answers, the existing full-accuracy predicate—detection plus correct complete PI/PO assignments and target-fault mention—passes only **10.72% for single_completion, 13.09% for MCTS, 14.53% for best-of-N, and 15.64% for evolution**. This does not evaluate a rerun that searches under full-accuracy acceptance, nor verify an exhaustive claimed fault set.
 
-The prior trajectory audit also shows greedy's final expected outputs match its earlier tool-request guess in 7,628/7,753 tool-observed slots (98.39%). Only 1,254 match every good-machine output from the returned table. In this setting, the model usually preserves its guess instead of correcting it from feedback. Vector search gets outputs directly from simulation; its 84.92% full accuracy is a system capability, not learned prediction. A fair deployable-pipeline comparison should offer the same deterministic expected-output generation to every method, while reporting raw model output fidelity separately.
+The prior trajectory audit also shows single_completion's final expected outputs match its earlier tool-request guess in 7,628/7,753 tool-observed slots (98.39%). Only 1,254 match every good-machine output from the returned table. In this setting, the model usually preserves its guess instead of correcting it from feedback. Vector search gets outputs directly from simulation; its 84.92% full accuracy is a system capability, not learned prediction. A fair deployable-pipeline comparison should offer the same deterministic expected-output generation to every method, while reporting raw model output fidelity separately.
 
 The prior model-free control—zeros, ones, then up to two random vectors—achieves 89.69% detection pass@1 and 96.68% pass@16, with 14,654 logical simulation evaluations. This offline control uses the prior audit's execution loop and parser; it is not a new W&B run or measured wrapper runtime. It beats the model searches per four-candidate slot, while best-of-N ultimately solves more targets. Uniform random alone is too weak a baseline for a claim of sophisticated reasoning.
 
@@ -80,13 +80,13 @@ New qualification: checkpoint 50's checksum-verified `fixed_eval_manifest.json` 
 | Method | Detection pass@1 on recorded GRPO holdout circuits |
 |---|---:|
 | random | 62.59% |
-| greedy | 62.85% |
+| single_completion | 62.85% |
 | mcts | 76.41% |
 | best_of_n | 84.95% |
 | evolutionary | 84.86% |
 | vector_evolutionary | 87.68% |
 
-The greedy-minus-random difference is +0.26 points, CI −5.11 to +5.55. This subset also does not demonstrate an aggregate advantage. The saved buffer fingerprint was not reconstructed, and SFT/pretraining exposure was not established. These periodically evaluated circuits are not a fresh untouched test set. It would be incorrect to infer that all 512 were consumed in GRPO merely from raw-cache overlap; it would also be incorrect to call the complete benchmark design-disjoint.
+The single_completion-minus-random difference is +0.26 points, CI −5.11 to +5.55. This subset also does not demonstrate an aggregate advantage. The saved buffer fingerprint was not reconstructed, and SFT/pretraining exposure was not established. These periodically evaluated circuits are not a fresh untouched test set. It would be incorrect to infer that all 512 were consumed in GRPO merely from raw-cache overlap; it would also be incorrect to call the complete benchmark design-disjoint.
 
 **What remains necessary to validate the stronger claim**
 

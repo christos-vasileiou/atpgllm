@@ -2,7 +2,7 @@ Latest follow-up (September 17): [Resolved findings and next steps](RESOLVED_FIN
 
 [CONCERNS_VALIDATION.md](CONCERNS_VALIDATION.md) rechecks the raw metrics, independently validates three circuits, and qualifies the training-overlap finding using the checkpoint's 72-circuit GRPO exclusion manifest. The parser-defect discussion below describes the historical runs; the current worktree already contains related fixes.
 
-**The six runs show useful structured behavior on some faults, but do not establish a general reasoning advantage or a practical advantage over cheap vector search.** Greedy and random have essentially identical aggregate single-slot detection. The evolutionary runs never reach evolution. MCTS spends its small budget on too few distinct vectors. Most model answers have incorrect expected outputs even after receiving simulation results.
+**The six runs show useful structured behavior on some faults, but do not establish a general reasoning advantage or a practical advantage over cheap vector search.** single_completion and random have essentially identical aggregate single-slot detection. The evolutionary runs never reach evolution. MCTS spends its small budget on too few distinct vectors. Most model answers have incorrect expected outputs even after receiving simulation results.
 
 This audit used the six requested W&B directories, their evaluation JSON files, saved trajectories, and the implementation at `libatpgllm` commit `f34692a`. Existing evaluator/launcher edits were left untouched. All measurements below are local calculations, not literature-derived estimates. The audit adds reports and analysis scripts only.
 
@@ -11,7 +11,7 @@ The matched configuration is Granite 4.2 8B GRPO checkpoint 50, `conversation-se
 | Method / W&B ID | Pass@1 | Pass@4 | Pass@16 | Targets solved at least once | Evaluation time | Generated tokens | Simulator executions |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | random / `johktkni` | 60.51% | 85.58% | 92.38% | 473/512 | 51.94 s | 0 | 8,192 |
-| greedy / `dms52ruj` | 60.57% | 87.09% | 95.51% | 489/512 | 8.18 h | 21.59 M | 7,767 |
+| single_completion / `dms52ruj` | 60.57% | 87.09% | 95.51% | 489/512 | 8.18 h | 21.59 M | 7,767 |
 | mcts / `8rvdaqde` | 75.67% | 92.24% | 96.48% | 494/512 | 12.16 h | 31.20 M | 10,617 |
 | best_of_n / `snqbdxoi` | 85.13% | 95.10% | 98.05% | 502/512 | 13.93 h | 35.31 M | 13,276 |
 | evolutionary / `ipt1fjf7` | 84.46% | 95.43% | 98.05% | 502/512 | 14.80 h | 36.47 M | 13,267 |
@@ -19,13 +19,13 @@ The matched configuration is Granite 4.2 8B GRPO checkpoint 50, `conversation-se
 
 These are final `pass@k` values, not `running_pass@k`. The latter were last logged at 320 examples and differ from the final 512-example result. Times are observed evaluation wall times on the recorded machines, not controlled isolated throughput measurements. Simulator executions count wrapper executions, including a failed execution; simulator requests also include cache hits.
 
-One search slot for the four search methods can contain **up to four attempts**. A greedy/random slot contains one attempt. Thus search pass@1 is not single-draw model accuracy, and search pass@16 can spend up to 64 attempts per target. Also, `greedy` here means one stochastic model trajectory: temperature 0.7 is not greedy decoding.
+One search slot for the four search methods can contain **up to four attempts**. A single_completion/random slot contains one attempt. Thus search pass@1 is not single-draw model accuracy, and search pass@16 can spend up to 64 attempts per target. Also, `single_completion` here means one stochastic model trajectory: temperature 0.7 is not greedy decoding.
 
-The seeds do not provide bitwise matched model trajectories across runs. Among 5,167 best-of-N slots returning after one attempt, all have the same slot seed as greedy, but only 1,009 have identical completion text and 4,274 have the same detection outcome. The saved data do not identify the cause; backend/batch numerical variation is one possibility. Comparisons below pair circuits, not an assumption that the first model draw was identical. Controlled reruns should freeze model/data artifacts and verify backend reproducibility.
+The seeds do not provide bitwise matched model trajectories across runs. Among 5,167 best-of-N slots returning after one attempt, all have the same slot seed as single_completion, but only 1,009 have identical completion text and 4,274 have the same detection outcome. The saved data do not identify the cause; backend/batch numerical variation is one possibility. Comparisons below pair circuits, not an assumption that the first model draw was identical. Controlled reruns should freeze model/data artifacts and verify backend reproducibility.
 
 ![Detection curves and per-circuit comparison](performance.png)
 
-**Random versus greedy: the near tie is real.** Greedy produced 4,962 detecting slots, versus random's 4,957 out of 8,192. Its advantage is 0.061 percentage points. A paired bootstrap over the 512 circuits gives a 95% interval of **−2.04 to +2.17 percentage points**. This is no demonstrated aggregate single-slot advantage; it is not a formal proof of exact equivalence.
+**Random versus single_completion: the near tie is real.** single_completion produced 4,962 detecting slots, versus random's 4,957 out of 8,192. Its advantage is 0.061 percentage points. A paired bootstrap over the 512 circuits gives a 95% interval of **−2.04 to +2.17 percentage points**. This is no demonstrated aggregate single-slot advantage; it is not a formal proof of exact equivalence.
 
 The relevant probability is the fraction of detecting assignments, not the probability of guessing one specific assignment:
 
@@ -39,20 +39,20 @@ All **47,803 saved FINAL slots** across the six runs had detection labels matchi
 
 **There is structure in the model's proposals, hidden by the aggregate.** Excluding the four circuits with broken bus parsing, stratifying by independently probed random difficulty gives:
 
-| Circuit group | Circuits | random | greedy | best_of_n | evolutionary | vector_evolutionary |
+| Circuit group | Circuits | random | single_completion | best_of_n | evolutionary | vector_evolutionary |
 |---|---:|---:|---:|---:|---:|---:|
 | Estimated uniform detection ≤10% | 44 | 2.70% | 15.34% | 31.96% | 34.38% | 9.38% |
 | Estimated uniform detection >50% | 279 | 82.35% | 75.07% | 94.96% | 94.20% | 98.43% |
 
 These are per-slot rates, with the same one-versus-four-attempt distinction. The strata come from the separate uniform probe, not from selecting the model's wins. A zero-hit Monte Carlo probe does not imply zero true detection probability.
 
-Concrete examples: on index 227 (`equals`, `sa1 n81`), greedy succeeds 8/16 times and its detecting vector assigns identical 32-bit operands; best-of-N succeeds 12/16. On index 473 (`equals15bit`, `sa1 n31`), greedy succeeds 12/16 and best-of-N 16/16, again using matching operands. The recorded random and vector-search runs solve neither target, and neither target had a hit in the independent 8,192-vector uniform probe. These are examples of nonuniform, useful proposals, not evidence from fluent reasoning text.
+Concrete examples: on index 227 (`equals`, `sa1 n81`), single_completion succeeds 8/16 times and its detecting vector assigns identical 32-bit operands; best-of-N succeeds 12/16. On index 473 (`equals15bit`, `sa1 n31`), single_completion succeeds 12/16 and best-of-N 16/16, again using matching operands. The recorded random and vector-search runs solve neither target, and neither target had a hit in the independent 8,192-vector uniform probe. These are examples of nonuniform, useful proposals, not evidence from fluent reasoning text.
 
 However, both examples are also solved by the all-zero and all-one patterns. Across all 512 targets, all-zero detects 52.34%, all-one detects 54.10%, and **trying both detects 81.64% with at most two calls**. The two-pattern strategy solves 40.91% of the 44 hard cases. Therefore, an advantage over uniform random alone is insufficient to establish sophisticated reasoning; simple structured-vector heuristics must be included.
 
 I also evaluated an additional offline control: **try zeros, then ones, then up to two random vectors, stopping on detection**, with 16 slots per circuit and seed 42 derived from the same problem IDs. Its measured pass@1 is **89.685%**, pass@4 **94.906%**, and pass@16 **96.680%** (495/512 targets). It uses 14,654 logical simulator evaluations and no model calls. Best-of-N's corresponding values are 85.132%, 95.103%, and 98.047%, with 13,276 recorded wrapper executions and 35.31 million generated tokens. Thus the cheap control is stronger per four-candidate search, while the model eventually reaches more targets. This control was evaluated with the separate NumPy execution loop, not the original W&B launcher; its count is a logical evaluation count, not a measured wrapper runtime. It shares the parser limitation. The independent probability estimate for this control is 89.863%, consistent with the measured 89.685%.
 
-Greedy's pass@16 advantage over random is more substantial than its pass@1 difference: +3.125 points, with paired circuit-bootstrap interval +0.98 to +5.27 points. It solves 25 targets that random misses and misses 9 that random solves. This supports complementary behavior, subject to the parser and generalization caveats.
+single_completion's pass@16 advantage over random is more substantial than its pass@1 difference: +3.125 points, with paired circuit-bootstrap interval +0.98 to +5.27 points. It solves 25 targets that random misses and misses 9 that random solves. This supports complementary behavior, subject to the parser and generalization caveats.
 
 **The evolutionary labels are misleading at this budget.** In [the model policy](../../../atpgllm/training/search_policies.py), `attempt < min(population_size, budget)` sends every one of the four attempts through seed generation. With population size 6 and budget 4, the seed temperatures are 0.5, 0.8, 1.0, 0.5. No mutation, crossover, or feedback evolution occurs. This run is effectively simulator-selected model sampling with varying temperature.
 
@@ -80,7 +80,7 @@ Distinct-vector diagnostics count scored final vectors, not every tool vector. F
 | Method | All expected output bits correct | Detecting, correct PI/PO report, target fault reported |
 |---|---:|---:|
 | random | 5.94% | 2.51% |
-| greedy | 15.33% | 10.72% |
+| single_completion | 15.33% | 10.72% |
 | mcts | 16.93% | 13.09% |
 | best_of_n | 16.99% | 14.53% |
 | evolutionary | 18.57% | 15.64% |
@@ -90,7 +90,7 @@ The vector method gets output values from simulation, so its fidelity is not lea
 
 Several dashboard labels also require care. In [reward_funcs.py](../../../atpgllm/llm/reward_funcs.py), `input_vector_acc` measures a complete valid PI assignment, not similarity to an optimal test; `detected_faults_acc` measures mentioning the requested fault, not verified fault-set coverage; and `pred_vs_fault_sim_acc` compares a completion's simulation table against verification. In the new evaluator that table comes from the real tool and is matched to the final vector, so a high score does not show that the model predicted or copied the expected outputs correctly. Random's 100% fault-name score is obtained by mechanically inserting the target string.
 
-The selected trajectories expose a specific failure to use feedback: **7,628 of 7,753 greedy slots with a tool observation (98.39%) report expected outputs identical to their own earlier tool-request `output_vector`**. Only 1,254 of those trajectories match every canonical output in the returned good-machine table. The analogous original-request matches are 7,918/7,981 for best-of-N, 7,885/7,939 for evolution, and 7,902/7,953 for MCTS. The fields generally preserve the pre-simulation guess rather than correct it from the observed result. This is stronger evidence of weak feedback use than a subjective reading of the generated reasoning.
+The selected trajectories expose a specific failure to use feedback: **7,628 of 7,753 single_completion slots with a tool observation (98.39%) report expected outputs identical to their own earlier tool-request `output_vector`**. Only 1,254 of those trajectories match every canonical output in the returned good-machine table. The analogous original-request matches are 7,918/7,981 for best-of-N, 7,885/7,939 for evolution, and 7,902/7,953 for MCTS. The fields generally preserve the pre-simulation guess rather than correct it from the observed result. This is stronger evidence of weak feedback use than a subjective reading of the generated reasoning.
 
 **A real simulator/parser defect affects four rows.** [netlist_utils.py](../../../../data_preprocessing/netlist_utils.py) reduces bus ranges to widths and expands indices using `range(width)`. Thus `input [6:2] opcode` becomes `opcode[0]` through `opcode[4]`; `output [1:7] leds` becomes `leds[0]` through `leds[6]`. The actual circuit still references the original indices.
 

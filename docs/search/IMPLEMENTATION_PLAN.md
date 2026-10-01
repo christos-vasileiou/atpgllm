@@ -47,7 +47,7 @@ The runner should receive canonical messages from prompt construction; reversing
 a rendered prompt is only a compatibility fallback. A failed fallback is an
 explicit error, not an empty system/user context.
 
-Route search, best-of-N, and the greedy evaluator through this runner, with
+Route search, best-of-N, and the single_completion evaluator through this runner, with
 backend adapters returning finish metadata and measured usage. Migrate one
 caller at a time and compare its rendered prompts against the old single-round
 path. Preserve the final flattened output ordering expected by
@@ -64,7 +64,7 @@ before this gate passes.
 
 ## Phase 3: establish corrected baselines and implement evolution
 
-Run corrected `greedy` and `best_of_n` through the common runner. These establish
+Run corrected `single_completion` and `best_of_n` through the common runner. These establish
 whether the tool protocol and final-answer parser work on actual checkpoints.
 
 Then implement evolution in this order:
@@ -107,7 +107,7 @@ Keep the existing CLI meanings that users rely on:
 
 | Existing setting | Keep |
 | --- | --- |
-| `--sampling_method` | `greedy`, `best_of_n`, `mcts`, `evolutionary`, `random`. |
+| `--sampling_method` | `single_completion`, `best_of_n`, `mcts`, `evolutionary`, `random`. |
 | `--num_completions` | N independent applications of the selected policy. |
 | `--n` | B for best-of-N only. |
 | `--budget` | Per-slot search limit for MCTS/evolution; record the new attempt-based semantics as a versioned change. |
@@ -200,7 +200,7 @@ resources permit. Report these as proposed run sizes, not a power calculation.
 
 | Comparison | Question |
 | --- | --- |
-| Corrected greedy vs best-of-N | How much does extra independent sampling already buy? |
+| Corrected single_completion vs best-of-N | How much does extra independent sampling already buy? |
 | Best-of-N vs evolution vs MCTS | Does adaptive search improve outcomes at the same resources? |
 | Tools 0/1/2/3 rounds | Is there enough useful feedback depth to justify search? |
 | Evolution with/without vector edits and diversity | Do concrete candidate changes help beyond suffix resampling? |

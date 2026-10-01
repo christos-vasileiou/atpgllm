@@ -21,8 +21,8 @@ def vector(text):
 
 def main():
     result={}
-    greedy=json.loads(next(DATA.glob('*_greedy_*.json')).read_text())
-    rows=greedy['per_problem_results']
+    single_completion=json.loads(next(DATA.glob('*_single_completion_*.json')).read_text())
+    rows=single_completion['per_problem_results']
     hashes={}
     for i,r in enumerate(rows):
         prompt=next(m['content'] for m in r['search_slots'][0]['messages'] if m['role']=='user')

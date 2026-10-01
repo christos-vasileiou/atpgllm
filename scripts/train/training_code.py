@@ -555,6 +555,7 @@ def train_with_grpo(
     netlist_diversity_strategy: str = "even_spacing",
     disable_dropout: bool = True,
     vllm_importance_sampling_mode: str = "token_truncate",
+    ddp_timeout: int = 3600,
     grpo_learning_rate: float = 5e-6,
     grpo_warmup_steps: int = 10,
     fixed_eval_size: int = 0,
@@ -646,6 +647,10 @@ def train_with_grpo(
     vllm_importance_sampling_mode : str
         vLLM-to-training policy correction mode. Token-level truncation avoids
         exponentiating summed mismatch across long ATPG completions.
+    ddp_timeout : int
+        Collective timeout in seconds, including rank-zero vLLM generation.
+        Applied before the first process group is initialized, not just to the
+        later GRPOConfig; fixed evaluation also uses this group.
     grpo_learning_rate, grpo_warmup_steps
         Optimizer settings; the fixed-evaluation pilot uses 1e-6 and two steps.
     fixed_eval_size : int
@@ -665,6 +670,10 @@ def train_with_grpo(
         validate_training_state_checkpoint(resume_from)
         resume_checkpoint = resume_from
         print(f"[Resume] Will restore full training state from: {resume_from}")
+
+    # Direct Python launches also fail before model loading or dataset buffering.
+    from atpgllm.training.simulator_provenance import SimulatorProvenanceCallback
+    simulator_callback = SimulatorProvenanceCallback(resume_checkpoint)
 
     # Lazy-import GRPO trainers and GRPOConfig to avoid pulling in
     # trl.GRPOTrainer (and its vllm dependency) during SFT-only runs.
@@ -690,6 +699,11 @@ def train_with_grpo(
         raise ValueError("Fixed evaluation currently requires dual adapters, an SFT/GRPO checkpoint, and vLLM server mode")
     if deepspeed and not use_ddp:
         raise ValueError("--deepspeed requires --use_ddp (one 4-bit model copy per rank)")
+
+    # PartialState is shared: its first initialization fixes the actual NCCL
+    # timeout. Do this before any model/dataset helper or fixed-eval setup.
+    from atpgllm.training.distributed_runtime import initialize_grpo_distributed
+    distributed_state = initialize_grpo_distributed(ddp_timeout)
 
     # Determine device_map: per-GPU for DDP, "auto" otherwise
     device_map = _get_device_map(use_ddp)
@@ -810,14 +824,13 @@ def train_with_grpo(
     eval_records = []
     eval_data_state = None
     if fixed_eval_size:
-        from accelerate import PartialState
         from datasets import Dataset
         from atpgllm.training.fixed_eval import (
             digest, load_or_create_manifest, training_indices_without_holdout,
             validate_eval_layout, checkpoint_manifest, circuit_ids,
             training_buffer_state, validate_resume_buffer,
         )
-        state = PartialState()
+        state = distributed_state
         validate_eval_layout(fixed_eval_size, fixed_eval_generations,
                              fixed_eval_batch_size, state.num_processes)
         saved_manifest = checkpoint_manifest(resume_checkpoint)
@@ -907,6 +920,7 @@ def train_with_grpo(
     #   - steps_per_generation=1: generates 2*1=2 samples at a time (memory efficient)
     training_args = GRPOConfig(
         output_dir=output_dir,
+        ddp_timeout=ddp_timeout,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=grpo_learning_rate,
@@ -963,9 +977,8 @@ def train_with_grpo(
         log_unique_prompts=True,
     )
 
-    from atpgllm.training.simulator_provenance import SimulatorProvenanceCallback
     shared_callbacks = [
-        SimulatorProvenanceCallback(resume_checkpoint),
+        simulator_callback,
         ThroughputMetricsCallback(),
         ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
         TrainingStateCheckpointCallback(
@@ -1015,7 +1028,8 @@ def train_with_grpo(
         )
 
     trainer.train_best_of_n = train_best_of_n
-    print(f"[Training sampling] candidates={train_best_of_n or num_generations}, retained={num_generations}, temperature=1.0")
+    print(f"[Training sampling] candidates={train_best_of_n or num_generations}, retained={num_generations}, "
+          f"selection={'pods max-variance' if train_best_of_n > num_generations else 'none'}, temperature=1.0")
     if resume_checkpoint:
         patch_trainer_cpu_optimizer_resume(trainer)
     trainer.train(resume_from_checkpoint=resume_checkpoint)
@@ -1071,6 +1085,7 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "vllm_server_url",
     "disable_dropout",
     "vllm_importance_sampling_mode",
+    "ddp_timeout",
     "grpo_learning_rate", "grpo_warmup_steps",
     "fixed_eval_size", "fixed_eval_split", "fixed_eval_manifest", "fixed_eval_seed",
     "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size",
@@ -1218,9 +1233,11 @@ def main() -> None:
     parser.add_argument("--num_generations", type=int, default=_env('NUM_GENERATIONS', 8),
                         help="Number of generations per prompt to sample.")
     parser.add_argument("--train_best_of_n", type=int, default=_env("TRAIN_BEST_OF_N", 0),
-                        help="Training candidates per prompt; keep best NUM_GENERATIONS by simulator reward. 0 disables; otherwise a multiple of NUM_GENERATIONS.")
+                        help="Training candidates per prompt; keep the NUM_GENERATIONS with maximal simulator-reward variance (PODS max-variance down-sampling). 0 disables; otherwise a multiple of NUM_GENERATIONS.")
     parser.add_argument("--grpo_learning_rate", type=float, default=_env("GRPO_LEARNING_RATE", 5e-6))
     parser.add_argument("--grpo_warmup_steps", type=int, default=_env("GRPO_WARMUP_STEPS", 10))
+    parser.add_argument("--ddp_timeout", type=int, default=_env("DDP_TIMEOUT", 3600),
+                        help="GRPO collective timeout in seconds, including vLLM generation waits (default: 3600)")
     parser.add_argument("--fixed_eval_size", type=int, default=_env("FIXED_EVAL_SIZE", 0),
                         help="Frozen held-out faults; 0 disables the in-training evaluation pilot.")
     parser.add_argument("--fixed_eval_split", default=_env("FIXED_EVAL_SPLIT", "test"))

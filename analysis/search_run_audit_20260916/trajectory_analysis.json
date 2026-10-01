@@ -414,19 +414,6 @@
     "expected_matches_good_table": 1519,
     "expected_matches_bad_table": 528
   },
-  "greedy": {
-    "slots": 8192,
-    "valid_finals": 7663,
-    "valid_successes": 4962,
-    "all_zero_final": 337,
-    "all_one_final": 204,
-    "with_tool_observation": 7753,
-    "tool_vector_detects": 5017,
-    "final_vector_matches_tool": 7651,
-    "expected_matches_tool_request": 7628,
-    "expected_matches_good_table": 1254,
-    "expected_matches_bad_table": 576
-  },
   "best_of_n": {
     "slots": 8192,
     "valid_finals": 7963,
@@ -439,6 +426,19 @@
     "expected_matches_tool_request": 7918,
     "expected_matches_good_table": 1388,
     "expected_matches_bad_table": 519
+  },
+  "single_completion": {
+    "slots": 8192,
+    "valid_finals": 7663,
+    "valid_successes": 4962,
+    "all_zero_final": 337,
+    "all_one_final": 204,
+    "with_tool_observation": 7753,
+    "tool_vector_detects": 5017,
+    "final_vector_matches_tool": 7651,
+    "expected_matches_tool_request": 7628,
+    "expected_matches_good_table": 1254,
+    "expected_matches_bad_table": 576
   },
   "mcts": {
     "slots": 8192,

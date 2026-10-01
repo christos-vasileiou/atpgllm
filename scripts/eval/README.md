@@ -45,7 +45,7 @@ The previous runtime defaults are shared by both scripts:
 | Environment variable | Default |
 | --- | --- |
 | `EVAL_DATASET` | `chrivasileiou/asap7-language-of-test-v2` |
-| `SAMPLING_METHOD` | `greedy` (`random`, `best_of_n`, `mcts`, `evolutionary`, `vector_evolutionary` also supported) |
+| `SAMPLING_METHOD` | `single_completion` (`random`, `best_of_n`, `mcts`, `evolutionary`, `vector_evolutionary` also supported) |
 | `NUM_COMPLETIONS` | `50` (`NUM_SAMPLES` is an alias) |
 | `PASS_AT_K` | `1 2 4 8 16` (each must be ≤ `NUM_COMPLETIONS`) |
 | `SEARCH_BUDGET` | `50`, only for `mcts` / `evolutionary` / `vector_evolutionary` |

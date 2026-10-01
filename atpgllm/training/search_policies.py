@@ -44,7 +44,7 @@ class Slot:
 
 
 class SamplingStrategy:
-    name = "greedy"
+    name = "single_completion"
 
     def __init__(self, generator, verifier, num_completions=1, *, budget=1, width=None,
                  use_tools=True, max_tool_rounds=1, seed=42, threshold_mode="fault_detected",

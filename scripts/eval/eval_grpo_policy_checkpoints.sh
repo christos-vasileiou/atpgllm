@@ -10,15 +10,41 @@
 # The export block below uses the current defaults; edit values as needed.
 # Choices separated by "|" in comments mean select ONE value, not a shell pipe.
 #
+# Problem difficulty and reproducible selection:
+# export EVAL_SELECTION=uniform_faults  # uniform_faults|stratified|legacy_prefix
+# export EVAL_CANDIDATE_POOL=4096       # Reservoir size for stratified selection
+# export EVAL_MANIFEST=/path/eval.json  # Create once/reuse across models; existing membership wins
+#                                      # Default: <repo>/runs/shared_eval_manifest.json
+# export DIFFICULTY_RANDOM_SAMPLES=4096 # Uniform PI trials for circuits above exhaustive limit
+# export DIFFICULTY_EXACT_MAX_INPUTS=12 # Enumerate all vectors for <=12 inputs (0..16)
+# export DIFFICULTY_SEED=1729           # Independent of generation seed
+# Default selection scans the full test stream; -1 samples means all eligible pairs.
+# Use a NEW manifest path to change selection. Stratified scores are challenge-set scores.
+# See docs/FAULT_DIFFICULTY_EVALUATION.md for metric meanings and CPU-only replay.
+#
+# Pre-manifest language-of-test-v2 test set (the exact 512 problems of the Sep-16
+# checkpoint-50 runs). The manifest is a frozen replica of the old buffering (raw
+# netlist < 4096 tokens); EVAL_SELECTION=legacy_prefix alone does NOT reproduce it,
+# because it filters on the full chat prompt. MAX_PROMPT_LENGTH must admit those
+# prompts. Use a separate results dir to avoid overwriting same-named files.
+# export EVAL_MANIFEST=runs/legacy_prefix_eval_manifest.json
+# export MAX_PROMPT_LENGTH=16384
+# export EVAL_RESULTS_DIR=runs/eval_results_<experiment>_legacy_policy
+# export MAX_TOOL_ROUNDS=1                  # Old runs used 1; the manifest runs used 5
+# export NUM_COMPLETIONS=16
+# export EVAL_PROMPT_BATCH_SIZE=64
+#
 # Sampling and pass@k:
-# export SAMPLING_METHOD=greedy          # greedy|random|best_of_n|mcts|evolutionary|vector_evolutionary
+# export SAMPLING_METHOD=single_completion          # single_completion|random|best_of_n|mcts|evolutionary|vector_evolutionary
 # export NUM_COMPLETIONS=50             # Integer >= 1; independent completions per problem
 # export PASS_AT_K="1 2 4 8 16"          # Space-separated integers: 1 <= k <= NUM_COMPLETIONS
 # export TEMPERATURE=0.7                # Float >= 0; 0 = deterministic token selection
 # export TOP_P=0.95                     # Float: 0 < TOP_P <= 1; 1 disables nucleus filtering
 # export THRESHOLD_MODE=fault_detected   # fault_detected|positive_reward|full_accuracy
+# export GREEDY_TOOL_CALLS=0            # 0|1; 1 = <tool_call> bodies (simulator arguments) at
+#                                      #      temperature 0, all other text at TEMPERATURE
 #
-# greedy = independent LLM generations with optional tool calls (temperature applies).
+# single_completion = independent LLM generations with optional tool calls (temperature applies).
 # random = model-free, uniformly sampled PI/PO bitvectors; skips loading the LLM.
 # best_of_n = retain the best of N candidates per independent completion.
 # mcts/evolutionary = search with a separate budget per independent completion.
@@ -67,7 +93,7 @@
 # unset BEST_OF_N_WIDTH
 #
 # Return to the default sampling strategy:
-# export SAMPLING_METHOD=greedy         # greedy|random
+# export SAMPLING_METHOD=single_completion         # single_completion|random
 # unset SEARCH_BUDGET BEST_OF_N_WIDTH
 #
 # Legacy aliases (optional; no defaults for paths):
@@ -147,13 +173,14 @@ fi
 # Preserve the existing evaluation defaults across all models.
 DRY_RUN="${DRY_RUN:-0}"
 EVAL_RESULTS_DIR="${EVAL_RESULTS_DIR:-$REPO_ROOT/runs/eval_results_${EXPERIMENT}_policy}"
-SAMPLING_METHOD="${SAMPLING_METHOD:-greedy}"
+SAMPLING_METHOD="${SAMPLING_METHOD:-single_completion}"
 NUM_COMPLETIONS="${NUM_COMPLETIONS:-${NUM_SAMPLES:-50}}"
 PASS_AT_K="${PASS_AT_K:-1 2 4 8 16}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.95}"
 EVAL_PROMPT_BATCH_SIZE="${EVAL_PROMPT_BATCH_SIZE:-16}"
 MERGE_DEQUANT="${MERGE_DEQUANT:-1}"
+GREEDY_TOOL_CALLS="${GREEDY_TOOL_CALLS:-0}"
 read -ra K_VALUES <<< "$PASS_AT_K"
 
 positive_integer() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
@@ -164,9 +191,10 @@ for k in "${K_VALUES[@]}"; do
   [[ "$k" -le "$NUM_COMPLETIONS" ]] || die "pass@$k requires NUM_COMPLETIONS >= $k"
 done
 [[ "$MERGE_DEQUANT" == 0 || "$MERGE_DEQUANT" == 1 ]] || die "MERGE_DEQUANT must be 0 or 1"
+[[ "$GREEDY_TOOL_CALLS" == 0 || "$GREEDY_TOOL_CALLS" == 1 ]] || die "GREEDY_TOOL_CALLS must be 0 or 1"
 case "$SAMPLING_METHOD" in
-  greedy|random|best_of_n|mcts|evolutionary|vector_evolutionary) ;;
-  *) die "SAMPLING_METHOD must be greedy|random|best_of_n|mcts|evolutionary|vector_evolutionary" ;;
+  single_completion|random|best_of_n|mcts|evolutionary|vector_evolutionary) ;;
+  *) die "SAMPLING_METHOD must be single_completion|random|best_of_n|mcts|evolutionary|vector_evolutionary" ;;
 esac
 if [[ -n "${SEARCH_BUDGET:-}" && "$SAMPLING_METHOD" != mcts && "$SAMPLING_METHOD" != evolutionary && "$SAMPLING_METHOD" != vector_evolutionary ]]; then
   die "SEARCH_BUDGET applies only to mcts/evolutionary/vector_evolutionary"
@@ -190,6 +218,8 @@ case "$SAMPLING_METHOD" in
     OUT_TAG+="_bon${BEST_OF_N_WIDTH}"
     ;;
 esac
+# Keep greedy-tool-call results from overwriting sampled-tool-call results.
+[[ "$GREEDY_TOOL_CALLS" != 1 ]] || OUT_TAG+="_gtc"
 
 # Explicit TP_SIZE wins; otherwise use the visible GPUs. Dry runs need no GPU.
 if [[ -z "${TP_SIZE:-}" ]]; then
@@ -249,6 +279,12 @@ for checkpoint in "${CHECKPOINTS[@]}"; do
     --top_p "$TOP_P"
     --max_new_tokens "${MAX_NEW_TOKENS:-16384}"
     --max_eval_samples "${MAX_EVAL_SAMPLES:-512}"
+    --eval_selection "${EVAL_SELECTION:-uniform_faults}"
+    --eval_candidate_pool "${EVAL_CANDIDATE_POOL:-4096}"
+    --eval_manifest "${EVAL_MANIFEST:-$REPO_ROOT/runs/shared_eval_manifest.json}"
+    --difficulty_random_samples "${DIFFICULTY_RANDOM_SAMPLES:-4096}"
+    --difficulty_exact_max_inputs "${DIFFICULTY_EXACT_MAX_INPUTS:-12}"
+    --difficulty_seed "${DIFFICULTY_SEED:-1729}"
     --threshold_mode "${THRESHOLD_MODE:-fault_detected}"
     --eval_prompt_batch_size "$EVAL_PROMPT_BATCH_SIZE"
     --generation_micro_batch_size "${GENERATION_MICRO_BATCH_SIZE:-16}"
@@ -259,14 +295,22 @@ for checkpoint in "${CHECKPOINTS[@]}"; do
     "${SEARCH_ARGS[@]}"
   )
   [[ "$MERGE_DEQUANT" != 1 ]] || cmd+=(--merge_dequant)
+  [[ "$GREEDY_TOOL_CALLS" != 1 ]] || cmd+=(--greedy_tool_calls)
   echo "Evaluating: $adapter (tp_size=$TP_SIZE)"
   if [[ "$DRY_RUN" == 1 ]]; then
     printf '%q ' "${cmd[@]}"
-    printf '> %q\n' "$out_stdout"
+    printf '> %q 2>&1\n' "$out_stdout"
   else
     mkdir -p "$EVAL_RESULTS_DIR"
     echo "stdout -> $out_stdout"
-    "${cmd[@]}" >"$out_stdout"
+    if "${cmd[@]}" >"$out_stdout" 2>&1; then
+      :
+    else
+      status=$?
+      echo "Evaluation failed (exit $status); last 60 lines of $out_stdout:" >&2
+      tail -n 60 "$out_stdout" >&2
+      exit "$status"
+    fi
   fi
   evaluated=$((evaluated + 1))
 done

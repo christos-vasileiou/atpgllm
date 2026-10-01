@@ -41,7 +41,7 @@ change the meaning of the current pass@k evaluation.
 
 1. Correct conversation history, prefix continuation, tool execution, and final
    answer extraction. Add accurate cost accounting.
-2. Establish a corrected tool-using `greedy` and `best_of_n` baseline.
+2. Establish a corrected tool-using `single_completion` and `best_of_n` baseline.
 3. Implement evolution over valid conversation steps and structured vectors.
 4. Implement MCTS over the same steps, reusing the same execution and scoring code.
 5. Compare quality at equal token and simulator budgets before increasing scale.

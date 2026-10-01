@@ -1,4 +1,4 @@
-idx,problem_id,module,fault,pi_bits,po_bits,gates,exact,probe_vectors,uniform_detection,uniform_activation,expected_random_best4,target_is_pi,target_is_po,all_zero,all_one,zero_or_one,constant2_random2_observed,random,greedy,mcts,best_of_n,evolutionary,vector_evolutionary
+idx,problem_id,module,fault,pi_bits,po_bits,gates,exact,probe_vectors,uniform_detection,uniform_activation,expected_random_best4,target_is_pi,target_is_po,all_zero,all_one,zero_or_one,constant2_random2_observed,random,single_completion,mcts,best_of_n,evolutionary,vector_evolutionary
 0,74c15f2d12a2fa4103d7a877b85bd3994f45e5ef2e0c28522b1d75010e917e85,subminus,sa0 n50,16,9,73,True,65536,0.5,0.5,0.9375,False,False,1,0,1,1.0,0.3125,0.5625,0.625,0.9375,0.8125,0.875
 1,f0d863eb7d36fefd7b78a61f508637d0694b77f6b4a1e507c2aeb3195352c972,hexbcdconvertmodule,sa0 n5,4,8,12,True,16,0.375,0.5,0.847412109375,False,False,1,0,1,1.0,0.3125,0.5625,0.6875,1.0,0.9375,0.875
 2,439577e7ecb18462f096e114a38fd7a02dab8b514fc1e3ff2171c32f90a86f75,top,sa1 v_pad,14,11,27,True,16384,0.96484375,0.96484375,0.999998472398147,False,True,1,1,1,1.0,0.9375,0.875,1.0,1.0,1.0,1.0

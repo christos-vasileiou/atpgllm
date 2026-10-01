@@ -1,4 +1,4 @@
-"""Reconstruct saved greedy prompt lengths; no model loading or generation.
+"""Reconstruct saved single_completion prompt lengths; no model loading or generation.
 
 These are observational length strata, not a causal test of SFT truncation.
 Lengths use the local SFT tokenizer/template and the production tool schema.
@@ -58,7 +58,7 @@ def main():
     from transformers import AutoTokenizer
     _, tools = parser_and_tools()
     tokenizer = AutoTokenizer.from_pretrained(ROOT / "runs/sft_granite_4.2_8b/checkpoint-200", local_files_only=True)
-    path = next((ROOT / "runs/eval_results_grpo_granite_4.2_8b_policy").glob("*_greedy_*.json"))
+    path = next((ROOT / "runs/eval_results_grpo_granite_4.2_8b_policy").glob("*_single_completion_*.json"))
     data = json.loads(path.read_text())
     groups = collections.defaultdict(collections.Counter)
     per_problem = []

@@ -16,7 +16,7 @@ SFT's operative sequence limit is `SFTConfig(max_length=8192)`; its completion s
 
 The SFT formatter, reasoning-template renderer, and dataset utilities have no committed changes between the recorded SFT commit `eec7da1` and evaluation commit `f34692a`. This supports using the local formatter to investigate truncation risk, while not proving the exact cached dataset revision or consumed training stream.
 
-**What the saved 512-circuit greedy trajectories say about length**
+**What the saved 512-circuit single_completion trajectories say about length**
 
 Lengths below reconstruct the saved histories with the SFT checkpoint's tokenizer/template and production tool schema. They are observational strata, not a training-window intervention.
 
@@ -44,7 +44,7 @@ A prespecified Bernoulli sample (probability 0.001, seed 20260916) selected 736 
 
 This sample demonstrates that truncation can remove final-output supervision, but it does not show widespread removal in the eligible cached rows. It is a small probe of the formatter and cache, not an audit of the exact examples consumed by checkpoint 200 or its dependency revisions. Prefix-token positions are approximate at tokenization boundaries. See [sft_truncation_probe.py](sft_truncation_probe.py) and [sft_truncation_probe.json](sft_truncation_probe.json).
 
-A separate mechanism is visible in the training formatter: SFT tool requests receive the stored expected-output vector, and the final answer repeats that vector. These examples teach repetition of the supplied label; they do not demonstrate correcting a wrong request after feedback. The subsequent label audit shows why calling these values "gold" or "already correct" would be misleading: only 43/91 sampled eligible labels agree with the corrected circuit simulation, and three simple mismatches are independently confirmed from wiring. Forty-seven incorrect targets retain supervised tokens within the SFT cap. The observed 98.39% copying in the historical greedy trajectories is compatible with this supervision, although its causal contribution still requires repaired-data training experiments. See [the label audit](sft_training_label_probe.json) and [independent label checks](sft_label_independent_checks.json).
+A separate mechanism is visible in the training formatter: SFT tool requests receive the stored expected-output vector, and the final answer repeats that vector. These examples teach repetition of the supplied label; they do not demonstrate correcting a wrong request after feedback. The subsequent label audit shows why calling these values "gold" or "already correct" would be misleading: only 43/91 sampled eligible labels agree with the corrected circuit simulation, and three simple mismatches are independently confirmed from wiring. Forty-seven incorrect targets retain supervised tokens within the SFT cap. The observed 98.39% copying in the historical single_completion trajectories is compatible with this supervision, although its causal contribution still requires repaired-data training experiments. See [the label audit](sft_training_label_probe.json) and [independent label checks](sft_label_independent_checks.json).
 
 **Bus correction and deferred output enforcement**
 
