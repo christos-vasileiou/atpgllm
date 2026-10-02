@@ -34,7 +34,7 @@ start_tetramax_service() {
         bind_host=0.0.0.0
         advertise_host="${TMAX_SERVICE_ADVERTISE_HOST:-$(hostname -f)}"
     fi
-    local -a command=("$service_python" -u "$project_root/data_preprocessing/tetramax_service.py"
+    local -a command=("$service_python" -u "${DATA_PREPROCESSING_ROOT:-$project_root/data_preprocessing}/tetramax_service.py"
         --host "$bind_host" --advertise-host "$advertise_host"
         --workers "${TMAX_SERVICE_WORKERS:-${TMAX_MAX_CONCURRENT:-16}}"
         --queue-size "${TMAX_QUEUE_SIZE:-128}" --port "${TMAX_SERVICE_PORT:-0}")

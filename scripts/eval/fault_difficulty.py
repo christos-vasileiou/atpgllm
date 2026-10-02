@@ -14,6 +14,7 @@ import hashlib
 import itertools
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
@@ -99,7 +100,8 @@ class Circuit:
     semantics. Unsupported syntax is rejected, never silently skipped.
     """
     def __init__(self, text, gates):
-        sys.path.insert(0, str(ROOT.parent / "data_preprocessing")) if str(ROOT.parent / "data_preprocessing") not in sys.path else None
+        preprocessing = os.environ.get("DATA_PREPROCESSING_ROOT") or str(ROOT.parent / "data_preprocessing")
+        sys.path.insert(0, preprocessing) if preprocessing not in sys.path else None
         from tetramax_backend import SimulationNetlist
         meta = SimulationNetlist(text)
         self.meta = meta

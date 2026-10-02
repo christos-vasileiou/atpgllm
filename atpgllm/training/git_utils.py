@@ -2,13 +2,15 @@ import subprocess
 import os
 import wandb
 
-def get_git_info():
-    """Extracts Git repository name, branch, and commit hash."""
+def get_git_info(root=None, prefix="git_"):
+    """Extracts Git repository name, branch, commit hash and dirty flag of ``root`` (default: cwd)."""
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(root or '.'), *args], stderr=subprocess.DEVNULL).decode('utf-8').strip()
     try:
-        repo = subprocess.check_output(['git', 'config', '--get', 'remote.origin.url'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
-        branch = subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
-        commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
-        return {"git_repo": repo, "git_branch": branch, "git_commit": commit}
+        return {f"{prefix}repo": git('config', '--get', 'remote.origin.url'),
+                f"{prefix}branch": git('rev-parse', '--abbrev-ref', 'HEAD'),
+                f"{prefix}commit": git('rev-parse', 'HEAD'),
+                f"{prefix}dirty": bool(git('status', '--porcelain', '--untracked-files=no'))}
     except Exception:
         # Fails silently if not a git repo or git is not installed
         return {}

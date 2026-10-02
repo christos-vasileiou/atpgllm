@@ -12,6 +12,7 @@ import ast
 from collections import Counter, defaultdict
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 import re
@@ -21,7 +22,7 @@ import time
 from lot_metrics import compact, coverage_curve, outcomes, parse_answer, summarize, interval
 
 ROOT = Path(__file__).resolve().parents[2]
-PREPROCESSING = ROOT.parent / "data_preprocessing"
+PREPROCESSING = Path(os.environ.get("DATA_PREPROCESSING_ROOT") or ROOT.parent / "data_preprocessing")
 sys.path.insert(0, str(PREPROCESSING))
 
 

@@ -1,8 +1,8 @@
 import sys
-from pathlib import Path
 
 # Add data_preprocessing to sys.path for shared utilities
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'data_preprocessing'))
+from atpgllm.training._paths import ensure_data_preprocessing_on_path
+ensure_data_preprocessing_on_path()
 
 import pandas as pd
 import regex as re

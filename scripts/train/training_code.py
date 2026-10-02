@@ -95,8 +95,10 @@ Version Requirements:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -140,7 +142,7 @@ def _setup_mig_visibility() -> None:
 _setup_mig_visibility()
 
 
-from atpgllm.training._paths import ensure_data_preprocessing_on_path
+from atpgllm.training._paths import DATA_PREPROCESSING, LIBATPGLLM_ROOT, ensure_data_preprocessing_on_path
 ensure_data_preprocessing_on_path()
 
 from datasets import load_dataset
@@ -1114,6 +1116,24 @@ def _load_launch_config_snapshot(path: str | None) -> dict[str, str]:
     return out
 
 
+def _code_provenance() -> dict:
+    """Branch/commit/dirty state of the libatpgllm and data_preprocessing checkouts in use."""
+    return {**get_git_info(LIBATPGLLM_ROOT), **get_git_info(DATA_PREPROCESSING, prefix="dp_git_"),
+            "dp_root": str(DATA_PREPROCESSING)}
+
+
+def _record_code_provenance(output_dir: str, provenance: dict) -> None:
+    """Append this launch's code provenance to <output_dir>/code_provenance.jsonl (rank 0 only)."""
+    if os.environ.get("RANK", "0") != "0":
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    record = {"launched_at": datetime.now().isoformat(timespec="seconds"),
+              "slurm_job_id": os.environ.get("SLURM_JOB_ID"), **provenance}
+    with open(os.path.join(output_dir, "code_provenance.jsonl"), "a") as f:
+        f.write(json.dumps(record) + "\n")
+    print(f"[code_provenance] {record}")
+
+
 def _wandb_run_config(
     method: str,
     args_dict: dict,
@@ -1411,7 +1431,9 @@ def main() -> None:
     # 1. Wandb config: CLI hyperparameters + git metadata + launcher config snapshot
     launch_snapshot_path = os.environ.get("LAUNCH_CONFIG_SNAPSHOT")
     launch_config = _load_launch_config_snapshot(launch_snapshot_path)
-    run_config = _wandb_run_config(method, args_dict, get_git_info(), launch_config)
+    code_provenance = _code_provenance()
+    _record_code_provenance(args_dict['output_dir'], code_provenance)
+    run_config = _wandb_run_config(method, args_dict, code_provenance, launch_config)
 
     # 2. Initialize wandb explicitly to capture everything from this point forward
     wandb.init(
