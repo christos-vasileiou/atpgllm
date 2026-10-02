@@ -6,8 +6,8 @@ gate into a versioned ordered set of categorical/binary attributes and learn a
 small embedding per attribute value. The concatenation is fused through an MLP
 to produce the initial node embedding for the GNN.
 
-Additionally, 4 continuous **structural features** (forward depth, backward
-depth, in-degree, out-degree) are concatenated before the MLP.  These
+Additionally, 5 continuous **structural features** (forward depth, backward
+depth, in-degree, out-degree, port position) are concatenated before the MLP.  These
 replace RWPE / Laplacian PE — which are degenerate on DAGs — with
 task-native features that directly encode SCOAP-like controllability and
 observability information. Five inference-safe target-fault features identify

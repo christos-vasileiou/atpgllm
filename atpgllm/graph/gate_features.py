@@ -44,7 +44,23 @@ LOGIC_FAMILIES: List[str] = [
     "DFF", "LATCH", "ICG", "SCAN_FF",
     "TIE",
     "COMPOUND_AOI", "COMPOUND_OAI",
+    # Pseudo-cells for non-gate graph nodes (see netlist_parser).
+    "PI", "PO", "CONST0", "CONST1", "ASSIGN",
 ]
+
+# Pseudo-cell names used by the parser for primary inputs/outputs, constant
+# sources, and ``assign`` pass-throughs. Each is registered in every vocab so
+# it receives its own logic family and function identity.
+PSEUDO_CELLS: Dict[str, str] = {
+    "<PI>": "PI",
+    "<PO>": "PO",
+    "<CONST0>": "CONST0",
+    "<CONST1>": "CONST1",
+    "<ASSIGN>": "ASSIGN",
+}
+# Pin names used on pseudo-cells.
+PSEUDO_IN_PIN = "<IN>"
+PSEUDO_OUT_PIN = "<OUT>"
 
 INPUT_COUNT_CLASSES: List[str] = [
     "UNKNOWN", "1", "2", "3", "4", "5", "6_PLUS",
@@ -66,7 +82,8 @@ DRIVE_STRENGTH_CLASSES: List[str] = [
 
 BINARY_CLASSES: List[str] = ["UNKNOWN", "False", "True"]
 NUM_OUTPUT_CLASSES: List[str] = ["UNKNOWN", "1", "2", "SPECIAL"]
-VOCAB_SCHEMA_VERSION = 1
+# v2: function_id attribute, pseudo-cells, and the pin-role vocabulary.
+VOCAB_SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------
 # SINGLE SOURCE OF TRUTH for which gate attributes are used by the model.
@@ -88,6 +105,9 @@ ATTRIBUTE_NAMES: List[str] = [
     "num_outputs",
     # "tristate",
     # "is_clock_related",
+    # Exact Boolean-function identity; the attributes above alone merge
+    # e.g. MAJ with MAJI and AO211 with AO22.
+    "function_id",
 ]
 NUM_ATTRIBUTES = len(ATTRIBUTE_NAMES)
 
@@ -286,6 +306,8 @@ _ATTRIBUTE_REGISTRY: Dict[str, Tuple[int, "callable"]] = {
     "num_outputs":         (len(NUM_OUTPUT_CLASSES),      _idx_num_outputs),
     "tristate":            (len(BINARY_CLASSES),          lambda a: 2 if a.tristate else 1),
     "is_clock_related":    (len(BINARY_CLASSES),          lambda a: 2 if a.is_clock_related else 1),
+    # Library-dependent labels; sized and indexed by GateAttributeVocab.
+    "function_id":         (0,                            None),
 }
 
 # Parallel registry: index -> human-readable label per attribute.
@@ -327,6 +349,29 @@ class GateAttributes:
     num_outputs: int
     tristate: bool
     is_clock_related: bool
+    # Canonical ``pin=expr`` signature; equal only for identical functions.
+    function: str = ""
+
+
+def _function_signature(func_dict: Dict[str, str]) -> str:
+    return ";".join(
+        pin + "=" + re.sub(r"\s+", "", expr)
+        for pin, expr in sorted(func_dict.items())
+    )
+
+
+def _pseudo_attrs(cell: str, family: str) -> GateAttributes:
+    return GateAttributes(
+        logic_family=family,
+        input_count={"PO": 1, "ASSIGN": 1}.get(family, 0),
+        output_complemented=False,
+        is_sequential=False,
+        drive_strength=1.0,
+        num_outputs=0 if family == "PO" else 1,
+        tristate=False,
+        is_clock_related=False,
+        function=cell,
+    )
 
 
 # =====================================================================
@@ -357,10 +402,34 @@ class GateAttributeVocab:
         self._indices: Dict[str, Tuple[int, ...]] = {}
 
         for cell_name in sorted(gate_funcs):
-            func_dict = gate_funcs[cell_name]
-            attrs = self._extract(cell_name, func_dict)
-            self._attrs[cell_name] = attrs
-            self._indices[cell_name] = self._to_indices(attrs)
+            self._attrs[cell_name] = self._extract(cell_name, gate_funcs[cell_name])
+        for cell_name, family in PSEUDO_CELLS.items():
+            self._attrs[cell_name] = _pseudo_attrs(cell_name, family)
+
+        self.function_labels: List[str] = ["UNKNOWN"] + sorted(
+            {attrs.function for attrs in self._attrs.values()}
+        )
+        pins: set[str] = set()
+        for func_dict in gate_funcs.values():
+            pins.update(func_dict)
+            for expr in func_dict.values():
+                pins.update(
+                    m.group(1) for m in _VAR_RE.finditer(expr)
+                    if m.group(1) not in _NON_INPUT_VARS
+                )
+        self.pin_labels: List[str] = (
+            ["UNKNOWN", PSEUDO_IN_PIN, PSEUDO_OUT_PIN] + sorted(pins)
+        )
+        self._init_indices()
+
+    def _init_indices(self) -> None:
+        self._pin_index = {pin: i for i, pin in enumerate(self.pin_labels)}
+        self._function_index = {
+            label: i for i, label in enumerate(self.function_labels)
+        }
+        self._indices = {
+            name: self._to_indices(attrs) for name, attrs in self._attrs.items()
+        }
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -379,17 +448,25 @@ class GateAttributeVocab:
     @property
     def vocab_sizes(self) -> Dict[str, int]:
         """Number of classes for each *enabled* attribute (embedding layers)."""
-        return {name: _ATTRIBUTE_REGISTRY[name][0] for name in self.attribute_names}
+        return {name: len(self._labels(name)) for name in self.attribute_names}
 
     @property
     def num_attributes(self) -> int:
         return len(self.attribute_names)
+
+    @property
+    def num_pins(self) -> int:
+        return len(self.pin_labels)
 
     def encode(self, cell_name: str) -> Tuple[int, ...]:
         """Return a tuple of integer indices for the enabled attributes."""
         if cell_name in self._indices:
             return self._indices[cell_name]
         return self._default_indices()
+
+    def encode_pin(self, pin: str) -> int:
+        """Pin-role index; 0 (UNKNOWN) for pins absent from the library."""
+        return self._pin_index.get(pin, 0)
 
     def to_dict(self) -> Dict[str, object]:
         """Serialize the exact, versioned embedding contract for checkpoints."""
@@ -399,7 +476,10 @@ class GateAttributeVocab:
             "labels": {
                 name: list(_ATTRIBUTE_LABELS[name])
                 for name in self.attribute_names
+                if name != "function_id"
             },
+            "function_labels": list(self.function_labels),
+            "pin_labels": list(self.pin_labels),
             "cells": {
                 name: {
                     "attrs": asdict(self._attrs[name]),
@@ -421,6 +501,8 @@ class GateAttributeVocab:
         attribute_names = tuple(payload.get("attribute_names", ()))
         labels = payload.get("labels", {})
         for name in attribute_names:
+            if name == "function_id":
+                continue  # library-dependent; restored from function_labels
             expected = list(_ATTRIBUTE_LABELS.get(name, ()))
             actual = list(labels.get(name, ())) if isinstance(labels, dict) else []
             if actual != expected:
@@ -431,8 +513,9 @@ class GateAttributeVocab:
 
         obj = cls.__new__(cls)
         obj.attribute_names = attribute_names
+        obj.function_labels = list(payload["function_labels"])
+        obj.pin_labels = list(payload["pin_labels"])
         obj._attrs = {}
-        obj._indices = {}
         cells = payload.get("cells", {})
         if not isinstance(cells, dict):
             raise ValueError("Gate-vocab payload field 'cells' must be a mapping.")
@@ -441,7 +524,10 @@ class GateAttributeVocab:
             if not isinstance(item, dict):
                 raise ValueError(f"Invalid gate-vocab entry for {name!r}.")
             obj._attrs[name] = GateAttributes(**item["attrs"])
-            obj._indices[name] = tuple(int(x) for x in item["indices"])
+        obj._init_indices()
+        for name in sorted(cells):
+            if list(obj._indices[name]) != [int(x) for x in cells[name]["indices"]]:
+                raise ValueError(f"Gate-vocab indices for {name!r} do not round-trip.")
         return obj
 
     @property
@@ -517,7 +603,7 @@ class GateAttributeVocab:
                 f"attribute(s) are enabled: {self.attribute_names}"
             )
         return {
-            name: _ATTRIBUTE_LABELS[name][idx]
+            name: self._labels(name)[idx]
             for name, idx in zip(self.attribute_names, indices)
         }
 
@@ -598,13 +684,13 @@ class GateAttributeVocab:
 
         # Count cells per (attribute, value) across the vocab
         counts: Dict[str, Dict[str, int]] = {
-            name: {label: 0 for label in _ATTRIBUTE_LABELS[name]}
+            name: {label: 0 for label in self._labels(name)}
             for name in self.attribute_names
         }
         for attrs in self._attrs.values():
             for name in self.attribute_names:
-                idx = _ATTRIBUTE_REGISTRY[name][1](attrs)
-                counts[name][_ATTRIBUTE_LABELS[name][idx]] += 1
+                idx = self._index(name, attrs)
+                counts[name][self._labels(name)[idx]] += 1
 
         ncols = min(3, self.num_attributes)
         nrows = (self.num_attributes + ncols - 1) // ncols
@@ -669,12 +755,21 @@ class GateAttributeVocab:
             is_clock_related=any(
                 prefix.upper().startswith(cp) for cp in _CLOCK_PREFIXES
             ),
+            function=_function_signature(func_dict),
         )
 
+    def _labels(self, name: str) -> List[str]:
+        if name == "function_id":
+            return self.function_labels
+        return _ATTRIBUTE_LABELS[name]
+
+    def _index(self, name: str, attrs: GateAttributes) -> int:
+        if name == "function_id":
+            return self._function_index.get(attrs.function, 0)
+        return _ATTRIBUTE_REGISTRY[name][1](attrs)
+
     def _to_indices(self, attrs: GateAttributes) -> Tuple[int, ...]:
-        return tuple(
-            _ATTRIBUTE_REGISTRY[name][1](attrs) for name in self.attribute_names
-        )
+        return tuple(self._index(name, attrs) for name in self.attribute_names)
 
     def _default_indices(self) -> Tuple[int, ...]:
         """All-unknown / all-false fallback (one entry per enabled attribute)."""

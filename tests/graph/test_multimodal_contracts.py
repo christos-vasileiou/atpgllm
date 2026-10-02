@@ -14,7 +14,7 @@ from atpgllm.graph.checkpoints import (
 from atpgllm.graph.dataset import record_to_pyg, render_prompt_and_answer
 from atpgllm.graph.gate_features import GateAttributeVocab
 from atpgllm.graph.models_stage1 import GraphQFormer, NetlistGraphEncoder
-from atpgllm.graph.netlist_parser import parse_verilog_to_pyg
+from atpgllm.graph.netlist_parser import GraphRejected, parse_verilog_to_pyg
 from atpgllm.graph.pretrain import GraphPretrainingModel
 from atpgllm.multimodal.grpo import (
     graph_grpo_loss,
@@ -30,7 +30,9 @@ GATE_FUNCS = {
 }
 
 NETLIST = """
-module tiny(input a, input b, output y);
+module tiny(a, b, y);
+input a, b;
+output y;
 wire n1;
 AND2x1_ASAP7_75t_R U1 (.A(a), .B(b), .Y(n1));
 INVx1_ASAP7_75t_R U2 (.A(n1), .Y(y));
@@ -63,31 +65,36 @@ def test_vocab_round_trip_has_explicit_unknowns():
     assert restored.fingerprint == vocab.fingerprint
     assert restored.encode("AND2x1_ASAP7_75t_R") == known
 
-    unknown_graph = parse_verilog_to_pyg(
-        """
-        module unknown_cell(input a, input b, output y);
-        wire n1;
-        MYSTERYx1 U0 (.A(a), .Y(n1));
-        AND2x1_ASAP7_75t_R U1 (.A(n1), .B(b), .Y(y));
-        endmodule
-        """,
-        GATE_FUNCS,
-        vocab,
-    )
-    assert unknown_graph.num_nodes == 2
-    assert unknown_graph.gate_attrs[0].tolist() == list(unknown)
+    # The simulator silently skips unknown cells, so the graph rejects them.
+    with pytest.raises(GraphRejected) as rejected:
+        parse_verilog_to_pyg(
+            """
+            module unknown_cell(a, b, y);
+            input a, b;
+            output y;
+            wire n1;
+            MYSTERYx1 U0 (.A(a), .Y(n1));
+            AND2x1_ASAP7_75t_R U1 (.A(n1), .B(b), .Y(y));
+            endmodule
+            """,
+            GATE_FUNCS,
+            vocab,
+        )
+    assert rejected.value.reason == "unknown_cell"
 
 
 def test_fault_context_keeps_labels_out_of_inputs():
     vocab = GateAttributeVocab(GATE_FUNCS)
     graph = record_to_pyg(_record(), GATE_FUNCS, vocab)
     assert graph is not None
-    assert graph.fault_feats.shape == (2, 5)
-    assert graph.fault_feats[:, 0].tolist() == [1.0, 1.0]
-    assert graph.fault_feats[:, 3].tolist() == [1.0, 1.0]
-    assert graph.propagation_mask.tolist() == [True, True]
-    assert graph.backtrack_mask.tolist() == [True, False]
-    assert graph.discrepancy_mask.tolist() == [True, True]
+    # Nodes: <PI> a, <PI> b, U1, U2, <PO> y.
+    assert graph.node_names == ["a", "b", "U1", "U2", "y"]
+    assert graph.fault_feats.shape == (5, 5)
+    assert graph.fault_feats[:, 0].tolist() == [0.0, 0.0, 1.0, 1.0, 0.0]
+    assert graph.fault_feats[:, 3].tolist() == [0.0, 0.0, 1.0, 1.0, 0.0]
+    assert graph.propagation_mask.tolist() == [False, False, True, True, False]
+    assert graph.backtrack_mask.tolist() == [False, False, True, False, False]
+    assert graph.discrepancy_mask.tolist() == [False, False, True, True, False]
 
     changed = _record()
     changed["snapshot"] = ""
@@ -136,7 +143,7 @@ def test_graph_pretraining_shapes_and_losses():
     )
     outputs = model(batch)
     losses = model.compute_losses(batch, outputs)
-    assert outputs.node_embs.shape == (4, 8)
+    assert outputs.node_embs.shape == (10, 8)
     assert torch.isfinite(losses.total)
 
 

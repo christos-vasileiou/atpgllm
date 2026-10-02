@@ -28,10 +28,10 @@ Verilog Netlist (text)
         v
 +-----------------------+
 | Netlist Parser        |   netlist_parser.py
-| Regex-based extraction|   Handles escaped names: \add_x_1/n36, \*Logic1*, s7[3]
-| of gate instances,    |   Builds directed edges: driver → sink (DAG)
-| net connections,      |   Computes structural features (Kahn's algorithm)
-| I/O declarations      |
+| Fault simulator's own |   Nodes: gates + <PI>/<PO>/<ASSIGN>/<CONST*>
+| parse (OptimizedNet-  |   Edges: driver pin → sink pin, one per reading pin
+| list); rejects what   |   Computes structural features (Kahn's algorithm)
+| it cannot represent   |
 +----------+------------+
            |
            v
@@ -50,7 +50,7 @@ Verilog Netlist (text)
 | Encoder (nn.Module)   |
 |                       |
 | A learned embeddings  |   [N, A] int → [N, A*d_attr] embedded
-| + structure + fault   |   [N, 9] float (depth, degree, target)
+| + structure + fault   |   [N, 10] float (depth, degree, port, target)
 | → MLP fusion          |   → [N, 256] initial node embedding
 +-----------+-----------+
             |
@@ -101,11 +101,11 @@ A monolithic embedding table (one vector per cell name) would:
 
 ### Solution: Attribute Decomposition
 
-Each cell can be decomposed into eight categorical/binary attributes. The
-checkpointed production contract currently enables the four entries in
-`ATTRIBUTE_NAMES`: `logic_family`, `input_count`, `is_sequential`, and
-`num_outputs`. Changing this ordered list intentionally changes the vocabulary
-fingerprint and invalidates incompatible checkpoints.
+Each cell can be decomposed into nine categorical/binary attributes. The
+checkpointed production contract (vocab schema v2) enables the five entries in
+`ATTRIBUTE_NAMES`: `logic_family`, `input_count`, `is_sequential`,
+`num_outputs`, and `function_id`. Changing this ordered list intentionally
+changes the vocabulary fingerprint and invalidates incompatible checkpoints.
 
 | # | Attribute             | Classes | Examples                              | Why it matters for ATPG             |
 |---|-----------------------|---------|---------------------------------------|-------------------------------------|
@@ -117,11 +117,14 @@ fingerprint and invalidates incompatible checkpoints.
 | 5 | `num_outputs`         | 3       | 1 (most), 2 (FA: carry+sum), special  | Multi-output gates create coupled fault effects |
 | 6 | `tristate`            | 3       | UNKNOWN / True / False                | Placeholder for future PDKs with tristate buffers |
 | 7 | `is_clock_related`    | 3       | UNKNOWN / ICG,CKINVDC / normal        | Clock gates require special ATPG handling (launch/capture) |
+| 8 | `function_id`         | library | one per distinct Boolean function     | The other attributes alone merge MAJ with MAJI and AO211 with AO22; drive variants still share an id |
 
-Every enabled attribute has an explicit index-0 UNKNOWN value. Unknown cell
-types are retained by the parser, using common output-pin names as a
-conservative connectivity fallback. `GateAttributeVocab.to_dict()` serializes
-labels, active ordering, cells, and indices; its SHA-256 fingerprint is checked
+`logic_family` and `function_id` also cover the pseudo-cells `<PI>`, `<PO>`,
+`<CONST0>`, `<CONST1>`, and `<ASSIGN>`. The vocabulary additionally holds the
+pin-name list used for edge roles. Every enabled attribute has an explicit
+index-0 UNKNOWN value; the parser rejects unknown cells rather than guessing
+their pins. `GateAttributeVocab.to_dict()` serializes labels, function and pin
+lists, active ordering, cells, and indices; its SHA-256 fingerprint is checked
 at every checkpoint transition.
 
 ### Why not monolithic embeddings?
@@ -180,7 +183,7 @@ suffer from:
 
 ### Solution: DAG-native structural features
 
-Four features computed per node in O(N + E) via Kahn's algorithm:
+Five features computed per node in O(N + E) via Kahn's algorithm:
 
 | Feature              | Computation                          | ATPG Meaning                          |
 |----------------------|--------------------------------------|---------------------------------------|
@@ -188,15 +191,15 @@ Four features computed per node in O(N + E) via Kahn's algorithm:
 | `backward_depth`     | Longest path to any PO (normalised 0-1)   | Approximates combinational observability — gates farther from outputs are harder to observe |
 | `log_in_degree`      | log2(1 + fanin count)                | Higher fanin = more inputs to sensitise for fault propagation |
 | `log_out_degree`     | log2(1 + fanout count)               | Higher fanout creates reconvergent structures that complicate ATPG |
+| `port_position`      | Bit index of a `<PI>`/`<PO>` node in the simulator's input/output vector order (normalised 0-1); 0 elsewhere | Ties graph inputs/outputs to vector positions; without it, two circuits that differ only by which input feeds which pin encode identically |
 
-These four features are a continuous relaxation of **SCOAP measures**
+The first four features are a continuous relaxation of **SCOAP measures**
 (Sandia Controllability/Observability Analysis Program), which are the
 foundation of classical ATPG heuristics like PODEM and FAN.
 
 Forward/backward depth uses Kahn's topological sort with longest-path
-relaxation.  Cycles (which shouldn't exist in synthesised combinational logic
-but may appear in feedback paths) are handled gracefully — nodes remaining
-after the topological traversal are assigned max_depth + 1.
+relaxation. Graphs with cycles are rejected (`GraphRejected("cycle")`); the
+schema models combinational logic only.
 
 
 ## Component 3: Node Feature Encoder
@@ -206,7 +209,7 @@ after the topological traversal are assigned max_depth + 1.
 ### Architecture
 
 ```
-gate_attrs [N, A] (int64)          structure [N, 4] + fault [N, 5]
+gate_attrs [N, A] (int64)          structure [N, 5] + fault [N, 5]
      |                                       |
      v                                       |
 A × nn.Embedding(n_classes, d_attr)           |
@@ -340,36 +343,49 @@ the model implicit information about circuit complexity.
 
 **File:** `netlist_parser.py`
 
-Regex-based Verilog structural netlist parser that handles ASAP7 synthesised
-output including:
+The netlist is parsed by the fault simulator's `OptimizedNetlist`
+(`data_preprocessing/fault_sim.py`), so the graph and the simulator agree on
+bus indices (`input [7:4] a` → `a[4]..a[7]`), escaped names, `assign`
+pass-throughs, `*Logic0*`/`*Logic1*` constants, and multi-output cells.
 
-| Net Name Pattern       | Example                | How it's handled                          |
-|------------------------|------------------------|-------------------------------------------|
-| Simple wire            | `n35`                  | Matched by `\w+`                          |
-| Bus indexing           | `s7[3]`, `out1[1]`     | Brackets pass through `[^)]+?`            |
-| Escaped identifier     | `\add_x_1/n36`         | Matched by `\\[^\s]+` (backslash + non-whitespace) |
-| Escaped bus            | `\y[80]`               | Same escaped pattern                      |
-| Logic constant         | `\*Logic1*`            | Detected by LOGIC_VALUE regex, converted to `"1"` |
-| Multi-line connections | `.CI(\n\add_x_1/n39 )` | `[\s\S]+?` in gate pattern spans newlines |
+Nodes are gate instances plus pseudo-cells: one `<PI>`/`<PO>` per port bit in
+simulator (vector) order, one `<ASSIGN>` per `assign` (a fault on an alias net
+affects only that alias's readers, as in the simulator), and `<CONST0>`/
+`<CONST1>` sources. Each net has exactly one driver; every reading pin gets its
+own edge.
+
+Netlists that cannot be represented faithfully raise `GraphRejected` with a
+reason: `unknown_cell`, `sequential_cell`, `duplicate_instance`,
+`unsupported_declaration`, `unsupported_assign` (non-alias `assign`),
+`unconnected_pin`, `multi_driven_net`, `undriven_net`, `cycle`; and per record
+`fault_unparsable` or `fault_net_unknown`. `record_to_pyg` returns `None` for
+rejected records and counts reasons; other errors propagate. Fault-independent
+graphs are cached per netlist hash.
 
 The parser produces:
 - `gate_attrs [N, A]` — versioned attribute indices via `GateAttributeVocab`
-- `structural_feats [N, 4]` — depth/degree via `compute_structural_features`
-- `edge_index [2, E]` — directed edges (driver → sink)
+- `structural_feats [N, 5]` — depth/degree/port position via `compute_structural_features`
+- `edge_index [2, E]` — directed edges (driver → sink), one per reading pin
+- `edge_pins [E, 2]` — (driver output pin, sink input pin) vocabulary indices
 - `fault_feats [N, 5]` — target location/direction and stuck-at polarity
+- `fault_edge [E]` — 1.0 on edges carrying the target fault net
+- `gate_node_mask`, `po_node_mask [N]` and `node_names` (instance or port net names)
 - Backward-compatible `x [N, 1]` dummy features
 
 Dataset records additionally carry `propagation_mask`, `backtrack_mask`, and
 `discrepancy_mask` with per-graph validity flags. The discrepancy mask compares
-Good Machine and Bad Machine values on each gate's output nets. These tensors
-supervise encoder pretraining only.
+Good Machine and Bad Machine values on each node's driven nets. These tensors
+supervise encoder pretraining only: propagation/backtrack are scored on gate
+nodes, discrepancy on every node that drives a net.
 
 
 ## Shape Contracts
 
 - Graph batch: PyG `Batch` with `gate_attrs [N,A]`,
-  `structural_feats [N,4]`, optional `fault_feats [N,5]`,
-  `edge_index [2,E]`, and `batch [N]`.
+  `structural_feats [N,5]`, optional `fault_feats [N,5]`,
+  `edge_index [2,E]`, `edge_pins [E,2]`, optional `fault_edge [E]`, and
+  `batch [N]`. The DAG-GIN layers are GINE convolutions whose messages add
+  the edge-role embedding.
 - DAG encoder: `node_embs [N,d_g]`, `graph_embs [B,4*d_g]`.
 - Q-Former: densifies nodes with a valid-node mask and returns
   `query_embs [B,Q,d_q]`; padded nodes are masked in cross-attention.
@@ -427,12 +443,20 @@ Run from `libatpgllm/` after activating the project environment.
 ### Stage A — target-conditioned DAG encoder pretraining
 
 ```bash
+activate && python -m atpgllm.graph.scripts.search_graph_pipeline prepare-split \
+  --config scripts/train/configs/hpo_graph_pipeline.yaml \
+  --output runs/graph_splits/asap7-language-of-test-v2.json
 activate && python -m atpgllm.graph.scripts.train_graph_encoder \
   --dataset chrivasileiou/asap7-language-of-test-v2 \
+  --split-manifest runs/graph_splits/asap7-language-of-test-v2.json \
   --output-dir runs/graph_pretrain
 ```
 
-The netlist and target fault are inputs. Three node heads supervise fault
+Training uses only `train` designs of the design-disjoint split; every
+`--eval-every` steps the encoder is scored on `validation` designs (at most
+`--eval-faults-per-design` faults each) with per-head AP/IoU, logged to
+`metrics.jsonl`, and the best score is kept as `graph_pretrain_best.pt`. The
+netlist and target fault are inputs. Three node heads supervise fault
 propagation, ATPG backtracking, and Good/Bad Machine discrepancy masks. The
 checkpoint exports the DAG encoder; auxiliary heads do not cross into the LLM.
 
@@ -527,11 +551,12 @@ attribute-order and shape compatibility.
 
 ## Current Limitations
 
-- The parser targets synthesized structural netlists. Unknown cells are
-  retained using conventional output-pin names, but libraries with unusual pin
-  naming need an explicit gate-function entry.
-- Sequential feedback is tolerated by structural-depth fallback, but this is
-  not a scan-chain/timing model.
+- The parser accepts the simulator's subset of synthesized structural
+  Verilog (non-ANSI port declarations, alias/constant `assign` only) and
+  combinational cells from `sim_config.json`; everything else is rejected
+  with a counted reason rather than approximated.
+- Port identity is a normalised bit position, a weak signal on very wide
+  buses; port names are kept in `node_names` but not encoded.
 - Stage-D generation is single-prompt grouped sampling without vLLM, DDP, or
   tool-call continuation. It preserves graph gradients but is slower than the
   text-only TRL/vLLM path.

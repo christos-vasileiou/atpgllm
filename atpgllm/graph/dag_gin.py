@@ -28,11 +28,11 @@ Compatible with PyG batched graphs (``DataLoader`` + ``Batch``).
 
 from __future__ import annotations
 
-from typing import Dict, Literal
+from typing import Dict, Literal, Optional
 
 import torch
 from torch import nn, Tensor
-from torch_geometric.nn import GINConv, global_mean_pool, global_max_pool, global_add_pool
+from torch_geometric.nn import GINEConv, global_mean_pool, global_max_pool, global_add_pool
 
 
 # =====================================================================
@@ -53,20 +53,21 @@ def _gin_mlp(dim: int) -> nn.Sequential:
 
 
 class DAGGINLayer(nn.Module):
-    """One layer of bidirectional GIN message passing.
+    """One layer of bidirectional GINE message passing.
 
-    For each node *v*:
+    For each node *v*, with edge embedding :math:`e_{uv}` (pin roles and
+    fault-net flag):
 
     .. math::
 
         h_v^{\\text{fwd}} = \\text{MLP}_{\\text{fwd}}\\bigl(
             (1+\\varepsilon_{\\text{fwd}})\\,h_v
-            + \\sum_{u \\in \\text{pred}(v)} h_u
+            + \\sum_{u \\in \\text{pred}(v)} \\text{ReLU}(h_u + e_{uv})
         \\bigr)
 
         h_v^{\\text{bwd}} = \\text{MLP}_{\\text{bwd}}\\bigl(
             (1+\\varepsilon_{\\text{bwd}})\\,h_v
-            + \\sum_{w \\in \\text{succ}(v)} h_w
+            + \\sum_{w \\in \\text{succ}(v)} \\text{ReLU}(h_w + e_{vw})
         \\bigr)
 
         h_v' = \\text{MLP}_{\\text{fuse}}\\bigl(
@@ -78,8 +79,8 @@ class DAGGINLayer(nn.Module):
 
     def __init__(self, hidden_dim: int, dropout: float = 0.1) -> None:
         super().__init__()
-        self.gin_fwd = GINConv(nn=_gin_mlp(hidden_dim), train_eps=True)
-        self.gin_bwd = GINConv(nn=_gin_mlp(hidden_dim), train_eps=True)
+        self.gin_fwd = GINEConv(nn=_gin_mlp(hidden_dim), train_eps=True)
+        self.gin_bwd = GINEConv(nn=_gin_mlp(hidden_dim), train_eps=True)
 
         self.fuse = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
@@ -93,6 +94,7 @@ class DAGGINLayer(nn.Module):
         x: Tensor,
         edge_index_fwd: Tensor,
         edge_index_bwd: Tensor,
+        edge_attr: Tensor,
     ) -> Tensor:
         """
         Parameters
@@ -105,9 +107,11 @@ class DAGGINLayer(nn.Module):
         edge_index_bwd : Tensor[2, E]
             Reversed edges (``edge_index_fwd.flip(0)``).  Each node
             aggregates from its *fanout*.
+        edge_attr : Tensor[E, H]
+            Edge embeddings, shared by both directions.
         """
-        h_fwd = self.gin_fwd(x, edge_index_fwd)
-        h_bwd = self.gin_bwd(x, edge_index_bwd)
+        h_fwd = self.gin_fwd(x, edge_index_fwd, edge_attr)
+        h_bwd = self.gin_bwd(x, edge_index_bwd, edge_attr)
         h = self.fuse(torch.cat([h_fwd, h_bwd], dim=-1))
         return self.dropout(h)
 
@@ -177,6 +181,7 @@ class DAGGINEncoder(nn.Module):
         x: Tensor,
         edge_index: Tensor,
         batch: Tensor,
+        edge_attr: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         """
         Parameters
@@ -188,6 +193,8 @@ class DAGGINEncoder(nn.Module):
             ``netlist_parser``).
         batch : Tensor[N_total]
             Graph membership per node (from PyG ``DataLoader``).
+        edge_attr : Tensor[E_total, hidden_dim], optional
+            Edge embeddings; zeros when omitted.
 
         Returns
         -------
@@ -200,10 +207,12 @@ class DAGGINEncoder(nn.Module):
         edge_index_bwd = edge_index.flip(0)
 
         h = self.input_proj(x)
+        if edge_attr is None:
+            edge_attr = h.new_zeros((edge_index.size(1), h.size(1)))
         layer_outputs = [h]
 
         for layer in self.layers:
-            h_new = layer(h, edge_index, edge_index_bwd)
+            h_new = layer(h, edge_index, edge_index_bwd, edge_attr)
             h = h + h_new  # residual
             layer_outputs.append(h)
 

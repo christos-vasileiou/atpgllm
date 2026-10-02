@@ -23,6 +23,7 @@ case "${STAGE:?STAGE is required}" in
         CMD=(python -m atpgllm.graph.scripts.train_graph_encoder
             --dataset "$DATASET" --sim-config "$SIM_CONFIG"
             --output-dir "$OUTPUT_DIR"
+            --split-manifest "${SPLIT_MANIFEST:?SPLIT_MANIFEST is required}"
             --batch-size "${BATCH_SIZE:-8}" --grad-accum "${GRAD_ACCUM:-1}"
             --max-steps "$MAX_STEPS" --save-every "$SAVE_EVERY")
         [ -n "${RESUME:-}" ] && CMD+=(--resume "$RESUME")

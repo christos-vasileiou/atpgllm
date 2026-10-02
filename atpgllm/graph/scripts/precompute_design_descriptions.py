@@ -283,6 +283,9 @@ def _structural_stats(
     # edges to estimate depth in a topo sense — but it's cleaner to
     # recompute from edges directly.
     n = len(parsed.gates)
+    # Graph nodes include <PI>/<PO>/<ASSIGN>/<CONST*> pseudo-cells; depth and
+    # counts below describe real gates only.
+    is_gate = [not g.cell.startswith("<") for g in parsed.gates]
     in_deg = [0] * n
     out_deg = [0] * n
     succ: List[List[int]] = [[] for _ in range(n)]
@@ -299,7 +302,7 @@ def _structural_stats(
     while q:
         v = q.popleft()
         for w in succ[v]:
-            fwd_depth[w] = max(fwd_depth[w], fwd_depth[v] + 1)
+            fwd_depth[w] = max(fwd_depth[w], fwd_depth[v] + is_gate[w])
             remaining[w] -= 1
             if remaining[w] == 0:
                 q.append(w)
@@ -308,8 +311,9 @@ def _structural_stats(
 
     # Cell-base histogram (top by count).
     cell_counter: collections.Counter = collections.Counter()
-    for g in parsed.gates:
-        cell_counter[_base_cell_name(g.cell)] += 1
+    for g, gate in zip(parsed.gates, is_gate):
+        if gate:
+            cell_counter[_base_cell_name(g.cell)] += 1
     total = sum(cell_counter.values()) or 1
     cell_mix = [
         {"cell": c, "count": k, "pct": round(100.0 * k / total, 1)}
@@ -329,7 +333,7 @@ def _structural_stats(
     pi_groups, po_groups = _expand_pi_po_groups(parsed)
 
     return {
-        "n_gates": len(parsed.gates),
+        "n_gates": sum(is_gate),
         "n_pi_bits": len(parsed.inputs),
         "n_po_bits": len(parsed.outputs),
         "pi_groups": pi_groups,

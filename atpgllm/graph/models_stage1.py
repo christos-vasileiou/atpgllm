@@ -295,6 +295,12 @@ class NetlistGraphEncoder(nn.Module):
             dropout=dropout,
             num_pools=gin_num_pools,
         )
+        # Edge roles: driver output pin, sink input pin, and whether the
+        # edge carries the target fault net.
+        self.driver_pin_emb = nn.Embedding(vocab.num_pins, gin_hidden_dim)
+        self.sink_pin_emb = nn.Embedding(vocab.num_pins, gin_hidden_dim)
+        self.fault_edge_emb = nn.Parameter(torch.zeros(gin_hidden_dim))
+        nn.init.normal_(self.fault_edge_emb, std=0.02)
         self.out_dim = gin_hidden_dim
         self.graph_dim = gin_hidden_dim * gin_num_pools
 
@@ -304,7 +310,14 @@ class NetlistGraphEncoder(nn.Module):
             data.structural_feats,
             getattr(data, "fault_feats", None),
         )
-        return self.dag_gin(x, data.edge_index, data.batch)
+        edge_attr = (
+            self.driver_pin_emb(data.edge_pins[:, 0])
+            + self.sink_pin_emb(data.edge_pins[:, 1])
+        )
+        fault_edge = getattr(data, "fault_edge", None)
+        if fault_edge is not None:
+            edge_attr = edge_attr + fault_edge.to(edge_attr.dtype).unsqueeze(-1) * self.fault_edge_emb
+        return self.dag_gin(x, data.edge_index, data.batch, edge_attr)
 
 
 # =====================================================================

@@ -26,6 +26,7 @@ in :class:`atpgllm.training.conversation.ConversationExample`. A legacy
 """
 
 import copy
+import collections
 import hashlib
 import json
 import os
@@ -43,6 +44,8 @@ from torch_geometric.data import Batch, Data
 from .fault_context import attach_atpg_context
 from .gate_features import GateAttributeVocab
 from .netlist_parser import (
+    GraphRejected,
+    ParsedNetlistGraph,
     parse_verilog_to_graph,
     parse_verilog_to_pyg,
     parsed_to_pyg,
@@ -261,30 +264,69 @@ def make_text_caption(
 # ---------------------------------------------------------------------
 
 
-def record_to_pyg(
-    record: Dict[str, Any],
-    gate_funcs: Dict[str, Dict[str, str]],
-    vocab: GateAttributeVocab,
-    min_nodes: int = 1,
-) -> Optional[Data]:
-    """Parse a dataset record's ``netlist`` to a PyG ``Data``.
-
-    Returns ``None`` if the netlist field is missing, empty, or parses
-    to fewer than ``min_nodes`` gates (degenerate).
-    """
+def _netlist_text(record: Dict[str, Any]) -> str:
     netlist = record.get("netlist")
     # ``ConversationExample.from_record`` rewrites the netlist field
     # in-place into ``{"doc_id": ..., "netlist": "..."}`` after rendering.
     # Handle both forms so this helper is order-independent.
     if isinstance(netlist, dict):
         netlist = netlist.get("netlist")
+    return netlist or ""
+
+
+# Fault-independent graph per circuit; datasets repeat each circuit across
+# many fault records, and the simulator-backed parse dominates load time.
+_GRAPH_CACHE: "collections.OrderedDict[tuple, Any]" = collections.OrderedDict()
+_GRAPH_CACHE_SIZE = 4096
+
+
+def _circuit_graph(
+    netlist: str,
+    gate_funcs: Dict[str, Dict[str, str]],
+    vocab: GateAttributeVocab,
+) -> Tuple[ParsedNetlistGraph, Data]:
+    key = (id(gate_funcs), id(vocab), hashlib.sha256(netlist.encode("utf-8")).hexdigest())
+    cached = _GRAPH_CACHE.get(key)
+    if cached is None:
+        try:
+            parsed = parse_verilog_to_graph(netlist, gate_funcs)
+            cached = (parsed, parsed_to_pyg(parsed, vocab=vocab))
+        except GraphRejected as exc:
+            cached = exc
+        _GRAPH_CACHE[key] = cached
+        if len(_GRAPH_CACHE) > _GRAPH_CACHE_SIZE:
+            _GRAPH_CACHE.popitem(last=False)
+    else:
+        _GRAPH_CACHE.move_to_end(key)
+    if isinstance(cached, GraphRejected):
+        raise cached
+    return cached
+
+
+def record_to_pyg(
+    record: Dict[str, Any],
+    gate_funcs: Dict[str, Dict[str, str]],
+    vocab: GateAttributeVocab,
+    min_nodes: int = 1,
+    rejections: Optional[collections.Counter] = None,
+) -> Optional[Data]:
+    """Parse a dataset record's ``netlist`` and ``fault`` to a PyG ``Data``.
+
+    Returns ``None`` if the netlist field is missing or empty, the graph has
+    fewer than ``min_nodes`` nodes, or the record is rejected by the graph
+    schema (:class:`GraphRejected`); rejection reasons are counted in
+    ``rejections``. Other errors propagate.
+    """
+    netlist = _netlist_text(record)
     if not netlist:
         return None
     try:
-        parsed = parse_verilog_to_graph(netlist, gate_funcs)
-        data = parsed_to_pyg(parsed, vocab=vocab)
+        parsed, base = _circuit_graph(netlist, gate_funcs, vocab)
+        data = base.clone()
         attach_atpg_context(data, parsed, gate_funcs, record)
-    except Exception:
+    except GraphRejected as exc:
+        if rejections is not None:
+            rejections[exc.reason] += 1
         return None
     if data.num_nodes < min_nodes:
         return None
@@ -312,10 +354,13 @@ class ASAP7GraphPretrainDataset(IterableDataset):
         self.gate_funcs = gate_funcs
         self.vocab = vocab
         self.skip_invalid = skip_invalid
+        self.rejections: collections.Counter = collections.Counter()
 
     def __iter__(self) -> Iterator[Data]:
         for record in self.hf_stream:
-            graph = record_to_pyg(record, self.gate_funcs, self.vocab)
+            graph = record_to_pyg(
+                record, self.gate_funcs, self.vocab, rejections=self.rejections
+            )
             if graph is None:
                 if self.skip_invalid:
                     continue

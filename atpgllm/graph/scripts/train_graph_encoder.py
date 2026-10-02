@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
+from itertools import islice
 from pathlib import Path
 
 import torch
@@ -20,6 +22,9 @@ from atpgllm.graph.dataset import (
     collate_graph_pretrain_batch,
 )
 from atpgllm.graph.gate_features import GateAttributeVocab
+from atpgllm.graph.hpo.manifests import design_hash
+from atpgllm.graph.hpo.splits import DesignSplitManifest
+from atpgllm.graph.hpo.validation import evaluate_graph_pretraining
 from atpgllm.graph.pretrain import GraphPretrainingModel
 from atpgllm.training._paths import resolve_sim_config_path
 
@@ -32,6 +37,16 @@ def _args() -> argparse.Namespace:
         default="chrivasileiou/asap7-language-of-test-v2",
     )
     parser.add_argument("--split", default="train")
+    parser.add_argument(
+        "--split-manifest",
+        type=Path,
+        required=True,
+        help="Design-disjoint split (search_graph_pipeline prepare-split); "
+        "trains on 'train' designs, evaluates on 'validation' designs.",
+    )
+    parser.add_argument("--eval-every", type=int, default=500)
+    parser.add_argument("--eval-graphs", type=int, default=512)
+    parser.add_argument("--eval-faults-per-design", type=int, default=2)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -50,6 +65,17 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--fp32", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
+
+
+def _cap_per_design(records, cap: int):
+    """Keep at most ``cap`` records per design so a few large circuits do
+    not dominate the validation set."""
+    seen: collections.Counter = collections.Counter()
+    for record in records:
+        key = design_hash(record)
+        if seen[key] < cap:
+            seen[key] += 1
+            yield record
 
 
 def main() -> None:
@@ -91,12 +117,40 @@ def main() -> None:
         step = int(checkpoint["step"])
         parent_stage = STAGE_GRAPH_PRETRAIN
 
+    manifest = DesignSplitManifest.load(args.split_manifest)
+    if (manifest.dataset, manifest.source_split) != (args.dataset, args.split):
+        raise ValueError(
+            f"Split manifest is for {manifest.dataset}:{manifest.source_split}, "
+            f"not {args.dataset}:{args.split}."
+        )
+    validation = ASAP7GraphPretrainDataset(
+        _cap_per_design(
+            manifest.filter_records(
+                load_dataset(args.dataset, split=args.split, streaming=True),
+                "validation",
+            ),
+            args.eval_faults_per_design,
+        ),
+        gate_funcs,
+        vocab,
+    )
+    validation_graphs = list(islice(validation, args.eval_graphs))
+    if not validation_graphs:
+        raise ValueError("No valid validation graphs matched the split manifest.")
+    print(
+        f"validation graphs={len(validation_graphs)} "
+        f"rejected={dict(validation.rejections)}",
+        flush=True,
+    )
+
     stream = load_dataset(
         args.dataset,
         split=args.split,
         streaming=True,
     ).shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
-    dataset = ASAP7GraphPretrainDataset(stream, gate_funcs, vocab)
+    dataset = ASAP7GraphPretrainDataset(
+        manifest.filter_records(stream, "train"), gate_funcs, vocab
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -126,7 +180,28 @@ def main() -> None:
             step=step,
             session=vars(args),
         )
-    
+
+    best_score = None
+
+    def evaluate() -> None:
+        nonlocal best_score
+        loader = DataLoader(
+            validation_graphs,
+            batch_size=args.batch_size,
+            collate_fn=collate_graph_pretrain_batch,
+        )
+        metrics = evaluate_graph_pretraining(
+            model, loader, device=device, max_batches=len(loader)
+        )
+        record = {"step": step, **metrics, "rejected": dict(dataset.rejections)}
+        print("eval " + json.dumps(record), flush=True)
+        with (args.output_dir / "metrics.jsonl").open("a") as fh:
+            fh.write(json.dumps(record) + "\n")
+        score = metrics["semantic_score"]
+        if score is not None and (best_score is None or score > best_score):
+            best_score = score
+            save("graph_pretrain_best.pt")
+
     micro_step = 0
     for graph in loader:
         graph = graph.to(device)
@@ -156,9 +231,13 @@ def main() -> None:
             )
         if step % args.save_every == 0:
             save(f"graph_pretrain_step{step}.pt")
+        if step % args.eval_every == 0:
+            evaluate()
         if step >= args.max_steps:
             break
 
+    if step % args.eval_every:
+        evaluate()
     save("graph_pretrain_final.pt")
 
 

@@ -51,7 +51,9 @@ def evaluate_graph_pretraining(
                 if not bool(present[graph_index]):
                     skipped[task] += 1
                     continue
-                node_mask = graph.batch == graph_index
+                node_mask = (graph.batch == graph_index) & model.scored_nodes(
+                    task, graph
+                )
                 ap = binary_average_precision(
                     probabilities[node_mask].cpu(),
                     labels[node_mask].cpu(),

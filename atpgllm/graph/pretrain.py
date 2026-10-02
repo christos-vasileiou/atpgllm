@@ -39,6 +39,14 @@ class GraphPretrainingModel(nn.Module):
         "discrepancy": ("discrepancy_mask", "has_discrepancy_labels"),
     }
 
+    @staticmethod
+    def scored_nodes(name: str, data) -> Tensor:
+        """Nodes a head is scored on: path labels name gate instances; a
+        discrepancy label exists for every node that drives a net."""
+        if name == "discrepancy":
+            return ~data.po_node_mask
+        return data.gate_node_mask
+
     def __init__(
         self,
         vocab: GateAttributeVocab,
@@ -87,8 +95,9 @@ class GraphPretrainingModel(nn.Module):
         labels: Tensor,
         graph_has_labels: Tensor,
         batch_index: Tensor,
+        node_mask: Tensor,
     ) -> Tensor:
-        valid = graph_has_labels.reshape(-1).bool()[batch_index]
+        valid = graph_has_labels.reshape(-1).bool()[batch_index] & node_mask
         if not valid.any():
             return logits.sum() * 0.0
         selected_logits = logits[valid]
@@ -119,5 +128,6 @@ class GraphPretrainingModel(nn.Module):
                 getattr(data, label_field),
                 getattr(data, present_field),
                 data.batch,
+                self.scored_nodes(name, data),
             )
         return GraphPretrainLosses(**losses)

@@ -1,27 +1,24 @@
 from __future__ import annotations
 
 """
-Lightweight Verilog netlist → graph parser for ASAP7-style gate-level
-netlists using DGL as the graph backend.
+Structural Verilog netlist → graph parser for ASAP7-style gate-level
+netlists, built on the fault simulator's own parse.
 
-This module reuses the same regex patterns as ``OptimizedNetlist`` in
-``fault_sim.py`` but only extracts a graph structure:
-
-- one node per gate instance
-- directed edges from driver gates to sink gates via nets
-
-The parser expects a ``gate_func`` dictionary (as produced by
-``data_preprocessing/gate_funcs_extraction.py``), so that it can
-distinguish output pins from input pins for each cell.
-
-The returned object can be converted into a graph suitable for
-PyTorch Geometric with:
+The netlist is parsed by ``OptimizedNetlist`` (``fault_sim.py``), so the
+graph uses exactly the simulator's view of the circuit: declared bus
+indices, ``assign`` pass-throughs, constants, and multi-output cells.
+Graph nodes are:
 
 - one node per gate instance
-- directed edges from driver gates to sink gates via nets
+- one ``<PI>`` node per primary-input bit and ``<PO>`` node per output bit,
+  in the simulator's (and therefore the input/output vector's) bit order
+- one ``<ASSIGN>`` node per ``assign`` statement (a fault on an alias net
+  only affects that alias's readers, as in the simulator)
+- ``<CONST0>`` / ``<CONST1>`` source nodes for tied inputs
 
-For multi-GPU training, graphs can be batched via a PyG
-``DataLoader`` and trained with standard DDP/FSDP setups.
+Directed edges run from the node driving a net to each pin reading it and
+carry the (driver output pin, sink input pin) roles. Netlists the schema
+cannot represent faithfully raise :class:`GraphRejected` with a reason.
 """
 
 from collections import deque
@@ -33,7 +30,12 @@ import regex as re
 import torch
 from torch_geometric.data import Data
 
-from .gate_features import GateAttributeVocab, NUM_ATTRIBUTES
+from .gate_features import (
+    GateAttributeVocab,
+    NUM_ATTRIBUTES,
+    PSEUDO_IN_PIN,
+    PSEUDO_OUT_PIN,
+)
 
 
 # ---------------------------------------------------------------------
@@ -48,6 +50,7 @@ STRUCTURAL_FEATURE_NAMES: List[str] = [
     "backward_depth",
     "log_in_degree",
     "log_out_degree",
+    "port_position",
 ]
 NUM_STRUCTURAL_FEATURES = len(STRUCTURAL_FEATURE_NAMES)
 
@@ -56,6 +59,7 @@ _ALL_STRUCTURAL_FEATURES: Tuple[str, ...] = (
     "backward_depth",
     "log_in_degree",
     "log_out_degree",
+    "port_position",
 )
 
 _unknown_sf = set(STRUCTURAL_FEATURE_NAMES) - set(_ALL_STRUCTURAL_FEATURES)
@@ -66,8 +70,19 @@ if _unknown_sf:
     )
 
 
+class GraphRejected(ValueError):
+    """A netlist or fault that the graph schema cannot represent faithfully."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+
+
 @dataclass
 class ParsedGate:
+    """One graph node: a gate instance or a ``<PI>``/``<PO>``/``<ASSIGN>``/
+    ``<CONST*>`` pseudo-cell."""
+
     cell: str
     inst: str
     # port name -> net name
@@ -77,20 +92,22 @@ class ParsedGate:
 @dataclass
 class ParsedNetlistGraph:
     """
-    Lightweight representation of a structural netlist.
+    Node/edge representation of a structural netlist.
 
     Attributes
     ----------
     gates:
-        List of gate instances with cell type, instance name and
-        port→net connections.
+        Graph nodes (gate instances and pseudo-cells) with cell type,
+        instance name and port→net connections.
     net_drivers:
-        Mapping: net name → list of node indices that drive the net.
+        Mapping: net name → [index of the single node driving the net].
     net_sinks:
-        Mapping: net name → list of node indices that read the net.
+        Mapping: net name → indices of nodes reading the net (one entry
+        per reading pin).
     inputs / outputs / wires:
-        Expanded lists of primary input / output / internal wire nets.
-        Bus and array declarations are expanded to scalar net names.
+        Simulator-ordered primary input / output / wire bits.
+    edges:
+        ``(driver, sink, driver_pin, sink_pin, net)`` per reading pin.
     """
 
     gates: List[ParsedGate]
@@ -99,166 +116,42 @@ class ParsedNetlistGraph:
     inputs: List[str]
     outputs: List[str]
     wires: List[str]
+    edges: List[Tuple[int, int, str, str, str]]
 
 
-# Regex patterns adapted from ``OptimizedNetlist._parse_and_compile``
+# Same instance pattern as ``OptimizedNetlist._parse_and_compile``; used to
+# find instances the simulator silently skips.
 GATE_INGREDIENT = r"((?:\\[^\s]+|\w+))\s+((?:\\[^\s]+|\w+))\s*\(\s*([\s\S]+?)\s*\)\s*;"
-GATE_CONNECTIONS = r"\.((?:\\[^\s]+|\w+))\s*\(\s*([^)]+?)\s*\)"
-LOGIC_VALUE = r"\*Logic(?P<val>[01]+)\*\s*"
-
 _GATE_INGREDIENT_RE = re.compile(GATE_INGREDIENT)
-_GATE_CONNECTIONS_RE = re.compile(GATE_CONNECTIONS)
-_LOGIC_VALUE_RE = re.compile(LOGIC_VALUE)
-_COMMON_OUTPUT_PINS = frozenset({
-    "Y", "Z", "ZN", "Q", "QN", "O", "OUT", "CO", "CON", "S", "SN",
-})
-
-# Declaration regex adapted to support ASAP7-style synthesised netlists.
-# Matches lines like:
-#   input a, b;
-#   output [3:0] sum;
-DECL_RE = re.compile(
-    r"(?P<kind>input|output|inout|wire|reg|tri)\s*"
-    r"(?P<packed>\[[^]]+\])?\s*"
-    r"(?P<rest>[^;]+);",
-    re.IGNORECASE,
-)
-
-NAME_RE = re.compile(
-    r"(?P<name>[A-Za-z_\\][\w\\]*)"
-    r"(?P<unpacked>\[[^]]+\])?\s*$"
-)
+_ASSIGN_RE = re.compile(r"\bassign\b")
+_STATE_VAR_RE = re.compile(r"\bIQN?\b")
+_FUNC_VAR_RE = re.compile(r"\b([A-Z][A-Z0-9]*)\b")
+_NON_INPUT_VARS = frozenset({"IQ", "IQN", "VDD", "VSS"})
+_CONST_NETS = {"0": "<CONST0>", "1": "<CONST1>"}
+_LOGIC_VALUE_RE = re.compile(r"^\\?\*Logic(?P<val>[01])\*$")
 
 
-def _parse_range(rng: str | None) -> int:
-    """Convert [msb:lsb] into integer width. If None, return 1."""
-    if not rng:
-        return 1
-    nums = re.findall(r"\d+", rng)
-    if len(nums) != 2:
-        return 1
-    msb, lsb = map(int, nums)
-    return abs(msb - lsb) + 1
+def _net(name: str) -> str:
+    """Normalise ``*Logic0*``/``\\*Logic1*`` constants to ``"0"``/``"1"``, as
+    the simulator does when evaluating."""
+    name = name.strip()
+    match = _LOGIC_VALUE_RE.match(name)
+    return match.group("val") if match else name
 
 
-def _expand_nets_from_decl(verilog_text: str, keyword: str) -> List[str]:
-    """
-    Expand net declarations for a given keyword (input/output/wire…).
+def _simulator_netlist(verilog_text: str, gate_func: Dict):
+    from atpgllm.training.reward_function_factory import RewardFunctionFactory
+    from fault_sim import OptimizedNetlist  # on sys.path via the import above
 
-    This mirrors the behaviour of ``netlist_utils.expand_nets`` but is
-    self-contained to avoid tight coupling. It is robust to both scalar
-    and bus/array style declarations.
-    """
-    keyword = keyword.lower()
-    assert keyword in {"input", "output", "inout", "wire", "reg", "tri"}
-
-    expanded: List[str] = []
-    for m in DECL_RE.finditer(verilog_text):
-        kind = m.group("kind").lower()
-        if kind != keyword:
-            continue
-        packed = m.group("packed")
-        rest = m.group("rest")
-        bus_width = _parse_range(packed)
-
-        for token in rest.split(","):
-            token = token.strip()
-            if not token:
-                continue
-            nm = NAME_RE.match(token)
-            if not nm:
-                continue
-            base = nm.group("name")
-            unpacked = nm.group("unpacked")
-            array_len = _parse_range(unpacked)
-
-            # Scalar net
-            if bus_width == 1 and array_len == 1 and not packed and not unpacked:
-                expanded.append(base)
-                continue
-
-            # Expand bus and/or array dimensions
-            for i in range(bus_width):
-                for j in range(max(1, array_len)):
-                    suffix = ""
-                    if packed:
-                        suffix += f"[{i}]"
-                    if unpacked:
-                        suffix += f"[{j}]"
-                    expanded.append(f"{base}{suffix}")
-
-    return expanded
-
-
-def _parse_gates(verilog_text: str, gate_func: Dict) -> List[ParsedGate]:
-    """Parse gate instances from the Verilog netlist text."""
-    gates: List[ParsedGate] = []
-
-    for match in _GATE_INGREDIENT_RE.finditer(verilog_text):
-        gate_type, instance, connections_str = match.groups()
-
-        # Skip module headers. Unknown cells are retained and encoded through
-        # the vocabulary's explicit UNKNOWN values; their output pins use the
-        # conservative common-name fallback in _build_driver_sink_maps.
-        if gate_type.startswith("module"):
-            continue
-
-        raw_conns = dict(_GATE_CONNECTIONS_RE.findall(connections_str))
-
-        # Clean any encoded logic values in connections (e.g. *Logic1*)
-        connections: Dict[str, str] = {}
-        for port, net in raw_conns.items():
-            m = _LOGIC_VALUE_RE.search(net)
-            if m:
-                connections[port] = m.group("val")
-            else:
-                connections[port] = net.strip()
-
-        gates.append(ParsedGate(cell=gate_type, inst=instance, connections=connections))
-
-    return gates
-
-
-def _build_driver_sink_maps(
-    gates: List[ParsedGate],
-    gate_func: Dict,
-) -> Tuple[Dict[str, List[int]], Dict[str, List[int]]]:
-    """
-    Build driver / sink maps per net using ``gate_func`` to
-    identify output vs input ports for each cell.
-    """
-    net_drivers: Dict[str, List[int]] = {}
-    net_sinks: Dict[str, List[int]] = {}
-
-    for node_idx, gate in enumerate(gates):
-        cell_type = gate.cell
-        cell_outputs = set(gate_func.get(cell_type, {}).keys())
-        instance_ports = set(gate.connections.keys())
-        if not cell_outputs:
-            cell_outputs = {
-                port
-                for port in instance_ports
-                if port.upper() in _COMMON_OUTPUT_PINS
-            }
-
-        out_ports = instance_ports & cell_outputs
-        in_ports = instance_ports - cell_outputs
-
-        # Drivers: each output port drives its connected net
-        for p in out_ports:
-            out_net = gate.connections[p]
-            if not out_net:
-                continue
-            net_drivers.setdefault(out_net, []).append(node_idx)
-
-        # Sinks: each input port reads its connected net
-        for p in in_ports:
-            in_net = gate.connections[p]
-            if not in_net:
-                continue
-            net_sinks.setdefault(in_net, []).append(node_idx)
-
-    return net_drivers, net_sinks
+    try:
+        return OptimizedNetlist(
+            verilog_text,
+            gate_func,
+            RewardFunctionFactory.DECL_RE,
+            RewardFunctionFactory.NAME_RE,
+        )
+    except ValueError as exc:
+        raise GraphRejected("unsupported_declaration", str(exc)) from exc
 
 
 def parse_verilog_to_graph(
@@ -266,37 +159,129 @@ def parse_verilog_to_graph(
     gate_func: Dict,
 ) -> ParsedNetlistGraph:
     """
-    Parse a structural Verilog netlist into a driver/sink representation.
+    Parse a structural combinational netlist into graph nodes and edges.
 
     Args
     ----
     verilog_text:
         Full Verilog netlist text for a single module.
     gate_func:
-        Normalised gate function dict:
-        ``{cell_name: {output_pin: {...}}}`` as produced by
-        ``gate_funcs_extraction.py``.
-    """
-    gates = _parse_gates(verilog_text, gate_func)
-    net_drivers, net_sinks = _build_driver_sink_maps(gates, gate_func)
+        ``{cell_name: {output_pin: boolean_expression}}`` as in
+        ``sim_config.json["gate_funcs"]``.
 
-    inputs = _expand_nets_from_decl(verilog_text, "input")
-    outputs = _expand_nets_from_decl(verilog_text, "output")
-    wires = _expand_nets_from_decl(verilog_text, "wire")
+    Raises
+    ------
+    GraphRejected
+        For constructs the simulator skips or the schema cannot represent:
+        unknown or sequential cells, unparsed ``assign`` statements,
+        unconnected function pins, multiply-driven or undriven nets.
+    """
+    instances = [
+        (cell, inst)
+        for cell, inst, _ in _GATE_INGREDIENT_RE.findall(verilog_text)
+        if not cell.startswith("module")
+    ]
+    for cell, inst in instances:
+        if cell not in gate_func:
+            raise GraphRejected("unknown_cell", f"{cell} {inst}")
+        if any(_STATE_VAR_RE.search(expr) for expr in gate_func[cell].values()):
+            raise GraphRejected("sequential_cell", f"{cell} {inst}")
+    if len({inst for _, inst in instances}) != len(instances):
+        raise GraphRejected("duplicate_instance")
+
+    sim = _simulator_netlist(verilog_text, gate_func)
+
+    nodes: List[ParsedGate] = []
+    driver: Dict[str, Tuple[int, str]] = {}
+    reads: List[Tuple[str, int, str]] = []
+
+    def add_node(cell: str, inst: str, connections: Dict[str, str]) -> int:
+        nodes.append(ParsedGate(cell=cell, inst=inst, connections=connections))
+        return len(nodes) - 1
+
+    def add_driver(net: str, node: int, pin: str) -> None:
+        if net in driver:
+            raise GraphRejected("multi_driven_net", net)
+        driver[net] = (node, pin)
+
+    for net in sim.input_nets:
+        add_driver(net, add_node("<PI>", net, {PSEUDO_OUT_PIN: net}), PSEUDO_OUT_PIN)
+
+    gate_index: Dict[str, int] = {}
+    for cell, inst, out_pin, out_net, input_map in sim.gate_metadata:
+        out_net = _net(out_net)
+        input_map = {pin: _net(net) for pin, net in input_map.items()}
+        if inst not in gate_index:
+            gate_index[inst] = add_node(cell, inst, dict(input_map))
+            for pin, net in input_map.items():
+                reads.append((net, gate_index[inst], pin))
+        node = gate_index[inst]
+        nodes[node].connections[out_pin] = out_net
+        add_driver(out_net, node, out_pin)
+        used = {
+            m.group(1)
+            for m in _FUNC_VAR_RE.finditer(gate_func[cell][out_pin])
+        } - _NON_INPUT_VARS
+        missing = used - set(input_map)
+        if missing:
+            raise GraphRejected("unconnected_pin", f"{inst} {sorted(missing)}")
+    if len(gate_index) != len(instances):
+        raise GraphRejected("unparsed_gate")
+
+    assigns = 0
+    for instr in sim.instructions:
+        if instr[0] not in ("assign_net", "assign_const"):
+            continue
+        net, src = instr[1], str(instr[2])
+        if instr[0] == "assign_const" and net in driver:
+            continue  # TIEHI/TIELO output, already a gate node
+        assigns += 1
+        node = add_node(
+            "<ASSIGN>", net, {PSEUDO_IN_PIN: src, PSEUDO_OUT_PIN: net}
+        )
+        add_driver(net, node, PSEUDO_OUT_PIN)
+        reads.append((src, node, PSEUDO_IN_PIN))
+    if assigns != len(_ASSIGN_RE.findall(verilog_text)):
+        raise GraphRejected("unsupported_assign")
+
+    for net in sim.output_nets:
+        reads.append((net, add_node("<PO>", net, {PSEUDO_IN_PIN: net}), PSEUDO_IN_PIN))
+
+    edges: List[Tuple[int, int, str, str, str]] = []
+    net_sinks: Dict[str, List[int]] = {}
+    for net, sink, sink_pin in reads:
+        if net not in driver and net in _CONST_NETS:
+            cell = _CONST_NETS[net]
+            add_driver(net, add_node(cell, cell, {PSEUDO_OUT_PIN: net}), PSEUDO_OUT_PIN)
+        if net not in driver:
+            raise GraphRejected("undriven_net", net)
+        src, src_pin = driver[net]
+        edges.append((src, sink, src_pin, sink_pin, net))
+        net_sinks.setdefault(net, []).append(sink)
+
+    from netlist_utils import declared_nets
+    from atpgllm.training.reward_function_factory import RewardFunctionFactory
 
     return ParsedNetlistGraph(
-        gates=gates,
-        net_drivers=net_drivers,
+        gates=nodes,
+        net_drivers={net: [node] for net, (node, _) in driver.items()},
         net_sinks=net_sinks,
-        inputs=inputs,
-        outputs=outputs,
-        wires=wires,
+        inputs=list(sim.input_nets),
+        outputs=list(sim.output_nets),
+        wires=declared_nets(
+            verilog_text,
+            "wire",
+            RewardFunctionFactory.DECL_RE,
+            RewardFunctionFactory.NAME_RE,
+        ),
+        edges=edges,
     )
 
 
 def compute_structural_features(
     edge_index: torch.Tensor,
     num_nodes: int,
+    port_position: Optional[List[float]] = None,
 ) -> torch.Tensor:
     """Compute DAG-native structural features for each node.
 
@@ -318,6 +303,10 @@ def compute_structural_features(
            directly affects sensitisation difficulty.
         - **log_out_degree**: ``log₂(1 + out_degree)``.  High-fanout
            nodes create reconvergent structures that complicate ATPG.
+        - **port_position**: a ``<PI>``/``<PO>`` node's bit index in the
+           input/output vector order, normalised to 0–1; 0 elsewhere.
+
+    Raises :class:`GraphRejected` (``cycle``) when the graph is not a DAG.
     """
     if num_nodes == 0:
         return torch.zeros((0, NUM_STRUCTURAL_FEATURES), dtype=torch.float32)
@@ -346,13 +335,17 @@ def compute_structural_features(
         if remaining_in[v] == 0:
             queue.append(v)
 
+    visited = 0
     while queue:
         v = queue.popleft()
+        visited += 1
         for w in successors[v]:
             fwd_depth[w] = max(fwd_depth[w], fwd_depth[v] + 1)
             remaining_in[w] -= 1
             if remaining_in[w] == 0:
                 queue.append(w)
+    if visited != num_nodes:
+        raise GraphRejected("cycle")
 
     # ----- Backward depth (reverse Kahn's) -----
     bwd_depth = [0] * num_nodes
@@ -386,6 +379,7 @@ def compute_structural_features(
         "backward_depth": norm_bwd,
         "log_in_degree":  log_in,
         "log_out_degree": log_out,
+        "port_position":  port_position or [0.0] * num_nodes,
     }
     selected = [_all_cols[name] for name in STRUCTURAL_FEATURE_NAMES]
     if not selected:
@@ -403,7 +397,14 @@ def parsed_to_pyg(
     When *vocab* is provided, the returned ``Data`` includes:
 
     - ``gate_attrs`` : ``[N, NUM_ATTRIBUTES]`` int64 — decomposed attribute indices
-    - ``structural_feats`` : ``[N, NUM_STRUCTURAL_FEATURES]`` float32 — depth / degree features
+    - ``edge_pins`` : ``[E, 2]`` int64 — (driver output pin, sink input pin) roles
+
+    Always included:
+
+    - ``edge_index`` : ``[2, E]`` — one driver → sink edge per reading pin
+    - ``structural_feats`` : ``[N, NUM_STRUCTURAL_FEATURES]`` float32 — depth / degree / port features
+    - ``gate_node_mask`` / ``po_node_mask`` : ``[N]`` bool — node kinds
+    - ``node_names`` : instance names, or net names for ``<PI>``/``<PO>`` nodes
 
     These are consumed by :class:`AttributeDecompositionEncoder` and
     :class:`DAGGINEncoder`.
@@ -413,25 +414,22 @@ def parsed_to_pyg(
     """
     num_nodes = len(parsed.gates)
 
-    # Build edges: for each net, connect all drivers to all sinks
-    edge_src: List[int] = []
-    edge_dst: List[int] = []
+    edge_index = torch.tensor(
+        [[e[0] for e in parsed.edges], [e[1] for e in parsed.edges]],
+        dtype=torch.int64,
+    ).reshape(2, -1)
 
-    for net, drivers in parsed.net_drivers.items():
-        sinks = parsed.net_sinks.get(net, [])
-        if not drivers or not sinks:
-            continue
-        for d in drivers:
-            for s in sinks:
-                edge_src.append(d)
-                edge_dst.append(s)
-
-    if edge_src:
-        src = torch.tensor(edge_src, dtype=torch.int64)
-        dst = torch.tensor(edge_dst, dtype=torch.int64)
-        edge_index = torch.stack([src, dst], dim=0)
-    else:
-        edge_index = torch.empty((2, 0), dtype=torch.int64)
+    pi_pos = {net: i for i, net in enumerate(parsed.inputs)}
+    po_pos = {net: i for i, net in enumerate(parsed.outputs)}
+    port_position = [
+        pi_pos[g_.inst] / max(1, len(pi_pos) - 1) if g_.cell == "<PI>"
+        else po_pos[g_.inst] / max(1, len(po_pos) - 1) if g_.cell == "<PO>"
+        else 0.0
+        for g_ in parsed.gates
+    ]
+    structural_feats = compute_structural_features(
+        edge_index, num_nodes, port_position
+    )
 
     # Dummy ``x`` for backward compatibility
     x = torch.zeros((num_nodes, 1), dtype=torch.float32)
@@ -468,12 +466,13 @@ def parsed_to_pyg(
             gate_attrs = torch.empty(
                 (0, vocab.num_attributes), dtype=torch.int64
             )
-        structural_feats = compute_structural_features(edge_index, num_nodes)
+        edge_pins = torch.tensor(
+            [[vocab.encode_pin(e[2]), vocab.encode_pin(e[3])] for e in parsed.edges],
+            dtype=torch.int64,
+        ).reshape(-1, 2)
     else:
         gate_attrs = torch.zeros((num_nodes, NUM_ATTRIBUTES), dtype=torch.int64)
-        structural_feats = torch.zeros(
-            (num_nodes, NUM_STRUCTURAL_FEATURES), dtype=torch.float32
-        )
+        edge_pins = torch.zeros((len(parsed.edges), 2), dtype=torch.int64)
 
     return Data(
         x=x,
@@ -482,6 +481,14 @@ def parsed_to_pyg(
         inst_id=inst_id,
         gate_attrs=gate_attrs,
         structural_feats=structural_feats,
+        edge_pins=edge_pins,
+        gate_node_mask=torch.tensor(
+            [not ct.startswith("<") for ct in cell_types], dtype=torch.bool
+        ),
+        po_node_mask=torch.tensor(
+            [ct == "<PO>" for ct in cell_types], dtype=torch.bool
+        ),
+        node_names=inst_names,
     )
 
 

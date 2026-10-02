@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, Mapping
 import torch
 from torch_geometric.data import Data
 
-from .netlist_parser import ParsedNetlistGraph
+from .netlist_parser import GraphRejected, ParsedNetlistGraph
 
 
 FAULT_FEATURE_NAMES = (
@@ -82,26 +82,26 @@ def _instance_mask(
     names: set[str],
 ) -> torch.Tensor:
     return torch.tensor(
-        [gate.inst in names for gate in parsed.gates],
+        [
+            not gate.cell.startswith("<") and gate.inst in names
+            for gate in parsed.gates
+        ],
         dtype=torch.bool,
     )
 
 
 def _discrepancy_mask(
     parsed: ParsedNetlistGraph,
-    gate_funcs: Dict[str, Dict[str, str]],
     snapshot: Any,
 ) -> tuple[torch.Tensor, bool]:
     good, bad = _snapshot_states(snapshot)
     has_label = bool(good) and bool(bad)
+    driven: Dict[int, list[str]] = {}
+    for net, (node,) in parsed.net_drivers.items():
+        driven.setdefault(node, []).append(net)
     values = []
-    for gate in parsed.gates:
-        output_pins = gate_funcs.get(gate.cell, {}).keys()
-        output_nets = [
-            gate.connections[pin]
-            for pin in output_pins
-            if pin in gate.connections
-        ]
+    for node in range(len(parsed.gates)):
+        output_nets = driven.get(node, [])
         values.append(
             has_label
             and any(
@@ -120,20 +120,33 @@ def attach_atpg_context(
 ) -> Data:
     """Attach target-fault inputs and auxiliary labels to a parsed graph.
 
-    Only the netlist and target fault contribute to ``fault_feats``. Snapshot,
+    Only the netlist and target fault contribute to ``fault_feats`` and
+    ``fault_edge`` (1.0 on every edge carrying the faulty net). Snapshot,
     propagation, and backtrack fields are attached as labels for encoder
     pretraining and are never consumed by the inference encoder.
+
+    Raises :class:`GraphRejected` when a fault is given but cannot be parsed
+    or names a net absent from the graph.
     """
     num_nodes = len(parsed.gates)
     fault_feats = torch.zeros((num_nodes, NUM_FAULT_FEATURES), dtype=torch.float32)
     target_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    fault_edge = torch.zeros(len(parsed.edges), dtype=torch.float32)
 
-    try:
-        fault = parse_fault(str(record.get("fault", "") or ""))
-    except ValueError:
-        fault = None
+    fault = None
+    fault_text = str(record.get("fault", "") or "")
+    if fault_text.strip():
+        try:
+            fault = parse_fault(fault_text)
+        except ValueError as exc:
+            raise GraphRejected("fault_unparsable", fault_text) from exc
+        if fault.net not in parsed.net_drivers:
+            raise GraphRejected("fault_net_unknown", fault.net)
 
     if fault is not None:
+        for i, edge in enumerate(parsed.edges):
+            if edge[4] == fault.net:
+                fault_edge[i] = 1.0
         drivers = set(parsed.net_drivers.get(fault.net, ()))
         sinks = set(parsed.net_sinks.get(fault.net, ()))
         sites = drivers | sinks
@@ -151,10 +164,11 @@ def attach_atpg_context(
     propagation_mask = _instance_mask(parsed, propagation_names)
     backtrack_mask = _instance_mask(parsed, backtrack_names)
     discrepancy_mask, has_discrepancy = _discrepancy_mask(
-        parsed, gate_funcs, record.get("snapshot")
+        parsed, record.get("snapshot")
     )
 
     data.fault_feats = fault_feats
+    data.fault_edge = fault_edge
     data.target_node_mask = target_mask
     data.propagation_mask = propagation_mask
     data.backtrack_mask = backtrack_mask
