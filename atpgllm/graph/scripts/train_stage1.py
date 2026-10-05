@@ -633,11 +633,10 @@ def main() -> None:
             max_batches=len(validation_loader),
             groups=validation_groups,
         )
-        row = {
-            "step": step,
-            **metrics,
-            "train_rejected": dict(getattr(dataset, "rejections", {})),
-        }
+        row: dict[str, Any] = {"step": step, **metrics}
+        if args.num_workers == 0:
+            # DataLoader workers count rejections in their own processes.
+            row["train_rejected"] = dict(getattr(dataset, "rejections", {}))
         _append_jsonl(metrics_path, row)
         print("eval " + json.dumps(row), flush=True)
         if wb_run is not None:
@@ -732,7 +731,7 @@ def main() -> None:
 
         if validation_items and evaluated_at != step:
             evaluate(step)
-        if getattr(dataset, "rejections", None):
+        if args.num_workers == 0 and getattr(dataset, "rejections", None):
             print(f"Training records rejected: {dict(dataset.rejections)}", flush=True)
 
         wh = list(weighted_history)
