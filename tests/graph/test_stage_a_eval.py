@@ -76,6 +76,22 @@ def test_validation_set_respects_bucket_and_design_caps():
     assert len(items) == 1 and scanned == 4
 
 
+def test_validation_set_caps_per_difficulty():
+    records = [_record("sa0 n1", difficulty="easy"), _record("sa1 n1", difficulty="easy"),
+               _record("sa0 y", difficulty="hard")]
+    # Size-bucket cap of 1: the easy majority would take the only slot.
+    items, _, _ = build_validation_set(
+        records, GATE_FUNCS, VOCAB, per_bucket=1, per_design=2, scan_limit=100
+    )
+    assert [item.difficulty for item in items] == ["easy"]
+    # Per (size, difficulty) cap of 1: the hard fault gets its own slot.
+    items, _, _ = build_validation_set(
+        records, GATE_FUNCS, VOCAB, per_bucket=1, per_design=1, scan_limit=100,
+        per_difficulty=1,
+    )
+    assert [item.difficulty for item in items] == ["easy", "hard"]
+
+
 def test_grouped_metrics_and_lift_over_rule():
     items, _, _ = build_validation_set(
         # Only U2 labelled: AP is undefined when every gate is positive.
@@ -134,6 +150,18 @@ def test_circuit_sampling_caps_and_mixes(tmp_path):
     big = [r["netlist"] for r in records if r["circuit_id"] == "big"]
     assert all(n is big[0] for n in big)
     assert choose_rows(files, per_circuit=10, total=7, seed=0) == picks[:7]
+
+    # Grouping by (circuit, difficulty) keeps a circuit's rare label.
+    path = tmp_path / "graded.parquet"
+    pq.write_table(pa.table({
+        "circuit_id": ["c"] * 12,
+        "difficulty": ["easy"] * 10 + ["hard"] * 2,
+    }), path)
+    by_circuit = choose_rows([str(path)], per_circuit=2, total=None, seed=0)
+    graded = choose_rows([str(path)], per_circuit=2, total=None, seed=0,
+                         group_by=("circuit_id", "difficulty"))
+    assert len(by_circuit) == 2 and len(graded) == 4
+    assert {row for _, row in graded} >= {10, 11}
 
 
 def test_sampled_columns_cover_every_record_field_the_graph_reads():

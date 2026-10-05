@@ -55,6 +55,15 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--eval-graphs-per-bucket", type=int, default=200)
     parser.add_argument("--eval-faults-per-design", type=int, default=2)
+    parser.add_argument(
+        "--eval-graphs-per-difficulty",
+        type=int,
+        default=0,
+        help="If > 0: cap validation graphs per (size bucket, difficulty label) "
+        "instead of per size bucket, and --eval-faults-per-design per "
+        "(circuit, difficulty); with --load parquet, validation rows are also "
+        "sampled per (circuit, difficulty), so hard faults are represented.",
+    )
     parser.add_argument("--eval-scan-records", type=int, default=60_000)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
@@ -83,8 +92,9 @@ def _args() -> argparse.Namespace:
         "--eval-rows-per-circuit",
         type=int,
         default=20,
-        help="parquet only: random validation rows read per circuit before "
-        "the size-bucket and per-design caps apply.",
+        help="parquet only: random validation rows read per circuit (per "
+        "circuit and difficulty with --eval-graphs-per-difficulty) before the "
+        "size-bucket and per-design caps apply.",
     )
     parser.add_argument("--shuffle-buffer", type=int, default=2_048)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -169,6 +179,11 @@ def main() -> None:
             per_circuit=args.eval_rows_per_circuit,
             total=None,
             seed=args.seed,
+            group_by=(
+                ("circuit_id", "difficulty")
+                if args.eval_graphs_per_difficulty > 0
+                else ("circuit_id",)
+            ),
         )
         # The rows this run will consume, plus 20% for unlabelled records.
         needed = int(1.2 * args.max_steps * args.batch_size * args.grad_accum)
@@ -193,6 +208,7 @@ def main() -> None:
         per_bucket=args.eval_graphs_per_bucket,
         per_design=args.eval_faults_per_design,
         scan_limit=args.eval_scan_records,
+        per_difficulty=args.eval_graphs_per_difficulty or None,
     )
     if not validation_items:
         raise ValueError("No labelled validation graphs were found.")

@@ -53,18 +53,22 @@ def choose_rows(
     per_circuit: int,
     total: Optional[int],
     seed: int,
+    group_by: Sequence[str] = ("circuit_id",),
 ) -> List[Tuple[int, int]]:
     """``(file index, row index)`` picks in a random order: at most
-    ``per_circuit`` random rows per circuit (0 = all), at most ``total``."""
-    by_circuit: Dict[str, List[Tuple[int, int]]] = collections.defaultdict(list)
+    ``per_circuit`` random rows per group of ``group_by`` values (0 = all),
+    at most ``total``. Grouping by ``("circuit_id", "difficulty")`` keeps the
+    rare difficulty labels of every circuit."""
+    groups: Dict[Tuple[Any, ...], List[Tuple[int, int]]] = collections.defaultdict(list)
     for file_index, path in enumerate(files):
-        ids = pq.read_table(path, columns=["circuit_id"]).column("circuit_id").to_pylist()
-        for row, circuit in enumerate(ids):
-            by_circuit[circuit].append((file_index, row))
+        table = pq.read_table(path, columns=list(group_by))
+        keys = zip(*(table.column(name).to_pylist() for name in group_by))
+        for row, key in enumerate(keys):
+            groups[key].append((file_index, row))
     rng = random.Random(seed)
     picks: List[Tuple[int, int]] = []
-    for circuit in sorted(by_circuit):
-        rows = by_circuit[circuit]
+    for key in sorted(groups, key=lambda k: tuple(map(str, k))):
+        rows = groups[key]
         picks.extend(rng.sample(rows, per_circuit) if 0 < per_circuit < len(rows) else rows)
     rng.shuffle(picks)
     return picks[:total] if total else picks
@@ -99,11 +103,15 @@ def sampled_records(
     total: Optional[int],
     seed: int,
     repeat: bool = False,
+    group_by: Sequence[str] = ("circuit_id",),
 ) -> Iterator[Dict[str, Any]]:
     """Yield the sampled rows; with ``repeat``, again in a new order per epoch."""
     files = split_files(dataset, split, revision)
     records = load_rows(
-        files, choose_rows(files, per_circuit=per_circuit, total=total, seed=seed)
+        files,
+        choose_rows(
+            files, per_circuit=per_circuit, total=total, seed=seed, group_by=group_by
+        ),
     )
     print(f"{dataset}:{split} sampled {len(records)} rows", flush=True)
     epoch = 0

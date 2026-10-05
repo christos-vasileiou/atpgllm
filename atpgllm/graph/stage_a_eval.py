@@ -4,7 +4,8 @@ A single average over validation graphs is dominated by whichever circuits are
 most numerous; with a per-design cap that is the many small circuits, where the
 tasks are easiest. This module
 
-- builds a validation set with up to N graphs per circuit-size bucket,
+- builds a validation set with up to N graphs per circuit-size bucket
+  (optionally per size bucket and difficulty label),
 - reports metrics per size bucket and per difficulty label,
 - scores the same graphs with a label-free structural rule (downstream cone of
   the fault for propagation/discrepancy, its fan-in for backtrack), so each
@@ -62,36 +63,44 @@ def build_validation_set(
     per_bucket: int,
     per_design: int,
     scan_limit: int,
+    per_difficulty: Optional[int] = None,
 ) -> Tuple[List[ValidationItem], collections.Counter, int]:
     """Collect up to ``per_bucket`` labelled graphs per size bucket, at most
-    ``per_design`` per circuit, reading at most ``scan_limit`` records."""
+    ``per_design`` per circuit, reading at most ``scan_limit`` records.
+
+    With ``per_difficulty``, the caps are per difficulty label instead: up to
+    ``per_difficulty`` graphs per (size bucket, difficulty) and ``per_design``
+    per (circuit, difficulty), so rare hard faults are not crowded out by the
+    easy majority.
+    """
     rejections: collections.Counter = collections.Counter()
     per_design_seen: collections.Counter = collections.Counter()
     counts: collections.Counter = collections.Counter()
     items: List[ValidationItem] = []
     scanned = 0
     for record in records:
-        if scanned >= scan_limit or all(
-            counts[name] >= per_bucket for name, _ in SIZE_BUCKETS
+        if scanned >= scan_limit or (
+            per_difficulty is None
+            and all(counts[name] >= per_bucket for name, _ in SIZE_BUCKETS)
         ):
             break
         scanned += 1
+        difficulty = str(record.get("difficulty") or "unknown")
         key = design_hash(record)
+        if per_difficulty is not None:
+            key = (key, difficulty)
         if per_design_seen[key] >= per_design:
             continue
         graph = record_to_pyg(dict(record), gate_funcs, vocab, rejections=rejections)
         if graph is None or not has_pretraining_labels(graph):
             continue
         bucket = size_bucket(graph)
-        if counts[bucket] >= per_bucket:
+        cell = bucket if per_difficulty is None else (bucket, difficulty)
+        if counts[cell] >= (per_bucket if per_difficulty is None else per_difficulty):
             continue
         per_design_seen[key] += 1
-        counts[bucket] += 1
-        items.append(ValidationItem(
-            graph=graph,
-            size=bucket,
-            difficulty=str(record.get("difficulty") or "unknown"),
-        ))
+        counts[cell] += 1
+        items.append(ValidationItem(graph=graph, size=bucket, difficulty=difficulty))
     return items, rejections, scanned
 
 

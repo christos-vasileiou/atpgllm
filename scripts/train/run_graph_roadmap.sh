@@ -32,6 +32,7 @@ case "${STAGE:?STAGE is required}" in
         fi
         [ -n "${EVAL_EVERY:-}" ] && CMD+=(--eval-every "$EVAL_EVERY")
         [ -n "${EVAL_FAULTS_PER_DESIGN:-}" ] && CMD+=(--eval-faults-per-design "$EVAL_FAULTS_PER_DESIGN")
+        [ -n "${EVAL_GRAPHS_PER_DIFFICULTY:-}" ] && CMD+=(--eval-graphs-per-difficulty "$EVAL_GRAPHS_PER_DIFFICULTY")
         [ -n "${LOAD:-}" ] && CMD+=(--load "$LOAD")
         [ -n "${MAX_ROWS_PER_CIRCUIT:-}" ] && CMD+=(--max-rows-per-circuit "$MAX_ROWS_PER_CIRCUIT")
         [ -n "${EVAL_ROWS_PER_CIRCUIT:-}" ] && CMD+=(--eval-rows-per-circuit "$EVAL_ROWS_PER_CIRCUIT")
