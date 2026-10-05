@@ -18,7 +18,16 @@ Activate the project env (alias: ``activate``), then::
         --per-device-train-batch-size 4 --grad-accum 4 --max-steps 50000 --lr 1e-4
 
 The script streams the dataset, so no full-dataset download is
-required.
+required. For datasets stored grouped by circuit (asap7-language-of-test-v3)
+use ``--load parquet``: rows are sampled at random from the cached parquet
+files, at most ``--max-rows-per-circuit`` per circuit.
+
+With ``--eval-split`` the model is scored on held-out (graph, caption) pairs
+at step 0 and every ``--eval-every`` steps (``metrics.jsonl``; the best by
+``--select-metric`` is saved as ``stage1_best.pt``): retrieval across
+circuits and among the faults of one circuit, matching AP and generation
+loss. ``--graph-init random`` builds the same encoder with random weights, the
+control arm for asking whether Stage-A pretraining helps.
 
 By default training uses **full bfloat16** on CUDA when supported; pass
 ``--fp32`` for float32 everywhere.
@@ -54,6 +63,9 @@ from atpgllm.graph import (
     Stage1Trainer,
     collate_graph_text_batch,
 )
+from atpgllm.graph.circuit_sampling import sampled_records
+from atpgllm.graph.hpo.validation import evaluate_graph_text_alignment
+from atpgllm.graph.stage_b_eval import build_alignment_validation_set
 from atpgllm.graph.train_stage1 import LossWeights
 from atpgllm.graph.checkpoints import (
     STAGE_GRAPH_PRETRAIN,
@@ -81,6 +93,53 @@ def _parse_args() -> argparse.Namespace:
                    help="Path to sim_config.json with gate_funcs dict.")
     p.add_argument("--dataset", type=str, default="chrivasileiou/asap7-language-of-test")
     p.add_argument("--split", type=str, default="train")
+    p.add_argument("--revision", help="Dataset revision (commit) to pin.")
+    p.add_argument(
+        "--load",
+        choices=("streaming", "parquet"),
+        default="streaming",
+        help="parquet: sample rows at random from the split's cached parquet "
+             "files (needed when rows are grouped by circuit, as in v3).",
+    )
+    p.add_argument(
+        "--max-rows-per-circuit",
+        type=int,
+        default=0,
+        help="parquet only: at most this many random training rows per "
+             "circuit (0 = all).",
+    )
+    p.add_argument(
+        "--eval-split",
+        help="Held-out split, circuit-disjoint from --split (v3: 'validation'). "
+             "Enables evaluation at step 0 and every --eval-every steps.",
+    )
+    p.add_argument("--eval-every", type=int, default=500)
+    p.add_argument(
+        "--eval-rows-per-circuit",
+        type=int,
+        default=20,
+        help="parquet only: random held-out rows read per circuit.",
+    )
+    p.add_argument(
+        "--eval-faults-per-circuit",
+        type=int,
+        default=6,
+        help="Held-out pairs per circuit, one per distinct fault.",
+    )
+    p.add_argument("--eval-pairs", type=int, default=1024,
+                   help="At most this many held-out pairs.")
+    p.add_argument(
+        "--eval-seed",
+        type=int,
+        default=42,
+        help="Seed of the held-out sample, separate from --seed so runs with "
+             "different training seeds score the same pairs.",
+    )
+    p.add_argument(
+        "--select-metric",
+        default="semantic_score",
+        help="Held-out metric (higher is better) that picks stage1_best.pt.",
+    )
     p.add_argument(
         "--descriptions-json",
         type=Path,
@@ -97,7 +156,8 @@ def _parse_args() -> argparse.Namespace:
     source.add_argument(
         "--graph-ckpt",
         type=Path,
-        help="Stage-A graph_pretrain checkpoint used to initialize the DAG encoder.",
+        help="Stage-A graph_pretrain checkpoint: the DAG encoder's architecture "
+             "and (with --graph-init pretrained) its weights.",
     )
     source.add_argument(
         "--resume",
@@ -105,6 +165,13 @@ def _parse_args() -> argparse.Namespace:
         help="Resume a graph_text_alignment checkpoint including optimizer state.",
     )
 
+    p.add_argument(
+        "--graph-init",
+        choices=("pretrained", "random"),
+        default="pretrained",
+        help="random: same encoder architecture as --graph-ckpt, random "
+             "weights (control arm).",
+    )
     p.add_argument(
         "--per-device-train-batch-size",
         type=int,
@@ -137,8 +204,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--num-queries", type=int, default=32)
     p.add_argument("--qformer-layers", type=int, default=6)
     p.add_argument("--qformer-hidden", type=int, default=512)
-    p.add_argument("--gin-layers", type=int, default=6)
-    p.add_argument("--gin-hidden", type=int, default=256)
     p.add_argument("--proj-dim", type=int, default=512)
 
     p.add_argument("--w-gtc", type=float, default=1.0)
@@ -273,10 +338,34 @@ def _wandb_finish(run: Any) -> None:
 # ---------------------------------------------------------------------
 
 
+def _model_state(model: Stage1GraphTextModel, freeze_text: bool) -> dict[str, Any]:
+    """The model's state; without the frozen text encoder, which reloads
+    from ``text_model_name`` (Stage C reads only the graph encoder and
+    Q-Former)."""
+    state = model.state_dict()
+    if freeze_text:
+        state = {
+            key: value
+            for key, value in state.items()
+            if not key.startswith("text_encoder.")
+        }
+    return state
+
+
+def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    with path.open("a") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
 def main() -> None:
     args = _parse_args()
+    # The tokenizer runs in the main process (held-out pairs) before
+    # DataLoader workers fork; its thread pool is not fork-safe.
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
+    if args.resume is not None and args.graph_init != "pretrained":
+        raise ValueError("--graph-init applies to --graph-ckpt, not --resume.")
 
     # --- Load gate_funcs + vocab ---
     with args.sim_config.open() as fh:
@@ -289,7 +378,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.text_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     # --- Dataset ---
     if args.descriptions_json is not None:
         dataset = ASAP7DesignDataset(
@@ -307,21 +396,37 @@ def main() -> None:
             flush=True,
         )
     else:
-        hf_stream = (
-            load_dataset(args.dataset, split=args.split, streaming=True)
-            .shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
-        )
+        if args.load == "parquet":
+            # The rows this run will consume, plus 20% for rejected records.
+            needed = int(
+                1.2 * args.max_steps * args.per_device_train_batch_size * args.grad_accum
+            )
+            records = sampled_records(
+                args.dataset,
+                args.split,
+                revision=args.revision,
+                per_circuit=args.max_rows_per_circuit,
+                total=needed,
+                seed=args.seed,
+                repeat=True,
+                columns=None,
+            )
+        else:
+            records = load_dataset(
+                args.dataset, split=args.split, streaming=True, revision=args.revision
+            ).shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
         dataset = ASAP7GraphTextDataset(
-            hf_stream=hf_stream,
+            hf_stream=records,
             gate_funcs=gate_funcs,
             vocab=vocab,
             tokenizer=tokenizer,
             max_text_len=args.max_text_len,
             max_answer_len=args.max_answer_len,
+            shard_by_worker=args.load == "parquet",
         )
         print(
-            f"Stage-1 source: streaming HF dataset {args.dataset!r} "
-            f"split={args.split!r} (per-record captions; not BRIDGES-faithful)",
+            f"Stage-1 source: {args.load} {args.dataset!r} split={args.split!r} "
+            f"(per-record captions)",
             flush=True,
         )
 
@@ -341,40 +446,92 @@ def main() -> None:
         drop_last=True,
     )
 
+    # --- Held-out pairs ---
+    validation_items: list[dict[str, Any]] = []
+    if args.eval_split:
+        if args.load == "parquet":
+            eval_records = sampled_records(
+                args.dataset,
+                args.eval_split,
+                revision=args.revision,
+                per_circuit=args.eval_rows_per_circuit,
+                total=None,
+                seed=args.eval_seed,
+                columns=None,
+            )
+        else:
+            eval_records = load_dataset(
+                args.dataset, split=args.eval_split, streaming=True,
+                revision=args.revision,
+            )
+        eval_dataset = ASAP7GraphTextDataset(
+            hf_stream=eval_records,
+            gate_funcs=gate_funcs,
+            vocab=vocab,
+            tokenizer=tokenizer,
+            max_text_len=args.max_text_len,
+            max_answer_len=args.max_answer_len,
+        )
+        validation_items = build_alignment_validation_set(
+            eval_dataset,
+            per_circuit=args.eval_faults_per_circuit,
+            limit=args.eval_pairs,
+        )
+        circuits = {item["circuit"] for item in validation_items}
+        print(
+            f"validation pairs={len(validation_items)} circuits={len(circuits)} "
+            f"rejected={dict(eval_dataset.rejections)}",
+            flush=True,
+        )
+        if len(validation_items) < 2:
+            raise ValueError("Stage-B evaluation needs at least two held-out pairs.")
+    validation_groups = [item["circuit"] for item in validation_items]
+
     # --- Model ---
-    model = Stage1GraphTextModel(
-        vocab=vocab,
-        text_model_name=args.text_model,
-        gin_hidden_dim=args.gin_hidden,
-        gin_num_layers=args.gin_layers,
-        qformer_hidden_dim=args.qformer_hidden,
-        qformer_layers=args.qformer_layers,
-        num_queries=args.num_queries,
-        proj_dim=args.proj_dim,
-        freeze_text=args.freeze_text,
-    )
+    # Seeded again so both --graph-init arms build every module from the
+    # same random state; only the graph encoder's weights then differ.
+    torch.manual_seed(args.seed)
     resume_payload = None
     if args.graph_ckpt is not None:
         graph_checkpoint = load_stage_checkpoint(
             args.graph_ckpt,
             expected_stages=[STAGE_GRAPH_PRETRAIN],
             vocab=vocab,
-            expected_architecture={
-                "graph_encoder": model.graph_encoder.config,
-            },
         )
-        model.graph_encoder.load_state_dict(
-            graph_checkpoint["states"]["graph_encoder"],
-            strict=True,
-        )
+        graph_config = graph_checkpoint["architecture"]["graph_encoder"]
     else:
         resume_payload = load_stage_checkpoint(
             args.resume,
             expected_stages=[STAGE_GRAPH_TEXT_ALIGNMENT],
             vocab=vocab,
-            expected_architecture=model.architecture_config,
         )
-        model.load_state_dict(resume_payload["states"]["model"], strict=True)
+        graph_config = resume_payload["architecture"]["graph_encoder"]
+    model = Stage1GraphTextModel(
+        vocab=vocab,
+        text_model_name=args.text_model,
+        graph_encoder_config=graph_config,
+        qformer_hidden_dim=args.qformer_hidden,
+        qformer_layers=args.qformer_layers,
+        num_queries=args.num_queries,
+        proj_dim=args.proj_dim,
+        freeze_text=args.freeze_text,
+    )
+    if resume_payload is not None:
+        missing, unexpected = model.load_state_dict(
+            resume_payload["states"]["model"], strict=False
+        )
+        if unexpected or any(not key.startswith("text_encoder.") for key in missing):
+            raise ValueError(
+                f"Resume state does not match the model: missing={missing[:5]} "
+                f"unexpected={unexpected[:5]}"
+            )
+    elif args.graph_init == "pretrained":
+        model.graph_encoder.load_state_dict(
+            graph_checkpoint["states"]["graph_encoder"],
+            strict=True,
+        )
+    print(f"Graph encoder: {args.graph_init if resume_payload is None else 'resumed'}",
+          flush=True)
     _set_graph_policy(model, args.graph_policy)
 
     trainer = Stage1Trainer(
@@ -438,6 +595,70 @@ def main() -> None:
         print(str(e), file=sys.stderr)
         raise SystemExit(1) from e
 
+    parent_stage = (
+        STAGE_GRAPH_TEXT_ALIGNMENT if resume_payload is not None else STAGE_GRAPH_PRETRAIN
+    )
+
+    def save(path: Path, step: int) -> None:
+        save_stage_checkpoint(
+            path,
+            stage=STAGE_GRAPH_TEXT_ALIGNMENT,
+            parent_stage=parent_stage,
+            vocab=vocab,
+            architecture=model.architecture_config,
+            states={
+                "model": _model_state(trainer.model, args.freeze_text),
+                "gtm_loss": trainer.gtm_loss.state_dict(),
+                "gtg_loss": trainer.gtg_loss.state_dict(),
+            },
+            optimizer_state=optimizer.state_dict(),
+            step=step,
+            session=vars(args),
+        )
+
+    metrics_path = args.output_dir / "metrics.jsonl"
+    best_score: float | None = None
+
+    def evaluate(step: int) -> None:
+        nonlocal best_score
+        validation_loader = DataLoader(
+            validation_items,
+            batch_size=args.per_device_train_batch_size,
+            shuffle=False,
+            collate_fn=collate,
+        )
+        metrics = evaluate_graph_text_alignment(
+            trainer,
+            validation_loader,
+            max_batches=len(validation_loader),
+            groups=validation_groups,
+        )
+        row = {
+            "step": step,
+            **metrics,
+            "train_rejected": dict(getattr(dataset, "rejections", {})),
+        }
+        _append_jsonl(metrics_path, row)
+        print("eval " + json.dumps(row), flush=True)
+        if wb_run is not None:
+            import wandb  # type: ignore[import-not-found]
+
+            wandb.log({
+                "train/step": step,
+                **{
+                    f"eval/{key}": value
+                    for key, value in metrics.items()
+                    if isinstance(value, (int, float))
+                },
+            })
+        score = metrics.get(args.select_metric)
+        if score is None:
+            raise ValueError(f"--select-metric {args.select_metric!r} is undefined.")
+        if step > 0 and not args.no_save and (best_score is None or score > best_score):
+            best_score = float(score)
+            save(args.output_dir / "stage1_best.pt", step)
+            print(f"New best {args.select_metric}={score:.4f} at step {step}", flush=True)
+
     # --- Train ---
     step = int(resume_payload["step"]) if resume_payload is not None else 0
     track_metrics = args.metrics_json is not None
@@ -447,7 +668,11 @@ def main() -> None:
     ) if history_window else deque()
     last_components: dict[str, float] | None = None
     accum_index = 0
+    evaluated_at: int | None = None
     try:
+        if validation_items and resume_payload is None:
+            evaluate(0)
+            evaluated_at = 0
         for batch in loader:
             losses = trainer.train_step(
                 batch,
@@ -476,7 +701,8 @@ def main() -> None:
                     f"total={total:.4f} "
                     f"gtc={d['gtc']:.4f} "
                     f"gtm={d['gtm']:.4f} "
-                    f"gtg={d['gtg']:.4f}"
+                    f"gtg={d['gtg']:.4f}",
+                    flush=True,
                 )
                 if wb_run is not None:
                     import wandb  # type: ignore[import-not-found]
@@ -492,31 +718,22 @@ def main() -> None:
                         }
                     )
 
+            if validation_items and step % args.eval_every == 0:
+                evaluate(step)
+                evaluated_at = step
+
             if not args.no_save and step % args.save_every == 0:
                 ckpt_path = args.output_dir / f"stage1_step{step}.pt"
-                save_stage_checkpoint(
-                    ckpt_path,
-                    stage=STAGE_GRAPH_TEXT_ALIGNMENT,
-                    parent_stage=(
-                        STAGE_GRAPH_TEXT_ALIGNMENT
-                        if resume_payload is not None
-                        else STAGE_GRAPH_PRETRAIN
-                    ),
-                    vocab=vocab,
-                    architecture=model.architecture_config,
-                    states={
-                        "model": trainer.model.state_dict(),
-                        "gtm_loss": trainer.gtm_loss.state_dict(),
-                        "gtg_loss": trainer.gtg_loss.state_dict(),
-                    },
-                    optimizer_state=optimizer.state_dict(),
-                    step=step,
-                    session=vars(args),
-                )
+                save(ckpt_path, step)
                 print(f"Saved {ckpt_path}")
 
             if step >= args.max_steps:
                 break
+
+        if validation_items and evaluated_at != step:
+            evaluate(step)
+        if getattr(dataset, "rejections", None):
+            print(f"Training records rejected: {dict(dataset.rejections)}", flush=True)
 
         wh = list(weighted_history)
         mean_w = sum(wh) / len(wh) if wh else None
@@ -565,25 +782,7 @@ def main() -> None:
         # Final save
         if not args.no_save:
             final = args.output_dir / "stage1_final.pt"
-            save_stage_checkpoint(
-                final,
-                stage=STAGE_GRAPH_TEXT_ALIGNMENT,
-                parent_stage=(
-                    STAGE_GRAPH_TEXT_ALIGNMENT
-                    if resume_payload is not None
-                    else STAGE_GRAPH_PRETRAIN
-                ),
-                vocab=vocab,
-                architecture=model.architecture_config,
-                states={
-                    "model": trainer.model.state_dict(),
-                    "gtm_loss": trainer.gtm_loss.state_dict(),
-                    "gtg_loss": trainer.gtg_loss.state_dict(),
-                },
-                optimizer_state=optimizer.state_dict(),
-                step=step,
-                session=vars(args),
-            )
+            save(final, step)
             print(f"Final checkpoint: {final}")
     finally:
         _wandb_finish(wb_run)

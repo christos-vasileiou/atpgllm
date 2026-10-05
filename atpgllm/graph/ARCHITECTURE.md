@@ -498,6 +498,22 @@ with GTC, GTM, and GTG. `--graph-policy` is `frozen`, `last_layer`, or `full`.
 The default freezes the Stage-A encoder. Precomputed per-design descriptions
 avoid contradictory captions for one circuit.
 
+On v3, `--load parquet` samples training rows per circuit as in Stage A, and
+`--eval-split validation` scores held-out (graph, caption) pairs at step 0 and
+every `--eval-every` steps (`metrics.jsonl`). The held-out set keeps one pair
+per (circuit, fault), since v3 repeats each fault once per test pattern with
+the same graph, and up to `--eval-faults-per-circuit` faults per circuit.
+Besides recall and MRR over all pairs it reports `circuit_r1` (the top match
+is from the right circuit) and `within_circuit_r1` (among one circuit's
+faults, the right fault comes first; chance `within_circuit_chance_r1`).
+`--graph-init random` builds the same encoder with random weights: the
+control for whether Stage-A pretraining helps
+(`graph_alignment_v3_pretrained.conf` vs `graph_alignment_v3_random.conf`).
+Frozen encoders stay in eval mode while training, so BatchNorm statistics do
+not drift. With `--freeze-text`, checkpoints leave out the text encoder, which
+reloads from `--text-model`; Stage C reads only the graph encoder and
+Q-Former.
+
 ### Stage C — graph-conditioned QLoRA SFT
 
 ```bash

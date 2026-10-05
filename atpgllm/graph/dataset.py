@@ -422,6 +422,15 @@ class ASAP7GraphTextDataset(IterableDataset):
     tests_dir : Path, optional
         Override for the ``libatpgllm/tests`` directory containing
         ``conversation.py`` (used for placeholder rendering).
+    shard_by_worker : bool
+        Give each DataLoader worker every n-th record. Needed when
+        ``hf_stream`` is a plain iterable, which every worker would
+        otherwise read in full; leave False for a HF streaming dataset,
+        which shards itself.
+
+    Rejected records are counted by reason in ``rejections``. Each example
+    also carries ``circuit`` (``circuit_id``, else a netlist hash) and
+    ``difficulty`` for grouped evaluation.
     """
 
     def __init__(
@@ -435,6 +444,7 @@ class ASAP7GraphTextDataset(IterableDataset):
         caption_words: int = 4096,
         skip_invalid: bool = True,
         tests_dir: Optional[Path] = None,
+        shard_by_worker: bool = False,
     ) -> None:
         super().__init__()
         self.hf_stream = hf_stream
@@ -446,10 +456,20 @@ class ASAP7GraphTextDataset(IterableDataset):
         self.caption_words = caption_words
         self.skip_invalid = skip_invalid
         self.tests_dir = tests_dir
+        self.shard_by_worker = shard_by_worker
+        self.rejections: collections.Counter = collections.Counter()
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
-        for record in self.hf_stream:
-            data = record_to_pyg(record, self.gate_funcs, self.vocab)
+        worker = torch.utils.data.get_worker_info() if self.shard_by_worker else None
+        for index, record in enumerate(self.hf_stream):
+            if worker is not None and index % worker.num_workers != worker.id:
+                continue
+            circuit = record.get("circuit_id") or hashlib.sha256(
+                _netlist_text(record).encode("utf-8")
+            ).hexdigest()[:16]
+            data = record_to_pyg(
+                record, self.gate_funcs, self.vocab, rejections=self.rejections
+            )
             if data is None:
                 if self.skip_invalid:
                     continue
@@ -482,6 +502,8 @@ class ASAP7GraphTextDataset(IterableDataset):
                 "answer_content": rendered.answer,
                 "module_name": rendered.module_name,
                 "fault": rendered.fault,
+                "circuit": circuit,
+                "difficulty": str(record.get("difficulty") or "unknown"),
             }
 
 

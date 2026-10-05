@@ -104,16 +104,29 @@ def sampled_records(
     seed: int,
     repeat: bool = False,
     group_by: Sequence[str] = ("circuit_id",),
+    columns: Optional[Sequence[str]] = GRAPH_COLUMNS,
 ) -> Iterator[Dict[str, Any]]:
-    """Yield the sampled rows; with ``repeat``, again in a new order per epoch."""
+    """The sampled rows; with ``repeat``, again in a new order per epoch.
+    ``columns=None`` loads every column (captions fill placeholders from any
+    of them). Rows are loaded when this is called, so DataLoader workers
+    forked afterwards share them instead of each loading its own copy."""
     files = split_files(dataset, split, revision)
+    if columns is None:
+        columns = pq.read_schema(files[0]).names
     records = load_rows(
         files,
         choose_rows(
             files, per_circuit=per_circuit, total=total, seed=seed, group_by=group_by
         ),
+        columns=columns,
     )
     print(f"{dataset}:{split} sampled {len(records)} rows", flush=True)
+    return _epochs(records, repeat=repeat, seed=seed)
+
+
+def _epochs(
+    records: List[Dict[str, Any]], *, repeat: bool, seed: int
+) -> Iterator[Dict[str, Any]]:
     epoch = 0
     while True:
         yield from records

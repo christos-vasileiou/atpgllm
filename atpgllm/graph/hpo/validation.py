@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Iterable
+from typing import Any, Hashable, Iterable, Sequence
 
 import torch
 from torch import nn
@@ -13,6 +13,7 @@ from .metrics import (
     binary_iou,
     graph_pretrain_score,
     graph_text_alignment_score,
+    grouped_retrieval_metrics,
     mean_defined,
     retrieval_metrics,
 )
@@ -88,7 +89,14 @@ def evaluate_graph_text_alignment(
     batches: Iterable[dict[str, Any]],
     *,
     max_batches: int,
+    groups: Sequence[Hashable] | None = None,
 ) -> dict[str, float | None]:
+    """Retrieval, matching and generation metrics on held-out pairs.
+
+    With ``groups`` (the circuit of each pair, in batch order), also reports
+    :func:`grouped_retrieval_metrics`: whether the right circuit and, within
+    a circuit, the right fault come first.
+    """
     model = trainer.model
     was_training = model.training
     model.eval()
@@ -143,6 +151,10 @@ def evaluate_graph_text_alignment(
     text = torch.cat(text_representations, dim=0)
     similarity = torch.einsum("iqd,jd->iqj", graph_q, text).max(dim=1).values
     metrics: dict[str, float | None] = retrieval_metrics(similarity)
+    if groups is not None:
+        metrics.update(
+            grouped_retrieval_metrics(similarity, list(groups)[: similarity.size(0)])
+        )
     metrics["matching_ap"] = binary_average_precision(
         matching_scores,
         matching_labels,

@@ -53,6 +53,22 @@ case "${STAGE:?STAGE is required}" in
             CMD+=(--graph-ckpt "${GRAPH_CHECKPOINT:?GRAPH_CHECKPOINT is required}")
         fi
         [ -n "${DESCRIPTIONS_JSON:-}" ] && CMD+=(--descriptions-json "$DESCRIPTIONS_JSON")
+        [ -n "${GRAPH_INIT:-}" ] && CMD+=(--graph-init "$GRAPH_INIT")
+        [ "${FREEZE_TEXT:-False}" = True ] && CMD+=(--freeze-text)
+        [ -n "${REVISION:-}" ] && CMD+=(--revision "$REVISION")
+        [ -n "${LOAD:-}" ] && CMD+=(--load "$LOAD")
+        [ -n "${MAX_ROWS_PER_CIRCUIT:-}" ] && CMD+=(--max-rows-per-circuit "$MAX_ROWS_PER_CIRCUIT")
+        [ -n "${EVAL_SPLIT:-}" ] && CMD+=(--eval-split "$EVAL_SPLIT")
+        [ -n "${EVAL_EVERY:-}" ] && CMD+=(--eval-every "$EVAL_EVERY")
+        [ -n "${EVAL_ROWS_PER_CIRCUIT:-}" ] && CMD+=(--eval-rows-per-circuit "$EVAL_ROWS_PER_CIRCUIT")
+        [ -n "${EVAL_FAULTS_PER_CIRCUIT:-}" ] && CMD+=(--eval-faults-per-circuit "$EVAL_FAULTS_PER_CIRCUIT")
+        [ -n "${EVAL_PAIRS:-}" ] && CMD+=(--eval-pairs "$EVAL_PAIRS")
+        [ -n "${SELECT_METRIC:-}" ] && CMD+=(--select-metric "$SELECT_METRIC")
+        [ -n "${MAX_TEXT_LEN:-}" ] && CMD+=(--max-text-len "$MAX_TEXT_LEN")
+        [ -n "${MAX_ANSWER_LEN:-}" ] && CMD+=(--max-answer-len "$MAX_ANSWER_LEN")
+        [ -n "${NUM_WORKERS:-}" ] && CMD+=(--num-workers "$NUM_WORKERS")
+        [ -n "${LR:-}" ] && CMD+=(--lr "$LR")
+        [ -n "${SEED:-}" ] && CMD+=(--seed "$SEED")
         ;;
     multimodal_sft|multimodal_grpo)
         METHOD=${STAGE#multimodal_}

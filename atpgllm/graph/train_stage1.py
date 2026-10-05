@@ -227,6 +227,7 @@ class Stage1Trainer:
             )
 
         self.model.train()
+        self._keep_frozen_modules_in_eval()
         self.gtm_loss.train()
         self.gtg_loss.train()
         if accum_index == 0:
@@ -247,6 +248,21 @@ class Stage1Trainer:
             optimizer.step()
 
         return losses
+
+    def _keep_frozen_modules_in_eval(self) -> None:
+        """A frozen encoder must not change in train mode: BatchNorm would
+        update its running statistics and dropout would add noise. Encoders
+        with no trainable parameters run in eval mode, and so does every
+        normalization layer whose own parameters are frozen."""
+        for encoder in (self.model.graph_encoder, self.model.text_encoder):
+            if not any(p.requires_grad for p in encoder.parameters()):
+                encoder.eval()
+                continue
+            for module in encoder.modules():
+                if isinstance(module, nn.modules.batchnorm._BatchNorm) and not any(
+                    p.requires_grad for p in module.parameters()
+                ):
+                    module.eval()
 
     @torch.no_grad()
     def eval_step(self, batch: Dict[str, Any]) -> Stage1Losses:

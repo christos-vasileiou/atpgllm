@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Mapping, Sequence
+from typing import Hashable, Iterable, Mapping, Sequence
 
 import torch
 from torch import Tensor
@@ -130,6 +130,62 @@ def retrieval_metrics(similarity: Tensor) -> dict[str, float]:
         "mean_r1": 0.5 * (g1 + t1),
         "mean_r5": 0.5 * (g5 + t5),
         "mean_mrr": 0.5 * (gm + tm),
+    }
+
+
+def grouped_retrieval_metrics(
+    similarity: Tensor,
+    groups: Sequence[Hashable],
+) -> dict[str, float | int | None]:
+    """Retrieval read per circuit for a square matched-pair matrix.
+
+    ``groups[i]`` names the circuit of pair ``i``. Two questions, each
+    averaged over both directions (graph to text, text to graph):
+
+    - ``circuit_r1``: the top-1 match comes from the right circuit
+      (any fault of it). Tells circuits apart.
+    - ``within_circuit_r1``: ranked only among pairs of the same circuit,
+      the right one comes first. Tells faults of one circuit apart; its
+      chance level is ``within_circuit_chance_r1`` (mean 1 / group size).
+      Only circuits with at least two pairs count.
+    """
+    if similarity.ndim != 2 or similarity.size(0) != similarity.size(1):
+        raise ValueError("similarity must be a square [N, N] matrix")
+    count = similarity.size(0)
+    if len(groups) != count:
+        raise ValueError("groups must name one circuit per pair")
+    ids = {group: index for index, group in enumerate(dict.fromkeys(groups))}
+    labels = torch.tensor([ids[group] for group in groups])
+    same = labels.unsqueeze(0).eq(labels.unsqueeze(1))
+    sizes = same.sum(dim=1)
+    multi = sizes.ge(2)
+
+    def direction(matrix: Tensor) -> tuple[float, float | None]:
+        top = matrix.argmax(dim=1)
+        circuit = float(same[torch.arange(count), top].to(torch.float32).mean())
+        if not bool(multi.any()):
+            return circuit, None
+        # A tie with another pair of the circuit counts as a miss.
+        own = matrix.diagonal().unsqueeze(1)
+        rivals = (matrix.ge(own) & same).sum(dim=1) - 1
+        within = float(rivals[multi].eq(0).to(torch.float32).mean())
+        return circuit, within
+
+    g_circuit, g_within = direction(similarity)
+    t_circuit, t_within = direction(similarity.t())
+    return {
+        "circuit_r1": 0.5 * (g_circuit + t_circuit),
+        "within_circuit_r1": (
+            None if g_within is None else 0.5 * (g_within + t_within)
+        ),
+        "within_circuit_chance_r1": (
+            float(sizes[multi].to(torch.float32).reciprocal().mean())
+            if bool(multi.any())
+            else None
+        ),
+        "within_circuit_pairs": int(multi.sum()),
+        "circuits": len(ids),
+        "chance_r1": 1.0 / count,
     }
 
 
