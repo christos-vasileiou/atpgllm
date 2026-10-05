@@ -173,3 +173,14 @@ def test_stage_a_heads_are_scored_on_meaningful_nodes():
     drivers = [names[i] for i in GraphPretrainingModel.scored_nodes("discrepancy", graph).nonzero().flatten()]
     assert gates == ["U1", "U2"]
     assert drivers == ["a", "b", "c", "U1", "U2"]
+
+
+def test_record_for_another_circuit_is_rejected():
+    rejections = collections.Counter()
+    good = {"netlist": AO21, "fault": "sa0 y", "input_vector": '{"a": 0, "b": 0, "c": 1}'}
+    assert record_to_pyg(good, GATE_FUNCS, VOCAB, rejections=rejections) is not None
+    swapped = {**good, "input_vector": '{"ina[0]": 0, "inb[0]": 1, "c": 1}'}
+    reordered = {**good, "input_vector": '{"b": 0, "a": 0, "c": 1}'}
+    assert record_to_pyg(swapped, GATE_FUNCS, VOCAB, rejections=rejections) is None
+    assert record_to_pyg(reordered, GATE_FUNCS, VOCAB, rejections=rejections) is None
+    assert rejections == {"vector_port_mismatch": 2}

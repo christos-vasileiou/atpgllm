@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import collections
 import json
-from itertools import islice
+import time
 from pathlib import Path
 
 import torch
@@ -17,15 +16,19 @@ from atpgllm.graph.checkpoints import (
     load_stage_checkpoint,
     save_stage_checkpoint,
 )
+from atpgllm.graph.circuit_sampling import sampled_records
 from atpgllm.graph.dataset import (
     ASAP7GraphPretrainDataset,
     collate_graph_pretrain_batch,
 )
 from atpgllm.graph.gate_features import GateAttributeVocab
-from atpgllm.graph.hpo.manifests import design_hash
 from atpgllm.graph.hpo.splits import DesignSplitManifest
-from atpgllm.graph.hpo.validation import evaluate_graph_pretraining
 from atpgllm.graph.pretrain import GraphPretrainingModel
+from atpgllm.graph.stage_a_eval import (
+    build_validation_set,
+    evaluate_stage_a,
+    rule_baseline,
+)
 from atpgllm.training._paths import resolve_sim_config_path
 
 
@@ -37,16 +40,22 @@ def _args() -> argparse.Namespace:
         default="chrivasileiou/asap7-language-of-test-v2",
     )
     parser.add_argument("--split", default="train")
-    parser.add_argument(
+    held_out = parser.add_mutually_exclusive_group(required=True)
+    held_out.add_argument(
         "--split-manifest",
         type=Path,
-        required=True,
-        help="Design-disjoint split (search_graph_pipeline prepare-split); "
-        "trains on 'train' designs, evaluates on 'validation' designs.",
+        help="Design-disjoint split (search_graph_pipeline prepare-split) of "
+        "--split; trains on its 'train' designs, evaluates on 'validation'.",
+    )
+    held_out.add_argument(
+        "--eval-split",
+        help="A dataset split that is already circuit-disjoint from --split "
+        "(e.g. 'validation' in asap7-language-of-test-v3).",
     )
     parser.add_argument("--eval-every", type=int, default=500)
-    parser.add_argument("--eval-graphs", type=int, default=512)
+    parser.add_argument("--eval-graphs-per-bucket", type=int, default=200)
     parser.add_argument("--eval-faults-per-design", type=int, default=2)
+    parser.add_argument("--eval-scan-records", type=int, default=60_000)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -54,6 +63,29 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=20_000)
     parser.add_argument("--save-every", type=int, default=1_000)
     parser.add_argument("--log-every", type=int, default=20)
+    parser.add_argument("--revision", help="Dataset revision (commit) to pin.")
+    parser.add_argument(
+        "--load",
+        choices=("streaming", "parquet"),
+        default="streaming",
+        help="parquet: sample rows at random from the split's cached parquet "
+        "files and shuffle them globally; needed when rows are grouped by "
+        "circuit (v3). Requires a circuit_id column and --eval-split.",
+    )
+    parser.add_argument(
+        "--max-rows-per-circuit",
+        type=int,
+        default=0,
+        help="parquet only: at most this many random training rows per "
+        "circuit (0 = all), so a few huge circuits do not dominate.",
+    )
+    parser.add_argument(
+        "--eval-rows-per-circuit",
+        type=int,
+        default=20,
+        help="parquet only: random validation rows read per circuit before "
+        "the size-bucket and per-design caps apply.",
+    )
     parser.add_argument("--shuffle-buffer", type=int, default=2_048)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -65,17 +97,6 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--fp32", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
-
-
-def _cap_per_design(records, cap: int):
-    """Keep at most ``cap`` records per design so a few large circuits do
-    not dominate the validation set."""
-    seen: collections.Counter = collections.Counter()
-    for record in records:
-        key = design_hash(record)
-        if seen[key] < cap:
-            seen[key] += 1
-            yield record
 
 
 def main() -> None:
@@ -117,40 +138,76 @@ def main() -> None:
         step = int(checkpoint["step"])
         parent_stage = STAGE_GRAPH_PRETRAIN
 
-    manifest = DesignSplitManifest.load(args.split_manifest)
-    if (manifest.dataset, manifest.source_split) != (args.dataset, args.split):
-        raise ValueError(
-            f"Split manifest is for {manifest.dataset}:{manifest.source_split}, "
-            f"not {args.dataset}:{args.split}."
+    if args.load == "parquet" and args.split_manifest:
+        raise ValueError("--load parquet uses the dataset's own splits; pass --eval-split")
+    if args.max_rows_per_circuit and args.load != "parquet":
+        raise ValueError("--max-rows-per-circuit needs --load parquet")
+
+    def stream(split: str, buffer_size: int):
+        return load_dataset(
+            args.dataset, split=split, streaming=True, revision=args.revision
+        ).shuffle(seed=args.seed, buffer_size=buffer_size)
+
+    if args.split_manifest:
+        manifest = DesignSplitManifest.load(args.split_manifest)
+        if (manifest.dataset, manifest.source_split) != (args.dataset, args.split):
+            raise ValueError(
+                f"Split manifest is for {manifest.dataset}:{manifest.source_split}, "
+                f"not {args.dataset}:{args.split}."
+            )
+        validation_records = manifest.filter_records(
+            stream(args.split, 10_000), "validation"
         )
-    validation = ASAP7GraphPretrainDataset(
-        _cap_per_design(
-            manifest.filter_records(
-                load_dataset(args.dataset, split=args.split, streaming=True),
-                "validation",
-            ),
-            args.eval_faults_per_design,
-        ),
+        train_records = manifest.filter_records(
+            stream(args.split, args.shuffle_buffer), "train"
+        )
+    elif args.load == "parquet":
+        validation_records = sampled_records(
+            args.dataset,
+            args.eval_split,
+            revision=args.revision,
+            per_circuit=args.eval_rows_per_circuit,
+            total=None,
+            seed=args.seed,
+        )
+        # The rows this run will consume, plus 20% for unlabelled records.
+        needed = int(1.2 * args.max_steps * args.batch_size * args.grad_accum)
+        train_records = sampled_records(
+            args.dataset,
+            args.split,
+            revision=args.revision,
+            per_circuit=args.max_rows_per_circuit,
+            total=needed,
+            seed=args.seed,
+            repeat=True,
+        )
+    else:
+        validation_records = stream(args.eval_split, 10_000)
+        train_records = stream(args.split, args.shuffle_buffer)
+
+    started = time.time()
+    validation_items, validation_rejections, scanned = build_validation_set(
+        validation_records,
         gate_funcs,
         vocab,
+        per_bucket=args.eval_graphs_per_bucket,
+        per_design=args.eval_faults_per_design,
+        scan_limit=args.eval_scan_records,
     )
-    validation_graphs = list(islice(validation, args.eval_graphs))
-    if not validation_graphs:
-        raise ValueError("No valid validation graphs matched the split manifest.")
+    if not validation_items:
+        raise ValueError("No labelled validation graphs were found.")
+    baseline = rule_baseline(validation_items)
+    (args.output_dir / "rule_baseline.json").write_text(json.dumps(baseline, indent=2))
     print(
-        f"validation graphs={len(validation_graphs)} "
-        f"rejected={dict(validation.rejections)}",
+        f"validation graphs={len(validation_items)} "
+        f"by_size={ {k: v['graphs'] for k, v in baseline['by_size'].items()} } "
+        f"scanned={scanned} rejected={dict(validation_rejections)} "
+        f"seconds={time.time() - started:.0f}",
         flush=True,
     )
+    print("rule_baseline " + json.dumps(baseline), flush=True)
 
-    stream = load_dataset(
-        args.dataset,
-        split=args.split,
-        streaming=True,
-    ).shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
-    dataset = ASAP7GraphPretrainDataset(
-        manifest.filter_records(stream, "train"), gate_funcs, vocab
-    )
+    dataset = ASAP7GraphPretrainDataset(train_records, gate_funcs, vocab)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -185,19 +242,18 @@ def main() -> None:
 
     def evaluate() -> None:
         nonlocal best_score
-        loader = DataLoader(
-            validation_graphs,
+        metrics = evaluate_stage_a(
+            model,
+            validation_items,
+            device=device,
             batch_size=args.batch_size,
-            collate_fn=collate_graph_pretrain_batch,
-        )
-        metrics = evaluate_graph_pretraining(
-            model, loader, device=device, max_batches=len(loader)
+            baseline=baseline,
         )
         record = {"step": step, **metrics, "rejected": dict(dataset.rejections)}
         print("eval " + json.dumps(record), flush=True)
         with (args.output_dir / "metrics.jsonl").open("a") as fh:
             fh.write(json.dumps(record) + "\n")
-        score = metrics["semantic_score"]
+        score = metrics["score"]
         if score is not None and (best_score is None or score > best_score):
             best_score = score
             save("graph_pretrain_best.pt")

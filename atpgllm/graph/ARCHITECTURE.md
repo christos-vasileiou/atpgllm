@@ -358,7 +358,9 @@ Netlists that cannot be represented faithfully raise `GraphRejected` with a
 reason: `unknown_cell`, `sequential_cell`, `duplicate_instance`,
 `unsupported_declaration`, `unsupported_assign` (non-alias `assign`),
 `unconnected_pin`, `multi_driven_net`, `undriven_net`, `cycle`; and per record
-`fault_unparsable` or `fault_net_unknown`. `record_to_pyg` returns `None` for
+`vector_port_mismatch` (the record's `input_vector` bits are not the netlist's
+inputs in order, i.e. the record describes another circuit), `fault_unparsable`
+or `fault_net_unknown`. `record_to_pyg` returns `None` for
 rejected records and counts reasons; other errors propagate. Fault-independent
 graphs are cached per netlist hash.
 
@@ -452,11 +454,33 @@ activate && python -m atpgllm.graph.scripts.train_graph_encoder \
   --output-dir runs/graph_pretrain
 ```
 
-Training uses only `train` designs of the design-disjoint split; every
-`--eval-every` steps the encoder is scored on `validation` designs (at most
-`--eval-faults-per-design` faults each) with per-head AP/IoU, logged to
-`metrics.jsonl`, and the best score is kept as `graph_pretrain_best.pt`. The
-netlist and target fault are inputs. Three node heads supervise fault
+For `asap7-language-of-test-v3`, whose splits are already circuit- and
+structure-disjoint, use the dataset's own validation split instead of a
+manifest (`scripts/train/configs/graph_pretrain_v3.conf`):
+
+```bash
+bash scripts/train/run_graph_roadmap.sh scripts/train/configs/graph_pretrain_v3.conf
+```
+
+v3 stores rows grouped by circuit, and one circuit holds 33.5% of train
+(revision `907bcb1`). `--load parquet` (`circuit_sampling.py`) reads only
+`circuit_id` from the split's cached parquet files, picks at most
+`--max-rows-per-circuit` random rows per circuit, loads just those rows (one
+netlist copy per circuit), and shuffles them globally each epoch. It avoids
+both a streaming buffer, which cannot mix circuit-sized runs, and the
+uncompressed Arrow cache (about 18 GB per revision). `--revision` pins the
+dataset commit.
+
+Training never reads validation circuits. The validation set holds up to
+`--eval-graphs-per-bucket` graphs per circuit-size bucket (<=50, 51-200,
+>200 gates), at most `--eval-faults-per-design` faults per circuit
+(`stage_a_eval.py`). Every `--eval-every` steps it reports per-head AP/IoU
+overall, per size bucket and per difficulty label, plus each head's AP lift
+over a label-free structural rule (the fault's downstream cone for
+propagation and discrepancy, its fan-in for backtrack; written once to
+`rule_baseline.json`). Metrics go to `metrics.jsonl`; the checkpoint with the
+best size-balanced score (mean over buckets with at least 20 graphs) is kept
+as `graph_pretrain_best.pt`. The netlist and target fault are inputs. Three node heads supervise fault
 propagation, ATPG backtracking, and Good/Bad Machine discrepancy masks. The
 checkpoint exports the DAG encoder; auxiliary heads do not cross into the LLM.
 

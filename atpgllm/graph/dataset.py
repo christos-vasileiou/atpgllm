@@ -338,6 +338,15 @@ def record_to_pyg(
 # ---------------------------------------------------------------------
 
 
+def has_pretraining_labels(graph: Data) -> bool:
+    """True when at least one Stage-A head has labels for this graph."""
+    return (
+        bool(graph.has_propagation_labels.item())
+        or bool(graph.has_backtrack_labels.item())
+        or bool(graph.has_discrepancy_labels.item())
+    )
+
+
 class ASAP7GraphPretrainDataset(IterableDataset):
     """Stream target-fault-conditioned graphs with ATPG node labels."""
 
@@ -367,11 +376,7 @@ class ASAP7GraphPretrainDataset(IterableDataset):
                 raise ValueError(
                     f"Failed to parse record: module={record.get('module_name')}"
                 )
-            if not (
-                bool(graph.has_propagation_labels.item())
-                or bool(graph.has_backtrack_labels.item())
-                or bool(graph.has_discrepancy_labels.item())
-            ):
+            if not has_pretraining_labels(graph):
                 if self.skip_invalid:
                     continue
                 raise ValueError("Record has no graph-pretraining labels.")

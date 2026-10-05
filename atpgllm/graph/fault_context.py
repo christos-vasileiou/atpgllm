@@ -125,13 +125,19 @@ def attach_atpg_context(
     propagation, and backtrack fields are attached as labels for encoder
     pretraining and are never consumed by the inference encoder.
 
-    Raises :class:`GraphRejected` when a fault is given but cannot be parsed
-    or names a net absent from the graph.
+    Raises :class:`GraphRejected` when the record's ``input_vector`` bits are
+    not the netlist's primary inputs in order (the record describes another
+    circuit), or when a fault is given but cannot be parsed or names a net
+    absent from the graph.
     """
     num_nodes = len(parsed.gates)
     fault_feats = torch.zeros((num_nodes, NUM_FAULT_FEATURES), dtype=torch.float32)
     target_mask = torch.zeros(num_nodes, dtype=torch.bool)
     fault_edge = torch.zeros(len(parsed.edges), dtype=torch.float32)
+
+    vector = _mapping(record.get("input_vector"))
+    if vector and list(vector) != parsed.inputs:
+        raise GraphRejected("vector_port_mismatch")
 
     fault = None
     fault_text = str(record.get("fault", "") or "")

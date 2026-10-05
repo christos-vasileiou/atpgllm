@@ -23,9 +23,19 @@ case "${STAGE:?STAGE is required}" in
         CMD=(python -m atpgllm.graph.scripts.train_graph_encoder
             --dataset "$DATASET" --sim-config "$SIM_CONFIG"
             --output-dir "$OUTPUT_DIR"
-            --split-manifest "${SPLIT_MANIFEST:?SPLIT_MANIFEST is required}"
             --batch-size "${BATCH_SIZE:-8}" --grad-accum "${GRAD_ACCUM:-1}"
             --max-steps "$MAX_STEPS" --save-every "$SAVE_EVERY")
+        if [ -n "${EVAL_SPLIT:-}" ]; then
+            CMD+=(--eval-split "$EVAL_SPLIT")
+        else
+            CMD+=(--split-manifest "${SPLIT_MANIFEST:?SPLIT_MANIFEST or EVAL_SPLIT is required}")
+        fi
+        [ -n "${EVAL_EVERY:-}" ] && CMD+=(--eval-every "$EVAL_EVERY")
+        [ -n "${EVAL_FAULTS_PER_DESIGN:-}" ] && CMD+=(--eval-faults-per-design "$EVAL_FAULTS_PER_DESIGN")
+        [ -n "${LOAD:-}" ] && CMD+=(--load "$LOAD")
+        [ -n "${MAX_ROWS_PER_CIRCUIT:-}" ] && CMD+=(--max-rows-per-circuit "$MAX_ROWS_PER_CIRCUIT")
+        [ -n "${EVAL_ROWS_PER_CIRCUIT:-}" ] && CMD+=(--eval-rows-per-circuit "$EVAL_ROWS_PER_CIRCUIT")
+        [ -n "${REVISION:-}" ] && CMD+=(--revision "$REVISION")
         [ -n "${RESUME:-}" ] && CMD+=(--resume "$RESUME")
         ;;
     graph_text_alignment)
