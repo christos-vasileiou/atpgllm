@@ -131,3 +131,11 @@ def test_circuit_sampling_caps_and_mixes(tmp_path):
     big = [r["netlist"] for r in records if r["circuit_id"] == "big"]
     assert all(n is big[0] for n in big)
     assert choose_rows(files, per_circuit=10, total=7, seed=0) == picks[:7]
+
+
+def test_sampled_columns_cover_every_record_field_the_graph_reads():
+    # Fields attach_atpg_context reads; a missing column silently skips a check.
+    from atpgllm.graph.circuit_sampling import GRAPH_COLUMNS
+
+    assert {"netlist", "fault", "input_vector", "fault_propagation_gates",
+            "backtrack_gates", "snapshot", "difficulty"} <= set(GRAPH_COLUMNS)

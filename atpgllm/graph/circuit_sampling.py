@@ -26,6 +26,8 @@ GRAPH_COLUMNS: Tuple[str, ...] = (
     "snapshot",
     "difficulty",
     "circuit_id",
+    # Read by the vector_port_mismatch check, not by the encoder.
+    "input_vector",
 )
 
 
