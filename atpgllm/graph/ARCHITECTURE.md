@@ -527,7 +527,30 @@ The rendered prompt replaces the duplicated Verilog body with a stable
 the graph prefix. The target fault remains in user text and graph features.
 Answer-only labels preserve the current conversation target. `full` jointly
 updates the DAG encoder, Q-Former, LM projector, and LoRA adapter; `qformer`,
-`last_layer`, and `frozen` provide explicit ablations.
+`last_layer`, and `frozen` provide explicit ablations. The pretrained encoder
+and Q-Former learn at `--graph-lr`; the new projector learns at `--lr` with
+the adapters.
+
+By default (`--tool-format`) examples are chats with the fault-simulation tool,
+rendered by the LM's chat template with the tool schema: the model reasons,
+calls the tool, reads the simulator's Good/Bad Machine table, and reports.
+Labels cover only assistant turns that are training targets; prompts and tool
+responses are context. `--retry-fraction` (0.3) of the examples first show a
+real failed call: the dataset pattern with one to three inputs flipped,
+simulated and kept only if it misses the fault
+(`atpgllm/training/tool_trajectories.py`). That call is context. The model is
+trained on the next turn: read from the snapshot why the pattern missed (the
+fault net already holds the stuck-at value, or the difference stops before
+every output), call the tool again with the fixed pattern, and name the
+outputs where the machines differ (`atpgllm/training/tool_feedback.py`). The
+conversation builder's default output is unchanged; these trajectories are
+opt-in (`failed_attempt=`, `interpret_results=`).
+
+`--eval-split` reports held-out loss on single-call and retry examples
+separately. `--probe-examples` decodes on held-out circuits and simulates the
+model's calls: `first_try_detects` (from the prompt alone) and
+`recovery_detects` (after a real failed call and its negative result).
+Config: `scripts/train/configs/multimodal_sft_v3.conf`.
 
 ### Stage D — graph-conditioned QLoRA GRPO
 

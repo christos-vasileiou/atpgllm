@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import regex as re
 
@@ -208,6 +208,10 @@ class ConversationExample:
     """Internal container for a single training example."""
 
     messages: List[Dict[str, str]]  # list of {"role": ..., "content": ...}
+    # Per message: is it a training target? None means every assistant
+    # message is. Set for retry trajectories, whose injected failed first
+    # attempt is context the model must not learn to produce.
+    trainable: Optional[List[bool]] = None
 
     @staticmethod
     def _prepare_record(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -285,7 +289,13 @@ class ConversationExample:
         return messages
 
     @staticmethod
-    def from_record(record: Dict[str, Any], use_tools: bool = False) -> "ConversationExample":
+    def from_record(
+        record: Dict[str, Any],
+        use_tools: bool = False,
+        *,
+        failed_attempt: Any = None,
+        interpret_results: bool = False,
+    ) -> "ConversationExample":
         """
         Create a ConversationExample from a dataset record.  This method
         combines the system, user, reasoning and answer fields into a
@@ -301,6 +311,18 @@ class ConversationExample:
         use_tools : bool
             If *True*, format the assistant turn with explicit tool-call
             JSON and a separate ``tool`` message containing the snapshot.
+        failed_attempt : FailedAttempt, optional
+            Requires ``use_tools``. Turn the conversation into a retry: the
+            first tool call uses this non-detecting pattern and gets its real
+            snapshot; the next assistant turn reads why it failed, calls the
+            tool again with the record's pattern, and reads the success. The
+            first assistant turn is marked not trainable (``trainable``).
+            See :mod:`atpgllm.training.tool_trajectories`.
+        interpret_results : bool
+            Start the final answer by naming the primary outputs where the
+            Good and Bad Machine differ, instead of a generic sentence.
+            Implied by ``failed_attempt``. Both default off, so the default
+            conversation is unchanged.
 
         Returns
         -------
@@ -326,6 +348,8 @@ class ConversationExample:
         13. non_controlling_nets <- from 'backtrack_nets' (sensitizing inputs)
         14. snapshot            <- from 'snapshot'
         """
+        if failed_attempt is not None and not use_tools:
+            raise ValueError("A retry trajectory needs use_tools=True.")
         prep = ConversationExample._prepare_record(record)
         system_content = prep["system_content"]
         user_content = prep["user_content"]
@@ -353,24 +377,32 @@ class ConversationExample:
         # RL training we can evaluate the reasoning chain separately from the
         # final answer.
         messages: List[Dict[str, str]] = []
+        trainable: List[bool] = []
         if system_content:
             messages.append({"role": "system", "content": system_content})
         if user_content:
             messages.append({"role": "user", "content": user_content})
         if reasoning_content:
             if use_tools:
-                arguments = dict.fromkeys(
-                    FAULT_SIMULATION_TOOL['function']['parameters']['properties'].keys()
-                )
-                arguments['input_vector'] = input_vector_dict
-                arguments['output_vector'] = expected_output_dict
-                arguments['fault'] = fault
-                arguments['doc_id'] = record.get('netlist', 'netlist is unknown').get('doc_id', 'netlist is unknown')
+                def tool_call(input_vector, output_vector):
+                    arguments = dict.fromkeys(
+                        FAULT_SIMULATION_TOOL['function']['parameters']['properties'].keys()
+                    )
+                    arguments['input_vector'] = input_vector
+                    arguments['output_vector'] = output_vector
+                    arguments['fault'] = fault
+                    arguments['doc_id'] = record.get('netlist', 'netlist is unknown').get('doc_id', 'netlist is unknown')
+                    return {
+                        "name": FAULT_SIMULATION_TOOL['function']['name'],
+                        "arguments": arguments,
+                    }
 
-                tool_call_json = {
-                    "name": FAULT_SIMULATION_TOOL['function']['name'],
-                    "arguments": arguments,
-                }
+                if failed_attempt is not None:
+                    tool_call_json = tool_call(
+                        failed_attempt.input_vector, failed_attempt.output_vector
+                    )
+                else:
+                    tool_call_json = tool_call(input_vector_dict, expected_output_dict)
 
                 # For SFT we include the reasoning verbatim.  At inference time
                 # you may instruct the model to produce its chain of thought
@@ -385,6 +417,32 @@ class ConversationExample:
                     "content": tool_call_content,
                     "tool_calls": [{"type": "function", "function": tool_call_json}],
                 })
+                if failed_attempt is not None:
+                    from atpgllm.training.tool_feedback import (
+                        revision_sentence,
+                        undetected_sentence,
+                    )
+
+                    trainable = [False] * len(messages)
+                    messages.append({
+                        "role": "tool",
+                        "name": FAULT_SIMULATION_TOOL['function']['name'],
+                        "content": failed_attempt.snapshot,
+                    })
+                    messages.append({
+                        "role": "assistant",
+                        "content": (
+                            undetected_sentence(failed_attempt.reading) + " "
+                            + revision_sentence(
+                                failed_attempt.reading, failed_attempt.changes
+                            ) + "\n"
+                        ),
+                        "tool_calls": [{
+                            "type": "function",
+                            "function": tool_call(input_vector_dict, expected_output_dict),
+                        }],
+                    })
+                    trainable += [False, True]
                 messages.append({
                     "role": "tool",
                     "name": FAULT_SIMULATION_TOOL['function']['name'],
@@ -402,12 +460,29 @@ class ConversationExample:
                     ),
                 })
         if answer_content:
+            lead = (
+                f"The fault {record['fault']} has been sensitized. I can see the "
+                "difference between Good/Bad Machine. "
+            )
+            if (interpret_results or failed_attempt is not None) and snapshot:
+                from atpgllm.training.tool_feedback import (
+                    detected_sentence,
+                    read_snapshot,
+                )
+
+                reading = read_snapshot(snapshot, fault, list(expected_output_dict))
+                if not reading.detected:
+                    raise ValueError(
+                        f"The record's snapshot does not detect {fault!r}."
+                    )
+                lead = detected_sentence(reading) + " "
             messages.append({
                 "role": "assistant",
-                "content": (
-                    f"The fault {record['fault']} has been sensitized. I can see the difference between Good/Bad Machine. "
-                    "To sum up, the vectors are:\n"
-                    + answer_content
-                ),
+                "content": lead + "To sum up, the vectors are:\n" + answer_content,
             })
-        return ConversationExample(messages=messages)
+        if failed_attempt is not None:
+            trainable += [m["role"] == "assistant" for m in messages[len(trainable):]]
+        return ConversationExample(
+            messages=messages,
+            trainable=trainable if failed_attempt is not None else None,
+        )

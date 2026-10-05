@@ -116,6 +116,11 @@ class GraphConditionedCausalLM(nn.Module):
                 device=labels.device,
             )
             full_labels = torch.cat([prefix_labels, labels], dim=1)
+        # Without padding the mask adds nothing to causal attention, and
+        # dropping it lets SDPA use a fused causal kernel instead of
+        # materializing a [seq, seq] mask (out of memory at 8k tokens).
+        if bool(full_mask.all()):
+            full_mask = None
         return self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=full_mask,
@@ -152,6 +157,17 @@ class GraphConditionedCausalLM(nn.Module):
             dim=-1,
             index=completion_ids.unsqueeze(-1),
         ).squeeze(-1)
+
+    @torch.no_grad()
+    def generate(self, graph, input_ids: Tensor, attention_mask: Tensor, **kwargs) -> Tensor:
+        """``llm.generate`` after the graph prefix, with a KV cache; returns
+        only the new tokens."""
+        inputs_embeds, full_mask = self._prefix_and_token_embeddings(
+            graph, input_ids, attention_mask
+        )
+        return self.llm.generate(
+            inputs_embeds=inputs_embeds, attention_mask=full_mask, **kwargs
+        )
 
     @torch.no_grad()
     def sample_group(
