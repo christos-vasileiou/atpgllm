@@ -17,22 +17,29 @@ def binary_average_precision(
     scores: Tensor | Sequence[float],
     labels: Tensor | Sequence[int],
 ) -> float | None:
-    """Average precision; return ``None`` when no positive label exists."""
+    """Average precision with tied scores ranked as one group (as sklearn's
+    ``average_precision_score``), so the result never depends on node order.
+
+    Returns ``None`` when it says nothing about the ranking: no positive label,
+    or every label positive (any scores then give 1.0).
+    """
     score = _as_float_tensor(scores)
     target = torch.as_tensor(labels, dtype=torch.bool).reshape(-1)
     if score.numel() != target.numel() or score.numel() == 0:
         raise ValueError("scores and labels must be non-empty and equally sized")
     positives = int(target.sum())
-    if positives == 0:
+    if positives == 0 or positives == target.numel():
         return None
-    order = torch.argsort(score, descending=True, stable=True)
-    ranked = target[order].to(torch.float64)
-    precision = ranked.cumsum(0) / torch.arange(
-        1,
-        ranked.numel() + 1,
-        dtype=torch.float64,
-    )
-    return float(precision[ranked.bool()].mean())
+    order = torch.argsort(score, descending=True)
+    ranked_scores = score[order]
+    true_positives = target[order].to(torch.float64).cumsum(0)
+    # Last position of each run of equal scores: one threshold per distinct score.
+    ends = torch.nonzero(ranked_scores[1:] != ranked_scores[:-1]).reshape(-1)
+    ends = torch.cat([ends, torch.tensor([score.numel() - 1])])
+    precision = true_positives[ends] / (ends + 1).to(torch.float64)
+    recall = true_positives[ends] / positives
+    recall_gain = torch.diff(recall, prepend=torch.zeros(1, dtype=torch.float64))
+    return float((recall_gain * precision).sum())
 
 
 def binary_roc_auc(

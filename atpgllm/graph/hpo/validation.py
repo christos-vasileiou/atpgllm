@@ -54,8 +54,10 @@ def evaluate_graph_pretraining(
                 node_mask = (graph.batch == graph_index) & model.scored_nodes(
                     task, graph
                 )
+                # Rank by logits: sigmoid saturates to 1.0 in float32 and
+                # would tie the most confident nodes.
                 ap = binary_average_precision(
-                    probabilities[node_mask].cpu(),
+                    outputs.logits[task][node_mask].cpu(),
                     labels[node_mask].cpu(),
                 )
                 if ap is None:

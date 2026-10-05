@@ -86,9 +86,21 @@ def test_graph_architecture_locking():
         )
 
 
+def test_average_precision_ranks_ties_as_one_group():
+    # A rule that scores the whole cone 1.0 must not gain from node order.
+    labels = [1, 0, 1, 0, 0]
+    assert binary_average_precision([1, 1, 1, 1, 0], labels) == pytest.approx(0.5)
+    assert binary_average_precision([1, 1, 1, 1, 0], labels[::-1][1:] + [0]) == pytest.approx(0.5)
+    # Matches sklearn's average_precision_score on a mixed case.
+    assert binary_average_precision([0.9, 0.8, 0.8, 0.3, 0.1], [1, 0, 1, 1, 0]) == pytest.approx(
+        1 / 3 * 1.0 + 1 / 3 * (2 / 3) + 1 / 3 * 0.75
+    )
+
+
 def test_semantic_metric_edge_cases():
     assert binary_average_precision([0.1, 0.2], [0, 0]) is None
-    assert binary_average_precision([0.1, 0.2], [1, 1]) == pytest.approx(1.0)
+    # Every label positive: any scores give 1.0, so it is left out.
+    assert binary_average_precision([0.1, 0.2], [1, 1]) is None
     assert binary_roc_auc([0.1, 0.2], [1, 1]) is None
     assert binary_roc_auc([0.1, 0.9], [0, 1]) == pytest.approx(1.0)
     assert binary_iou([0.1, 0.2], [0, 0]) == pytest.approx(1.0)

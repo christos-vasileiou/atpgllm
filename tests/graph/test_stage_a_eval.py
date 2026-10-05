@@ -31,11 +31,11 @@ OR2x2_ASAP7_75t_R U2 (.A(n1), .B(c), .Y(y));
 endmodule"""
 
 
-def _record(fault="sa0 n1", netlist=TWO_GATES, difficulty="easy"):
+def _record(fault="sa0 n1", netlist=TWO_GATES, difficulty="easy", propagation="U1, U2"):
     return {
         "netlist": netlist,
         "fault": fault,
-        "fault_propagation_gates": "U1, U2",
+        "fault_propagation_gates": propagation,
         "backtrack_gates": "U1",
         "snapshot": str({
             "Good Machine": {"a": 1, "b": 1, "c": 0, "n1": 1, "y": 1},
@@ -78,13 +78,16 @@ def test_validation_set_respects_bucket_and_design_caps():
 
 def test_grouped_metrics_and_lift_over_rule():
     items, _, _ = build_validation_set(
-        [_record(difficulty="easy"), _record("sa1 n1", difficulty="hard")],
+        # Only U2 labelled: AP is undefined when every gate is positive.
+        [_record(difficulty="easy", propagation="U2"),
+         _record("sa1 n1", difficulty="hard", propagation="U2")],
         GATE_FUNCS, VOCAB, per_bucket=10, per_design=2, scan_limit=10,
     )
     baseline = rule_baseline(items)
     assert baseline["by_size"]["<=50 gates"]["graphs"] == 2
     assert set(baseline["by_difficulty"]) == {"easy", "hard"}
-    assert baseline["overall"]["propagation_ap"] == 1.0
+    # The rule ranks U1 (distance 0) above the labelled U2 (distance 1).
+    assert baseline["overall"]["propagation_ap"] == 0.5
 
     torch.manual_seed(0)
     model = GraphPretrainingModel(
@@ -97,7 +100,7 @@ def test_grouped_metrics_and_lift_over_rule():
     # Two graphs is below MIN_BUCKET_GRAPHS, so no balanced score yet.
     assert report["score"] is None
     lift = report["lift_vs_rule"]["<=50 gates"]["propagation"]
-    assert lift == report["by_size"]["<=50 gates"]["propagation_ap"] - 1.0
+    assert lift == report["by_size"]["<=50 gates"]["propagation_ap"] - 0.5
     assert model.training  # evaluation restores train mode
 
 
