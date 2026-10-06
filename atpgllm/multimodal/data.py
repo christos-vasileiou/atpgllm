@@ -163,13 +163,16 @@ def build_tool_sft_example(
     max_seq_len: int,
     failed_attempt: Any = None,
     rejections: Optional[collections.Counter] = None,
+    tool_view: str = "po_fault",
 ) -> Optional[ToolSFTExample]:
     """One graph-conditioned tool-calling SFT example, or None when the record
     is rejected, its snapshot does not detect the fault, or it is longer than
     ``max_seq_len`` (dropped whole: truncation could cut through a tool turn).
 
     The prompt's netlist is replaced by :data:`GRAPH_CONTEXT`; the graph
-    reaches the model as the soft prefix instead.
+    reaches the model as the soft prefix instead. ``tool_view`` sets what tool
+    messages show (``atpgllm.training.tool_feedback.TOOL_VIEWS``); RL rollouts
+    of the model must use the same view.
     """
     from atpgllm.training.conversation import ConversationExample
 
@@ -183,6 +186,7 @@ def build_tool_sft_example(
             use_tools=True,
             failed_attempt=failed_attempt,
             interpret_results=True,
+            tool_view=tool_view,
         )
     except ValueError:
         if rejections is not None:

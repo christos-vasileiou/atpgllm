@@ -74,6 +74,7 @@ def run_tool_probe(
     *,
     device: torch.device,
     max_new_tokens: int = 1024,
+    tool_view: str = "po_fault",
 ) -> Dict[str, Any]:
     """Greedy decoding of one assistant turn per probe and question."""
     was_training = model.training
@@ -99,6 +100,7 @@ def run_tool_probe(
         conversation = ConversationExample.from_record(
             copy.deepcopy(record), use_tools=True,
             failed_attempt=item.failed_attempt, interpret_results=True,
+            tool_view=tool_view,
         )
         messages = [dict(m) for m in conversation.messages]
         for message in messages:

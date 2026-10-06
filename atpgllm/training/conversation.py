@@ -295,6 +295,7 @@ class ConversationExample:
         *,
         failed_attempt: Any = None,
         interpret_results: bool = False,
+        tool_view: str = "full",
     ) -> "ConversationExample":
         """
         Create a ConversationExample from a dataset record.  This method
@@ -323,6 +324,11 @@ class ConversationExample:
             Good and Bad Machine differ, instead of a generic sentence.
             Implied by ``failed_attempt``. Both default off, so the default
             conversation is unchanged.
+        tool_view : str
+            What the tool messages show (``tool_feedback.TOOL_VIEWS``):
+            ``full`` (default) is the simulator's whole table; ``po_fault``
+            keeps the primary outputs and the fault site. Interpretations
+            are read from the same view, so they cite only what is shown.
 
         Returns
         -------
@@ -350,6 +356,8 @@ class ConversationExample:
         """
         if failed_attempt is not None and not use_tools:
             raise ValueError("A retry trajectory needs use_tools=True.")
+        if tool_view != "full" and not use_tools:
+            raise ValueError("A tool view needs use_tools=True.")
         prep = ConversationExample._prepare_record(record)
         system_content = prep["system_content"]
         user_content = prep["user_content"]
@@ -360,6 +368,13 @@ class ConversationExample:
         reasoning_content = record.get("reasoning_content", "")
         answer_content = record.get("answer_content", "")
         snapshot = record.get("snapshot", "")
+
+        def shown(table: str) -> str:
+            if tool_view == "full" or not table:
+                return table
+            from atpgllm.training.tool_feedback import shown_snapshot
+
+            return shown_snapshot(table, fault, list(expected_output_dict), tool_view)
 
         # Lazy replacement of the placeholders
         answer_content = answer_content.replace('input_vector', 'input_vector_json')
@@ -419,23 +434,27 @@ class ConversationExample:
                 })
                 if failed_attempt is not None:
                     from atpgllm.training.tool_feedback import (
+                        read_snapshot,
                         revision_sentence,
                         undetected_sentence,
                     )
 
                     trainable = [False] * len(messages)
+                    failed_table = shown(failed_attempt.snapshot)
+                    reading = read_snapshot(
+                        failed_table, fault, list(expected_output_dict)
+                    )
                     messages.append({
                         "role": "tool",
                         "name": FAULT_SIMULATION_TOOL['function']['name'],
-                        "content": failed_attempt.snapshot,
+                        "content": failed_table,
                     })
                     messages.append({
                         "role": "assistant",
                         "content": (
-                            undetected_sentence(failed_attempt.reading) + " "
-                            + revision_sentence(
-                                failed_attempt.reading, failed_attempt.changes
-                            ) + "\n"
+                            undetected_sentence(reading) + " "
+                            + revision_sentence(reading, failed_attempt.changes)
+                            + "\n"
                         ),
                         "tool_calls": [{
                             "type": "function",
@@ -446,7 +465,7 @@ class ConversationExample:
                 messages.append({
                     "role": "tool",
                     "name": FAULT_SIMULATION_TOOL['function']['name'],
-                    "content": snapshot,
+                    "content": shown(snapshot),
                 })
             else:
                 messages.append({
@@ -470,7 +489,9 @@ class ConversationExample:
                     read_snapshot,
                 )
 
-                reading = read_snapshot(snapshot, fault, list(expected_output_dict))
+                reading = read_snapshot(
+                    shown(snapshot), fault, list(expected_output_dict)
+                )
                 if not reading.detected:
                     raise ValueError(
                         f"The record's snapshot does not detect {fault!r}."

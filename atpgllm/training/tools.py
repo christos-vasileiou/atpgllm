@@ -53,8 +53,25 @@ def _require_bit_mapping(name, vector):
         raise ValueError(f"{name} has non-binary values for nets {bad[:5]}")
 
 
+def tool_view() -> str:
+    """What the tool returns to the model: ``FAULT_SIM_TOOL_VIEW`` (default
+    ``full``, the whole Good/Bad table; ``po_fault``: primary outputs and the
+    fault site, see :mod:`atpgllm.training.tool_feedback`). A model must be
+    trained and rolled out with the same view."""
+    return os.environ.get('FAULT_SIM_TOOL_VIEW', 'full')
+
+
+def observation(snapshot, fault, view=None) -> str:
+    """The model's view of a simulator table (fast or TetraMAX frame)."""
+    from atpgllm.training.tool_feedback import shown_snapshot
+    table = snapshot[['Good Machine', 'Bad Machine']].to_json()
+    outputs = list(snapshot.index[snapshot['POs'].astype(bool)]) if 'POs' in snapshot else []
+    return shown_snapshot(table, fault, outputs, view or tool_view())
+
+
 async def fault_simulation_tool_handler(input_vector, output_vector, fault, doc_id, netlist,
-                                        expected_doc_id=None, expected_fault=None, cancel=None) -> str:
+                                        expected_doc_id=None, expected_fault=None, cancel=None,
+                                        view=None) -> str:
     """Execute off the event loop; cancellation waits for supervised cleanup."""
     if expected_doc_id is not None and str(doc_id) != str(expected_doc_id):
         raise ValueError("Tool document does not match the authoritative problem")
@@ -76,7 +93,7 @@ async def fault_simulation_tool_handler(input_vector, output_vector, fault, doc_
             snapshot = runner(input_vector, output_vector, fault, model, gates, module_name=doc_id)
         if 'error' in snapshot.columns:
             return str(snapshot.loc[0, 'error'])
-        return snapshot[['Good Machine', 'Bad Machine']].to_json()
+        return observation(snapshot, fault, view)
     task = asyncio.create_task(asyncio.to_thread(execute))
     try:
         return await asyncio.shield(task)

@@ -88,6 +88,14 @@ def _parse_args() -> argparse.Namespace:
         help="Share of tool-format examples that start with a real failed "
              "call and train the diagnosis and retry.",
     )
+    parser.add_argument(
+        "--tool-view",
+        choices=("po_fault", "full"),
+        default="po_fault",
+        help="What the fault-simulation tool shows the model: primary outputs "
+             "and the fault site (default), or the full Good/Bad table. GRPO "
+             "rollouts must use the view the SFT model was trained with.",
+    )
     parser.add_argument("--max-flips", type=int, default=3,
                         help="Inputs flipped to make a failed first call.")
     parser.add_argument("--eval-split", help="Held-out split (v3: validation).")
@@ -424,12 +432,12 @@ def _tool_example(record, args, gate_funcs, vocab, tokenizer, rejections, salt):
     if attempt is not None:
         example = build_tool_sft_example(
             record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
-            failed_attempt=attempt, rejections=rejections,
+            failed_attempt=attempt, rejections=rejections, tool_view=args.tool_view,
         )
     if example is None:
         example = build_tool_sft_example(
             record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
-            rejections=rejections,
+            rejections=rejections, tool_view=args.tool_view,
         )
     return example
 
@@ -455,7 +463,7 @@ def _held_out(args, gate_funcs, vocab, tokenizer):
                                      max_flips=args.max_flips)
             if attempt is not None and build_tool_sft_example(
                 record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
-                failed_attempt=attempt,
+                failed_attempt=attempt, tool_view=args.tool_view,
             ) is not None:
                 probes.append(ProbeItem(record=record, failed_attempt=attempt))
         if len(examples) >= args.eval_examples and len(probes) >= args.probe_examples:
@@ -546,7 +554,7 @@ def train_sft(args: argparse.Namespace) -> None:
         if probe and probes:
             result = run_tool_probe(
                 model, tokenizer, probes, gate_funcs, vocab, device=device,
-                max_new_tokens=args.probe_max_new_tokens,
+                max_new_tokens=args.probe_max_new_tokens, tool_view=args.tool_view,
             )
             samples = result.pop("samples")
             row.update({f"probe_{k}": v for k, v in result.items()})

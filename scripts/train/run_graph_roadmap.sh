@@ -93,6 +93,7 @@ case "${STAGE:?STAGE is required}" in
         [ -n "${MAX_ROWS_PER_CIRCUIT:-}" ] && CMD+=(--max-rows-per-circuit "$MAX_ROWS_PER_CIRCUIT")
         [ "${TOOL_FORMAT:-True}" = False ] && CMD+=(--no-tool-format)
         [ -n "${RETRY_FRACTION:-}" ] && CMD+=(--retry-fraction "$RETRY_FRACTION")
+        [ -n "${TOOL_VIEW:-}" ] && CMD+=(--tool-view "$TOOL_VIEW")
         [ -n "${EVAL_SPLIT:-}" ] && CMD+=(--eval-split "$EVAL_SPLIT")
         [ -n "${EVAL_EVERY:-}" ] && CMD+=(--eval-every "$EVAL_EVERY")
         [ -n "${EVAL_EXAMPLES:-}" ] && CMD+=(--eval-examples "$EVAL_EXAMPLES")

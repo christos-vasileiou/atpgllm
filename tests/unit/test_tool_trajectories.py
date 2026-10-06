@@ -132,3 +132,49 @@ def test_tool_conversation_labels_only_trainable_turns():
     assert "Drive n1 to 1" not in trained          # the failed turn's reasoning
     assert "\"Good Machine\":" not in trained      # tool responses (JSON)
     assert trained.count("<tool_call>") == 1       # only the corrected call
+
+
+def test_po_fault_view_keeps_outputs_and_fault_site():
+    from atpgllm.training.tool_feedback import shown_snapshot
+
+    record = _record()
+    blocked = simulate(record, {"a": 1, "b": 1, "c": 1})
+    shown = json.loads(shown_snapshot(blocked, "sa0 n1", ["y"], "po_fault"))
+    assert list(shown["Good Machine"]) == ["n1", "y"]       # table order kept
+    assert shown["Bad Machine"] == {"n1": 0, "y": 1}
+    assert shown_snapshot(blocked, "sa0 n1", ["y"], "full") == blocked
+    with pytest.raises(ValueError):
+        shown_snapshot(blocked, "sa0 n1", ["y"], "pis_only")
+
+
+def test_live_tool_and_sft_show_the_same_view(monkeypatch):
+    import asyncio
+
+    from atpgllm.training.tool_feedback import shown_snapshot
+    from atpgllm.training.tools import fault_simulation_tool_handler
+
+    record = _record()
+    vector = {"a": 1, "b": 1, "c": 1}
+    monkeypatch.setenv("FAULT_SIM_TOOL_VIEW", "po_fault")
+    live = asyncio.run(fault_simulation_tool_handler(
+        vector, {"y": 1}, "sa0 n1", "tiny", record["netlist"]
+    ))
+    assert live == shown_snapshot(simulate(record, vector), "sa0 n1", ["y"], "po_fault")
+
+
+def test_retry_under_po_fault_view_cites_only_what_is_shown():
+    record = _record()
+    attempt = next(
+        a for a in (failed_attempt(record, random.Random(s)) for s in range(50))
+        if a.reading.activated
+    )
+    retry = ConversationExample.from_record(
+        copy.deepcopy(record), use_tools=True, failed_attempt=attempt,
+        tool_view="po_fault",
+    )
+    tool_messages = [m["content"] for m in retry.messages if m["role"] == "tool"]
+    assert all(set(json.loads(t)["Good Machine"]) == {"n1", "y"} for t in tool_messages)
+    diagnosis = retry.messages[4]["content"]
+    assert "The fault is activated (n1 is 1 in the Good Machine and 0 in the Bad Machine), but" in diagnosis
+    with pytest.raises(ValueError):
+        ConversationExample.from_record(copy.deepcopy(record), tool_view="po_fault")
