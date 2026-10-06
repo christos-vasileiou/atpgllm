@@ -20,7 +20,7 @@ from typing import List, Dict, Any, Optional
 import regex as re
 
 from atpgllm.training.template_rendering import render_reasoning_template
-from atpgllm.training.tools import FAULT_SIMULATION_TOOL
+from atpgllm.training.tools import FAULT_SIMULATION_TOOL, tool_view as configured_tool_view
 
 FAULT_PATTERN = re.compile(r"(sa)(\d)\s+(.+)", re.IGNORECASE)
 INDEXED_BRACKET_PATTERN = re.compile(r"^(.+)\[(\d+)\]$")
@@ -295,7 +295,7 @@ class ConversationExample:
         *,
         failed_attempt: Any = None,
         interpret_results: bool = False,
-        tool_view: str = "full",
+        tool_view: Optional[str] = None,
     ) -> "ConversationExample":
         """
         Create a ConversationExample from a dataset record.  This method
@@ -324,11 +324,13 @@ class ConversationExample:
             Good and Bad Machine differ, instead of a generic sentence.
             Implied by ``failed_attempt``. Both default off, so the default
             conversation is unchanged.
-        tool_view : str
+        tool_view : str, optional
             What the tool messages show (``tool_feedback.TOOL_VIEWS``):
-            ``full`` (default) is the simulator's whole table; ``po_fault``
-            keeps the primary outputs and the fault site. Interpretations
-            are read from the same view, so they cite only what is shown.
+            ``full`` is the simulator's whole table; ``po_fault`` keeps the
+            primary outputs and the fault site. Interpretations are read from
+            the same view, so they cite only what is shown. Default: the
+            ``FAULT_SIM_TOOL_VIEW`` setting the RL tool handler also reads
+            (``full`` when unset), so SFT data and rollouts agree.
 
         Returns
         -------
@@ -356,7 +358,9 @@ class ConversationExample:
         """
         if failed_attempt is not None and not use_tools:
             raise ValueError("A retry trajectory needs use_tools=True.")
-        if tool_view != "full" and not use_tools:
+        if tool_view is None:
+            tool_view = configured_tool_view() if use_tools else "full"
+        elif tool_view != "full" and not use_tools:
             raise ValueError("A tool view needs use_tools=True.")
         prep = ConversationExample._prepare_record(record)
         system_content = prep["system_content"]

@@ -73,6 +73,10 @@ async def fault_simulation_tool_handler(input_vector, output_vector, fault, doc_
                                         expected_doc_id=None, expected_fault=None, cancel=None,
                                         view=None) -> str:
     """Execute off the event loop; cancellation waits for supervised cleanup."""
+    if not isinstance(fault, str):
+        raise TypeError("fault must be a string such as 'sa0 <net>'")
+    if not isinstance(doc_id, str):
+        raise TypeError("doc_id must be the netlist's doc_id string")
     if expected_doc_id is not None and str(doc_id) != str(expected_doc_id):
         raise ValueError("Tool document does not match the authoritative problem")
     if expected_fault is not None and fault.strip() != expected_fault.strip():
@@ -110,6 +114,13 @@ def tool_deadline_s():
     return acquire_timeout_s() + per_run_timeout_s() + 20
 
 
+class ToolContext(dict):
+    """The problem a tool call is checked and run against (``netlist``,
+    ``expected_doc_id``, ``expected_fault``, optionally ``view``), given by
+    the caller instead of parsed from the prompt; graph-conditioned prompts
+    carry no netlist."""
+
+
 def _execute_tool(item, functions, cancelled):
     call, prompt = item
     try:
@@ -122,7 +133,7 @@ def _execute_tool(item, functions, cancelled):
         if not isinstance(args, dict) or set(args) != {'input_vector','output_vector','fault','doc_id'}:
             raise ValueError('Tool arguments must match the fault_simulation_tool schema')
         args = dict(args)
-        args.update(ToolHelper.context(prompt))
+        args.update(prompt if isinstance(prompt, ToolContext) else ToolHelper.context(prompt))
         if name == 'fault_simulation_tool':
             args['cancel'] = cancelled
         fn = functions[name]

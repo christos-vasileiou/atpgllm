@@ -13,11 +13,20 @@ from the snapshot and call the tool again with a fixed pattern
 ``--eval-split`` scores held-out loss (single-call and retry examples
 separately); ``--probe-examples`` runs the model on held-out circuits and
 simulates its tool calls (:mod:`atpgllm.multimodal.tool_probe`).
+
+GRPO (Stage D) rolls out multi-turn tool use: the model writes a turn, a tool
+call in it is simulated (the same handler and view as SFT, with the netlist
+from the record), the answer is appended as context, and the model continues,
+up to ``--max-tool-calls`` (:mod:`atpgllm.multimodal.tool_rollout`). The
+reward scores the final turn's vector with a full simulation; advantages are
+GDPO (default, per-objective) or GRPO (scalar). Only the model's own tokens
+are trained.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import collections
 import copy
 import json
@@ -29,6 +38,7 @@ from typing import Any, Iterable
 
 import torch
 from datasets import load_dataset
+from torch_geometric.data import Batch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from atpgllm.graph.checkpoints import (
@@ -41,14 +51,34 @@ from atpgllm.graph.checkpoints import (
 from atpgllm.graph.gate_features import GateAttributeVocab
 from atpgllm.multimodal import (
     GraphConditionedCausalLM,
-    build_graph_prompt_example,
     build_multimodal_sft_batch,
     graph_grpo_loss,
     group_relative_advantages,
     load_aligned_graph_stack,
 )
 from atpgllm.graph.circuit_sampling import sampled_records
-from atpgllm.multimodal.data import build_tool_sft_example, collate_tool_sft
+from atpgllm.graph.dataset import record_to_pyg
+from atpgllm.llm.reward_funcs import train_scalar_from_reward_components
+from atpgllm.multimodal.data import (
+    _compact_netlist_payload,
+    _template_ids,
+    build_tool_sft_example,
+    collate_tool_sft,
+)
+from atpgllm.multimodal.tool_rollout import reward_text, rollout_group, turn_stop
+from atpgllm.training.conversation import ConversationExample
+from atpgllm.training.gdpo import (
+    compute_gdpo_advantages,
+    reward_output_to_tensors,
+    select_objective_columns,
+)
+from atpgllm.training.tool_feedback import read_snapshot
+from atpgllm.training.tools import (
+    SimulationError,
+    ToolContext,
+    execute_tool_batch,
+    fault_simulation_tool_handler,
+)
 from atpgllm.multimodal.tool_probe import ProbeItem, run_tool_probe
 from atpgllm.training._paths import resolve_sim_config_path
 from atpgllm.training.tool_trajectories import failed_attempt, record_seed
@@ -152,6 +182,18 @@ def _parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--num-generations", type=int, default=8)
+    parser.add_argument("--max-tool-calls", type=int, default=3,
+                        help="GRPO: tool calls per trajectory (SFT shows up to 2).")
+    # Smoke tests only: an untrained policy scores 0 everywhere, so every
+    # group is skipped and the update path never runs.
+    parser.add_argument("--debug-random-advantages", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--advantage",
+        choices=("gdpo", "grpo"),
+        default="gdpo",
+        help="GRPO: per-objective GDPO advantages (default) or scalar GRPO.",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.03)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
@@ -663,6 +705,66 @@ def _reference_prefix(
     return projector(queries)
 
 
+def _grpo_prompt(record: dict[str, Any], tokenizer) -> list[int]:
+    """System + user turn with the tool schema; the netlist is the graph."""
+    messages = ConversationExample.prompt_messages_from_record(copy.deepcopy(record))
+    full, compact = _compact_netlist_payload(record)
+    for message in messages:
+        if message["role"] == "user":
+            message["content"] = message["content"].replace(full, compact)
+    return _template_ids(tokenizer, messages, generation_prompt=True)
+
+
+def _tool_runner(record: dict[str, Any], view: str):
+    """Runs a batch of the model's calls for this record's circuit and fault.
+    Errors in model-written arguments come back to the model as text;
+    simulator infrastructure failures stop the run before any update."""
+    full, _ = _compact_netlist_payload(record)
+    netlist = record["netlist"]["netlist"] if isinstance(record["netlist"], dict) else record["netlist"]
+    context = ToolContext(
+        netlist=netlist,
+        expected_doc_id=ast.literal_eval(full)["doc_id"],
+        expected_fault=record["fault"],
+        view=view,
+    )
+    functions = {"fault_simulation_tool": fault_simulation_tool_handler}
+
+    def run(calls: list[dict[str, Any]]) -> list[str]:
+        outcomes = execute_tool_batch(calls, [context] * len(calls), functions)
+        if any(failed for _, failed in outcomes):
+            raise SimulationError(
+                "Simulator infrastructure failure during a rollout; no update performed."
+            )
+        return [content for content, _ in outcomes]
+
+    return run
+
+
+def _rollout_stats(trajectories, record) -> dict[str, float]:
+    outputs = list(json.loads(record["expected_output"]))
+    stats = collections.Counter()
+    for trajectory in trajectories:
+        results = trajectory.tool_results
+        stats["trajectories"] += 1
+        stats["tool_calls"] += len(results)
+        stats["malformed_calls"] += sum(r.startswith("Tool execution failed") for r in results)
+        stats["truncated"] += trajectory.truncated
+        stats["call_limit_hit"] += trajectory.call_limit_hit
+        detected = []
+        for result in results:
+            try:
+                detected.append(read_snapshot(result, record["fault"], outputs).detected)
+            except (ValueError, KeyError, TypeError):
+                detected.append(False)
+        if detected:
+            stats["called"] += 1
+            stats["first_call_detects"] += detected[0]
+            if not detected[0]:
+                stats["first_call_missed"] += 1
+                stats["recovered"] += any(detected[1:])
+    return stats
+
+
 def train_grpo(args: argparse.Namespace) -> None:
     if args.sft_ckpt is None and args.resume is None:
         raise ValueError("GRPO requires --sft-ckpt or --resume.")
@@ -682,20 +784,25 @@ def train_grpo(args: argparse.Namespace) -> None:
             vocab=vocab,
         )
         source_payload = resume_payload
-        adapter_path = args.adapter or Path(source_payload["session"]["adapter_path"])
     else:
         source_payload = load_stage_checkpoint(
             args.sft_ckpt,
             expected_stages=[STAGE_MULTIMODAL_SFT],
             vocab=vocab,
         )
-        adapter_path = args.adapter or Path(source_payload["session"]["adapter_path"])
+    adapter_path = args.adapter or Path(source_payload["session"]["adapter_path"])
+    sft_view = source_payload["session"].get("tool_view")
+    if sft_view is not None and sft_view != args.tool_view:
+        raise ValueError(
+            f"--tool-view {args.tool_view!r} differs from the SFT model's {sft_view!r}."
+        )
 
-    llm = _load_grpo_llm(
-        args,
-        adapter_path,
-        resume=resume_payload is not None,
-    )
+    llm = _load_grpo_llm(args, adapter_path, resume=resume_payload is not None)
+    # As TRL does for GRPO: sampling and the trained policy should be the
+    # same function, so the LM's dropout is off.
+    for module in llm.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.p = 0.0
     model = GraphConditionedCausalLM(graph_encoder, q_former, llm)
     _load_module_state(model, source_payload["states"])
     model.set_graph_policy(args.graph_policy)
@@ -703,27 +810,14 @@ def train_grpo(args: argparse.Namespace) -> None:
     for module in (model.graph_encoder, model.q_former, model.graph_to_llm):
         module.to(device)
 
+    reference_modules = (
+        copy.deepcopy(model.graph_encoder),
+        copy.deepcopy(model.q_former),
+        copy.deepcopy(model.graph_to_llm),
+    )
     if resume_payload:
-        reference_modules = (
-            copy.deepcopy(model.graph_encoder),
-            copy.deepcopy(model.q_former),
-            copy.deepcopy(model.graph_to_llm),
-        )
-        reference_modules[0].load_state_dict(
-            resume_payload["states"]["reference_graph_encoder"]
-        )
-        reference_modules[1].load_state_dict(
-            resume_payload["states"]["reference_q_former"]
-        )
-        reference_modules[2].load_state_dict(
-            resume_payload["states"]["reference_graph_to_llm"]
-        )
-    else:
-        reference_modules = (
-            copy.deepcopy(model.graph_encoder),
-            copy.deepcopy(model.q_former),
-            copy.deepcopy(model.graph_to_llm),
-        )
+        for module, name in zip(reference_modules, ("graph_encoder", "q_former", "graph_to_llm")):
+            module.load_state_dict(resume_payload["states"][f"reference_{name}"])
     for module in reference_modules:
         module.eval()
         for parameter in module.parameters():
@@ -731,162 +825,206 @@ def train_grpo(args: argparse.Namespace) -> None:
 
     architecture = _architecture(model, alignment, args)
     if source_payload["architecture"] != architecture:
-        raise ValueError(
-            "SFT/GRPO architecture differs from the source checkpoint."
-        )
+        raise ValueError("SFT/GRPO architecture differs from the source checkpoint.")
     optimizer = _optimizer(model, args)
     if resume_payload and resume_payload.get("optimizer"):
         optimizer.load_state_dict(resume_payload["optimizer"])
     step = int(resume_payload["step"]) if resume_payload else 0
+    parent_stage = STAGE_MULTIMODAL_GRPO if resume_payload else STAGE_MULTIMODAL_SFT
     reward_fn = RewardFunctionFactory(
         str(resolve_sim_config_path(args.sim_config))
-    ).create_reward_function(return_component_dicts=False)
+    ).create_reward_function(return_component_dicts=True)
+    _, stop = turn_stop(tokenizer)
+    metrics_path = args.output_dir / "metrics.jsonl"
+    probes: list = []
+    if args.eval_split and args.probe_examples:
+        saved = args.eval_examples
+        args.eval_examples = 0
+        _, probes, _ = _held_out(args, gate_funcs, vocab, tokenizer)
+        args.eval_examples = saved
 
-    stream = load_dataset(
-        args.dataset,
-        split=args.split,
-        streaming=True,
-    ).shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
-    model.train()
+    def train_mode() -> None:
+        # The LM trains with gradient checkpointing (train mode); the graph
+        # encoder keeps its BatchNorm statistics and no dropout, so the
+        # prefix it trains is the one generation used. Its weights still learn.
+        model.train()
+        model.graph_encoder.eval()
+
+    def save(name: str) -> None:
+        _save(
+            model,
+            optimizer,
+            path=args.output_dir / f"multimodal_grpo_{name}.pt",
+            adapter_path=args.output_dir / f"adapters_{name}",
+            stage=STAGE_MULTIMODAL_GRPO,
+            parent_stage=parent_stage,
+            vocab=vocab,
+            architecture=architecture,
+            step=step,
+            args=args,
+            reference_modules=reference_modules,
+        )
+
+    def probe() -> None:
+        if not probes:
+            return
+        result = run_tool_probe(
+            model, tokenizer, probes, gate_funcs, vocab, device=device,
+            max_new_tokens=args.probe_max_new_tokens, tool_view=args.tool_view,
+        )
+        samples = result.pop("samples")
+        (args.output_dir / f"probe_samples_step{step}.json").write_text(json.dumps(samples, indent=2))
+        row = {"step": step, **{f"probe_{k}": v for k, v in result.items()}}
+        _append_jsonl(metrics_path, row)
+        print("eval " + json.dumps(row), flush=True)
+        train_mode()
+
+    needed = int(3 * args.max_steps * args.grad_accum)
+    records = _records(args, args.split, per_circuit=args.max_rows_per_circuit,
+                       total=needed, seed=args.seed, repeat=True)
+    rejections: collections.Counter = collections.Counter()
+    window: collections.Counter = collections.Counter()
+    rewards_seen: list[float] = []
+    detections: list[float] = []
+    train_mode()
     optimizer.zero_grad(set_to_none=True)
-    accum_step = 0
-    for record in stream:
-        example = build_graph_prompt_example(
-            record,
-            gate_funcs,
-            vocab,
-            tokenizer,
-            max_prompt_length=args.max_prompt_length,
-        )
-        if example is None:
+    accumulated = 0
+    groups_seen = 0
+    started = time.time()
+    for record in records:
+        graph = record_to_pyg(record, gate_funcs, vocab, rejections=rejections)
+        if graph is None:
             continue
-        graph = example.graph.to(device)
-        prompt_ids = example.prompt_ids.to(device)
-        prompt_mask = example.prompt_mask.to(device)
-        model.llm.set_adapter("policy")
-        completion_ids, completion_mask = model.sample_group(
-            graph,
-            prompt_ids,
-            prompt_mask,
-            num_generations=args.num_generations,
-            max_new_tokens=args.max_completion_length,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            temperature=args.temperature,
-        )
-        completions = tokenizer.batch_decode(
-            completion_ids,
-            skip_special_tokens=True,
-        )
-        reward_kwargs = {
-            key: [value] * args.num_generations
-            for key, value in record.items()
-        }
-        reward_values = reward_fn(
-            prompts=[example.prompt] * args.num_generations,
-            completions=completions,
-            **reward_kwargs,
-        )
-        rewards = torch.tensor(reward_values, dtype=torch.float32, device=device)
-        advantages = group_relative_advantages(rewards)
-        repeated_prompt_ids = prompt_ids.repeat(args.num_generations, 1)
-        repeated_prompt_mask = prompt_mask.repeat(args.num_generations, 1)
+        prompt_ids = _grpo_prompt(record, tokenizer)
+        if len(prompt_ids) > args.max_prompt_length:
+            rejections["prompt_too_long"] += 1
+            continue
+        graph = Batch.from_data_list([graph]).to(device)
 
+        model.eval()
         with torch.no_grad():
-            policy_prefix = model.graph_soft_prompt(graph).repeat(
-                args.num_generations, 1, 1
-            )
-            old_log_probs = model.completion_log_probs(
-                graph,
-                repeated_prompt_ids,
-                repeated_prompt_mask,
-                completion_ids,
-                completion_mask,
-                prefix=policy_prefix,
-            )
-            model.llm.set_adapter("reference")
-            reference_prefix = _reference_prefix(
-                reference_modules,
-                graph,
-            ).repeat(args.num_generations, 1, 1)
-            reference_log_probs = model.completion_log_probs(
-                graph,
-                repeated_prompt_ids,
-                repeated_prompt_mask,
-                completion_ids,
-                completion_mask,
-                prefix=reference_prefix,
-            )
-            model.llm.set_adapter("policy")
+            prefix = model.graph_soft_prompt(graph)
 
-        policy_prefix = model.graph_soft_prompt(graph).repeat(
-            args.num_generations, 1, 1
+        def generate_turn(contexts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
+            return model.generate_turns(
+                prefix, contexts, pad_token_id=tokenizer.pad_token_id,
+                max_new_tokens=max_new_tokens, do_sample=True,
+                temperature=args.temperature, top_p=1.0, top_k=0, eos_token_id=stop,
+            )
+
+        trajectories = rollout_group(
+            generate_turn, tokenizer, prompt_ids, _tool_runner(record, args.tool_view),
+            num_generations=args.num_generations,
+            max_tool_calls=args.max_tool_calls,
+            max_completion_tokens=args.max_completion_length,
         )
-        policy_log_probs = model.completion_log_probs(
-            graph,
-            repeated_prompt_ids,
-            repeated_prompt_mask,
-            completion_ids,
-            completion_mask,
-            prefix=policy_prefix,
+        train_mode()
+        window.update(_rollout_stats(trajectories, record))
+
+        prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+        rows = reward_fn(
+            prompts=[prompt_text] * len(trajectories),
+            completions=[reward_text(t) for t in trajectories],
+            **{key: [value] * len(trajectories) for key, value in record.items()},
         )
-        loss = graph_grpo_loss(
-            policy_log_probs,
-            old_log_probs,
-            reference_log_probs,
-            completion_mask,
-            advantages,
-            clip_epsilon=args.clip_epsilon,
-            beta=args.beta,
+        scalars = torch.tensor(
+            [train_scalar_from_reward_components(row) for row in rows], device=device
         )
-        (loss / args.grad_accum).backward()
-        accum_step += 1
-        if accum_step < args.grad_accum:
+        rewards_seen.extend(scalars.tolist())
+        detections.extend(float(row.get("detection", 0.0)) for row in rows)
+        if args.advantage == "gdpo":
+            _, components, keys = reward_output_to_tensors(rows, device)
+            objectives = select_objective_columns(
+                components, keys, reward_fn.gdpo_objective_keys
+            )
+            advantages = compute_gdpo_advantages(
+                objectives, len(trajectories), reward_fn.gdpo_objective_weights
+            ).advantages
+        else:
+            advantages = group_relative_advantages(scalars)
+        if args.debug_random_advantages:
+            advantages = torch.randn(len(trajectories), device=device)
+        groups_seen += 1
+        signal = bool(advantages.ne(0).any())
+        print(
+            f"group {groups_seen}: rewards={[round(x, 3) for x in scalars.tolist()]} "
+            f"calls={[len(t.tool_results) for t in trajectories]} "
+            f"tokens={[len(t.completion_ids) for t in trajectories]} "
+            f"{'update' if signal else 'skipped: no signal'}",
+            flush=True,
+        )
+        if not signal:
+            window["zero_advantage_groups"] += 1
+            continue
+        window["groups"] += 1
+
+        prompt = torch.tensor([prompt_ids], device=device)
+        prompt_mask = torch.ones_like(prompt)
+        for index, trajectory in enumerate(trajectories):
+            if not any(trajectory.loss_mask):
+                continue
+            completion = torch.tensor([trajectory.completion_ids], device=device)
+            attention = torch.ones_like(completion)
+            with torch.no_grad():
+                model.llm.set_adapter("reference")
+                reference = model.completion_log_probs(
+                    graph, prompt, prompt_mask, completion, attention,
+                    prefix=_reference_prefix(reference_modules, graph),
+                )
+                model.llm.set_adapter("policy")
+            policy = model.completion_log_probs(
+                graph, prompt, prompt_mask, completion, attention,
+                prefix=model.graph_soft_prompt(graph),
+            )
+            loss = graph_grpo_loss(
+                policy,
+                policy.detach(),  # one update per rollout: the sampler is this policy
+                reference,
+                torch.tensor([trajectory.loss_mask], device=device),
+                advantages[index:index + 1],
+                clip_epsilon=args.clip_epsilon,
+                beta=args.beta,
+            )
+            (loss / (len(trajectories) * args.grad_accum)).backward()
+        accumulated += 1
+        if accumulated % args.grad_accum:
             continue
         torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad],
-            args.grad_clip,
+            [p for p in model.parameters() if p.requires_grad], args.grad_clip,
         )
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-        accum_step = 0
         step += 1
         if step % args.log_every == 0:
-            print(
-                f"step={step} grpo_loss={loss.item():.4f} "
-                f"reward_mean={rewards.mean().item():.4f} "
-                f"reward_std={rewards.std(unbiased=False).item():.4f}",
-                flush=True,
-            )
+            n = max(1, window["trajectories"])
+            row = {
+                "step": step,
+                "sec_per_step": round((time.time() - started) / args.log_every, 1),
+                "reward_mean": sum(rewards_seen) / max(1, len(rewards_seen)),
+                "detection_rate": sum(detections) / max(1, len(detections)),
+                "tool_calls_per_trajectory": window["tool_calls"] / n,
+                "first_call_detects": window["first_call_detects"] / max(1, window["called"]),
+                "recovery_rate": window["recovered"] / max(1, window["first_call_missed"]),
+                "malformed_call_share": window["malformed_calls"] / max(1, window["tool_calls"]),
+                "truncated_share": window["truncated"] / n,
+                "zero_advantage_group_share": window["zero_advantage_groups"]
+                / max(1, window["groups"] + window["zero_advantage_groups"]),
+                "rejected": dict(rejections),
+            }
+            _append_jsonl(metrics_path, row)
+            print("train " + json.dumps(row), flush=True)
+            window.clear()
+            rewards_seen.clear()
+            detections.clear()
+            started = time.time()
+        if args.probe_every and step % args.probe_every == 0 and step < args.max_steps:
+            probe()
         if step % args.save_every == 0:
-            _save(
-                model,
-                optimizer,
-                path=args.output_dir / f"multimodal_grpo_step{step}.pt",
-                adapter_path=args.output_dir / f"adapters_step{step}",
-                stage=STAGE_MULTIMODAL_GRPO,
-                parent_stage=STAGE_MULTIMODAL_GRPO if resume_payload else STAGE_MULTIMODAL_SFT,
-                vocab=vocab,
-                architecture=architecture,
-                step=step,
-                args=args,
-                reference_modules=reference_modules,
-            )
+            save(f"step{step}")
         if step >= args.max_steps:
             break
-    _save(
-        model,
-        optimizer,
-        path=args.output_dir / "multimodal_grpo_final.pt",
-        adapter_path=args.output_dir / "adapters_final",
-        stage=STAGE_MULTIMODAL_GRPO,
-        parent_stage=STAGE_MULTIMODAL_GRPO if resume_payload else STAGE_MULTIMODAL_SFT,
-        vocab=vocab,
-        architecture=architecture,
-        step=step,
-        args=args,
-        reference_modules=reference_modules,
-    )
+    probe()
+    save("final")
 
 
 def main() -> None:

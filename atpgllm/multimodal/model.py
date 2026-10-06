@@ -170,6 +170,45 @@ class GraphConditionedCausalLM(nn.Module):
         )
 
     @torch.no_grad()
+    def generate_turns(
+        self,
+        prefix: Tensor,
+        contexts: list[list[int]],
+        *,
+        pad_token_id: int,
+        **kwargs,
+    ) -> list[list[int]]:
+        """One batched generation over several token contexts that share one
+        graph prefix (``[1, Q, D]``). Each row is left-padded before the
+        prefix, so its positions run contiguously; returns the new tokens of
+        each row, unpadded."""
+        embed = self.llm.get_input_embeddings()
+        width = max(len(ids) for ids in contexts)
+        rows, masks = [], []
+        prefix = prefix.to(device=embed.weight.device, dtype=embed.weight.dtype)
+        for ids in contexts:
+            pad = width - len(ids)
+            tokens = torch.tensor(
+                [pad_token_id] * pad + list(ids), device=embed.weight.device
+            )
+            embeddings = embed(tokens)
+            rows.append(torch.cat([embeddings[:pad], prefix[0], embeddings[pad:]], dim=0))
+            masks.append(torch.tensor(
+                [0] * pad + [1] * (prefix.size(1) + len(ids)), device=embed.weight.device
+            ))
+        output = self.llm.generate(
+            inputs_embeds=torch.stack(rows),
+            attention_mask=torch.stack(masks),
+            pad_token_id=pad_token_id,
+            use_cache=True,
+            **kwargs,
+        )
+        return [
+            [token for token in row.tolist() if token != pad_token_id]
+            for row in output
+        ]
+
+    @torch.no_grad()
     def sample_group(
         self,
         graph,

@@ -561,6 +561,22 @@ activate && python scripts/train/multimodal_training.py --method grpo \
   --output-dir runs/multimodal_grpo --graph-policy full
 ```
 
+Rollouts are multi-turn (`atpgllm/multimodal/tool_rollout.py`): the model
+writes a turn; a fault-simulation call in it is executed by the shared handler
+(`atpgllm/training/tools.py`, so the fast simulator or TetraMAX via
+`resolve_fault_sim_runner()`), with the netlist, doc_id and fault taken from
+the record because the prompt carries the graph instead; the answer is
+appended in the chat template's tool format and the model continues, up to
+`--max-tool-calls`. Errors in model-written arguments come back as tool
+messages; simulator infrastructure failures stop the run. Only the model's
+own tokens are trained. The rendering matches Stage C's SFT token for token
+(`tests/unit/test_tool_rollout.py`). The reward fully simulates the vector of
+the final turn (reports in earlier turns are renamed so they are not scored);
+advantages are GDPO by default (`--advantage grpo` for scalar). `--tool-view`
+must match the SFT model's and is checked against its checkpoint. Groups whose
+rollouts score alike are skipped. Config:
+`scripts/train/configs/multimodal_grpo_v3.conf`.
+
 GRPO uses the existing fault-simulation reward factory. A frozen SFT LoRA
 adapter and frozen SFT graph stack form the reference policy; a separate policy
 adapter plus the selected graph modules are optimized jointly. The local
