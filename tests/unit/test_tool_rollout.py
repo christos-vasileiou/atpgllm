@@ -148,3 +148,18 @@ def test_malformed_model_arguments_come_back_as_tool_errors():
     assert not failed and reply == (
         "Tool execution failed: fault must be a string such as 'sa0 <net>'"
     )
+
+
+def test_reward_trace_pairs_each_executed_call_with_its_turn():
+    from atpgllm.multimodal.tool_rollout import Trajectory, reward_trace
+
+    call = '<tool_call>\n{"name": "fault_simulation_tool", "arguments": {"input_vector": "a=1"}}\n</tool_call>'
+    trajectory = Trajectory(
+        turns=["<think>r</think>\n" + call, "<think>r</think>\n" + call],
+        tool_results=["{}"],
+        call_limit_hit=True,
+    )
+    trace = reward_trace(trajectory)
+    assert trace["calls"] == [{"arguments": {"input_vector": "a=1"}, "result": "{}"}]
+    # The second call was not run, so its turn is the (unanswered) final turn.
+    assert len(trace["turns"]) == 2

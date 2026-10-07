@@ -139,3 +139,16 @@ def reward_text(trajectory: Trajectory) -> str:
                 "<tool_response>\n" + trajectory.tool_results[index] + "\n</tool_response>"
             )
     return "\n".join(parts)
+
+
+def reward_trace(trajectory: Trajectory) -> Dict[str, Any]:
+    """The reward's ``tool_trace``: the model's turns and the calls that ran.
+
+    Each executed call is the one parsed from the turn before its result; a
+    turn whose call was not run (``call_limit_hit``) stays the final turn.
+    """
+    calls = []
+    for turn, result in zip(trajectory.turns, trajectory.tool_results):
+        call = parse_tool_call(turn)
+        calls.append({"arguments": call.get("arguments") if call else None, "result": result})
+    return {"turns": list(trajectory.turns), "calls": calls}

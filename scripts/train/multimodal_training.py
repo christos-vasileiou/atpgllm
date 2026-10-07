@@ -18,9 +18,10 @@ GRPO (Stage D) rolls out multi-turn tool use: the model writes a turn, a tool
 call in it is simulated (the same handler and view as SFT, with the netlist
 from the record), the answer is appended as context, and the model continues,
 up to ``--max-tool-calls`` (:mod:`atpgllm.multimodal.tool_rollout`). The
-reward scores the final turn's vector with a full simulation; advantages are
-GDPO (default, per-objective) or GRPO (scalar). Only the model's own tokens
-are trained.
+reward scores the trajectory's tool calls, simulating only the last turn that
+called the tool (:func:`atpgllm.llm.reward_funcs.test_generation_grpo_reward`);
+advantages are GDPO (default, per-objective) or GRPO (scalar). Only the
+model's own tokens are trained.
 """
 
 from __future__ import annotations
@@ -65,7 +66,7 @@ from atpgllm.multimodal.data import (
     build_tool_sft_example,
     collate_tool_sft,
 )
-from atpgllm.multimodal.tool_rollout import reward_text, rollout_group, turn_stop
+from atpgllm.multimodal.tool_rollout import reward_text, reward_trace, rollout_group, turn_stop
 from atpgllm.training.conversation import ConversationExample
 from atpgllm.training.gdpo import (
     compute_gdpo_advantages,
@@ -925,13 +926,17 @@ def train_grpo(args: argparse.Namespace) -> None:
         rows = reward_fn(
             prompts=[prompt_text] * len(trajectories),
             completions=[reward_text(t) for t in trajectories],
+            tool_trace=[reward_trace(t) for t in trajectories],
             **{key: [value] * len(trajectories) for key, value in record.items()},
         )
         scalars = torch.tensor(
             [train_scalar_from_reward_components(row) for row in rows], device=device
         )
         rewards_seen.extend(scalars.tolist())
-        detections.extend(float(row.get("detection", 0.0)) for row in rows)
+        # The final answer's detection; the objective divides it by attempts.
+        detections.extend(
+            float(row.get("fault_detected_by_pred_input_vector_acc_logonly", 0.0)) for row in rows
+        )
         if args.advantage == "gdpo":
             _, components, keys = reward_output_to_tensors(rows, device)
             objectives = select_objective_columns(

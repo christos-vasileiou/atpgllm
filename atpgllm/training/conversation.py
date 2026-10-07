@@ -453,12 +453,14 @@ class ConversationExample:
                         "name": FAULT_SIMULATION_TOOL['function']['name'],
                         "content": failed_table,
                     })
+                    # A negative result is followed by new reasoning and a new
+                    # call, the protocol the GRPO format objective checks.
                     messages.append({
                         "role": "assistant",
                         "content": (
-                            undetected_sentence(reading) + " "
+                            "<think>" + undetected_sentence(reading) + " "
                             + revision_sentence(reading, failed_attempt.changes)
-                            + "\n"
+                            + "</think>\n\n"
                         ),
                         "tool_calls": [{
                             "type": "function",
