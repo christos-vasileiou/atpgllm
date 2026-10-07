@@ -9,6 +9,7 @@
 set -euo pipefail
 PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 cd "$PROJECT_ROOT"
+DATA_PREPROCESSING="${DATA_PREPROCESSING_ROOT:-$PROJECT_ROOT/data_preprocessing}"
 if ! type module >/dev/null 2>&1; then
     if [[ -f /etc/profile.d/lmod.sh ]]; then
         source /etc/profile.d/lmod.sh
@@ -21,8 +22,8 @@ export TMAX_TIMEOUT_S="${TMAX_TIMEOUT_S:-120}"
 export TMAX_ACQUIRE_TIMEOUT_S="${TMAX_ACQUIRE_TIMEOUT_S:-120}"
 SIM_PYTHON="${SIM_PYTHON:-/work/cxv200006/myenv/bin/python}"
 if [[ "${TMAX_RECONFIGURE_DRAINED:-0}" == 1 ]]; then
-    "$SIM_PYTHON" data_preprocessing/tetramax_pool.py resume
+    "$SIM_PYTHON" "$DATA_PREPROCESSING"/tetramax_pool.py resume
 fi
-exec "$SIM_PYTHON" data_preprocessing/tetramax_service.py \
+exec "$SIM_PYTHON" "$DATA_PREPROCESSING"/tetramax_service.py \
     --host 0.0.0.0 --workers "${TMAX_SERVICE_WORKERS:-16}" \
     --queue-size "${TMAX_QUEUE_SIZE:-128}" --port "${TMAX_SERVICE_PORT:-8766}"

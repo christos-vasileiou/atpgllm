@@ -10,7 +10,12 @@ from pathlib import Path
 _THIS = Path(__file__).resolve()
 LIBATPGLLM_ROOT = _THIS.parents[2]
 MONOREPO_ROOT = _THIS.parents[3]
-DATA_PREPROCESSING = MONOREPO_ROOT / "data_preprocessing"
+# DATA_PREPROCESSING_ROOT pairs this checkout with any data_preprocessing checkout
+# (e.g. a worktree on the paired branch); default is the sibling directory.
+_override = os.environ.get("DATA_PREPROCESSING_ROOT")
+DATA_PREPROCESSING = Path(_override).expanduser().resolve() if _override else MONOREPO_ROOT / "data_preprocessing"
+if not DATA_PREPROCESSING.is_dir():
+    raise FileNotFoundError(f"data_preprocessing checkout not found: {DATA_PREPROCESSING} (DATA_PREPROCESSING_ROOT={_override!r})")
 PACKAGE_DATA_DIR = _THIS.parent / "data"
 DEFAULT_SIM_CONFIG = PACKAGE_DATA_DIR / "sim_config.json"
 

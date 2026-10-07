@@ -99,11 +99,14 @@ def test_native_rewards_mask_unknowns_and_exclude_internal_objective(monkeypatch
                         'PIs':[True,False,False],'POs':[False,True,True]},index=['a','y','z'])
     def simulator(*args,**kw):
         return frame,{'tetramax_available':True,'tetramax_detected':True}
+    # A call verified the answer, so fidelity is scored against its frame.
+    verified={'turns':['','answer'],'calls':[{'arguments':{'input_vector':'a:1'},
+              'result':'{"Good Machine":{},"Bad Machine":{}}'}]}
     result=score(['sa0 y']*2,['answer']*2,
         netlists=[SimpleNamespace(input_nets=['a'],output_nets=['y','z'])]*2,
         fault_fn=lambda *a,**k:[('sa0','y')], simulation_fn=lambda _:[],
         input_vector_fn=lambda _:['a:1'],expected_output_fn=lambda _:['y:1,z:0'],
-        detected_faults_fn=lambda _:['sa0 y'],fault_sim=simulator)
+        detected_faults_fn=lambda _:['sa0 y'],fault_sim=simulator,tool_trace=[verified]*2)
     assert active_reward_objectives()[0]==('detection','fidelity','format')
     assert len(result)==2
     for reward in result:
@@ -131,7 +134,10 @@ def test_reward_failure_reports_cause_without_hiding_infrastructure(monkeypatch,
         module_name=['design'], fault_fn=lambda *a, **k: [('sa0', 'y')],
         simulation_fn=lambda _: [], input_vector_fn=lambda _: ['a:1'],
         expected_output_fn=lambda _: ['y:1'], detected_faults_fn=lambda _: ['sa0 y'],
-        fault_sim=simulator)[0]
+        fault_sim=simulator,
+        # The reward simulates the model's last tool call.
+        tool_trace=[{'turns': ['', 'answer'], 'calls': [{'arguments': {'input_vector': 'a:1'},
+                     'result': '{"Good Machine":{},"Bad Machine":{}}'}]}])[0]
     log = capsys.readouterr().err
     assert reward['detection'] == 0
     assert reward['simulator_error_logonly'] == float(failure != 'invalid_request')

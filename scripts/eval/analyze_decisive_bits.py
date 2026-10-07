@@ -125,15 +125,17 @@ def load_run(path, bin_of, circuits):
             c["novec"] += 1
             continue
         rc = slot["reward_components"]
+        # The final answer's detection; the objective divides it by attempts.
+        detected = float(rc.get("fault_detected_by_pred_input_vector_acc_logonly", rc["detection"]))
         zeros = all(int(x) == 0 for x in v.values())
         c["fin"] += 1
-        c["det"] += rc["detection"]
+        c["det"] += detected
         c["zeros"] += zeros
         polarity = slot["fault"].split()[0]
         c[f"{polarity}_fin"] += 1
         kind = f"{polarity}_{'zeros' if zeros else 'other'}"
         c[kind] += 1
-        c[f"{kind}_det"] += rc["detection"]
+        c[f"{kind}_det"] += detected
         if finite(rc.get("activation")):
             c[f"{kind}_act_n"] += 1
             c[f"{kind}_act"] += rc["activation"]
@@ -141,7 +143,7 @@ def load_run(path, bin_of, circuits):
             q = per_problem[p]
             q[0] += 1
             q[1] += rc["activation"]
-            q[2] += rc["detection"]
+            q[2] += detected
         circuit = circuits.get(p)
         if circuit is None or any(n not in v for n in circuit.meta.input_nets):
             continue
