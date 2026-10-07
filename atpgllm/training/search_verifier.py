@@ -177,12 +177,19 @@ class Verifier:
         text = "\n".join(f'{name}: "{val}"' for name, val in fields.items())
         matched = next((o for o in reversed(state.observations)
                         if o.get("vector") == vector and o.get("identity") == problem.simulation_identity), None)
+        # The reward scores tool calls, not the answer: evaluation hands it the
+        # answer's vector as the last call, re-simulated below with this
+        # simulation, so detection and the accuracy keys describe the answer.
+        # The call shows the matching observation, or nothing when none matched.
+        shown = matched["result"] if matched else '{"Good Machine": {}, "Bad Machine": {}}'
+        trace = {"turns": ["", text],
+                 "calls": [{"arguments": {"input_vector": vector}, "result": shown}]}
         if matched:
             text += "\n<tool_response>" + matched["result"] + "</tool_response>"
         # The already accounted simulation is supplied to the reward code;
         # no extra backend call occurs when it calculates its components.
         try:
-            comps = self._reward([problem.prompt], [text],
+            comps = self._reward([problem.prompt], [text], tool_trace=[trace],
                 netlists=[problem.netlist], fault=[problem.fault], module_name=[problem.module],
                 lib_gate_funcs=self.reward_factory.gate_funcs,
                 fault_sim=lambda *a, **k: (frame.copy(deep=True), dict(sim_rewards)),

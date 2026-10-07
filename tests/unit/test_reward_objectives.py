@@ -53,6 +53,13 @@ def _score(
 
     netlist = SimpleNamespace(input_nets=["a", "b"], output_nets=["y"])
     reward_kwargs = {"fault": [dataset_fault]} if dataset_fault is not None else {}
+    # Detection scores tool calls: one call ran the answer's vector.
+    vector = (_extract("INPUT_VECTOR")(completion) or [None])[0]
+    shown = _simulation(detected=detected)[["Good Machine", "Bad Machine"]].to_json()
+    reward_kwargs["tool_trace"] = [{
+        "turns": ["", completion],
+        "calls": [{"arguments": {"input_vector": vector}, "result": shown}],
+    }]
     rewards = score_generation(
         [prompt],
         [completion],
@@ -80,22 +87,22 @@ def test_reward_exposes_only_four_training_objectives():
     assert reward["detection"] == 1.0
     assert reward["activation"] == 1.0
     assert reward["fidelity"] == 1.0
-    assert reward["format"] == pytest.approx(0.75)
+    # The call turn holds no reasoning.
+    assert reward["format"] == pytest.approx(7 / 8)
     assert reward["pi_completeness_logonly"] == 0.5
 
 
-def test_easy_auxiliaries_are_zero_when_fault_is_not_detected():
-    reward, _ = _score(
+def test_format_is_not_gated_on_detection():
+    completion = (
         'INPUT_VECTOR:"a:1,b:0" EXPECTED_OUTPUT:"y:1" '
-        'DETECTED_FAULTS:"sa0 n_fault"',
-        detected=False,
+        'DETECTED_FAULTS:"sa0 n_fault"'
     )
+    missed, _ = _score(completion, detected=False)
 
-    assert reward["detection"] == 0.0
-    assert reward["activation"] == 1.0
-    assert reward["fidelity"] == 0.0
-    assert reward["format"] == 0.0
-    assert reward["fault_mention_logonly"] == 1.0
+    assert missed["detection"] == 0.0
+    assert missed["activation"] == 1.0
+    assert missed["format"] > 0.0
+    assert missed["fault_mention_logonly"] == 1.0
 
 
 def test_detection_uses_canonical_outputs_not_claimed_values():
@@ -105,7 +112,7 @@ def test_detection_uses_canonical_outputs_not_claimed_values():
     )
 
     assert reward["detection"] == 1.0
-    assert reward["fidelity"] == 1.0
+    assert reward["expected_output_acc_logonly"] == 1.0
     # The claimed value was 1; the zero is only an ignored PO-name placeholder.
     assert calls[0][1] == {"y": 0}
 
@@ -114,7 +121,7 @@ def test_detection_uses_canonical_outputs_not_claimed_values():
         'DETECTED_FAULTS:"sa0 n_fault"'
     )
     assert wrong_claim["detection"] == 1.0
-    assert wrong_claim["fidelity"] == 0.0
+    assert wrong_claim["expected_output_acc_logonly"] == 0.0
 
 
 def test_missing_expected_output_does_not_block_detection():
@@ -124,7 +131,8 @@ def test_missing_expected_output_does_not_block_detection():
 
     assert calls
     assert reward["detection"] == 1.0
-    assert reward["fidelity"] == 0.0
+    # Inputs match the call; the missing outputs score 0.
+    assert reward["fidelity"] == 0.5
     assert 0.0 < reward["format"] < 1.0
 
 

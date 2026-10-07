@@ -184,6 +184,14 @@ def capture_rewards(reward_fn, records: list):
     return wrapped
 
 
+def _detected(components):
+    """Whether the final answer detected the fault. The ``detection`` objective
+    divides that by the attempts it took; records from before it did keep the
+    binary value there."""
+    return bool(components.get("fault_detected_by_pred_input_vector_acc_logonly",
+                               components["detection"]))
+
+
 def summarize_records(records: list[dict], example_ids: list[str], generations: int) -> dict:
     counts = Counter(row["example_id"] for row in records)
     expected = Counter({key: generations for key in example_ids})
@@ -195,9 +203,10 @@ def summarize_records(records: list[dict], example_ids: list[str], generations: 
     components = [row["components"] for row in records]
     n = len(components)
     metrics = {
-        "detection": sum(c["detection"] for c in components) / n,
-        "solved_at_k": sum(any(c["detection"] > 0 for c in group) for group in grouped.values()) / len(grouped),
-        "all_fail_fraction": sum(all(c["detection"] == 0 for c in group) for group in grouped.values()) / len(grouped),
+        "detection": sum(_detected(c) for c in components) / n,
+        "detection_objective": sum(c["detection"] for c in components) / n,
+        "solved_at_k": sum(any(_detected(c) for c in group) for group in grouped.values()) / len(grouped),
+        "all_fail_fraction": sum(all(not _detected(c) for c in group) for group in grouped.values()) / len(grouped),
         "simulation_valid_fraction": sum(c["simulation_valid_logonly"] for c in components) / n,
         "simulator_error_fraction": sum(c["simulator_error_logonly"] for c in components) / n,
         "pi_complete_fraction": sum(c["pi_completeness_logonly"] >= 0.999 for c in components) / n,
@@ -213,7 +222,7 @@ def summarize_records(records: list[dict], example_ids: list[str], generations: 
     # is not zero activation; omit this optional metric if any value is unknown.
     if all(available):
         metrics["activation_without_detection"] = sum(
-            value > 0 and c["detection"] == 0 for value, c in zip(activation, components)
+            value > 0 and not _detected(c) for value, c in zip(activation, components)
         ) / n
     return metrics
 
