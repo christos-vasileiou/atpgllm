@@ -181,6 +181,30 @@ class ToolScheduler:
         return [call for call, _ in selected], ready, [future.result() for _, future in selected]
 
 
+class ToolTrace:
+    """Per trajectory, the text the model wrote in each turn and the tool calls
+    that ran between turns, as recorded by the tool loop. The reward reads it
+    (``tool_trace``) instead of re-parsing the decoded completion, where the
+    model could write a ``<tool_response>`` of its own."""
+
+    def __init__(self, first_turns):
+        self.traces = [{'turns': [text], 'calls': []} for text in first_turns]
+
+    def called(self, indices, calls, outcomes):
+        for index, call, (result, _) in zip(indices, calls, outcomes):
+            arguments = call.get('arguments')
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    pass
+            self.traces[index]['calls'].append({'arguments': arguments, 'result': result})
+
+    def continued(self, indices, texts):
+        for index, text in zip(indices, texts):
+            self.traces[index]['turns'].append(text)
+
+
 def abort_on_simulator_failure(trainer, failed):
     """All DDP ranks stop before continuation or optimization on an infra failure."""
     import torch

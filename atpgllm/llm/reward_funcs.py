@@ -172,119 +172,177 @@ def _fault_detected_at_pos(simulation_df: pd.DataFrame) -> bool:
     return False
 
 
-def _fault_site_activated(simulation_df: pd.DataFrame, fault_net: str, stuck_at: int) -> bool:
-    if simulation_df is None or fault_net not in simulation_df.index:
+_THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
+_TOOL_RESPONSE_BLOCK = re.compile(r"<tool_response>(.*?)</tool_response>", re.DOTALL)
+# Checks on the turn that ends a trajectory; a missing final turn fails all.
+_FINAL_TURN_CHECKS = 6
+
+
+class Trajectory:
+    """A completion as model turns and the tool calls that ended them.
+
+    ``turns[k]`` is the text the model wrote in turn ``k``; ``calls[k]`` is the
+    call executed after it, ``{"arguments": ..., "result": <tool text>}``. A
+    trajectory that ends on the model's answer has one more turn than calls.
+    Trainers pass the executed calls they recorded (``tool_trace``); for other
+    callers the completion text is split at its ``<tool_response>`` blocks.
+    """
+
+    def __init__(self, turns: List[str], calls: List[Dict[str, Any]]):
+        self.turns = [turn or "" for turn in turns]
+        self.calls = list(calls)
+
+    @property
+    def final_turn(self) -> Optional[str]:
+        return self.turns[len(self.calls)] if len(self.turns) > len(self.calls) else None
+
+    @classmethod
+    def from_trace(cls, trace: Dict[str, Any]) -> "Trajectory":
+        return cls(list(trace.get("turns") or []), list(trace.get("calls") or []))
+
+    @classmethod
+    def from_text(cls, completion: str) -> "Trajectory":
+        from atpgllm.training.revert_template import parse_tool_call
+        turns, calls, start = [], [], 0
+        for match in _TOOL_RESPONSE_BLOCK.finditer(completion):
+            turn = completion[start:match.start()]
+            call = parse_tool_call(turn)
+            turns.append(turn)
+            calls.append({"arguments": call.get("arguments") if call else None,
+                          "result": match.group(1).strip()})
+            start = match.end()
+        turns.append(completion[start:])
+        return cls(turns, calls)
+
+
+def prompt_opens_thinking(prompt: Any) -> bool:
+    """Whether the chat template opens ``<think>`` for each assistant turn.
+
+    Granite 4.2's generation prompt ends with ``<think>\\n``, so the opening tag
+    belongs to the prompt (and, after a tool answer, to the inserted
+    continuation prefix) and the model writes only the reasoning and
+    ``</think>``.
+    """
+    return isinstance(prompt, str) and prompt.rstrip().endswith(_THINK_OPEN)
+
+
+def _reasoned(turn: str, opened_by_template: bool) -> bool:
+    """The model closed a thinking block holding non-empty reasoning."""
+    close = turn.find(_THINK_CLOSE)
+    if close < 0:
         return False
-    row = simulation_df.loc[fault_net]
-    g = _cell_to_int(row["Good Machine"])
-    b = _cell_to_int(row["Bad Machine"])
-    if g is None or b is None:
+    head = turn[:close]
+    opening = head.rfind(_THINK_OPEN)
+    if opening >= 0:
+        reasoning = head[opening + len(_THINK_OPEN):]
+    elif opened_by_template:
+        reasoning = head
+    else:
         return False
-    return b == stuck_at and g != b
+    return bool(reasoning.strip())
 
 
-def _po_prediction_score(
-    simulation_df: pd.DataFrame, pred_expected_output: str
-) -> Tuple[float, int]:
-    """Fraction of POs where EXPECTED_OUTPUT matches simulated good machine (0..1, count)."""
-    if simulation_df is None or "POs" not in simulation_df.columns:
-        return 0.0, 0
-    po_rows = simulation_df.loc[simulation_df["POs"]]
-    if po_rows.empty:
-        return 0.0, 0
-    sep = ":" if ":" in pred_expected_output else "="
+def _thinking_closed(turn: str, opened_by_template: bool) -> bool:
+    """A thinking block the turn has open (its own or the template's) is closed."""
+    opening = turn.rfind(_THINK_OPEN)
+    if opening >= 0:
+        return _THINK_CLOSE in turn[opening:]
+    return _THINK_CLOSE in turn if opened_by_template else True
+
+
+def _vector_key(vector: Any) -> Optional[Tuple[Tuple[str, str], ...]]:
+    """Order-insensitive identity of a net→value vector (``a=1, b:0`` or a dict)."""
+    if isinstance(vector, dict):
+        items = vector.items()
+    elif isinstance(vector, str):
+        sep = ":" if ":" in vector else "="
+        items = []
+        for part in vector.split(","):
+            if sep not in part:
+                return None
+            net, value = part.split(sep, 1)
+            items.append((net, value))
+    else:
+        return None
+    key = tuple(sorted((str(net).strip(), str(value).strip().lower()) for net, value in items))
+    return key or None
+
+
+def _tool_returned_table(result: Any) -> bool:
+    """The tool simulated the call (error strings and truncated JSON did not)."""
+    if not isinstance(result, str):
+        return False
     try:
-        pred = convert_string_to_dict(pred_expected_output, sep=sep)
-    except Exception:
-        return 0.0, len(po_rows)
-    ok = 0
-    supplied = 0
-    for po, row in po_rows.iterrows():
-        if po not in pred:
-            continue
-        supplied += 1
-        sim_g = _cell_to_int(row["Good Machine"])
-        if sim_g is None:
-            continue
-        try:
-            pred_value = int(pred[po])
-        except (TypeError, ValueError):
-            continue
-        if pred_value == sim_g:
-            ok += 1
-    # Missing outputs are incorrect; scoring only the supplied subset lets a
-    # one-output answer claim perfect fidelity on a multi-output design.
-    denom = len(po_rows)
-    return (ok / denom) if denom else 0.0, supplied
+        data = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(data, dict) and "Good Machine" in data and "Bad Machine" in data
 
 
-def _pi_assignment_score(
-    simulation_df: pd.DataFrame,
-    pred_input_vector: str,
-    required_inputs: Optional[List[str]] = None,
-) -> Tuple[float, int]:
-    """Fraction of canonical PIs supplied with valid binary values."""
-    if simulation_df is None:
-        return 0.0, 0
-    sep = ":" if ":" in pred_input_vector else "="
-    try:
-        pred = convert_string_to_dict(pred_input_vector, sep=sep)
-    except Exception:
-        return 0.0, len(required_inputs or [])
-
-    if required_inputs is None:
-        if "PIs" not in simulation_df.columns:
-            return 0.0, 0
-        required_inputs = list(simulation_df.index[simulation_df["PIs"]])
-    if not required_inputs:
-        return 0.0, 0
-
-    ok = 0
-    supplied = 0
-    for pi in required_inputs:
-        if pi not in pred:
-            continue
-        supplied += 1
-        try:
-            value = int(pred[pi])
-        except (TypeError, ValueError):
-            continue
-        if value in (0, 1):
-            ok += 1
-    return ok / len(required_inputs), supplied
-
-
-def _tool_response_po_consistency_bonus(completion: str, simulation_df: pd.DataFrame) -> float:
-    """Small bonus if <tool_response> Good/Bad PO values match authoritative simulation."""
-    raw = extract_json_tool_response_and_convert_to_df(completion)
-    if (
-        raw is None
-        or raw.empty
-        or simulation_df is None
-        or "POs" not in simulation_df.columns
-        or "Good Machine" not in raw.columns
-        or "Bad Machine" not in raw.columns
-    ):
+def _pi_agreement(
+    pred_input: Optional[str], reference: Any, inputs: List[str]
+) -> float:
+    """Fraction of primary inputs the answer sets as the reference call did."""
+    pred, ref = dict(_vector_key(pred_input) or ()), dict(_vector_key(reference) or ())
+    if not pred or not inputs:
         return 0.0
-    po_rows = simulation_df.loc[simulation_df["POs"]]
-    if po_rows.empty:
-        return 0.0
-    good_hits, bad_hits, n = 0, 0, 0
-    for po in po_rows.index:
-        if po not in raw.index:
-            continue
-        n += 1
-        sg = _cell_to_int(po_rows.loc[po, "Good Machine"])
-        sb = _cell_to_int(po_rows.loc[po, "Bad Machine"])
-        tg = _cell_to_int(raw.loc[po, "Good Machine"])
-        tb = _cell_to_int(raw.loc[po, "Bad Machine"])
-        if sg is not None and tg is not None and sg == tg:
-            good_hits += 1
-        if sb is not None and tb is not None and sb == tb:
-            bad_hits += 1
-    if n == 0:
-        return 0.0
-    return 1.5 * ((good_hits + bad_hits) / (2 * n))
+    return sum(pred.get(pi) == ref.get(pi) for pi in inputs) / len(inputs)
+
+
+def _po_agreement(
+    pred_output: Optional[str], good: Dict[str, Any], outputs: List[str]
+) -> float:
+    """Fraction of resolved primary outputs EXPECTED_OUTPUT gives as ``good``.
+
+    Outputs the simulation left unknown (TetraMAX ``x``) are not scored; NaN
+    means none was known.
+    """
+    known = {po: _cell_to_int(good.get(po)) for po in outputs}
+    known = {po: value for po, value in known.items() if value is not None}
+    if not known:
+        return float("nan")
+    pred = dict(_vector_key(pred_output) or ())
+    return sum(pred.get(po) == str(value) for po, value in known.items()) / len(known)
+
+
+def _tool_calls_in(text: Optional[str]) -> List[Dict[str, Any]]:
+    """Every tool call written in one model turn, in order."""
+    from atpgllm.training.revert_template import _tool_call_from_inner
+    calls = []
+    for match in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text or "", re.DOTALL):
+        call = _tool_call_from_inner(match.group(1))
+        calls.append(call if call is not None else {"arguments": None})
+    return calls
+
+
+def _outcome(good: Dict[str, Any], bad: Dict[str, Any], outputs: List[str],
+             net: str, stuck_at: int, detected: Optional[bool] = None) -> Dict[str, Any]:
+    """Detection and fault-site activation read from Good/Bad machine values."""
+    if detected is None:
+        detected = False
+        for po in outputs:
+            g, b = _cell_to_int(good.get(po)), _cell_to_int(bad.get(po))
+            if g is not None and b is not None and g != b:
+                detected = True
+                break
+    activated = float("nan")
+    if net in good:
+        g, b = _cell_to_int(good.get(net)), _cell_to_int(bad.get(net))
+        activated = float(g is not None and b is not None and b == stuck_at and g != b)
+    return {"good": good, "bad": bad, "detected": bool(detected), "activated": activated}
+
+
+def _outcome_from_result(result: Any, outputs: List[str], net: str,
+                         stuck_at: int) -> Optional[Dict[str, Any]]:
+    """What an executed call showed the model; None when the tool did not simulate."""
+    if not _tool_returned_table(result):
+        return None
+    data = json.loads(result)
+    return _outcome(dict(data["Good Machine"]), dict(data["Bad Machine"]), outputs, net, stuck_at)
+
+
+class _SimulatorFailure(Exception):
+    """Infrastructure failure: the row is flagged and every rank aborts."""
 
 
 def _mentions_target_fault(text: str, fault: str, fault_net: str) -> float:
@@ -301,12 +359,32 @@ def _mentions_target_fault(text: str, fault: str, fault_net: str) -> float:
 
 def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> List[Dict[str, float]]:
     """
-    ATPG reward with four explicit GDPO objectives.
+    ATPG reward with four explicit GDPO objectives over a tool-call trajectory.
 
-    ``detection`` is the authoritative functional objective. ``activation`` is
-    the only pre-detection progress signal. ``fidelity`` and ``format`` are
-    conditioned on detection so easy reporting proxies cannot train the policy
-    independently. Keys ending in ``_logonly`` are diagnostics only.
+    Only tool calls are scored for detection; the final answer is not
+    simulated. Calls the environment executed before the model's last
+    generation that called the tool are scored from the result the tool
+    returned. The calls of that last generation (several when the model lists
+    several) are re-simulated with the authoritative simulator. An *attempt*
+    is a distinct input vector, in call order, up to the first that detects
+    the fault.
+
+    ``detection``: 1 / (number of attempts) when an attempt detects the fault,
+    else 0; 0 without a tool call. Repeating a vector or calling again after
+    a success cannot raise it.
+    ``activation``: mean fault-site activation over the attempts.
+    ``fidelity``: agreement of the final INPUT_VECTOR and EXPECTED_OUTPUT with
+    the last call that detected the fault (its input vector and good machine
+    outputs); 0 when no call detected it.
+    ``format``: the protocol: think, then call; after a negative result think
+    and call again with a new vector; after a positive result answer with all
+    three fields and no further call. ``*_logonly`` keys are diagnostics only;
+    ``fault_detected_by_pred_input_vector_acc_logonly`` is 1 when the answer's
+    vector is one a call showed to detect the fault.
+
+    ``tool_trace`` (optional, one per completion) holds the turns and executed
+    calls a trainer recorded (see :class:`Trajectory`); without it the
+    completion text is split at its ``<tool_response>`` blocks.
     """
     netlists = kwargs.get("netlists", None)
     if netlists is None:
@@ -316,7 +394,7 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
         from concurrent.futures import ThreadPoolExecutor
         def score_one(index):
             options = dict(kwargs, netlists=[netlists[index]], _serial_native_reward=True)
-            for field in ('fault', 'module_name'):
+            for field in ('fault', 'module_name', 'tool_trace'):
                 value = kwargs.get(field)
                 if value is not None and not isinstance(value, str):
                     options[field] = [value[index]]
@@ -335,9 +413,6 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
         raise ValueError("expected_output_fn and detected_faults_fn must be provided")
 
     lib_gate_funcs = kwargs.get("lib_gate_funcs", None)
-    thinking_fn = kwargs.get("thinking_fn", None)
-    tool_call_fn = kwargs.get("tool_call_fn", None)
-    tool_response_fn = kwargs.get("tool_response_fn", None)
 
     if using_native_simulator():
         from fault_sim import resolve_fault_sim_runner
@@ -364,6 +439,7 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
     rewards: List[Dict[str, float]] = []
     module_names = kwargs.get("module_name") or []
     dataset_faults = kwargs.get("fault")
+    tool_traces = kwargs.get("tool_trace")
 
     for idx, (prompt, completion, netlist) in enumerate(zip(prompts, completions, netlists)):
         out: Dict[str, float] = {
@@ -384,6 +460,13 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
             "detected_faults_acc_logonly": 0.0,
             "simulation_valid_logonly": 0.0,
             "simulator_error_logonly": 0.0,
+            "tool_calls_logonly": 0.0,
+            "simulated_calls_logonly": 0.0,
+            "attempts_logonly": 0.0,
+            "duplicate_calls_logonly": 0.0,
+            "calls_after_detection_logonly": 0.0,
+            "reasoned_call_turns_logonly": 0.0,
+            "unverified_answer_logonly": 0.0,
         }
 
         dataset_fault = None
@@ -401,150 +484,261 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
             fault, net = fault_info[0]
         stuck_at = int(fault[-1]) if fault else -1
 
-        format_checks: List[float] = []
-        for fn in (thinking_fn, tool_call_fn, tool_response_fn):
-            if fn is not None:
-                try:
-                    format_checks.append(float(bool(fn(completion))))
-                except Exception:
-                    format_checks.append(0.0)
-
-        pred_input = (input_vector_fn(completion) or [None])[0]
-        pred_output = (expected_output_fn(completion) or [None])[0]
-        pred_faults = (detected_faults_fn(completion) or [None])[0]
-
-        format_checks.extend(
-            [float(bool(pred_input)), float(bool(pred_output)), float(bool(pred_faults))]
+        trace = None
+        if isinstance(tool_traces, (list, tuple)) and idx < len(tool_traces):
+            trace = tool_traces[idx]
+        trajectory = (
+            Trajectory.from_trace(trace) if isinstance(trace, dict)
+            else Trajectory.from_text(completion)
         )
-        format_score = (
-            sum(format_checks) / len(format_checks) if format_checks else 0.0
-        )
-        out["format_compliance_logonly"] = format_score
+        calls = trajectory.calls
+        final_turn = trajectory.final_turn
+        # Only the final turn answers; reports drafted in earlier turns do not.
+        answer = final_turn or ""
+        pred_input = (input_vector_fn(answer) or [None])[-1]
+        pred_output = (expected_output_fn(answer) or [None])[-1]
+        pred_faults = (detected_faults_fn(answer) or [None])[-1]
 
         sim_from_completion = _simulation_table_from_completion(completion, simulation_fn)
         if sim_from_completion is not None:
             out["sim_table_present_logonly"] = 1.0
+        mention = _mentions_target_fault(pred_faults, fault, net) if (pred_faults and fault) else 0.0
+        out["fault_mention_logonly"] = mention
+        out["detected_faults_acc_logonly"] = 1.0 if mention >= 0.99 else 0.0
+        out["tool_calls_logonly"] = float(len(calls))
 
-        if not (fault and net and pred_input and netlist):
+        if not (fault and net and netlist):
             rewards.append(out)
             continue
 
         mod_name = module_names[idx] if idx < len(module_names) else None
         canonical_outputs = list(getattr(netlist, "output_nets", []) or [])
         canonical_inputs = list(getattr(netlist, "input_nets", []) or [])
+        outputs = canonical_outputs or [po for po, _ in (_vector_key(pred_output) or ())]
         # Values are placeholders only. fast_fault_sim uses these canonical names
         # to mark POs and computes their values from the circuit.
-        simulation_outputs: Any
-        if canonical_outputs:
-            simulation_outputs = {po: 0 for po in canonical_outputs}
-        elif pred_output:
-            simulation_outputs = pred_output
-        else:
-            rewards.append(out)
-            continue
-
-        try:
-            result = fault_sim_runner(
-                pred_input,
-                simulation_outputs,
-                f"{fault} {net}",
-                netlist,
-                gate_func,
-                module_name=mod_name,
-                return_rewards=True,
-            )
-            fault_simulation, _fault_sim_rewards = result
-        except Exception as exc:
-            # Both DDP ranks abort after scoring. Preserve the original cause
-            # here, before it is reduced to a numeric infrastructure flag.
-            print(f"[rewards] Simulator failure for module={mod_name!r}, "
-                  f"fault={fault} {net}: {type(exc).__name__}: {exc}",
-                  file=sys.stderr, flush=True)
-            import traceback
-            traceback.print_exc()
-            out["simulator_error_logonly"] = 1.0
-            rewards.append(out)
-            continue
-
-        if not isinstance(fault_simulation, pd.DataFrame) or fault_simulation.empty:
-            print(f"[rewards] Simulator returned an empty or invalid result for "
-                  f"module={mod_name!r}, fault={fault} {net}", file=sys.stderr, flush=True)
-            out["simulator_error_logonly"] = 1.0
-            rewards.append(out)
-            continue
-        if "error" in fault_simulation.columns:
-            out["simulator_error_logonly"] = float(not _fault_sim_rewards.get('invalid_request', False))
-            if out["simulator_error_logonly"]:
-                print(f"[rewards] Simulator failure for module={mod_name!r}, "
-                      f"fault={fault} {net}: {fault_simulation['error'].tolist()}",
-                      file=sys.stderr, flush=True)
-            rewards.append(out)
-            continue
-        out["simulation_valid_logonly"] = 1.0
-
-        if _fault_sim_rewards.get("tetramax_available"):
-            detected = bool(_fault_sim_rewards.get("tetramax_detected"))
-        else:
-            detected = _fault_detected_at_pos(fault_simulation)
-        site_ok = _fault_site_activated(fault_simulation, net, stuck_at)
-        po_score, _ = (
-            _po_prediction_score(fault_simulation, pred_output)
-            if pred_output
-            else (0.0, 0)
-        )
-        if _fault_sim_rewards.get('tetramax_available'):
-            po_rows = fault_simulation.loc[fault_simulation['POs']]
-            known = po_rows['Good Machine'].map(_cell_to_int).notna()
-            out['known_po_fraction_logonly'] = float(known.mean()) if len(known) else 0.0
-            out['indeterminate_detection_logonly'] = float(_fault_sim_rewards.get('tetramax_indeterminate', False))
-            if known.any() and pred_output:
-                known_frame = fault_simulation.copy()
-                known_frame.loc[po_rows.index[~known], 'POs'] = False
-                po_score, _ = _po_prediction_score(known_frame, pred_output)
-            elif not known.any():
-                po_score = float('nan')
-        pi_score, _ = _pi_assignment_score(
-            fault_simulation,
-            pred_input,
-            required_inputs=canonical_inputs or None,
+        simulation_outputs: Any = (
+            {po: 0 for po in canonical_outputs} if canonical_outputs else pred_output
         )
 
-        tool_bonus = _tool_response_po_consistency_bonus(completion, fault_simulation)
-        mention = _mentions_target_fault(pred_faults, fault, net) if pred_faults else 0.0
-
-        detected_f = float(detected)
-        site_ok_f = float(site_ok)
-        if _fault_sim_rewards.get('tetramax_available') and net not in fault_simulation.index:
-            site_ok_f = float('nan')
-
-        out["detection"] = detected_f
-        out["activation"] = site_ok_f
-        out["fidelity"] = detected_f * po_score
-        out["format"] = detected_f * (0.5 * format_score + 0.5 * pi_score)
-        out["fault_detected_by_pred_input_vector_acc_logonly"] = detected_f
-        out["fault_site_activated_acc_logonly"] = site_ok_f
-        out["pi_completeness_logonly"] = pi_score
-        out["tool_response_fidelity_logonly"] = min(1.0, tool_bonus / 1.5)
-        out["fault_mention_logonly"] = mention
-        out["expected_output_acc_logonly"] = 1.0 if po_score >= 0.999 else 0.0
-        out["input_vector_acc_logonly"] = 1.0 if pi_score >= 0.999 else 0.0
-        out["detected_faults_acc_logonly"] = 1.0 if mention >= 0.99 else 0.0
-
-        if sim_from_completion is not None and "POs" in fault_simulation.columns:
+        def simulate(vector: Any) -> Optional[Dict[str, Any]]:
+            """Authoritative simulation of one input vector; None if it is invalid."""
             try:
-                po_gold = fault_simulation.loc[fault_simulation["POs"]]
+                frame, sim_rewards = fault_sim_runner(
+                    vector,
+                    simulation_outputs,
+                    f"{fault} {net}",
+                    netlist,
+                    gate_func,
+                    module_name=mod_name,
+                    return_rewards=True,
+                )
+            except Exception as exc:
+                # Both DDP ranks abort after scoring. Preserve the original cause
+                # here, before it is reduced to a numeric infrastructure flag.
+                print(f"[rewards] Simulator failure for module={mod_name!r}, "
+                      f"fault={fault} {net}: {type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
+                import traceback
+                traceback.print_exc()
+                raise _SimulatorFailure() from exc
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                print(f"[rewards] Simulator returned an empty or invalid result for "
+                      f"module={mod_name!r}, fault={fault} {net}", file=sys.stderr, flush=True)
+                raise _SimulatorFailure()
+            if "error" in frame.columns:
+                if sim_rewards.get("invalid_request", False):
+                    return None
+                print(f"[rewards] Simulator failure for module={mod_name!r}, "
+                      f"fault={fault} {net}: {frame['error'].tolist()}",
+                      file=sys.stderr, flush=True)
+                raise _SimulatorFailure()
+            tetramax = bool(sim_rewards.get("tetramax_available"))
+            outcome = _outcome(
+                frame["Good Machine"].to_dict(), frame["Bad Machine"].to_dict(), outputs,
+                net, stuck_at,
+                detected=bool(sim_rewards.get("tetramax_detected")) if tetramax else None,
+            )
+            if not tetramax and net not in frame.index:
+                outcome["activated"] = 0.0
+            outcome.update(frame=frame, rewards=sim_rewards)
+            return outcome
+
+        def vector_of(call: Dict[str, Any]) -> Any:
+            arguments = call.get("arguments")
+            if not isinstance(arguments, dict):
+                return None
+            claimed = arguments.get("fault")
+            if claimed is not None and " ".join(str(claimed).split()) != f"{fault} {net}":
+                return None
+            return arguments.get("input_vector")
+
+        # What each executed call showed the model (the protocol reacts to it).
+        shown = [_outcome_from_result(c.get("result"), outputs, net, stuck_at)
+                 if vector_of(c) is not None else None for c in calls]
+        keys = [_vector_key(vector_of(c)) if shown[k] is not None else None
+                for k, c in enumerate(calls)]
+
+        # The model's last generation that called the tool is re-simulated; its
+        # first call is the one the environment executed, if any.
+        pending = _tool_calls_in(final_turn)
+        if pending:
+            last_calls, first_executed = pending, None
+        elif calls:
+            # The environment runs a turn's first call; further calls the model
+            # listed in that turn are read from its text.
+            listed = [calls[-1]] + _tool_calls_in(trajectory.turns[len(calls) - 1])[1:]
+            last_calls, first_executed = listed, len(calls) - 1
+        else:
+            last_calls, first_executed = [], None
+        scored: List[Tuple[Any, Optional[Dict[str, Any]]]] = [
+            (keys[k], shown[k]) for k in range(len(calls) - (first_executed is not None))
+        ]
+        resimulated: List[Optional[Dict[str, Any]]] = []
+        try:
+            for position, call in enumerate(last_calls):
+                vector = vector_of(call)
+                if position == 0 and first_executed is not None:
+                    vector = vector if shown[first_executed] is not None else None
+                outcome = simulate(vector) if vector is not None else None
+                resimulated.append(outcome)
+                scored.append((_vector_key(vector) if outcome is not None else None, outcome))
+        except _SimulatorFailure:
+            out["simulator_error_logonly"] = 1.0
+            rewards.append(out)
+            continue
+        out["simulated_calls_logonly"] = float(sum(o is not None for o in resimulated))
+
+        # Attempts: distinct vectors in call order, up to the first detection.
+        # A call that did not simulate is an attempt that detected nothing.
+        attempts: List[Optional[Dict[str, Any]]] = []
+        seen: set = set()
+        for key, outcome in scored:
+            if key is not None and key in seen:
+                continue
+            if key is not None:
+                seen.add(key)
+            attempts.append(outcome)
+            if outcome is not None and outcome["detected"]:
+                break
+        detected_any = bool(attempts and attempts[-1] and attempts[-1]["detected"])
+        detection = 1.0 / len(attempts) if detected_any else 0.0
+        activations = [o["activated"] if o else 0.0 for o in attempts]
+        activation = (
+            float(np.nanmean(activations))
+            if any(math.isfinite(a) for a in activations)
+            else (float("nan") if activations else 0.0)
+        )
+
+        positives = [(key, o) for key, o in scored if o is not None and o["detected"]]
+        fidelity = 0.0
+        po_agreement = float("nan")
+        if positives:
+            ref_key, reference = positives[-1]
+            inputs = canonical_inputs or [
+                net_name for net_name, _ in (ref_key or ())
+            ]
+            parts = [_pi_agreement(pred_input, dict(ref_key or ()), inputs),
+                     _po_agreement(pred_output, reference["good"], outputs)
+                     if pred_output else 0.0]
+            po_agreement = parts[1]
+            finite = [p for p in parts if math.isfinite(p)]
+            fidelity = sum(finite) / len(finite)
+
+        opened = prompt_opens_thinking(prompt)
+        checks: List[bool] = []
+        reasoned_turns: List[bool] = []
+        shown_detected = [k for k, o in enumerate(shown) if o and o["detected"]]
+        first_detected = shown_detected[0] if shown_detected else None
+        called: set = set()
+        duplicates = 0
+        for k in range(len(calls)):
+            turn = trajectory.turns[k] if k < len(trajectory.turns) else ""
+            reasoned_turns.append(_reasoned(turn, opened))
+            checks.append(reasoned_turns[-1])
+            checks.append(shown[k] is not None)
+            if k > 0:
+                checks.append(first_detected is None or k <= first_detected)
+                checks.append(keys[k] is None or keys[k] not in called)
+            if keys[k] is not None:
+                duplicates += keys[k] in called
+                called.add(keys[k])
+        if final_turn is None:
+            checks += [False] * _FINAL_TURN_CHECKS
+        else:
+            checks += [
+                not pending,
+                _thinking_closed(final_turn, opened),
+                bool(pred_input),
+                bool(pred_output),
+                bool(pred_faults),
+                bool(shown) and bool(shown[-1] and shown[-1]["detected"]),
+            ]
+        format_score = sum(checks) / len(checks)
+
+        answer_key = _vector_key(pred_input)
+        verified = {key for key, _ in positives}
+        out["detection"] = detection
+        out["activation"] = activation
+        out["fidelity"] = fidelity
+        out["format"] = format_score
+        out["format_compliance_logonly"] = format_score
+        out["attempts_logonly"] = float(len(attempts))
+        out["duplicate_calls_logonly"] = float(duplicates)
+        out["calls_after_detection_logonly"] = float(
+            len(calls) - 1 - first_detected if first_detected is not None else 0
+        )
+        out["reasoned_call_turns_logonly"] = (
+            sum(reasoned_turns) / len(reasoned_turns) if reasoned_turns else 0.0
+        )
+        out["unverified_answer_logonly"] = float(bool(pred_input) and answer_key not in verified)
+        out["fault_detected_by_pred_input_vector_acc_logonly"] = float(
+            answer_key is not None and answer_key in verified
+        )
+        out["expected_output_acc_logonly"] = 1.0 if po_agreement >= 0.999 else 0.0
+        if canonical_inputs:
+            assigned = dict(answer_key or ())
+            pi_score = sum(assigned.get(pi) in ("0", "1") for pi in canonical_inputs) / len(canonical_inputs)
+            out["pi_completeness_logonly"] = pi_score
+            out["input_vector_acc_logonly"] = 1.0 if pi_score >= 0.999 else 0.0
+
+        last = next((o for o in reversed(resimulated) if o is not None), None)
+        if last is None:
+            rewards.append(out)
+            continue
+
+        frame, sim_rewards = last["frame"], last["rewards"]
+        out["simulation_valid_logonly"] = 1.0
+        out["fault_site_activated_acc_logonly"] = last["activated"]
+        if sim_rewards.get("tetramax_available"):
+            po_rows = frame.loc[frame["POs"]]
+            known = po_rows["Good Machine"].map(_cell_to_int).notna()
+            out["known_po_fraction_logonly"] = float(known.mean()) if len(known) else 0.0
+            out["indeterminate_detection_logonly"] = float(sim_rewards.get("tetramax_indeterminate", False))
+        # Agreement between what the executed call showed and the re-simulation.
+        if first_executed is not None and resimulated and resimulated[0] is not None:
+            shown_last = shown[first_executed]
+            matches = [
+                float(_cell_to_int(shown_last[side].get(po)) == _cell_to_int(resimulated[0][side].get(po)))
+                for po in outputs if po in shown_last["good"]
+                for side in ("good", "bad")
+            ]
+            out["tool_response_fidelity_logonly"] = sum(matches) / len(matches) if matches else 0.0
+
+        if sim_from_completion is not None and "POs" in frame.columns:
+            try:
+                po_gold = frame.loc[frame["POs"]]
                 po_pred = sim_from_completion.reindex(po_gold.index)
                 matches = []
-                for idx in po_gold.index:
-                    if idx not in po_pred.index:
+                for po in po_gold.index:
+                    if po not in po_pred.index:
                         continue
                     for col in ("Good Machine", "Bad Machine"):
-                        a, b = _cell_to_int(po_gold.loc[idx, col]), _cell_to_int(po_pred.loc[idx, col])
+                        a, b = _cell_to_int(po_gold.loc[po, col]), _cell_to_int(po_pred.loc[po, col])
                         if a is not None and b is not None:
                             matches.append(float(a == b))
                 if matches:
-                    acc = sum(matches) / len(matches)
-                    out["pred_vs_fault_sim_acc_logonly"] = acc
+                    out["pred_vs_fault_sim_acc_logonly"] = sum(matches) / len(matches)
             except Exception:
                 pass
 

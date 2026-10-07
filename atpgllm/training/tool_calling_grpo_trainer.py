@@ -51,7 +51,7 @@ from atpgllm.training.revert_template import (
     restore_generation_prefix,
     stringify_tool_arguments_for_template,
 )
-from atpgllm.training.tools import TOOLS, ToolHelper
+from atpgllm.training.tools import TOOLS, ToolHelper, ToolTrace
 from atpgllm.llm.reward_funcs import REWARD_LOGONLY_SUFFIX
 from atpgllm.training.gdpo import (
     compute_gdpo_advantages,
@@ -474,6 +474,9 @@ class ToolCallingGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
             tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count = (
                 self._custom_tool_call_loop(prompts, prompt_ids, completion_ids, completions, logprobs)
             )
+            # The reward reads each trajectory's turns and executed calls from here
+            # (per completion, so best-of-n selection keeps them aligned).
+            extra_fields = {**(extra_fields or {}), "tool_trace": self._tool_trace}
 
             prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)
             if tool_mask is not None:
@@ -568,6 +571,8 @@ class ToolCallingGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
 
     def _custom_tool_call_loop_impl(self, prompts, prompt_ids, completion_ids, completions, logprobs):
         tool_mask = [[1] * len(ids) for ids in completion_ids]
+        trace = ToolTrace(self.processing_class.batch_decode(completion_ids, skip_special_tokens=True))
+        self._tool_trace = trace.traces
         tool_call_count = 0
         tool_failure_count = 0
 
@@ -593,6 +598,7 @@ class ToolCallingGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
                     self, tool_calls, idxs_with_tool, prompts
                 )
                 abort_on_simulator_failure(self, any(failed for _, failed in batch_outcomes))
+                trace.called(idxs_with_tool, tool_calls, batch_outcomes)
 
                 if idxs_with_tool:
                     prompt_completion_tools = []
@@ -742,6 +748,7 @@ class ToolCallingGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
                 post_tool_texts = self.processing_class.batch_decode(
                     post_tool_ids, skip_special_tokens=True
                 )
+                trace.continued(idxs_with_tool, post_tool_texts)
 
                 for i, idx in enumerate(idxs_with_tool):
                     if post_tool_texts[i]:

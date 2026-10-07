@@ -66,7 +66,7 @@ from peft import LoraConfig, PeftModel
 from peft.tuners.lora import LoraLayer
 from trl import GRPOTrainer, GRPOConfig
 import copy
-from atpgllm.training.tools import TOOLS, ToolHelper
+from atpgllm.training.tools import TOOLS, ToolHelper, ToolTrace
 from atpgllm.training.revert_template import (
     parse_tool_call as parse_tool_call_text,
     revert_assistant_completion,
@@ -1252,6 +1252,9 @@ class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
             tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count = self._custom_tool_call_loop(
                 prompts, prompt_ids, completion_ids, completions, logprobs,
             )
+            # The reward reads each trajectory's turns and executed calls from here
+            # (per completion, so best-of-n selection keeps them aligned).
+            extra_fields = {**(extra_fields or {}), "tool_trace": self._tool_trace}
 
             # ── Step 4: Aggregate metrics across DDP ranks ──
             prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)
@@ -1371,6 +1374,8 @@ class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
             if found, the loop repeats.
         """
         tool_mask = [[1] * len(ids) for ids in completion_ids]
+        trace = ToolTrace(self.processing_class.batch_decode(completion_ids, skip_special_tokens=True))
+        self._tool_trace = trace.traces
         tool_call_count = 0
         tool_failure_count = 0
         
@@ -1402,6 +1407,7 @@ class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
                     self, tool_calls, idxs_with_tool, prompts
                 )
                 abort_on_simulator_failure(self, any(failed for _, failed in batch_outcomes))
+                trace.called(idxs_with_tool, tool_calls, batch_outcomes)
 
                 if idxs_with_tool:
                     prompt_completion_tools = []
@@ -1573,6 +1579,7 @@ class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
 
                 # 4d. Decode the new model output and check for further tool calls.
                 post_tool_texts = self.processing_class.batch_decode(post_tool_ids, skip_special_tokens=True)
+                trace.continued(idxs_with_tool, post_tool_texts)
 
                 for i, idx in enumerate(idxs_with_tool):
                     if post_tool_texts[i]:
