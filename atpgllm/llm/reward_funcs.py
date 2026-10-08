@@ -29,8 +29,8 @@ REWARD_LOGONLY_SUFFIX = "_logonly"
 
 # GDPO priorities are applied after each objective is normalized. Raw reward
 # magnitudes therefore do not encode cross-objective importance.
-ATPG_GDPO_OBJECTIVE_KEYS = ("detection", "activation", "fidelity", "format")
-ATPG_GDPO_OBJECTIVE_WEIGHTS = (1.0, 0.25, 0.20, 0.05)
+ATPG_GDPO_OBJECTIVE_KEYS = ("detection", "activation", "fidelity", "format", "uniqueness")
+ATPG_GDPO_OBJECTIVE_WEIGHTS = (1.0, 0.25, 0.20, 0.05, 0.10)
 
 
 def active_reward_objectives():
@@ -38,8 +38,8 @@ def active_reward_objectives():
     if not using_native_simulator():
         return ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS
     profile = os.environ.get('TMAX_REWARD_PROFILE', 'po')
-    profiles = {'detection': (('detection', 'format'), (1.0, 0.05)),
-                'po': (('detection', 'fidelity', 'format'), (1.0, 0.20, 0.05)),
+    profiles = {'detection': (('detection', 'format', 'uniqueness'), (1.0, 0.05, 0.10)),
+                'po': (('detection', 'fidelity', 'format', 'uniqueness'), (1.0, 0.20, 0.05, 0.10)),
                 'full': (ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS)}
     if profile not in profiles:
         raise ValueError(f'Unknown TMAX_REWARD_PROFILE: {profile}')
@@ -250,7 +250,7 @@ def _thinking_closed(turn: str, opened_by_template: bool) -> bool:
     return _THINK_CLOSE in turn if opened_by_template else True
 
 
-def _vector_key(vector: Any) -> Optional[Tuple[Tuple[str, str], ...]]:
+def vector_key(vector: Any) -> Optional[Tuple[Tuple[str, str], ...]]:
     """Order-insensitive identity of a net→value vector (``a=1, b:0`` or a dict)."""
     if isinstance(vector, dict):
         items = vector.items()
@@ -268,6 +268,32 @@ def _vector_key(vector: Any) -> Optional[Tuple[Tuple[str, str], ...]]:
     return key or None
 
 
+def call_identity(call: Dict[str, Any]) -> Any:
+    """The input vector a tool call submitted, so repeated vectors compare equal.
+
+    Two calls are the same vector when they assign the same values to the same
+    nets, in any order. A vector that cannot be read as such an assignment is
+    compared by its text, and a call without a readable vector by its arguments.
+    """
+    arguments = call.get("arguments") if isinstance(call, dict) else None
+    vector = arguments.get("input_vector") if isinstance(arguments, dict) else None
+    if vector is None:
+        return ("unparsed", json.dumps(arguments, sort_keys=True, default=str))
+    return vector_key(vector) or ("unparsed", str(vector))
+
+
+_TOOL_ARGUMENTS = {"input_vector", "output_vector", "fault", "doc_id"}
+
+
+def _executable(call: Dict[str, Any], doc_id: Optional[str]) -> bool:
+    """Whether the tool would run a call the environment never executed: the
+    tool's argument set and, when the prompt carries the circuit, its doc_id."""
+    arguments = call.get("arguments") if isinstance(call, dict) else None
+    if not isinstance(arguments, dict) or set(arguments) != _TOOL_ARGUMENTS:
+        return False
+    return doc_id is None or str(arguments["doc_id"]) == str(doc_id)
+
+
 def _tool_returned_table(result: Any) -> bool:
     """The tool simulated the call (error strings and truncated JSON did not)."""
     if not isinstance(result, str):
@@ -283,7 +309,7 @@ def _pi_agreement(
     pred_input: Optional[str], reference: Any, inputs: List[str]
 ) -> float:
     """Fraction of primary inputs the answer sets as the reference call did."""
-    pred, ref = dict(_vector_key(pred_input) or ()), dict(_vector_key(reference) or ())
+    pred, ref = dict(vector_key(pred_input) or ()), dict(vector_key(reference) or ())
     if not pred or not inputs:
         return 0.0
     return sum(pred.get(pi) == ref.get(pi) for pi in inputs) / len(inputs)
@@ -301,7 +327,7 @@ def _po_agreement(
     known = {po: value for po, value in known.items() if value is not None}
     if not known:
         return float("nan")
-    pred = dict(_vector_key(pred_output) or ())
+    pred = dict(vector_key(pred_output) or ())
     return sum(pred.get(po) == str(value) for po, value in known.items()) / len(known)
 
 
@@ -359,26 +385,29 @@ def _mentions_target_fault(text: str, fault: str, fault_net: str) -> float:
 
 def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> List[Dict[str, float]]:
     """
-    ATPG reward with four explicit GDPO objectives over a tool-call trajectory.
+    ATPG reward with five explicit GDPO objectives over a tool-call trajectory.
 
-    Only tool calls are scored for detection; the final answer is not
+    Only tool calls are scored for detection, and the final answer is not
     simulated. Calls the environment executed before the model's last
     generation that called the tool are scored from the result the tool
     returned. The calls of that last generation (several when the model lists
-    several) are re-simulated with the authoritative simulator. An *attempt*
-    is a distinct input vector, in call order, up to the first that detects
+    several) are simulated again, once per distinct vector. An *attempt* is
+    a call, repeats included, in order of issue up to the first that detects
     the fault.
 
     ``detection``: 1 / (number of attempts) when an attempt detects the fault,
-    else 0; 0 without a tool call. Repeating a vector or calling again after
-    a success cannot raise it.
+    else 0, and 0 without a tool call. Calling again after a success cannot
+    raise it, and every repeated vector before the success lowers it.
     ``activation``: mean fault-site activation over the attempts.
     ``fidelity``: agreement of the final INPUT_VECTOR and EXPECTED_OUTPUT with
     the last call that detected the fault (its input vector and good machine
-    outputs); 0 when no call detected it.
-    ``format``: the protocol: think, then call; after a negative result think
-    and call again with a new vector; after a positive result answer with all
-    three fields and no further call. ``*_logonly`` keys are diagnostics only;
+    outputs), 0 when no call detected it.
+    ``format``: the protocol. Think, then call. After a negative result think
+    and call again with a new vector. After a positive result answer with all
+    three fields and no further call.
+    ``uniqueness``: distinct vectors among the attempts divided by the number
+    of attempts, 0 without a tool call.
+    ``*_logonly`` keys are diagnostics only.
     ``fault_detected_by_pred_input_vector_acc_logonly`` is 1 when the answer's
     vector is one a call showed to detect the fault.
 
@@ -447,6 +476,7 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
             "activation": 0.0,
             "fidelity": 0.0,
             "format": 0.0,
+            "uniqueness": 0.0,
             "format_compliance_logonly": 0.0,
             "pi_completeness_logonly": 0.0,
             "tool_response_fidelity_logonly": 0.0,
@@ -514,15 +544,25 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
         mod_name = module_names[idx] if idx < len(module_names) else None
         canonical_outputs = list(getattr(netlist, "output_nets", []) or [])
         canonical_inputs = list(getattr(netlist, "input_nets", []) or [])
-        outputs = canonical_outputs or [po for po, _ in (_vector_key(pred_output) or ())]
+        outputs = canonical_outputs or [po for po, _ in (vector_key(pred_output) or ())]
         # Values are placeholders only. fast_fault_sim uses these canonical names
         # to mark POs and computes their values from the circuit.
         simulation_outputs: Any = (
             {po: 0 for po in canonical_outputs} if canonical_outputs else pred_output
         )
 
+        simulated: Dict[Any, Optional[Dict[str, Any]]] = {}
+
         def simulate(vector: Any) -> Optional[Dict[str, Any]]:
-            """Authoritative simulation of one input vector; None if it is invalid."""
+            """Authoritative simulation of one input vector, run once per vector.
+
+            None when the simulator rejects the vector."""
+            identity = vector_key(vector) or ("unparsed", str(vector))
+            if identity not in simulated:
+                simulated[identity] = run_simulation(vector)
+            return simulated[identity]
+
+        def run_simulation(vector: Any) -> Optional[Dict[str, Any]]:
             try:
                 frame, sim_rewards = fault_sim_runner(
                     vector,
@@ -576,8 +616,9 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
         # What each executed call showed the model (the protocol reacts to it).
         shown = [_outcome_from_result(c.get("result"), outputs, net, stuck_at)
                  if vector_of(c) is not None else None for c in calls]
-        keys = [_vector_key(vector_of(c)) if shown[k] is not None else None
+        keys = [vector_key(vector_of(c)) if shown[k] is not None else None
                 for k, c in enumerate(calls)]
+        identities = [call_identity(c) for c in calls]
 
         # The model's last generation that called the tool is re-simulated; its
         # first call is the one the environment executed, if any.
@@ -591,8 +632,17 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
             last_calls, first_executed = listed, len(calls) - 1
         else:
             last_calls, first_executed = [], None
-        scored: List[Tuple[Any, Optional[Dict[str, Any]]]] = [
-            (keys[k], shown[k]) for k in range(len(calls) - (first_executed is not None))
+        # Calls the environment never executed must pass the tool's own checks.
+        expected_doc_id = None
+        if isinstance(prompt, str):
+            from atpgllm.training.tools import ToolHelper
+            document = ToolHelper.get_document(prompt)
+            if isinstance(document, dict) and document.get("doc_id") is not None:
+                expected_doc_id = document["doc_id"]
+        # (identity, vector key, outcome) for every call, in order of issue.
+        scored: List[Tuple[Any, Any, Optional[Dict[str, Any]]]] = [
+            (identities[k], keys[k], shown[k])
+            for k in range(len(calls) - (first_executed is not None))
         ]
         resimulated: List[Optional[Dict[str, Any]]] = []
         try:
@@ -600,29 +650,30 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
                 vector = vector_of(call)
                 if position == 0 and first_executed is not None:
                     vector = vector if shown[first_executed] is not None else None
+                elif not _executable(call, expected_doc_id):
+                    vector = None
                 outcome = simulate(vector) if vector is not None else None
                 resimulated.append(outcome)
-                scored.append((_vector_key(vector) if outcome is not None else None, outcome))
+                scored.append((call_identity(call),
+                               vector_key(vector) if outcome is not None else None, outcome))
         except _SimulatorFailure:
             out["simulator_error_logonly"] = 1.0
             rewards.append(out)
             continue
-        out["simulated_calls_logonly"] = float(sum(o is not None for o in resimulated))
+        out["simulated_calls_logonly"] = float(len(simulated))
 
-        # Attempts: distinct vectors in call order, up to the first detection.
-        # A call that did not simulate is an attempt that detected nothing.
+        # Attempts: every call in order of issue, repeats included, up to the
+        # first detection. A call that did not simulate detected nothing.
         attempts: List[Optional[Dict[str, Any]]] = []
-        seen: set = set()
-        for key, outcome in scored:
-            if key is not None and key in seen:
-                continue
-            if key is not None:
-                seen.add(key)
+        attempted: List[Any] = []
+        for identity, _, outcome in scored:
             attempts.append(outcome)
+            attempted.append(identity)
             if outcome is not None and outcome["detected"]:
                 break
         detected_any = bool(attempts and attempts[-1] and attempts[-1]["detected"])
         detection = 1.0 / len(attempts) if detected_any else 0.0
+        uniqueness = len(set(attempted)) / len(attempted) if attempted else 0.0
         activations = [o["activated"] if o else 0.0 for o in attempts]
         activation = (
             float(np.nanmean(activations))
@@ -630,7 +681,7 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
             else (float("nan") if activations else 0.0)
         )
 
-        positives = [(key, o) for key, o in scored if o is not None and o["detected"]]
+        positives = [(key, o) for _, key, o in scored if o is not None and o["detected"]]
         fidelity = 0.0
         po_agreement = float("nan")
         if positives:
@@ -659,10 +710,9 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
             checks.append(shown[k] is not None)
             if k > 0:
                 checks.append(first_detected is None or k <= first_detected)
-                checks.append(keys[k] is None or keys[k] not in called)
-            if keys[k] is not None:
-                duplicates += keys[k] in called
-                called.add(keys[k])
+                checks.append(identities[k] not in called)
+            duplicates += identities[k] in called
+            called.add(identities[k])
         if final_turn is None:
             checks += [False] * _FINAL_TURN_CHECKS
         else:
@@ -676,12 +726,13 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
             ]
         format_score = sum(checks) / len(checks)
 
-        answer_key = _vector_key(pred_input)
+        answer_key = vector_key(pred_input)
         verified = {key for key, _ in positives}
         out["detection"] = detection
         out["activation"] = activation
         out["fidelity"] = fidelity
         out["format"] = format_score
+        out["uniqueness"] = uniqueness
         out["format_compliance_logonly"] = format_score
         out["attempts_logonly"] = float(len(attempts))
         out["duplicate_calls_logonly"] = float(duplicates)

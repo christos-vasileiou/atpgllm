@@ -277,7 +277,7 @@ class RewardFunctionFactory:
         ----------
         return_component_dicts
             If True, each reward is a component dict from ``test_generation_grpo_reward``.
-            The custom GRPO trainers recognize the attached GDPO metadata, preserve the four
+            The custom GRPO trainers recognize the attached GDPO metadata, preserve the five
             semantic objective columns, and log the remaining ``*_logonly`` diagnostics.
             If False (default), returns one scalar per completion for legacy callers.
         
