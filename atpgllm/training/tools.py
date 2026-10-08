@@ -137,11 +137,44 @@ def execute_tool_batch(calls, prompts, functions):
             raise
 
 
+def _vector_as_read(vector):
+    """A vector the way the simulator reads it, with its nets in any order.
+    Values stay exactly as written, so ``" 1"`` and ``1`` remain different."""
+    if isinstance(vector, dict):
+        try:
+            return ('dict', json.dumps(vector, sort_keys=True, default=str))
+        except TypeError:
+            return ('raw', repr(vector))
+    if isinstance(vector, str) and not vector.strip().startswith('{'):
+        try:
+            pairs = [field.rsplit(':' if ':' in field else '=', 1) for field in vector.split(',')]
+            pairs = [(net.strip(), bit.strip()) for net, bit in pairs]
+        except ValueError:
+            return ('raw', vector)
+        if len({net for net, _ in pairs}) == len(pairs):
+            return ('text', tuple(sorted(pairs)))
+    return ('raw', json.dumps(vector, default=str))
+
+
+def _output_nets(outputs):
+    """The output nets in their given order when every claimed value is a
+    valid bit, since the simulator then never reads the values; otherwise the
+    vector exactly as written, because an invalid value is an error."""
+    if isinstance(outputs, dict):
+        if all(type(bit) in (int, str) and bit in (0, 1, '0', '1') for bit in outputs.values()):
+            return ('names', tuple(outputs))
+    elif isinstance(outputs, str):
+        read = _vector_as_read(outputs)
+        if read[0] == 'text' and all(bit in ('0', '1') for _, bit in read[1]):
+            return ('names', tuple(net for net, _ in read[1]))
+    return ('raw', json.dumps(outputs, default=str))
+
+
 def repeat_key(call):
-    """What makes two calls return the same observation: the input vector, the
-    output nets (their claimed values are ignored by the simulator), the fault
-    and the circuit."""
-    from atpgllm.llm.reward_funcs import call_identity, vector_key
+    """Two calls with the same key get the same observation from the tool: the
+    same input vector, the same output nets, the same fault and the same
+    circuit. Everything the tool checks is compared as written, so a call the
+    tool rejects never shares a key with one it accepts."""
     arguments = call.get('arguments')
     if isinstance(arguments, str):
         try:
@@ -150,10 +183,11 @@ def repeat_key(call):
             return None
     if not isinstance(arguments, dict):
         return None
-    outputs = vector_key(arguments.get('output_vector'))
-    return (call.get('name'), call_identity({'arguments': arguments}),
-            tuple(net for net, _ in outputs) if outputs else str(arguments.get('output_vector')),
-            ' '.join(str(arguments.get('fault', '')).split()), str(arguments.get('doc_id')))
+    return (call.get('name'), _vector_as_read(arguments.get('input_vector')),
+            _output_nets(arguments.get('output_vector')),
+            json.dumps(arguments.get('fault'), default=str),
+            json.dumps(arguments.get('doc_id'), default=str),
+            tuple(sorted(arguments)))
 
 
 class ToolScheduler:
