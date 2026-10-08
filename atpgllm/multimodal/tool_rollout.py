@@ -4,7 +4,9 @@ A trajectory alternates model turns and fault-simulation results: the model
 writes a turn; if the turn ends with a tool call, the call is executed and the
 tool's answer is appended in the chat template's tool format; the model then
 writes the next turn. A trajectory ends with a turn that calls no tool, at
-``max_tool_calls``, or when ``max_completion_tokens`` is spent.
+``max_tool_calls``, or when ``max_completion_tokens`` is spent. A call that
+repeats an earlier call of the same trajectory gets the earlier answer without
+running the simulator again; it still counts as a call.
 
 Every trajectory keeps two masks over its completion tokens: all of them are
 attended to, but only the tokens the model wrote are trained (``loss_mask``);
@@ -20,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Tuple
 
 from atpgllm.training.revert_template import parse_tool_call
+from atpgllm.training.tools import repeat_key
 
 
 @dataclass
@@ -30,6 +33,7 @@ class Trajectory:
     tool_results: List[str] = field(default_factory=list)  # what the tool returned
     truncated: bool = False       # ran out of tokens mid-turn or before a reply
     call_limit_hit: bool = False  # asked for a call past max_tool_calls
+    reused_calls: int = 0         # calls answered from an earlier identical call
 
 
 def turn_stop(tokenizer) -> Tuple[str, int]:
@@ -72,11 +76,12 @@ def rollout_group(
 
     ``generate_turn(contexts, max_new_tokens)`` returns the new tokens for each
     context (one batched generation per turn); ``run_tools(calls)`` returns the
-    tool's answer for each parsed call.
+    tool's answer for each parsed call. Repeated calls never reach it.
     """
     stop_text, stop = turn_stop(tokenizer)
     trajectories = [Trajectory() for _ in range(num_generations)]
     calls = [0] * num_generations
+    observed: List[Dict[Any, str]] = [{} for _ in range(num_generations)]
     active = list(range(num_generations))
     while active:
         budgets = [max_completion_tokens - len(trajectories[i].completion_ids) for i in active]
@@ -104,10 +109,23 @@ def rollout_group(
                 trajectory.call_limit_hit = True
                 continue
             pending.append((i, call))
-        results = run_tools([call for _, call in pending]) if pending else []
+        keys = [repeat_key(call) for _, call in pending]
+        fresh = [
+            n for n, ((i, _), key) in enumerate(zip(pending, keys))
+            if key is None or key not in observed[i]
+        ]
+        answers = run_tools([pending[n][1] for n in fresh]) if fresh else []
+        results = dict(zip(fresh, answers))
         active = []
-        for (i, _), content in zip(pending, results):
+        for n, ((i, _), key) in enumerate(zip(pending, keys)):
             trajectory = trajectories[i]
+            if n in results:
+                content = results[n]
+                if key is not None:
+                    observed[i][key] = content
+            else:
+                content = observed[i][key]
+                trajectory.reused_calls += 1
             calls[i] += 1
             trajectory.tool_results.append(content)
             block = tool_turn_tokens(tokenizer, content)

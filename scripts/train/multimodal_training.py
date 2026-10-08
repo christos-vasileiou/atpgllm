@@ -749,6 +749,7 @@ def _rollout_stats(trajectories, record) -> dict[str, float]:
         stats["trajectories"] += 1
         stats["tool_calls"] += len(results)
         stats["malformed_calls"] += sum(r.startswith("Tool execution failed") for r in results)
+        stats["reused_calls"] += trajectory.reused_calls
         stats["truncated"] += trajectory.truncated
         stats["call_limit_hit"] += trajectory.call_limit_hit
         detected = []
@@ -1011,6 +1012,7 @@ def train_grpo(args: argparse.Namespace) -> None:
                 "first_call_detects": window["first_call_detects"] / max(1, window["called"]),
                 "recovery_rate": window["recovered"] / max(1, window["first_call_missed"]),
                 "malformed_call_share": window["malformed_calls"] / max(1, window["tool_calls"]),
+                "reused_call_share": window["reused_calls"] / max(1, window["tool_calls"]),
                 "truncated_share": window["truncated"] / n,
                 "zero_advantage_group_share": window["zero_advantage_groups"]
                 / max(1, window["groups"] + window["zero_advantage_groups"]),

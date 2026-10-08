@@ -163,3 +163,44 @@ def test_reward_trace_pairs_each_executed_call_with_its_turn():
     assert trace["calls"] == [{"arguments": {"input_vector": "a=1"}, "result": "{}"}]
     # The second call was not run, so its turn is the (unanswered) final turn.
     assert len(trace["turns"]) == 2
+
+
+
+def test_repeated_call_reuses_the_earlier_answer(tokenizer):
+    import json
+
+    from atpgllm.multimodal.tool_rollout import reward_trace, rollout_group
+
+    def turn(vector):
+        arguments = {"input_vector": vector, "output_vector": {"y": 0},
+                     "fault": "U1/A sa0", "doc_id": "d"}
+        text = json.dumps({"name": "fault_simulation_tool", "arguments": arguments})
+        return tokenizer.encode(f"<tool_call>\n{text}\n</tool_call><|im_end|>",
+                                add_special_tokens=False)
+
+    a, b = {"a": 1, "b": 0}, {"a": 0, "b": 0}
+    plan = [[turn(a), turn(a)], [turn(a), turn(a)], [turn(b), turn(a)]]
+    simulated = []
+
+    def generate_turn(contexts, n):
+        assert len(contexts) == 2
+        if plan:
+            return plan.pop(0)
+        return [tokenizer.encode("done<|im_end|>", add_special_tokens=False)] * 2
+
+    def run_tools(batch):
+        answers = []
+        for call in batch:
+            simulated.append(call["arguments"]["input_vector"])
+            answers.append(f"answer {len(simulated)}")
+        return answers
+
+    first, second = rollout_group(generate_turn, tokenizer, [1, 2], run_tools,
+                                  num_generations=2, max_tool_calls=3,
+                                  max_completion_tokens=10**6)
+    # Each trajectory runs its own first call; nothing is shared between them.
+    assert simulated == [a, a, b]
+    assert first.tool_results == ["answer 1", "answer 1", "answer 3"]
+    assert second.tool_results == ["answer 2"] * 3
+    assert (first.reused_calls, second.reused_calls) == (1, 2)
+    assert len(reward_trace(second)["calls"]) == 3   # repeats are still attempts
