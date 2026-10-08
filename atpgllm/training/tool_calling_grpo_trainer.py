@@ -783,6 +783,8 @@ class ToolCallingGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
         if tool_call_count > 0:
             self._metrics[mode]["tools/call_count"].append(tool_call_count)
             self._metrics[mode]["tools/failure_count"].append(tool_failure_count)
+            # Repeated calls answered from an earlier observation, not simulated.
+            self._metrics[mode]["tools/reused_count"].append(scheduler.reused)
             self._metrics[mode]["tools/failure_rate"].append(
                 tool_failure_count / tool_call_count if tool_call_count > 0 else 0.0
             )

@@ -13,7 +13,7 @@ import pytest
 import atpgllm.llm.reward_funcs as reward_funcs
 from atpgllm.llm.reward_funcs import (
     Trajectory,
-    _vector_key,
+    vector_key,
     prompt_opens_thinking,
     test_generation_grpo_reward as score_generation,
 )
@@ -31,7 +31,7 @@ TABLE = json.dumps({"Good Machine": {"y": 1}, "Bad Machine": {"y": 0}})
 
 
 def _frame(vector):
-    values = dict(_vector_key(vector) or ())
+    values = dict(vector_key(vector) or ())
     detected = values.get("a") == "1"
     activated = detected or values.get("b") == "0"
     return pd.DataFrame(
@@ -52,10 +52,12 @@ def _shown(vector):
     return _frame(vector)[["Good Machine", "Bad Machine"]].to_json()
 
 
-def _xml_call(vector):
+def _xml_call(vector, doc_id="d"):
     return ("<tool_call>\n<function=fault_simulation_tool>\n"
             f"<parameter=input_vector>\n{vector}\n</parameter>\n"
-            "<parameter=fault>\nsa0 n_fault\n</parameter>\n</function>\n</tool_call>")
+            "<parameter=output_vector>\ny=1\n</parameter>\n"
+            "<parameter=fault>\nsa0 n_fault\n</parameter>\n"
+            f"<parameter=doc_id>\n{doc_id}\n</parameter>\n</function>\n</tool_call>")
 
 
 def _call(vector, result=None):
@@ -130,6 +132,38 @@ def test_first_try_success_is_best():
     assert reward["activation"] == 1.0
     assert reward["fidelity"] == 1.0
     assert reward["format"] == 1.0
+    assert reward["uniqueness"] == 1.0
+
+
+def test_a_repeated_vector_is_another_attempt():
+    reward, _ = _score(_trace([INACTIVE, INACTIVE, DETECTS], _answer(DETECTS)))
+    assert reward["detection"] == pytest.approx(1 / 3)
+    assert reward["activation"] == pytest.approx(1 / 3)
+    assert reward["uniqueness"] == pytest.approx(2 / 3)
+    assert reward["duplicate_calls_logonly"] == 1.0
+    fresh, _ = _score(_trace([INACTIVE, BLOCKED, DETECTS], _answer(DETECTS)))
+    assert fresh["detection"] == reward["detection"]
+    assert fresh["uniqueness"] == 1.0 > reward["uniqueness"]
+    assert fresh["format"] > reward["format"]
+
+
+def test_the_reward_simulates_each_vector_once():
+    turns = [_call_turn(),
+             "Retry.\n</think>\n\n" + _xml_call(BLOCKED) + _xml_call(BLOCKED) + _xml_call(DETECTS),
+             _answer(DETECTS)]
+    trace = {"turns": turns, "calls": [_call(INACTIVE), _call(BLOCKED)]}
+    reward, simulated = _score(trace)
+    assert simulated == [BLOCKED, DETECTS]
+    assert reward["detection"] == pytest.approx(1 / 4)
+    assert reward["uniqueness"] == pytest.approx(3 / 4)
+    assert reward["simulated_calls_logonly"] == 2.0
+
+
+def test_identical_rejected_calls_are_repeats():
+    failed = _call("a=2", result="Tool execution failed: input_vector has non-binary values")
+    reward, _ = _score(_trace([failed, failed, DETECTS], _answer(DETECTS)))
+    assert reward["detection"] == pytest.approx(1 / 3)
+    assert reward["uniqueness"] == pytest.approx(2 / 3)
 
 
 def test_detection_and_activation_average_over_attempts():
@@ -192,6 +226,7 @@ def test_fidelity_uses_the_last_detecting_call():
 def test_detection_needs_a_tool_call():
     reward, simulated = _score(_trace([], _answer(DETECTS)))
     assert reward["detection"] == 0.0
+    assert reward["uniqueness"] == 0.0
     assert reward["activation"] == 0.0
     assert reward["fidelity"] == 0.0
     assert reward["format"] == pytest.approx(5 / 6)
@@ -348,3 +383,24 @@ def test_threaded_native_scoring_keeps_each_trace(monkeypatch):
               _trace([INACTIVE], _answer(INACTIVE))]
     rows, _ = _score_many(traces)
     assert [row["detection"] for row in rows] == [1.0, 0.5, 0.0]
+
+
+def test_unexecuted_calls_must_pass_the_tool_checks():
+    document = "{'doc_id': 'd', 'netlist': 'module m; endmodule'}"
+    prompt = f"target sa0 n_fault {document}<|im_start|>assistant\n<think>\n"
+    turns = [_call_turn(), "Retry.\n</think>\n\n" + _xml_call(DETECTS, doc_id="other")]
+    reward, simulated = _score({"turns": turns, "calls": [_call(INACTIVE)]}, prompt=prompt)
+    assert simulated == []
+    assert reward["detection"] == 0.0
+    turns[1] = "Retry.\n</think>\n\n" + _xml_call(DETECTS)
+    reward, simulated = _score({"turns": turns, "calls": [_call(INACTIVE)]}, prompt=prompt)
+    assert simulated == [DETECTS]
+    assert reward["detection"] == 0.5
+
+
+def test_calls_without_a_readable_vector_differ_by_their_arguments():
+    from atpgllm.llm.reward_funcs import call_identity
+    assert call_identity({"arguments": {"fault": "sa0 a"}}) != call_identity({"arguments": {"fault": "sa1 b"}})
+    assert call_identity({"arguments": None}) == call_identity({"arguments": None})
+    assert call_identity({"arguments": {"input_vector": "a=1, b=0"}}) == \
+        call_identity({"arguments": {"input_vector": "b:0,a:1", "fault": "sa1 x"}})

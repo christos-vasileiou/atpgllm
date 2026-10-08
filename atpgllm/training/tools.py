@@ -137,17 +137,40 @@ def execute_tool_batch(calls, prompts, functions):
             raise
 
 
+def repeat_key(call):
+    """What makes two calls return the same observation: the input vector, the
+    output nets (their claimed values are ignored by the simulator), the fault
+    and the circuit."""
+    from atpgllm.llm.reward_funcs import call_identity, vector_key
+    arguments = call.get('arguments')
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(arguments, dict):
+        return None
+    outputs = vector_key(arguments.get('output_vector'))
+    return (call.get('name'), call_identity({'arguments': arguments}),
+            tuple(net for net, _ in outputs) if outputs else str(arguments.get('output_vector')),
+            ' '.join(str(arguments.get('fault', '')).split()), str(arguments.get('doc_id')))
+
+
 class ToolScheduler:
     """Keep slow simulations running while ready trajectories resume generation.
 
     All collectives occur on the trainer thread. Trajectory indices, token masks,
     log probabilities and full-group optimization stay with the existing loop.
+    A call that repeats an earlier call of the same trajectory is answered with
+    the earlier observation instead of running the simulator again.
     """
     def __init__(self, functions):
         self.functions = functions
         self.cancelled = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=16)
         self.pending = {}
+        self.observed = {}  # (trajectory index, repeat_key) -> tool result
+        self.reused = 0
         self.pipelined = os.environ.get('TMAX_PIPELINED_TOOLS', '0') == '1'
 
     def __enter__(self):
@@ -159,11 +182,19 @@ class ToolScheduler:
 
     def take(self, trainer, calls, indices, prompts):
         import torch
+        from concurrent.futures import Future
         for call, index in zip(calls, indices):
             if index in self.pending:
                 raise RuntimeError('Duplicate in-flight tool for a trajectory')
-            self.pending[index] = (call, self.executor.submit(
-                _execute_tool, (call, prompts[index]), self.functions, self.cancelled))
+            key = repeat_key(call)
+            if key is not None and (index, key) in self.observed:
+                future = Future()
+                future.set_result((self.observed[(index, key)], False))
+                self.reused += 1
+            else:
+                future = self.executor.submit(
+                    _execute_tool, (call, prompts[index]), self.functions, self.cancelled)
+            self.pending[index] = (call, future)
         while True:
             ready = [idx for idx, (_, future) in self.pending.items() if future.done()]
             if not self.pipelined:
@@ -178,7 +209,12 @@ class ToolScheduler:
                 break
             time.sleep(0.05)
         selected = [self.pending.pop(index) for index in ready]
-        return [call for call, _ in selected], ready, [future.result() for _, future in selected]
+        outcomes = [future.result() for _, future in selected]
+        for index, (call, _), (result, failed) in zip(ready, selected, outcomes):
+            key = repeat_key(call)
+            if key is not None and not failed:
+                self.observed[(index, key)] = result
+        return [call for call, _ in selected], ready, outcomes
 
 
 class ToolTrace:

@@ -152,7 +152,7 @@ def test_resume_provenance_checked_before_training_and_service_cleaned_up(launch
     checkpoint = launcher.repo / 'checkpoint-3'
     checkpoint.mkdir()
     (checkpoint / 'trainer_state.json').write_text('{}')
-    provenance = {'backend': 'tetramax', 'reward_contract': 'atpg-rewards-v2',
+    provenance = {'backend': 'tetramax', 'reward_contract': 'atpg-rewards-v3',
                   'objectives': ['detection'], 'weights': [1.0], 'profile': 'po',
                   'simulator': {'schema': 'test', 'tool_version': 'test-version',
                                 'fingerprint': 'test-fingerprint' if mode == 'matching' else 'old-fingerprint'}}

@@ -107,7 +107,7 @@ def test_native_rewards_mask_unknowns_and_exclude_internal_objective(monkeypatch
         fault_fn=lambda *a,**k:[('sa0','y')], simulation_fn=lambda _:[],
         input_vector_fn=lambda _:['a:1'],expected_output_fn=lambda _:['y:1,z:0'],
         detected_faults_fn=lambda _:['sa0 y'],fault_sim=simulator,tool_trace=[verified]*2)
-    assert active_reward_objectives()[0]==('detection','fidelity','format')
+    assert active_reward_objectives()[0]==('detection','fidelity','format','uniqueness')
     assert len(result)==2
     for reward in result:
         assert reward['detection']==1 and reward['fidelity']==1
