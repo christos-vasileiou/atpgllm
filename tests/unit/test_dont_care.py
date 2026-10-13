@@ -147,3 +147,32 @@ def test_tool_guard_accepts_dont_cares():
     _require_bit_mapping("input_vector", "a: x, b: 1")
     with pytest.raises(ValueError):
         _require_bit_mapping("input_vector", {"a": 2})
+
+
+class _Template:
+    """A stand-in tokenizer: XML-style templates print each argument as JSON
+    text; JSON-style templates serialize the whole arguments object."""
+
+    def __init__(self, xml):
+        self.xml = xml
+
+    def apply_chat_template(self, messages, **kwargs):
+        args = messages[-1]["tool_calls"][0]["function"]["arguments"]
+        if self.xml:
+            return "|".join(v if isinstance(v, str) else json.dumps(v) for v in args.values())
+        return json.dumps(args)
+
+
+def test_vectors_stored_as_text_only_where_the_model_sees_the_same_tokens():
+    from datasets import Dataset
+    from atpgllm.training.dataset_utils import _vectors_to_text, tool_vectors_as_text
+    assert tool_vectors_as_text(_Template(xml=True))
+    assert not tool_vectors_as_text(_Template(xml=False))
+    messages = [{"role": "assistant", "content": "c", "tool_calls": [{"type": "function", "function": {
+        "name": "fault_simulation_tool",
+        "arguments": {"input_vector": {"a": 1, "b": "x"}, "output_vector": {"y": "x"},
+                      "fault": "sa0 a", "doc_id": "d"}}}]}]
+    converted = _vectors_to_text(copy.deepcopy(messages))
+    arguments = converted[0]["tool_calls"][0]["function"]["arguments"]
+    assert arguments["input_vector"] == '{"a": 1, "b": "x"}'
+    Dataset.from_list([{"messages": converted}])  # mixed 0/1/x vectors fit an Arrow column

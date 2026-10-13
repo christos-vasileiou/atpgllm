@@ -52,14 +52,17 @@ def _ordering_index(directory, circuits, seed):
     import pyarrow.parquet as pq
     index = {circuit: [] for circuit in circuits}
     for path in sorted((Path(directory) / 'validation').glob('*.parquet')):
-        table = pq.read_table(path, columns=['circuit_id', 'fault', 'input_vector'])
-        for position, (circuit, fault, vector) in enumerate(zip(
-                *(table.column(c).to_pylist() for c in ('circuit_id', 'fault', 'input_vector')))):
+        columns = ['circuit_id', 'fault', 'input_vector', 'netlist_id']
+        columns = [c for c in columns if c in pq.read_schema(path).names]
+        table = pq.read_table(path, columns=columns)
+        netlists = table.column('netlist_id').to_pylist() if 'netlist_id' in columns else [None] * len(table)
+        for position, (circuit, fault, vector, netlist) in enumerate(zip(
+                *(table.column(c).to_pylist() for c in ('circuit_id', 'fault', 'input_vector')), netlists)):
             if circuit not in index:
                 raise KeyError(f'Validation row of circuit {circuit} is missing from split_manifest.json')
             # Ordering is independent of shard order, process count and Python hash seed.
             key = digest(json.dumps([seed, circuit, fault, vector], sort_keys=True))
-            index[circuit].append((key, str(path), position))
+            index[circuit].append((key, str(path), position, netlist))
     for rows in index.values():
         rows.sort()
     return index
@@ -75,20 +78,26 @@ def _skip_message(circuit, info, examined, reasons, shortest_prompt, max_prompt_
             f"training data is unaffected.")
 
 
-def _shortest_prompt(rows, tokenizer, use_tools, sample=32):
+def _prompt_length(row, tokenizer, use_tools):
     from .conversation import ConversationExample
     from .tools import TOOLS
-    shortest = None
-    for row in rows[:sample]:
-        try:
-            messages = ConversationExample.prompt_messages_from_record(copy.deepcopy(row), use_tools=use_tools)
-            text = tokenizer.apply_chat_template(messages, tools=TOOLS if use_tools else None,
-                                                 add_generation_prompt=True, tokenize=False)
-        except Exception:
-            continue
-        ids = tokenizer(text, add_special_tokens=False)['input_ids']
-        shortest = len(ids) if shortest is None else min(shortest, len(ids))
-    return shortest
+    try:
+        messages = ConversationExample.prompt_messages_from_record(copy.deepcopy(row), use_tools=use_tools)
+        text = tokenizer.apply_chat_template(messages, tools=TOOLS if use_tools else None,
+                                             add_generation_prompt=True, tokenize=False)
+    except Exception:
+        return None
+    return len(tokenizer(text, add_special_tokens=False)['input_ids'])
+
+
+def _shortest_prompt(rows, tokenizer, use_tools, sample=32):
+    lengths = [n for n in (_prompt_length(row, tokenizer, use_tools) for row in rows[:sample]) if n is not None]
+    return min(lengths) if lengths else None
+
+
+# A circuit's prompts differ only in the fault and vector text, a few tokens;
+# a netlist whose sample prompt is this far over the limit cannot fit.
+_PROMPT_SLACK_TOKENS = 256
 
 
 def prepare_circuit_validation(directory, manifest, tokenizer, *, sft_format,
@@ -106,19 +115,21 @@ def prepare_circuit_validation(directory, manifest, tokenizer, *, sft_format,
     from collections import Counter
     import pyarrow.parquet as pq
     from datasets import Dataset
-    from .dataset_utils import _classify_sft_messages_batch, _format_sft_messages_record, _gate_filter_passes
+    from .dataset_utils import (_classify_sft_messages_batch, _format_sft_messages_record,
+                                _gate_filter_passes, tool_vectors_as_text)
     from .tools import TOOLS
 
     if per_circuit < 1:
         raise ValueError('SFT validation examples per circuit must be positive')
     use_tools = bool(getattr(tokenizer, 'chat_template', None) and 'tool' in tokenizer.chat_template)
+    vectors_as_text = use_tools and tool_vectors_as_text(tokenizer)
     info = {r['circuit_id']: r for r in manifest['circuits'] if r.get('split') == 'validation'}
     index = _ordering_index(directory, info, manifest['seed'])
     tables = {}
 
     def load(entries):
         rows = []
-        for _, path, position in entries:
+        for _, path, position, _netlist in entries:
             if path not in tables:
                 tables[path] = pq.read_table(path)
             rows.append(tables[path].slice(position, 1).to_pylist()[0])
@@ -128,6 +139,28 @@ def prepare_circuit_validation(directory, manifest, tokenizer, *, sft_format,
     for circuit, entries in sorted(index.items()):
         tables.clear()  # A circuit's rows sit in one or a few shards.
         reasons, kept_faults, examined = Counter(), set(), 0
+        shortest = None
+        if sft_format == 'messages':
+            # Screen each netlist once: rows of a netlist removed by the gate
+            # filter, or whose prompt is far over the limit, are not tokenized.
+            first = {}
+            for entry in entries:
+                first.setdefault(entry[3], entry)
+            excluded = set()
+            for netlist, entry in first.items():
+                row = load([entry])[0]
+                if not _gate_filter_passes(row):
+                    excluded.add(netlist)
+                    reasons['gate'] += sum(e[3] == netlist for e in entries)
+                    continue
+                length = _prompt_length(row, tokenizer, use_tools)
+                if length is not None:
+                    shortest = length if shortest is None else min(shortest, length)
+                if length is not None and length >= max_prompt_length + _PROMPT_SLACK_TOKENS:
+                    excluded.add(netlist)
+                    reasons['length'] += sum(e[3] == netlist for e in entries)
+            examined = sum(e[3] in excluded for e in entries)
+            entries = [e for e in entries if e[3] not in excluded]
         for start in range(0, len(entries), batch_size):
             if len(kept_faults) >= per_circuit:
                 break
@@ -139,7 +172,7 @@ def prepare_circuit_validation(directory, manifest, tokenizer, *, sft_format,
                 reasons[status] += 1
                 if status != 'ok' or row['fault'] in kept_faults or len(kept_faults) >= per_circuit:
                     continue
-                formatted = _format_sft_messages_record(copy.deepcopy(row), use_tools)
+                formatted = _format_sft_messages_record(copy.deepcopy(row), use_tools, vectors_as_text)
                 rendered = tokenizer.apply_chat_template(formatted['messages'], tokenize=False,
                                                           tools=TOOLS if use_tools else None)
                 length = len(tokenizer(rendered, add_special_tokens=False)['input_ids'])
@@ -153,10 +186,13 @@ def prepare_circuit_validation(directory, manifest, tokenizer, *, sft_format,
                                                         'module_name', 'fault', 'pattern_index')})
         reasons = Counter({k: v for k, v in reasons.items() if v > 0})
         if not kept_faults:
-            shortest = _shortest_prompt(load(entries), tokenizer, use_tools) if entries else None
+            if entries:
+                sampled = _shortest_prompt(load(entries), tokenizer, use_tools)
+                if sampled is not None:
+                    shortest = sampled if shortest is None else min(shortest, sampled)
             print(_skip_message(circuit, info[circuit], examined, reasons, shortest,
                                 max_prompt_length, max_model_len), flush=True)
-            skipped[circuit] = dict(rows=len(entries), filtering=dict(reasons), shortest_prompt=shortest)
+            skipped[circuit] = dict(rows=examined, filtering=dict(reasons), shortest_prompt=shortest)
             continue
         counts[circuit] = dict(selected=len(kept_faults), filtering=dict(reasons))
     if not selected:

@@ -38,7 +38,9 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from atpgllm.training.conversation import ConversationExample
-from atpgllm.training.tools import TOOLS
+from atpgllm.training.tools import FAULT_SIMULATION_TOOL, TOOLS
+
+FAULT_SIMULATION_TOOL_NAME = FAULT_SIMULATION_TOOL["function"]["name"]
 
 # =====================================================================
 # Training mode enumeration
@@ -71,19 +73,60 @@ def _gate_filter_passes(record: dict) -> bool:
     return gates_cnt not in (1, 5, 84)
 
 
-def _format_sft_messages_record(record: dict, use_tools: bool) -> dict:
+def tool_vectors_as_text(tokenizer) -> bool:
+    """Whether the chat template renders a tool-call vector given as JSON text
+    exactly as the same vector given as an object.
+
+    Don't-care datasets mix 0/1 integers and ``"x"`` inside one vector, which
+    Arrow cannot store in a column. Storing the vectors as JSON text avoids
+    that; it is used only where the model sees the same tokens either way
+    (Granite 4.2's XML tool calls). JSON-object templates (Qwen, Granite 4.1)
+    keep objects.
+    """
+    import json
+
+    def render(vector):
+        call = {"type": "function", "function": {"name": FAULT_SIMULATION_TOOL_NAME, "arguments": {
+            "input_vector": vector, "output_vector": vector, "fault": "sa0 a", "doc_id": "d"}}}
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": "u"},
+             {"role": "assistant", "content": "c", "tool_calls": [call]}],
+            tools=TOOLS, tokenize=False)
+
+    probe = {"a": 1, "b": "x"}
+    try:
+        return render(probe) == render(json.dumps(probe, ensure_ascii=False))
+    except Exception:
+        return False
+
+
+def _vectors_to_text(messages: list[dict]) -> list[dict]:
+    import json
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            arguments = call.get("function", {}).get("arguments")
+            if isinstance(arguments, dict):
+                for key in ("input_vector", "output_vector"):
+                    if isinstance(arguments.get(key), dict):
+                        arguments[key] = json.dumps(arguments[key], ensure_ascii=False)
+    return messages
+
+
+def _format_sft_messages_record(record: dict, use_tools: bool, vectors_as_text: bool = False) -> dict:
     convo = ConversationExample.from_record(record, use_tools=use_tools)
-    out: dict = {"messages": convo.messages}
+    messages = _vectors_to_text(convo.messages) if vectors_as_text else convo.messages
+    out: dict = {"messages": messages}
     if use_tools:
         out["tools"] = TOOLS
     return out
 
 
-def _format_sft_messages_batch(records: list[dict], use_tools: bool) -> list[dict]:
+def _format_sft_messages_batch(records: list[dict], use_tools: bool,
+                               vectors_as_text: bool = False) -> list[dict]:
     formatted = []
     for raw in records:
         rec = copy.deepcopy(raw)
-        formatted.append(_format_sft_messages_record(rec, use_tools))
+        formatted.append(_format_sft_messages_record(rec, use_tools, vectors_as_text))
     return formatted
 
 
@@ -209,6 +252,7 @@ def _sft_messages_stream(
     batch_size: int,
     num_workers: int,
     max_model_len: Optional[int] = None,
+    vectors_as_text: bool = False,
 ) -> Iterator[dict]:
     """Fused gate filter, prompt/sequence-length filters, optional skip, and SFT formatting."""
     skip_count = int(skip_count)
@@ -233,7 +277,7 @@ def _sft_messages_stream(
     def format_records(records: list[dict]) -> list[dict]:
         # Full SFT format stays on the main process to avoid pool deadlocks
         # (classify jobs already occupy worker_pool during pipelined skip).
-        return _format_sft_messages_batch(records, use_tools)
+        return _format_sft_messages_batch(records, use_tools, vectors_as_text)
 
     def consume_classified(batch: list[dict], statuses: list[str]) -> Iterator[dict]:
         nonlocal skipped_valid, skip_done
@@ -383,8 +427,10 @@ def _streaming_sft_messages_dataset(
             batch_size=skip_batch_size,
             num_workers=skip_num_workers,
             max_model_len=max_model_len,
+            vectors_as_text=vectors_as_text,
         )
 
+    vectors_as_text = use_tools and tool_vectors_as_text(tokenizer)
     return IterableDataset.from_generator(_generator)
 
 
@@ -928,12 +974,10 @@ def format_dataset_for_training(
 
             dataset = dataset.filter(filter_fn)
 
+            vectors_as_text = use_tools and tool_vectors_as_text(tokenizer)
+
             def format_fn(record):
-                convo = ConversationExample.from_record(record, use_tools=use_tools)
-                out = {"messages": convo.messages}
-                if use_tools:
-                    out["tools"] = TOOLS
-                return out
+                return _format_sft_messages_record(record, use_tools, vectors_as_text)
 
             mapped = dataset.map(format_fn)
             if max_prompt_length is not None:
