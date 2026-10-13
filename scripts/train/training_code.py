@@ -1111,6 +1111,7 @@ def train_with_grpo(
             launch_skip_buffer_size=skip_buffer_size,
             buffer_size=buffer_size,
             num_generations=max(num_generations, 2),
+            rolling_buffer=buffer_rolling,
         ),
     ]
 
