@@ -7,7 +7,7 @@ cannot mix that, and an Arrow cache of the whole split is tens of GB on
 network storage. Instead: read only ``circuit_id`` from the cached parquet
 files, choose rows at random (at most ``per_circuit`` per circuit, chosen at
 random within it), then load just those rows and the columns the graph code
-uses, keeping one copy of each circuit's netlist.
+uses, keeping one copy of each distinct netlist.
 """
 
 from __future__ import annotations
@@ -105,7 +105,10 @@ def load_rows(
         table = pq.read_table(files[file_index], columns=list(columns)).take(rows)
         for row, record in zip(rows, table.to_pylist()):
             if "netlist" in record:
-                record["netlist"] = netlists.setdefault(record["circuit_id"], record["netlist"])
+                # One copy per distinct netlist text. Not per circuit_id: a
+                # circuit groups structurally equal netlists whose port names
+                # differ, and each row's vector names its own netlist's ports.
+                record["netlist"] = netlists.setdefault(record["netlist"], record["netlist"])
             loaded[(file_index, row)] = record
     return [loaded[pick] for pick in picks]
 

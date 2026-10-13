@@ -192,3 +192,21 @@ def test_split_files_reads_a_local_dataset_directory(tmp_path):
         split_files(str(tmp_path), "train", "some-revision")
     with pytest.raises(FileNotFoundError):
         split_files(str(tmp_path), "test", None)
+
+
+def test_rows_keep_their_own_netlist_within_a_circuit(tmp_path):
+    # A circuit_id groups structurally equal netlists with different port
+    # names; each row must keep the netlist its vector was written for.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from atpgllm.graph.circuit_sampling import load_rows
+
+    path = tmp_path / "data-00000.parquet"
+    pq.write_table(pa.table({
+        "circuit_id": ["c", "c", "c"],
+        "netlist": ["module m(a, y);", "module m(b, y);", "module m(a, y);"],
+    }), path)
+    rows = load_rows([str(path)], [(0, 0), (0, 1), (0, 2)], columns=("circuit_id", "netlist"))
+    assert [r["netlist"] for r in rows] == ["module m(a, y);", "module m(b, y);", "module m(a, y);"]
+    assert rows[0]["netlist"] is rows[2]["netlist"]   # identical text is still shared
