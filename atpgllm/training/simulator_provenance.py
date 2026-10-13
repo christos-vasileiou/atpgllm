@@ -14,7 +14,7 @@ def runtime_provenance():
     from atpgllm.llm.reward_funcs import active_reward_objectives
     native = resolve_fault_sim_runner().__name__ == 'tetramax_fault_sim'
     keys, weights = active_reward_objectives()
-    result = {'backend': 'tetramax' if native else 'fast', 'reward_contract': 'atpg-rewards-v3',
+    result = {'backend': 'tetramax' if native else 'fast', 'reward_contract': 'atpg-rewards-v4',
               'objectives': list(keys), 'weights': list(weights),
               'profile': os.environ.get('TMAX_REWARD_PROFILE', 'po') if native else 'full'}
     if native:

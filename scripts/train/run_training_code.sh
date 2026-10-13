@@ -267,7 +267,7 @@ write_launch_config_snapshot() {
         PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS MAX_STEPS REPORT_TO
         MAX_MODEL_LEN MAX_PROMPT_LENGTH MAX_COMPLETION_LENGTH
         SFT_CIRCUIT_VALIDATION SFT_EVAL_STEPS SFT_EVAL_PER_CIRCUIT
-        ASSISTANT_ONLY_LOSS BUFFER_SIZE NUM_GENERATIONS TRAIN_BEST_OF_N STEPS_PER_GENERATION
+        ASSISTANT_ONLY_LOSS BUFFER_SIZE BUFFER_ROLLING SAVE_TOTAL_LIMIT NUM_GENERATIONS TRAIN_BEST_OF_N STEPS_PER_GENERATION
         NETLIST_DIVERSITY_STRATEGY DISABLE_DROPOUT VLLM_IMPORTANCE_SAMPLING_MODE
         DDP_TIMEOUT
         GRPO_LEARNING_RATE GRPO_WARMUP_STEPS FIXED_EVAL_SIZE FIXED_EVAL_SPLIT
@@ -434,6 +434,9 @@ build_cmd_args() {
         CMD_ARGS+=(--sft_circuit_validation --sft_eval_steps "${SFT_EVAL_STEPS:-10}"
                    --sft_eval_per_circuit "${SFT_EVAL_PER_CIRCUIT:-8}")
     fi
+    if [ "$METHOD" == "sft" ] && [ -n "${SAVE_TOTAL_LIMIT:-}" ]; then
+        CMD_ARGS+=(--save_total_limit "$SAVE_TOTAL_LIMIT")
+    fi
 
     # SFT only: assistant-only loss (mask system/user/tool-response tokens)
     if [ "$METHOD" == "sft" ]; then
@@ -494,6 +497,9 @@ build_cmd_args() {
                 CMD_ARGS+=(--fixed_eval_manifest "$FIXED_EVAL_MANIFEST")
             fi
         fi
+        if [[ "${BUFFER_ROLLING:-False}" =~ ^([Tt]rue|1)$ ]]; then
+            CMD_ARGS+=(--buffer_rolling)
+        fi
         if [ "${DISABLE_DROPOUT:-True}" == "False" ]; then
             CMD_ARGS+=(--no-disable_dropout)
         else
@@ -547,6 +553,7 @@ build_cmd_args() {
     if [ "$METHOD" == "grpo" ]; then
         echo "--- GRPO-specific ---"
         echo "BUFFER_SIZE: $BUFFER_SIZE"
+        echo "BUFFER_ROLLING: ${BUFFER_ROLLING:-False}"
         echo "NUM_GENERATIONS: $NUM_GENERATIONS"
         echo "STEPS_PER_GENERATION: $STEPS_PER_GENERATION"
         echo "MAX_COMPLETION_LENGTH: $MAX_COMPLETION_LENGTH"
@@ -788,6 +795,7 @@ trap 'exit 143' TERM
 # Fail before GPU/model startup if the simulator is unavailable. Submission
 # wrappers invoke this same launcher once the allocation begins.
 start_tetramax_service || exit 1
+preflight_tetramax_simulation || exit 1
 if [ "$METHOD" == grpo ] && [ "${RESUME_TRAINING_STATE:-False}" == True ] && [ "${DRY_RUN:-False}" != True ]; then
     # Compare against the ready service before spending time loading vLLM/models.
     python -m atpgllm.training.simulator_provenance "$RESUME_FROM" || exit 1

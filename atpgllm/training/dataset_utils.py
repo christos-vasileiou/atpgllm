@@ -38,7 +38,9 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from atpgllm.training.conversation import ConversationExample
-from atpgllm.training.tools import TOOLS
+from atpgllm.training.tools import FAULT_SIMULATION_TOOL, TOOLS
+
+FAULT_SIMULATION_TOOL_NAME = FAULT_SIMULATION_TOOL["function"]["name"]
 
 # =====================================================================
 # Training mode enumeration
@@ -71,19 +73,60 @@ def _gate_filter_passes(record: dict) -> bool:
     return gates_cnt not in (1, 5, 84)
 
 
-def _format_sft_messages_record(record: dict, use_tools: bool) -> dict:
+def tool_vectors_as_text(tokenizer) -> bool:
+    """Whether the chat template renders a tool-call vector given as JSON text
+    exactly as the same vector given as an object.
+
+    Don't-care datasets mix 0/1 integers and ``"x"`` inside one vector, which
+    Arrow cannot store in a column. Storing the vectors as JSON text avoids
+    that; it is used only where the model sees the same tokens either way
+    (Granite 4.2's XML tool calls). JSON-object templates (Qwen, Granite 4.1)
+    keep objects.
+    """
+    import json
+
+    def render(vector):
+        call = {"type": "function", "function": {"name": FAULT_SIMULATION_TOOL_NAME, "arguments": {
+            "input_vector": vector, "output_vector": vector, "fault": "sa0 a", "doc_id": "d"}}}
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": "u"},
+             {"role": "assistant", "content": "c", "tool_calls": [call]}],
+            tools=TOOLS, tokenize=False)
+
+    probe = {"a": 1, "b": "x"}
+    try:
+        return render(probe) == render(json.dumps(probe, ensure_ascii=False))
+    except Exception:
+        return False
+
+
+def _vectors_to_text(messages: list[dict]) -> list[dict]:
+    import json
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            arguments = call.get("function", {}).get("arguments")
+            if isinstance(arguments, dict):
+                for key in ("input_vector", "output_vector"):
+                    if isinstance(arguments.get(key), dict):
+                        arguments[key] = json.dumps(arguments[key], ensure_ascii=False)
+    return messages
+
+
+def _format_sft_messages_record(record: dict, use_tools: bool, vectors_as_text: bool = False) -> dict:
     convo = ConversationExample.from_record(record, use_tools=use_tools)
-    out: dict = {"messages": convo.messages}
+    messages = _vectors_to_text(convo.messages) if vectors_as_text else convo.messages
+    out: dict = {"messages": messages}
     if use_tools:
         out["tools"] = TOOLS
     return out
 
 
-def _format_sft_messages_batch(records: list[dict], use_tools: bool) -> list[dict]:
+def _format_sft_messages_batch(records: list[dict], use_tools: bool,
+                               vectors_as_text: bool = False) -> list[dict]:
     formatted = []
     for raw in records:
         rec = copy.deepcopy(raw)
-        formatted.append(_format_sft_messages_record(rec, use_tools))
+        formatted.append(_format_sft_messages_record(rec, use_tools, vectors_as_text))
     return formatted
 
 
@@ -92,8 +135,14 @@ def _classify_sft_messages_batch(
     tokenizer: AutoTokenizer,
     use_tools: bool,
     max_prompt_length: Optional[int],
+    max_model_len: Optional[int] = None,
 ) -> list[str]:
-    """Per-row status in stream order: ``gate``, ``length``, or ``ok``."""
+    """Per-row status in stream order: ``gate``, ``length``, ``too_long`` or ``ok``.
+
+    ``length``: the system+user prompt reaches ``max_prompt_length``.
+    ``too_long``: the full conversation (answer included) exceeds
+    ``max_model_len``; SFTTrainer would otherwise truncate the answer away.
+    """
     statuses: list[str] = ["gate"] * len(batch)
     tools = TOOLS if use_tools else None
     candidates: list[tuple[int, list[dict]]] = []
@@ -114,10 +163,14 @@ def _classify_sft_messages_batch(
             continue
         candidates.append((i, prompt_messages))
 
-    if not candidates or max_prompt_length is None:
+    if not candidates or (max_prompt_length is None and max_model_len is None):
         for idx, _ in candidates:
             statuses[idx] = "ok"
         return statuses
+    if max_prompt_length is None:
+        for idx, _ in candidates:
+            statuses[idx] = "ok"
+        return _mark_too_long(batch, statuses, tokenizer, use_tools, max_model_len)
 
     prompt_texts = [
         tokenizer.apply_chat_template(
@@ -140,6 +193,41 @@ def _classify_sft_messages_batch(
             statuses[idx] = "ok"
         else:
             statuses[idx] = "length"
+    return _mark_too_long(batch, statuses, tokenizer, use_tools, max_model_len)
+
+
+def _mark_too_long(
+    batch: list[dict],
+    statuses: list[str],
+    tokenizer: AutoTokenizer,
+    use_tools: bool,
+    max_model_len: Optional[int],
+) -> list[str]:
+    """Mark ``ok`` rows whose full rendered conversation exceeds ``max_model_len``."""
+    if max_model_len is None:
+        return statuses
+    ok = [i for i, status in enumerate(statuses) if status == "ok"]
+    if not ok:
+        return statuses
+    tools = TOOLS if use_tools else None
+    texts = [
+        tokenizer.apply_chat_template(
+            _format_sft_messages_record(copy.deepcopy(batch[i]), use_tools)["messages"],
+            tools=tools,
+            tokenize=False,
+        )
+        for i in ok
+    ]
+    encodings = tokenizer(
+        texts,
+        add_special_tokens=False,
+        truncation=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
+    )
+    for i, token_ids in zip(ok, encodings["input_ids"]):
+        if len(token_ids) > max_model_len:
+            statuses[i] = "too_long"
     return statuses
 
 
@@ -148,8 +236,11 @@ def _classify_sft_messages_batch_worker(
     tokenizer: AutoTokenizer,
     use_tools: bool,
     max_prompt_length: Optional[int],
+    max_model_len: Optional[int] = None,
 ) -> list[str]:
-    return _classify_sft_messages_batch(batch, tokenizer, use_tools, max_prompt_length)
+    return _classify_sft_messages_batch(
+        batch, tokenizer, use_tools, max_prompt_length, max_model_len,
+    )
 
 
 def _sft_messages_stream(
@@ -160,15 +251,17 @@ def _sft_messages_stream(
     skip_count: int,
     batch_size: int,
     num_workers: int,
+    max_model_len: Optional[int] = None,
+    vectors_as_text: bool = False,
 ) -> Iterator[dict]:
-    """Fused gate filter, prompt-length filter, optional skip, and SFT formatting."""
+    """Fused gate filter, prompt/sequence-length filters, optional skip, and SFT formatting."""
     skip_count = int(skip_count)
     batch_size = max(1, int(batch_size))
     num_workers = max(1, int(num_workers))
 
     skipped_valid = 0
     skip_done = skip_count == 0
-    stats = {"raw": 0, "gate": 0, "length": 0, "skipped": 0, "yielded": 0}
+    stats = {"raw": 0, "gate": 0, "length": 0, "too_long": 0, "skipped": 0, "yielded": 0}
 
     skip_pbar = (
         tqdm(
@@ -184,7 +277,7 @@ def _sft_messages_stream(
     def format_records(records: list[dict]) -> list[dict]:
         # Full SFT format stays on the main process to avoid pool deadlocks
         # (classify jobs already occupy worker_pool during pipelined skip).
-        return _format_sft_messages_batch(records, use_tools)
+        return _format_sft_messages_batch(records, use_tools, vectors_as_text)
 
     def consume_classified(batch: list[dict], statuses: list[str]) -> Iterator[dict]:
         nonlocal skipped_valid, skip_done
@@ -199,6 +292,9 @@ def _sft_messages_stream(
             if status == "length":
                 stats["length"] += 1
                 continue
+            if status == "too_long":
+                stats["too_long"] += 1
+                continue
             if not skip_done:
                 skipped_valid += 1
                 stats["skipped"] += 1
@@ -211,7 +307,8 @@ def _sft_messages_stream(
                     print(
                         f"[SFT] Skip complete: {skipped_valid} training example(s) "
                         f"(scanned {stats['raw']} raw row(s), "
-                        f"dropped gate={stats['gate']} length={stats['length']})."
+                        f"dropped gate={stats['gate']} length={stats['length']} "
+                        f"too_long={stats['too_long']})."
                     )
                 continue
             to_format.append(raw)
@@ -236,9 +333,10 @@ def _sft_messages_stream(
                 tokenizer,
                 use_tools,
                 max_prompt_length,
+                max_model_len,
             ).result()
         return _classify_sft_messages_batch(
-            batch, tokenizer, use_tools, max_prompt_length,
+            batch, tokenizer, use_tools, max_prompt_length, max_model_len,
         )
 
     try:
@@ -254,6 +352,7 @@ def _sft_messages_stream(
                     tokenizer,
                     use_tools,
                     max_prompt_length,
+                    max_model_len,
                 )))
                 if len(pending) > num_workers:
                     b, fut = pending.popleft()
@@ -270,6 +369,7 @@ def _sft_messages_stream(
                     tokenizer,
                     use_tools,
                     max_prompt_length,
+                    max_model_len,
                 )))
             else:
                 yield from consume_classified(batch, classify_batch(batch))
@@ -298,6 +398,7 @@ def _streaming_sft_messages_dataset(
     skip_buffer_size: int,
     skip_batch_size: int,
     skip_num_workers: int,
+    max_model_len: Optional[int] = None,
 ) -> IterableDataset:
     """IterableDataset with fused filter/format/skip for streaming SFT ``messages``."""
     skip_buffer_size = int(skip_buffer_size)
@@ -325,8 +426,11 @@ def _streaming_sft_messages_dataset(
             skip_count=skip_buffer_size,
             batch_size=skip_batch_size,
             num_workers=skip_num_workers,
+            max_model_len=max_model_len,
+            vectors_as_text=vectors_as_text,
         )
 
+    vectors_as_text = use_tools and tool_vectors_as_text(tokenizer)
     return IterableDataset.from_generator(_generator)
 
 
@@ -747,6 +851,27 @@ def filter_streaming_dataset_by_prompt_length(
     return dataset.filter(passes)
 
 
+def chat_template_uses_tools(tokenizer) -> bool:
+    template = getattr(tokenizer, "chat_template", None)
+    return bool(template) and ("tools" in template or "tool" in template)
+
+
+def format_grpo_record(record: dict, tokenizer: AutoTokenizer, use_tools: bool) -> dict:
+    """One GRPO row: the rendered system+user prompt plus the record's fields
+    (as derived by :meth:`ConversationExample.from_record`, which mutates it)."""
+    convo = ConversationExample.from_record(record, use_tools=use_tools)
+    prompt_messages = [
+        m for m in convo.messages
+        if m["role"] not in ("assistant", "tool")
+    ]
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False,
+        tools=TOOLS if use_tools else None,
+        add_generation_prompt=True,
+    )
+    return {"prompt": prompt, **record}
+
+
 def format_dataset_for_training(
     dataset,
     tokenizer: AutoTokenizer,
@@ -756,6 +881,7 @@ def format_dataset_for_training(
     skip_buffer_size: int = 0,
     skip_batch_size: int = 128,
     skip_num_workers: Optional[int] = None,
+    max_model_len: Optional[int] = None,
 ):
     """
     Convert a dataset of records into a format accepted by SFTTrainer or
@@ -806,6 +932,10 @@ def format_dataset_for_training(
         Raw rows per batch for the fast streaming SFT pipeline.
     skip_num_workers : int, optional
         Worker processes for batch classify/format. Default: ``min(16, cpu_count)``.
+    max_model_len : int, optional
+        Streaming SFT ``messages`` only. Drop examples whose full conversation
+        exceeds this many tokens instead of letting SFTTrainer truncate the
+        answer.
 
     Returns
     -------
@@ -816,7 +946,7 @@ def format_dataset_for_training(
     """
     is_streaming = isinstance(dataset, IterableDataset)
 
-    use_tools = hasattr(tokenizer, 'chat_template') and tokenizer.chat_template and ('tools' in tokenizer.chat_template or 'tool' in tokenizer.chat_template)
+    use_tools = chat_template_uses_tools(tokenizer)
 
     if skip_num_workers is None:
         skip_num_workers = _default_skip_num_workers()
@@ -825,6 +955,7 @@ def format_dataset_for_training(
         if sft_format == "messages":
             use_fast_stream = is_streaming and (
                 skip_buffer_size > 0 or max_prompt_length is not None
+                or max_model_len is not None
             )
             if use_fast_stream:
                 return _streaming_sft_messages_dataset(
@@ -835,6 +966,7 @@ def format_dataset_for_training(
                     skip_buffer_size=skip_buffer_size,
                     skip_batch_size=skip_batch_size,
                     skip_num_workers=skip_num_workers,
+                    max_model_len=max_model_len,
                 )
 
             def filter_fn(record):
@@ -842,12 +974,10 @@ def format_dataset_for_training(
 
             dataset = dataset.filter(filter_fn)
 
+            vectors_as_text = use_tools and tool_vectors_as_text(tokenizer)
+
             def format_fn(record):
-                convo = ConversationExample.from_record(record, use_tools=use_tools)
-                out = {"messages": convo.messages}
-                if use_tools:
-                    out["tools"] = TOOLS
-                return out
+                return _format_sft_messages_record(record, use_tools, vectors_as_text)
 
             mapped = dataset.map(format_fn)
             if max_prompt_length is not None:
@@ -893,17 +1023,7 @@ def format_dataset_for_training(
         dataset = dataset.filter(filter_fn)
 
         def format_fn(record):
-            convo = ConversationExample.from_record(record, use_tools=use_tools)
-            prompt_messages = [
-                m for m in convo.messages
-                if m["role"] not in ("assistant", "tool")
-            ]
-            prompt = tokenizer.apply_chat_template(
-                prompt_messages, tokenize=False,
-                tools=TOOLS if use_tools else None,
-                add_generation_prompt=True,
-            )
-            return {"prompt": prompt, **record}
+            return format_grpo_record(record, tokenizer, use_tools)
 
         return dataset.map(format_fn)
 

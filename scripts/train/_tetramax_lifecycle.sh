@@ -95,6 +95,35 @@ PY
     return 1
 }
 
+# One real 3-valued simulation through the service before any GPU work: proves
+# the binary, the license, the cell library and don't-care (x) inputs.
+preflight_tetramax_simulation() {
+    case "${TMAX_MANAGE_SERVICE:-False}" in True|true|1) ;; *) return 0 ;; esac
+    case "${TMAX_PREFLIGHT:-True}" in True|true|1) ;; *) return 0 ;; esac
+    [ "${DRY_RUN:-False}" == True ] && { echo "DRY RUN: would run one TetraMAX preflight simulation."; return 0; }
+    local project_root
+    project_root="$(cd "$_REPO_ROOT/.." && pwd)"
+    echo "TetraMAX preflight: simulating one pattern with a don't-care input..."
+    if ! DATA_PREPROCESSING_ROOT="${DATA_PREPROCESSING_ROOT:-$project_root/data_preprocessing}" \
+        "${SIM_PYTHON:-python}" - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ['DATA_PREPROCESSING_ROOT'])
+from tetramax_backend import make_request, simulate
+netlist = ('module preflight (a, b, y);\ninput a, b;\noutput y;\n'
+           'INVxp33_ASAP7_75t_R U1 ( .A(a), .Y(y) );\nendmodule')
+result = simulate(make_request(netlist, {'a': 0, 'b': 'x'}, {'y': 1}, 'sa0 y'))
+if not result.get('detected') or result['values'].get('b') != ['x', 'x']:
+    sys.exit(f"unexpected result: status={result.get('fault_status')} values={result.get('values')}")
+print(f"TetraMAX preflight OK: {result.get('tool_version')}, fault status {result['fault_status']}")
+PY
+    then
+        echo "ERROR: TetraMAX preflight simulation failed. Check that the TetraMAX binary and license"
+        echo "       are available on $(hostname) (TMAX_SERVICE_MODULE=${TMAX_SERVICE_MODULE:-unset}),"
+        echo "       that the ASAP7 cell library is found, and see the service log: ${TMAX_SERVICE_LOG:-n/a}"
+        return 1
+    fi
+}
+
 stop_tetramax_service() {
     [ -n "$TMAX_SERVICE_PID" ] || return 0
     echo "Stopping TetraMAX service (PID: $TMAX_SERVICE_PID)..."

@@ -88,8 +88,10 @@ def main():
         )
         expected_groups = {r['circuit_id'] for r in manifest['circuits']
                            if r.get('split') == 'validation'}
-        if set(sample['circuits']) != expected_groups:
+        if set(sample['circuits']) | set(sample['skipped_circuits']) != expected_groups:
             raise ValueError('Validation sample lost a held-out circuit group')
+        if sample['skipped_circuits']:
+            print(f"Skipped {len(sample['skipped_circuits'])} validation circuit(s) with no usable example")
 
         stage('Verify validation token lengths and assistant loss masks')
         lengths, prompts, assistant_tokens = [], [], []
