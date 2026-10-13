@@ -67,11 +67,19 @@ class SimulationReading:
     activated: bool
     differing_outputs: List[str]
     differing_internal: List[str]
+    # Primary outputs that are x in either machine (three-valued simulation).
+    unknown_outputs: Tuple[str, ...] = ()
 
 
 def _machines(snapshot: str | Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     data = json.loads(snapshot) if isinstance(snapshot, str) else snapshot
     return dict(data["Good Machine"]), dict(data["Bad Machine"])
+
+
+def _bit(value: Any) -> Optional[str]:
+    """``"0"`` or ``"1"`` for a known value, None for x or a missing net."""
+    text = str(value).strip()
+    return text if text in ("0", "1") else None
 
 
 def parse_fault(fault: str) -> Tuple[int, str]:
@@ -90,7 +98,13 @@ def read_snapshot(
     good, bad = _machines(snapshot)
     stuck_at, net = parse_fault(fault)
     outputs = set(output_nets)
-    differing = [n for n in good if str(good[n]) != str(bad.get(n))]
+    # Three-valued: only a 0 against a 1 is a difference. A net that is x in
+    # either machine is unknown, as TetraMAX and the reward read it.
+    differing = [
+        n for n in good
+        if _bit(good[n]) is not None and _bit(bad.get(n)) is not None
+        and _bit(good[n]) != _bit(bad.get(n))
+    ]
     differing_outputs = [n for n in differing if n in outputs]
     fault_net_good = None if good.get(net) is None else str(good[net])
     return SimulationReading(
@@ -102,6 +116,10 @@ def read_snapshot(
         activated=bool(differing),
         differing_outputs=differing_outputs,
         differing_internal=[n for n in differing if n not in outputs],
+        unknown_outputs=tuple(
+            n for n in good
+            if n in outputs and (_bit(good[n]) is None or _bit(bad.get(n)) is None)
+        ),
     )
 
 
@@ -129,9 +147,20 @@ def undetected_sentence(reading: SimulationReading) -> str:
         "The Good and Bad Machine agree on every primary output, so this "
         f"pattern does not detect {reading.fault}."
     )
+    if reading.unknown_outputs:
+        head = (
+            "No primary output has a 0 in one machine and a 1 in the other "
+            f"({_nets(list(reading.unknown_outputs))} unknown), so this pattern "
+            f"does not detect {reading.fault}."
+        )
     excitation = 1 - reading.stuck_at
     if not reading.activated:
         value = reading.fault_net_good if reading.fault_net_good is not None else "unknown"
+        if _bit(value) is None:
+            return (
+                f"{head} In the Good Machine {reading.fault_net} is {value}, so "
+                f"the fault is not activated: {reading.fault_net} must be {excitation}."
+            )
         return (
             f"{head} In the Good Machine {reading.fault_net} is {value}, the "
             f"value the stuck-at-{reading.stuck_at} fault forces, so the fault "

@@ -12,7 +12,9 @@ Every trajectory keeps two masks over its completion tokens: all of them are
 attended to, but only the tokens the model wrote are trained (``loss_mask``);
 the tool's answers are context. The rendering matches Stage C's SFT
 conversations token for token (``tests/unit/test_tool_rollout.py``), so the
-policy is rolled out in the format it was fine-tuned on.
+policy is rolled out in the format it was fine-tuned on. With Granite 4.2 the
+template's generation prompt opens ``<think>``, so each turn the model writes
+starts inside that block (:func:`atpgllm.multimodal.data.template_turns`).
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ class Trajectory:
 
 
 def turn_stop(tokenizer) -> Tuple[str, int]:
-    """The token that ends a model turn (Qwen2.5: ``<|im_end|>``)."""
+    """The token that ends a model turn (``<|im_end|>`` for Granite 4.2)."""
     text = tokenizer.eos_token
     return text, tokenizer.convert_tokens_to_ids(text)
 

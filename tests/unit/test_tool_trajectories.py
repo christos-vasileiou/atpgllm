@@ -109,23 +109,30 @@ def test_default_conversation_is_unchanged_and_retry_is_opt_in():
         ConversationExample.from_record(copy.deepcopy(record), failed_attempt=attempt)
 
 
-def test_tool_conversation_labels_only_trainable_turns():
+def granite_tokenizer():
+    """Granite 4.2's tokenizer from the local HF cache (loaded by path: by
+    model id, transformers asks the Hub about it even when cached)."""
+    from huggingface_hub import snapshot_download
     from transformers import AutoTokenizer
 
-    from atpgllm.multimodal.data import tokenize_tool_conversation
-
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            "Qwen/Qwen2.5-0.5B-Instruct", local_files_only=True
-        )
-    except OSError:
-        pytest.skip("Qwen2.5 tokenizer not cached")
+        path = snapshot_download("ibm-granite/granite-4.2-8b", local_files_only=True)
+        return AutoTokenizer.from_pretrained(path)
+    except Exception:
+        pytest.skip("Granite 4.2 tokenizer not cached")
+
+
+def test_tool_conversation_labels_only_trainable_turns():
+    from atpgllm.multimodal.data import template_turns, tokenize_tool_conversation
+
+    tokenizer = granite_tokenizer()
     record = _record()
     attempt = failed_attempt(record, random.Random(0))
     retry = ConversationExample.from_record(
         copy.deepcopy(record), use_tools=True, failed_attempt=attempt
     )
-    ids, labels = tokenize_tool_conversation(retry.messages, retry.trainable, tokenizer)
+    messages = template_turns(retry.messages, tokenizer)
+    ids, labels = tokenize_tool_conversation(messages, retry.trainable, tokenizer)
     trained = tokenizer.decode([t for t, l in zip(ids, labels) if l != -100])
     assert "does not detect sa0 n1" in trained
     assert "differ at 1 primary output" in trained
@@ -178,3 +185,31 @@ def test_retry_under_po_fault_view_cites_only_what_is_shown():
     assert "The fault is activated (n1 is 1 in the Good Machine and 0 in the Bad Machine), but" in diagnosis
     with pytest.raises(ValueError):
         ConversationExample.from_record(copy.deepcopy(record), tool_view="po_fault")
+
+
+def test_snapshot_reading_is_three_valued():
+    from atpgllm.training.tool_feedback import read_snapshot, undetected_sentence
+
+    # y differs only through x (a possible detect): not detected.
+    possible = json.dumps({"Good Machine": {"n1": 1, "y": 1, "z": 0},
+                           "Bad Machine": {"n1": 0, "y": "x", "z": 0}})
+    reading = read_snapshot(possible, "sa0 n1", ["y", "z"])
+    assert not reading.detected and reading.activated
+    assert reading.differing_outputs == [] and reading.unknown_outputs == ("y",)
+    assert undetected_sentence(reading).startswith(
+        "No primary output has a 0 in one machine and a 1 in the other (y unknown)")
+
+    # An x at the fault site is not an activation, and is not called the
+    # stuck-at value.
+    unknown_site = json.dumps({"Good Machine": {"n1": "x", "y": "x"},
+                               "Bad Machine": {"n1": 0, "y": "x"}})
+    reading = read_snapshot(unknown_site, "sa0 n1", ["y"])
+    assert not reading.detected and not reading.activated
+    sentence = undetected_sentence(reading)
+    assert "n1 is x, so the fault is not activated: n1 must be 1." in sentence
+    assert "the value the stuck-at" not in sentence
+
+    detected = json.dumps({"Good Machine": {"n1": 1, "y": 1, "z": "x"},
+                           "Bad Machine": {"n1": 0, "y": 0, "z": 1}})
+    reading = read_snapshot(detected, "sa0 n1", ["y", "z"])
+    assert reading.detected and reading.differing_outputs == ["y"]

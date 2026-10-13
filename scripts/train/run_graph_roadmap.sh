@@ -17,6 +17,26 @@ GRAD_ACCUM=${GRAD_ACCUM:-64}
 MAX_STEPS=${MAX_STEPS:-20000}
 SAVE_EVERY=${SAVE_EVERY:-1000}
 DRY_RUN=${DRY_RUN:-False}
+# This checkout's atpgllm, not the editable install (the primary checkout):
+# python puts scripts/train, not the repo root, first on sys.path.
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+[ -n "${DATA_PREPROCESSING_ROOT:-}" ] && export DATA_PREPROCESSING_ROOT
+[ -n "${CUDA_VISIBLE_DEVICES:-}" ] && export CUDA_VISIBLE_DEVICES
+# The simulator behind the tool, the retry examples and the rewards. TetraMAX
+# runs locally under the shared seat pool; a config may name a site profile
+# that puts tmax on PATH (non-interactive shells do not source it).
+FAULT_SIM_BACKEND=${FAULT_SIM_BACKEND:-fast}
+export FAULT_SIM_BACKEND
+if [ "$FAULT_SIM_BACKEND" = tetramax ]; then
+    export TMAX_LOCK_DIR="${TMAX_LOCK_DIR:-$(cd "$REPO_ROOT/.." && pwd)/.runtime/tetramax}"
+    if ! command -v "${TMAX_BIN:-tmax}" >/dev/null 2>&1 && [ -n "${SYNOPSYS_PROFILE:-}" ]; then
+        set +u; source "$SYNOPSYS_PROFILE" >/dev/null; set -u
+    fi
+    _REPO_ROOT="$REPO_ROOT"
+    source scripts/train/_tetramax_lifecycle.sh
+    # One 3-valued simulation before any GPU work (binary, license, library).
+    TMAX_MANAGE_SERVICE=True preflight_tetramax_simulation
+fi
 
 case "${STAGE:?STAGE is required}" in
     graph_pretrain)
@@ -76,7 +96,7 @@ case "${STAGE:?STAGE is required}" in
             --method "$METHOD" --dataset "$DATASET"
             --sim-config "$SIM_CONFIG" --output-dir "$OUTPUT_DIR"
             --alignment-ckpt "${ALIGNMENT_CHECKPOINT:?ALIGNMENT_CHECKPOINT is required}"
-            --llm "${LLM:-Qwen/Qwen2.5-7B-Instruct}"
+            --llm "${LLM:-ibm-granite/granite-4.2-8b}"
             --graph-policy "${GRAPH_POLICY:-full}"
             --batch-size "${BATCH_SIZE:-1}" --grad-accum "${GRAD_ACCUM:-16}"
             --max-steps "$MAX_STEPS" --save-every "$SAVE_EVERY"

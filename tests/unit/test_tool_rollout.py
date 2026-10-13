@@ -7,28 +7,21 @@ import pytest
 
 from atpgllm.training.conversation import ConversationExample
 from atpgllm.training.tool_trajectories import failed_attempt
-from test_tool_trajectories import _record
+from test_tool_trajectories import _record, granite_tokenizer
 
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    from transformers import AutoTokenizer
-
-    try:
-        return AutoTokenizer.from_pretrained(
-            "Qwen/Qwen2.5-0.5B-Instruct", local_files_only=True
-        )
-    except OSError:
-        pytest.skip("Qwen2.5 tokenizer not cached")
+    return granite_tokenizer()
 
 
 def _replay(tokenizer, conversation):
     """Feed the conversation's assistant turns to the rollout as the model's
     generations and its tool messages as the tool's answers."""
-    from atpgllm.multimodal.data import _template_ids, tokenize_tool_conversation
+    from atpgllm.multimodal.data import _template_ids, template_turns, tokenize_tool_conversation
     from atpgllm.multimodal.tool_rollout import rollout_group
 
-    messages = conversation.messages
+    messages = template_turns(conversation.messages, tokenizer)
     ids, labels = tokenize_tool_conversation(messages, None, tokenizer)
     first = next(i for i, m in enumerate(messages) if m["role"] == "assistant")
     prompt = _template_ids(tokenizer, messages[:first], generation_prompt=True)
@@ -86,7 +79,14 @@ def test_rollout_matches_sft_tokens_and_masks(tokenizer, retry):
     assert len(calls) == (2 if retry else 1)
     assert calls[-1]["arguments"]["input_vector"] == {"a": 1, "b": 1, "c": 0}
     assert not trajectory.truncated and not trajectory.call_limit_hit
-    assert trajectory.turns[-1].startswith("The Good and Bad Machine differ")
+    # Granite's generation prompt opens <think>, so every turn the model writes
+    # starts inside it: call turns close non-empty reasoning, the answer turn
+    # closes an empty block. That is what the GRPO format objective checks.
+    from atpgllm.llm.reward_funcs import _reasoned, prompt_opens_thinking
+
+    assert prompt_opens_thinking(tokenizer.decode(prompt))
+    assert all(_reasoned(turn, True) for turn in trajectory.turns[:-1])
+    assert trajectory.turns[-1].startswith("</think>\nThe Good and Bad Machine differ")
 
 
 def test_call_limit_and_budget_end_trajectories(tokenizer):

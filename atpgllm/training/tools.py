@@ -70,6 +70,31 @@ def observation(snapshot, fault, view=None) -> str:
     return shown_snapshot(table, fault, outputs, view or tool_view())
 
 
+def simulation_model(netlist):
+    """The parsed netlist the configured simulator (``FAULT_SIM_BACKEND``) takes."""
+    if resolve_fault_sim_runner().__name__ == 'tetramax_fault_sim':
+        return prepare_netlist(netlist)
+    from atpgllm.training.reward_function_factory import RewardFunctionFactory as RF
+    return prepare_netlist(netlist, _gates(), RF.DECL_RE, RF.NAME_RE)
+
+
+def _gates():
+    with resolve_sim_config_path().open(encoding='utf-8') as f:
+        return json.load(f)
+
+
+def run_fault_simulation(input_vector, output_vector, fault, netlist=None, *,
+                         model=None, doc_id=None, cancel=None):
+    """The tool's simulation: the configured simulator's Good/Bad table for one
+    vector (an ``error`` column when it rejects the request). Pass ``model``
+    from :func:`simulation_model` to reuse a parsed netlist."""
+    runner = resolve_fault_sim_runner()
+    model = model if model is not None else simulation_model(netlist)
+    if runner.__name__ == 'tetramax_fault_sim':
+        return runner(input_vector, output_vector, fault, model, cancel=cancel)
+    return runner(input_vector, output_vector, fault, model, _gates(), module_name=doc_id)
+
+
 async def fault_simulation_tool_handler(input_vector, output_vector, fault, doc_id, netlist,
                                         expected_doc_id=None, expected_fault=None, cancel=None,
                                         view=None) -> str:
@@ -86,16 +111,8 @@ async def fault_simulation_tool_handler(input_vector, output_vector, fault, doc_
     _require_bit_mapping("output_vector", output_vector)
     cancelled = cancel if cancel is not None else threading.Event()
     def execute():
-        runner = resolve_fault_sim_runner()
-        if runner.__name__ == 'tetramax_fault_sim':
-            model = prepare_netlist(netlist)
-            snapshot = runner(input_vector, output_vector, fault, model, cancel=cancelled)
-        else:
-            from atpgllm.training.reward_function_factory import RewardFunctionFactory as RF
-            with resolve_sim_config_path().open(encoding='utf-8') as f:
-                gates = json.load(f)
-            model = prepare_netlist(netlist, gates, RF.DECL_RE, RF.NAME_RE)
-            snapshot = runner(input_vector, output_vector, fault, model, gates, module_name=doc_id)
+        snapshot = run_fault_simulation(input_vector, output_vector, fault, netlist,
+                                        doc_id=doc_id, cancel=cancelled)
         if 'error' in snapshot.columns:
             # The simulator rejected the request (malformed vector, unknown net):
             # a model error, labelled like every other rejected call.

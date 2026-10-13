@@ -1,4 +1,5 @@
-"""Circuit-balanced row sampling straight from a Hub dataset's parquet files.
+"""Circuit-balanced row sampling straight from a dataset's parquet files
+(a Hub dataset or a local dataset directory).
 
 Some datasets (asap7-language-of-test-v3) store rows grouped by circuit, with
 one circuit holding a third of the training rows. A streaming shuffle buffer
@@ -14,6 +15,7 @@ from __future__ import annotations
 import collections
 import glob
 import random
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import pyarrow.parquet as pq
@@ -32,16 +34,30 @@ GRAPH_COLUMNS: Tuple[str, ...] = (
 
 
 def split_files(dataset: str, split: str, revision: Optional[str]) -> List[str]:
-    """Local parquet files of ``split`` (downloaded once into the HF cache)."""
-    from huggingface_hub import snapshot_download
+    """Local parquet files of ``split``.
 
-    root = snapshot_download(
-        dataset,
-        repo_type="dataset",
-        revision=revision,
-        allow_patterns=[f"data/{split}-*.parquet"],
-    )
-    files = sorted(glob.glob(f"{root}/data/{split}-*.parquet"))
+    ``dataset`` is a Hub dataset id (downloaded once into the HF cache, files
+    ``data/<split>-*.parquet``) or a local dataset directory as
+    data_preprocessing writes it (``<dir>/<split>/*.parquet``, for example the
+    unpublished v4). A local directory has no revisions.
+    """
+    if Path(dataset).is_dir():
+        if revision:
+            raise ValueError(f"--revision applies to Hub datasets, not the local {dataset}.")
+        root = Path(dataset)
+        files = sorted(glob.glob(f"{root}/{split}/*.parquet")) or sorted(
+            glob.glob(f"{root}/data/{split}-*.parquet")
+        )
+    else:
+        from huggingface_hub import snapshot_download
+
+        root = snapshot_download(
+            dataset,
+            repo_type="dataset",
+            revision=revision,
+            allow_patterns=[f"data/{split}-*.parquet"],
+        )
+        files = sorted(glob.glob(f"{root}/data/{split}-*.parquet"))
     if not files:
         raise FileNotFoundError(f"No parquet files for {dataset}:{split} at {root}.")
     return files

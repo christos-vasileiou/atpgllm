@@ -329,3 +329,27 @@ def test_multimodal_prefix_sft_and_grpo_wiring():
     )
     loss.backward()
     assert policy.grad is not None
+
+
+def test_generate_turns_keeps_the_stop_token_when_it_is_also_padding():
+    # Granite 4.2 pads with its stop token <|im_end|>: a finished row must
+    # keep the stop, and the padding after it must go.
+    stop = 7
+
+    class FakeLLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(16, 4)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def generate(self, inputs_embeds, attention_mask, **kwargs):
+            return torch.tensor([[3, 4, stop, stop, stop], [5, 6, 8, 9, 10]])
+
+    fake = SimpleNamespace(llm=FakeLLM())
+    turns = GraphConditionedCausalLM.generate_turns(
+        fake, torch.zeros(1, 2, 4), [[1, 2], [1]],
+        pad_token_id=stop, eos_token_id=stop, max_new_tokens=5,
+    )
+    assert turns == [[3, 4, stop], [5, 6, 8, 9, 10]]

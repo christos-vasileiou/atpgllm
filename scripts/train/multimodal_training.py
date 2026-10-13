@@ -30,9 +30,11 @@ import argparse
 import ast
 import collections
 import copy
+import hashlib
 import json
 import random
 import time
+from datetime import datetime
 from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable
@@ -76,12 +78,18 @@ from atpgllm.training.gdpo import (
 from atpgllm.training.tool_feedback import read_snapshot
 from atpgllm.training.tools import (
     SimulationError,
+    resolve_fault_sim_runner,
     ToolContext,
     execute_tool_batch,
     fault_simulation_tool_handler,
 )
 from atpgllm.multimodal.tool_probe import ProbeItem, run_tool_probe
-from atpgllm.training._paths import resolve_sim_config_path
+from atpgllm.training._paths import (
+    LIBATPGLLM_ROOT,
+    ensure_data_preprocessing_on_path,
+    resolve_sim_config_path,
+)
+from atpgllm.training.git_utils import get_git_info
 from atpgllm.training.tool_trajectories import failed_attempt, record_seed
 from atpgllm.training.reward_function_factory import RewardFunctionFactory
 
@@ -93,6 +101,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         default="chrivasileiou/asap7-language-of-test-v2",
+        help="Hub dataset id, or a local dataset directory (<dir>/<split>/*.parquet, "
+             "for example the v4 x-fill build); --load parquet reads either.",
     )
     parser.add_argument("--split", default="train")
     parser.add_argument("--revision", help="Dataset revision (commit) to pin.")
@@ -148,7 +158,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sft-ckpt", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--adapter", type=Path)
-    parser.add_argument("--llm", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--llm", default="ibm-granite/granite-4.2-8b")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--graph-policy",
@@ -435,6 +445,32 @@ def _save(
             "adapter_path": str(adapter_path.resolve()),
         },
     )
+
+
+def _record_launch(args: argparse.Namespace) -> None:
+    """Pin what this run depends on outside its arguments: the simulator the
+    tool, retries and rewards use, both code checkouts, and the dataset build.
+    Saved in each checkpoint's session and appended to code_provenance.jsonl."""
+    data_preprocessing = ensure_data_preprocessing_on_path()
+    args.simulator = resolve_fault_sim_runner().__name__
+    manifest = Path(args.dataset) / "split_manifest.json"
+    args.dataset_manifest_sha256 = (
+        hashlib.sha256(manifest.read_bytes()).hexdigest() if manifest.is_file() else None
+    )
+    record = {
+        "launched_at": datetime.now().isoformat(timespec="seconds"),
+        "method": args.method,
+        "simulator": args.simulator,
+        "dataset": args.dataset,
+        "dataset_manifest_sha256": args.dataset_manifest_sha256,
+        "llm": args.llm,
+        **get_git_info(LIBATPGLLM_ROOT),
+        **get_git_info(data_preprocessing, prefix="dp_git_"),
+        "dp_root": str(data_preprocessing),
+    }
+    with (args.output_dir / "code_provenance.jsonl").open("a") as fh:
+        fh.write(json.dumps(record) + "\n")
+    print(f"[code_provenance] {record}", flush=True)
 
 
 def _load_common(args: argparse.Namespace):
@@ -798,6 +834,14 @@ def train_grpo(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--tool-view {args.tool_view!r} differs from the SFT model's {sft_view!r}."
         )
+    # The model learned to read one simulator's answers (TetraMAX and the fast
+    # simulator differ on x values, alias wires and TIE nets).
+    sft_simulator = source_payload["session"].get("simulator")
+    if sft_simulator is not None and sft_simulator != args.simulator:
+        raise ValueError(
+            f"FAULT_SIM_BACKEND gives {args.simulator}, but the SFT model was "
+            f"trained on {sft_simulator}."
+        )
 
     llm = _load_grpo_llm(args, adapter_path, resume=resume_payload is not None)
     # As TRL does for GRPO: sampling and the trained policy should be the
@@ -1041,6 +1085,7 @@ def main() -> None:
     if args.method == "grpo" and args.num_generations < 2:
         raise ValueError("--num-generations must be >= 2 for GRPO")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    _record_launch(args)
     torch.manual_seed(args.seed)
     if args.method == "sft":
         train_sft(args)

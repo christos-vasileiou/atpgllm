@@ -113,6 +113,52 @@ def _template_ids(tokenizer, messages, *, generation_prompt: bool = False) -> Li
     return list(ids["input_ids"] if isinstance(ids, dict) else ids)
 
 
+_THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
+
+
+def template_opens_thinking(tokenizer) -> bool:
+    """Whether the chat template's generation prompt opens ``<think>`` (Granite
+    4.2: ``<|im_start|>assistant\n<think>\n``), so the model writes each turn
+    from inside a thinking block."""
+    cached = getattr(tokenizer, "_atpg_opens_thinking", None)
+    if cached is None:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "u"}], tokenize=False, add_generation_prompt=True
+        )
+        cached = prompt.rstrip().endswith(_THINK_OPEN)
+        tokenizer._atpg_opens_thinking = cached
+    return cached
+
+
+def template_turns(messages: Sequence[Dict[str, Any]], tokenizer) -> List[Dict[str, Any]]:
+    """The conversation with each assistant turn written as the template's
+    generation prompt begins it.
+
+    When the template opens thinking, a turn becomes ``<think>\n`` reasoning
+    ``\n</think>\n`` text (Granite 4.2's own layout); a turn without reasoning
+    (the final answer) gets an empty block. The opening ``<think>\n`` is then
+    part of the prompt in SFT and in rollouts alike, and the model learns to
+    write the rest. Other templates get the messages unchanged.
+    """
+    messages = [dict(message) for message in messages]
+    if not template_opens_thinking(tokenizer):
+        return messages
+    for message in messages:
+        if message["role"] != "assistant":
+            continue
+        content = message.get("content") or ""
+        if content.startswith(_THINK_OPEN) and _THINK_CLOSE in content:
+            reasoning, rest = content[len(_THINK_OPEN):].split(_THINK_CLOSE, 1)
+            reasoning = reasoning.strip("\n")
+        else:
+            reasoning, rest = "", content
+        message["content"] = (
+            _THINK_OPEN + "\n" + (reasoning + "\n" if reasoning else "")
+            + _THINK_CLOSE + "\n" + rest.lstrip("\n")
+        )
+    return messages
+
+
 def tokenize_tool_conversation(
     messages: Sequence[Dict[str, Any]],
     trainable: Optional[Sequence[bool]],
@@ -126,9 +172,9 @@ def tokenize_tool_conversation(
     generation prompt. Raises ValueError if the chat template is not
     prefix-preserving, which would misplace those spans.
     """
-    # Tool-call arguments stay dicts, as in the text-only SFT: Qwen2.5's
-    # template then writes them as a JSON object, its native form (a
-    # pre-serialized string would be written again as an escaped string).
+    # Tool-call arguments stay dicts: Granite 4.2's template iterates them
+    # into XML <parameter=...> blocks (and Qwen2.5's writes a JSON object);
+    # a pre-serialized string would be written again as an escaped string.
     messages = copy.deepcopy(list(messages))
     ids = _template_ids(tokenizer, messages)
     labels = [-100] * len(ids)
@@ -192,7 +238,7 @@ def build_tool_sft_example(
         if rejections is not None:
             rejections["snapshot_not_detecting"] += 1
         return None
-    messages = [dict(message) for message in conversation.messages]
+    messages = template_turns(conversation.messages, tokenizer)
     for message in messages:
         if message["role"] == "user":
             message["content"] = message["content"].replace(full, compact)

@@ -5,7 +5,9 @@ the simulator's real answer for it, a diagnosis read from that answer, and the
 corrected pattern. The failed pattern is the dataset's detecting pattern with
 one to three primary inputs flipped, preferring the inputs the backtrace
 names (they decide activation and propagation). Every candidate is simulated
-with the same simulator the tool uses, and only a confirmed miss is kept.
+with the same simulator the tool uses (``FAULT_SIM_BACKEND``; TetraMAX for
+the v4 x-fill data), and only a confirmed miss is kept. Only 0/1 inputs are
+flipped: a don't-care input stays x.
 """
 
 from __future__ import annotations
@@ -17,15 +19,12 @@ import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from atpgllm.training._paths import (
-    ensure_data_preprocessing_on_path,
-    resolve_sim_config_path,
-)
 from atpgllm.training.tool_feedback import SimulationReading, read_snapshot
-
-ensure_data_preprocessing_on_path()
-
-from fault_sim import fast_fault_sim, prepare_netlist  # noqa: E402
+from atpgllm.training.tools import (
+    resolve_fault_sim_runner,
+    run_fault_simulation,
+    simulation_model,
+)
 
 
 @dataclass(frozen=True)
@@ -37,8 +36,7 @@ class FailedAttempt:
     changes: List[Tuple[str, Any]]  # (input, detecting value) that fix it
 
 
-_MODELS: "collections.OrderedDict[str, Any]" = collections.OrderedDict()
-_GATES: Optional[Dict[str, Any]] = None
+_MODELS: "collections.OrderedDict[tuple, Any]" = collections.OrderedDict()
 
 
 def _netlist_text(record: Dict[str, Any]) -> str:
@@ -49,16 +47,14 @@ def _netlist_text(record: Dict[str, Any]) -> str:
 
 
 def _simulator_model(netlist: str):
-    global _GATES
-    from atpgllm.training.reward_function_factory import RewardFunctionFactory as RF
-
-    if _GATES is None:
-        with resolve_sim_config_path().open(encoding="utf-8") as fh:
-            _GATES = json.load(fh)
-    key = hashlib.sha256(netlist.encode("utf-8")).hexdigest()
+    # Keyed by backend too: the two simulators parse netlists differently.
+    key = (
+        resolve_fault_sim_runner().__name__,
+        hashlib.sha256(netlist.encode("utf-8")).hexdigest(),
+    )
     model = _MODELS.get(key)
     if model is None:
-        model = prepare_netlist(netlist, _GATES, RF.DECL_RE, RF.NAME_RE)
+        model = simulation_model(netlist)
         _MODELS[key] = model
         if len(_MODELS) > 256:
             _MODELS.popitem(last=False)
@@ -68,10 +64,13 @@ def _simulator_model(netlist: str):
 
 
 def simulate(record: Dict[str, Any], input_vector: Dict[str, Any]) -> str:
-    """The tool's answer for ``input_vector`` on this record's fault."""
+    """The tool's answer for ``input_vector`` on this record's fault, from the
+    simulator the tool uses (``FAULT_SIM_BACKEND``). A rejected request raises
+    ValueError; simulator infrastructure failures (``SimulationError``) pass
+    through."""
     model = _simulator_model(_netlist_text(record))
     expected = json.loads(record["expected_output"])
-    snapshot = fast_fault_sim(input_vector, expected, record["fault"], model, _GATES)
+    snapshot = run_fault_simulation(input_vector, expected, record["fault"], model=model)
     if "error" in snapshot.columns:
         raise ValueError(str(snapshot.loc[0, "error"]))
     return snapshot[["Good Machine", "Bad Machine"]].to_json()

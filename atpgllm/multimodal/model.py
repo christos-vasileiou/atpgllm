@@ -203,10 +203,19 @@ class GraphConditionedCausalLM(nn.Module):
             use_cache=True,
             **kwargs,
         )
-        return [
-            [token for token in row.tolist() if token != pad_token_id]
-            for row in output
-        ]
+        # Finished rows are padded after their stop token. Cut there rather
+        # than drop pad ids: Granite's pad token is its stop token <|im_end|>.
+        stops = kwargs.get("eos_token_id")
+        stops = set(stops if isinstance(stops, (list, tuple)) else [stops]) - {None}
+        turns = []
+        for row in output.tolist():
+            end = next((i + 1 for i, token in enumerate(row) if token in stops), None)
+            if end is None:
+                while row and row[-1] == pad_token_id:
+                    row = row[:-1]
+                end = len(row)
+            turns.append(row[:end])
+        return turns
 
     @torch.no_grad()
     def sample_group(

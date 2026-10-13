@@ -24,7 +24,7 @@ import torch
 from torch_geometric.data import Batch
 
 from atpgllm.graph.dataset import record_to_pyg
-from atpgllm.multimodal.data import _compact_netlist_payload, _template_ids
+from atpgllm.multimodal.data import _compact_netlist_payload, _template_ids, template_turns
 from atpgllm.training.conversation import ConversationExample
 from atpgllm.training.revert_template import parse_tool_call
 from atpgllm.training.tool_feedback import read_snapshot
@@ -102,7 +102,7 @@ def run_tool_probe(
             failed_attempt=item.failed_attempt, interpret_results=True,
             tool_view=tool_view,
         )
-        messages = [dict(m) for m in conversation.messages]
+        messages = template_turns(conversation.messages, tokenizer)
         for message in messages:
             if message["role"] == "user":
                 message["content"] = message["content"].replace(full, compact)

@@ -170,3 +170,25 @@ def test_sampled_columns_cover_every_record_field_the_graph_reads():
 
     assert {"netlist", "fault", "input_vector", "fault_propagation_gates",
             "backtrack_gates", "snapshot", "difficulty"} <= set(GRAPH_COLUMNS)
+
+
+def test_split_files_reads_a_local_dataset_directory(tmp_path):
+    import pyarrow as pa
+    import pytest
+    import pyarrow.parquet as pq
+
+    from atpgllm.graph.circuit_sampling import split_files
+
+    for split in ("train", "validation"):
+        (tmp_path / split).mkdir()
+        for index in (1, 0):
+            pq.write_table(pa.table({"circuit_id": ["c"]}),
+                           tmp_path / split / f"data-{index:05d}.parquet")
+    files = split_files(str(tmp_path), "validation", None)
+    assert [f.rsplit("/", 2)[-2:] for f in files] == [
+        ["validation", "data-00000.parquet"], ["validation", "data-00001.parquet"],
+    ]
+    with pytest.raises(ValueError):
+        split_files(str(tmp_path), "train", "some-revision")
+    with pytest.raises(FileNotFoundError):
+        split_files(str(tmp_path), "test", None)
