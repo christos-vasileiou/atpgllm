@@ -795,6 +795,7 @@ trap 'exit 143' TERM
 # Fail before GPU/model startup if the simulator is unavailable. Submission
 # wrappers invoke this same launcher once the allocation begins.
 start_tetramax_service || exit 1
+preflight_tetramax_simulation || exit 1
 if [ "$METHOD" == grpo ] && [ "${RESUME_TRAINING_STATE:-False}" == True ] && [ "${DRY_RUN:-False}" != True ]; then
     # Compare against the ready service before spending time loading vLLM/models.
     python -m atpgllm.training.simulator_provenance "$RESUME_FROM" || exit 1

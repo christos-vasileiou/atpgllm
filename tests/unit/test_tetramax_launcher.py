@@ -83,6 +83,7 @@ FAULT_SIM_BACKEND=tetramax
 TMAX_MANAGE_SERVICE=True
 TMAX_MAX_CONCURRENT=1
 TMAX_SERVICE_STARTUP_TIMEOUT_S=4
+TMAX_PREFLIGHT=False
 ''')
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('TMAX_', 'SLURM_', 'SIM_PYTHON'))}
@@ -126,6 +127,28 @@ def test_service_startup_failure_prevents_training(launcher):
     assert result.returncode == 1
     assert 'test simulator unavailable' in result.stdout
     assert not (launcher.repo / 'training-started').exists()
+    assert not launcher.credentials.exists()
+
+
+@pytest.mark.parametrize('detected', [True, False])
+def test_preflight_simulation_gates_training(launcher, detected):
+    with (launcher.backend / 'tetramax_backend.py').open('a') as f:
+        f.write(f'''
+def make_request(netlist, inputs, outputs, fault):
+    assert inputs == {{'a': 0, 'b': 'x'}}
+    return {{}}
+def simulate(*args, **kwargs):
+    return {{'detected': {detected}, 'fault_status': 'DS', 'tool_version': 'test',
+            'values': {{'a': [0, 0], 'b': ['x', 'x'], 'y': [1, 0]}}}}
+''')
+    launcher.append('TMAX_PREFLIGHT=True')
+    result = launcher.run()
+    assert (launcher.repo / 'training-started').exists() == detected, result.stdout + result.stderr
+    if detected:
+        assert 'TetraMAX preflight OK' in result.stdout
+    else:
+        assert result.returncode == 1
+        assert 'TetraMAX preflight simulation failed' in result.stdout
     assert not launcher.credentials.exists()
 
 
