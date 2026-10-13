@@ -45,7 +45,9 @@ def test_repeat_key_never_joins_a_rejected_call_to_an_accepted_one():
     assert repeat_key(_call({"b": 0, "a": 1}, outputs={"y": 0})) == base
     assert repeat_key(_call({"a": " 1", "b": 0}, outputs={"y": 1})) != base
     assert repeat_key(_call({"a": 1, "b": 0}, outputs={"y": True})) != base
-    assert repeat_key(_call({"a": 1, "b": 0}, outputs={"y": "x"})) != base
+    # x is a valid output claim the tool never reads, like 0 and 1.
+    assert repeat_key(_call({"a": 1, "b": 0}, outputs={"y": "x"})) == base
+    assert repeat_key(_call({"a": 1, "b": 0}, outputs={"y": "z"})) != base
     assert repeat_key(_call({"a": 1, "b": 0}, outputs={"y": 1}, fault="sa0  n1")) != base
     assert repeat_key(_call({"a": 1, "b": 0}, outputs={"y": 1}, doc_id=5)) != \
         repeat_key(_call({"a": 1, "b": 0}, outputs={"y": 1}, doc_id="5"))

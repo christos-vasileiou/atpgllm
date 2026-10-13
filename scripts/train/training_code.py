@@ -266,6 +266,7 @@ def train_with_sft(
     sft_circuit_validation: bool = False,
     sft_eval_steps: int = 10,
     sft_eval_per_circuit: int = 8,
+    save_total_limit: int | None = None,
     **kwargs,
 ) -> None:
     """
@@ -350,8 +351,8 @@ def train_with_sft(
     data_manifest = dataset_fingerprint = None
     if sft_circuit_validation:
         from atpgllm.training.sft_validation import (
-            check_sft_dataset, load_circuit_train, prepare_circuit_validation,
-            sft_evaluation_config,
+            cached_circuit_validation, check_sft_dataset, load_circuit_train,
+            prepare_circuit_validation, sft_evaluation_config,
         )
         data_manifest, dataset_fingerprint = check_sft_dataset(dataset_path, resume_from)
 
@@ -422,10 +423,22 @@ def train_with_sft(
             else load_dataset(dataset_path, split="train", streaming=True))
     eval_dataset = None
     if sft_circuit_validation:
-        eval_dataset, validation_report = prepare_circuit_validation(
-            dataset_path, data_manifest, tokenizer, sft_format=sft_format,
-            max_prompt_length=max_prompt_length, max_model_len=max_model_len,
-            per_circuit=sft_eval_per_circuit,
+        import hashlib
+        # Built once on the main process; the other ranks load the cache.
+        validation_key = {
+            "dataset_sha256": dataset_fingerprint, "sft_format": sft_format,
+            "max_prompt_length": max_prompt_length, "max_model_len": max_model_len,
+            "per_circuit": sft_eval_per_circuit,
+            "chat_template_sha256": hashlib.sha256(
+                str(tokenizer.chat_template).encode()).hexdigest(),
+        }
+        eval_dataset, validation_report = cached_circuit_validation(
+            Path(output_dir) / "sft_validation_examples.json", validation_key,
+            lambda: prepare_circuit_validation(
+                dataset_path, data_manifest, tokenizer, sft_format=sft_format,
+                max_prompt_length=max_prompt_length, max_model_len=max_model_len,
+                per_circuit=sft_eval_per_circuit,
+            ),
         )
         if int(os.environ.get("RANK", "0")) == 0:
             import json
@@ -436,7 +449,8 @@ def train_with_sft(
                 "validation": validation_report,
             }, indent=2) + "\n")
         print(f"[SFT] Fixed validation: {len(eval_dataset)} examples on "
-              f"{len(validation_report['circuits'])} unseen circuit groups.")
+              f"{len(validation_report['circuits'])} unseen circuit groups "
+              f"({len(validation_report.get('skipped_circuits', {}))} skipped).")
 
     # Format dataset into the chosen SFT layout
     train_dataset = format_dataset_for_training(
@@ -448,6 +462,7 @@ def train_with_sft(
         skip_buffer_size=skip_buffer_size if sft_format == "messages" else 0,
         skip_batch_size=skip_batch_size,
         skip_num_workers=skip_num_workers,
+        max_model_len=max_model_len if sft_format == "messages" else None,
     )
 
     if resume_training_state and skip_buffer_size:
@@ -485,6 +500,9 @@ def train_with_sft(
     )
     if sft_circuit_validation:
         sft_kwargs.update(sft_evaluation_config(sft_eval_steps))
+    if save_total_limit:
+        # The best checkpoint (load_best_model_at_end) is always kept as well.
+        sft_kwargs["save_total_limit"] = save_total_limit
     if assistant_only_loss:
         # SFTTrainer detects the conversational layout from the "messages"
         # column and applies the chat template internally with
@@ -524,6 +542,78 @@ def train_with_sft(
         patch_trainer_cpu_optimizer_resume(trainer)
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(output_dir)
+
+
+def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoint, buffer_size,
+                         max_prompt_length, netlist_diversity_strategy, held_out_examples,
+                         prompts_per_step, max_steps, is_main_process):
+    """GRPO prompts read from the whole train split, ``buffer_size`` at a time.
+
+    See :mod:`atpgllm.training.stream_buffer`. Rows pass the same filters as
+    the one-shot buffer (gate filter, prompt length, evaluation-circuit
+    holdout); each chunk is reordered for netlist diversity.
+    """
+    import hashlib
+    import math
+    from atpgllm.training.dataset_utils import (
+        _gate_filter_passes, chat_template_uses_tools, format_grpo_record,
+        interleave_for_field_diversity,
+    )
+    from atpgllm.training.fixed_eval import circuit_ids
+    from atpgllm.training.stream_buffer import (
+        LEDGER_NAME, RollingPromptBuffer, ShardPermutation, ledger_checkpoint_callback,
+    )
+
+    directory = Path(dataset_path)
+    if not (directory / "train").is_dir():
+        raise ValueError(f"--buffer_rolling needs a local dataset with a train/ split: {dataset_path}")
+    use_tools = chat_template_uses_tools(tokenizer)
+    held_out = set().union(*(circuit_ids(row) for row in held_out_examples))
+
+    def prepare(rows):
+        kept = [None] * len(rows)
+        candidates = []
+        for i, row in enumerate(rows):
+            if not _gate_filter_passes(row):
+                continue
+            example = format_grpo_record(dict(row), tokenizer, use_tools)
+            if held_out and not circuit_ids(example).isdisjoint(held_out):
+                continue
+            candidates.append((i, example))
+        if candidates:
+            lengths = tokenizer([ex["prompt"] for _, ex in candidates], add_special_tokens=False,
+                                truncation=False, return_attention_mask=False)["input_ids"]
+            for (i, example), ids in zip(candidates, lengths):
+                if len(ids) < max_prompt_length:
+                    kept[i] = example
+        return kept
+
+    def sha256(text):
+        return hashlib.sha256(str(text).encode()).hexdigest()
+
+    manifest = directory / "split_manifest.json"
+    settings = {
+        "dataset": directory.name,
+        "split_manifest_sha256": sha256(manifest.read_text()) if manifest.is_file() else None,
+        "max_prompt_length": max_prompt_length,
+        "chat_template_sha256": sha256(tokenizer.chat_template),
+        "netlist_diversity_strategy": netlist_diversity_strategy,
+        "holdout_sha256": sha256(sorted(held_out)),
+    }
+    # Twice the prompts max_steps can consume: the sampler never wraps around.
+    length = max(1, math.ceil(2 * max(max_steps, 1) * max(prompts_per_step, 1) / buffer_size)) * buffer_size
+    resume_ledger = Path(resume_checkpoint) / LEDGER_NAME if resume_checkpoint else None
+    buffer = RollingPromptBuffer(
+        ShardPermutation(directory, "train", seed=42), prepare,
+        chunk_size=buffer_size, length=length, ledger_path=Path(output_dir) / LEDGER_NAME,
+        settings=settings, writer=is_main_process, resume_ledger=resume_ledger,
+        reorder=lambda rows, k: interleave_for_field_diversity(
+            rows, "netlist", strategy=netlist_diversity_strategy, seed=42 + k),
+    )
+    print(f"[GRPO buffer] Rolling buffer: {buffer_size} prompts per chunk over "
+          f"{buffer.source.total} train rows, {len(held_out)} held-out circuit ids, "
+          f"virtual length {length} (~{prompts_per_step} prompts per optimizer step).")
+    return buffer, ledger_checkpoint_callback(buffer)
 
 
 def train_with_grpo(
@@ -567,6 +657,7 @@ def train_with_grpo(
     fixed_eval_steps: int = 5,
     fixed_eval_generations: int = 1,
     fixed_eval_batch_size: int = 1,
+    buffer_rolling: bool = False,
     **kwargs,
 ) -> None:
     """
@@ -790,11 +881,19 @@ def train_with_grpo(
 
     # Load and format dataset
     print(f"Loading dataset from: {dataset_path}")
-    data = load_dataset(dataset_path, split="train", streaming=True)
-    formatted_data = format_dataset_for_training(data, tokenizer, TrainingMode.GRPO)
+    if buffer_rolling:
+        # Built after the evaluation holdout is known (see below).
+        if skip_buffer_size:
+            print(f"[GRPO buffer] Ignoring skip_buffer_size={skip_buffer_size}: the rolling "
+                  "buffer resumes from its ledger.")
+        skip_buffer_size = 0
+    else:
+        data = load_dataset(dataset_path, split="train", streaming=True)
+        formatted_data = format_dataset_for_training(data, tokenizer, TrainingMode.GRPO)
 
-    print("Buffering streaming dataset (GRPOTrainer requires non-streaming Dataset)...")
-    if resume_training_state and skip_buffer_size:
+    if not buffer_rolling:
+        print("Buffering streaming dataset (GRPOTrainer requires non-streaming Dataset)...")
+    if not buffer_rolling and resume_training_state and skip_buffer_size:
         print(
             "[GRPO] Warning: --resume_training_state restores trainer step/checkpoint state; "
             "non-zero --skip_buffer_size also skips a dataset prefix. Combine only if intentional."
@@ -804,7 +903,7 @@ def train_with_grpo(
             f"[GRPO] Stream: skip first {skip_buffer_size} valid example(s), "
             f"then buffer up to {buffer_size} (independent quotas; skip does not shrink the buffer cap)."
         )
-    train_dataset = buffer_streaming_dataset(
+    train_dataset = None if buffer_rolling else buffer_streaming_dataset(
         formatted_data,
         buffer_size=buffer_size,
         shuffle=True,
@@ -840,8 +939,12 @@ def train_with_grpo(
         # cursor by deleting training rows. Select unseen circuits instead.
         holdout_policy = (
             saved_manifest["protocol"]["training_holdout_policy"] if saved_manifest else
-            "preserve_training_buffer" if resume_checkpoint else "exclude_evaluation_circuits"
+            "exclude_evaluation_circuits" if buffer_rolling or not resume_checkpoint
+            else "preserve_training_buffer"
         )
+        if buffer_rolling and holdout_policy != "exclude_evaluation_circuits":
+            raise ValueError("The rolling GRPO buffer excludes evaluation circuits while it "
+                             f"loads each chunk; checkpoint manifest asks for {holdout_policy!r}")
         training_circuits = (
             set().union(*(circuit_ids(row) for row in train_dataset))
             if holdout_policy == "preserve_training_buffer" else set()
@@ -864,6 +967,8 @@ def train_with_grpo(
             "prompt_pipeline": "single_generation_prefix_v1",
             "training_holdout_policy": holdout_policy,
         }
+        if buffer_rolling:
+            protocol["training_buffer"] = "rolling"
 
         def eval_candidates():
             raw = load_dataset(dataset_path, split=fixed_eval_split, streaming=True)
@@ -883,6 +988,11 @@ def train_with_grpo(
                 manifest_path, protocol, eval_candidates, resume_checkpoint=resume_checkpoint
             )
         eval_dataset = Dataset.from_list(fixed_manifest["examples"])
+        if buffer_rolling:
+            print(f"[Fixed eval] {len(eval_dataset)} frozen faults; their circuits are excluded "
+                  f"from every rolling-buffer chunk; manifest={manifest_path}, "
+                  f"sha256={fixed_manifest['examples_sha256']}")
+    if fixed_eval_size and not buffer_rolling:
         indices = training_indices_without_holdout(train_dataset, fixed_manifest["examples"])
         if holdout_policy == "preserve_training_buffer" and len(indices) != len(train_dataset):
             raise ValueError("Evaluation circuits overlap a resumed training buffer; "
@@ -893,6 +1003,18 @@ def train_with_grpo(
         train_dataset = train_dataset.select(indices)
         eval_data_state = training_buffer_state(train_dataset)
         validate_resume_buffer(resume_checkpoint, eval_data_state)
+
+    ledger_callback = None
+    if buffer_rolling:
+        train_dataset, ledger_callback = _rolling_grpo_buffer(
+            dataset_path, tokenizer, output_dir=output_dir, resume_checkpoint=resume_checkpoint,
+            buffer_size=buffer_size, max_prompt_length=max_prompt_length,
+            netlist_diversity_strategy=netlist_diversity_strategy,
+            held_out_examples=fixed_manifest["examples"] if fixed_manifest else [],
+            prompts_per_step=(per_device_train_batch_size * distributed_state.num_processes
+                              * gradient_accumulation_steps // max(num_generations, 2)),
+            max_steps=max_steps, is_main_process=distributed_state.is_main_process,
+        )
 
     # =========================================================================
     # REWARD FUNCTION SETUP
@@ -981,6 +1103,7 @@ def train_with_grpo(
 
     shared_callbacks = [
         simulator_callback,
+        *([ledger_callback] if ledger_callback else []),
         ThroughputMetricsCallback(),
         ContextLengthHistogramCallback(pad_token_id=tokenizer.pad_token_id, tokenizer=tokenizer),
         TrainingStateCheckpointCallback(
@@ -988,6 +1111,7 @@ def train_with_grpo(
             launch_skip_buffer_size=skip_buffer_size,
             buffer_size=buffer_size,
             num_generations=max(num_generations, 2),
+            rolling_buffer=buffer_rolling,
         ),
     ]
 
@@ -1072,6 +1196,7 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "sft_circuit_validation",
     "sft_eval_steps",
     "sft_eval_per_circuit",
+    "save_total_limit",
 })
 _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "buffer_size",
@@ -1091,6 +1216,7 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "grpo_learning_rate", "grpo_warmup_steps",
     "fixed_eval_size", "fixed_eval_split", "fixed_eval_manifest", "fixed_eval_seed",
     "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size",
+    "buffer_rolling",
 })
 
 
@@ -1222,6 +1348,18 @@ def main() -> None:
                         help="Audit repaired local circuit splits and enable fixed SFT validation")
     parser.add_argument("--sft_eval_steps", type=int, default=10)
     parser.add_argument("--sft_eval_per_circuit", type=int, default=8)
+    parser.add_argument("--save_total_limit", type=int, default=_env("SAVE_TOTAL_LIMIT", None),
+                        help="SFT: keep at most this many checkpoints (the best one is always kept). "
+                             "Env: SAVE_TOTAL_LIMIT (default: keep all)")
+    parser.add_argument(
+        "--buffer_rolling",
+        action=argparse.BooleanOptionalAction,
+        default=_env("BUFFER_ROLLING", "0").lower() in ("1", "true", "yes"),
+        help="GRPO: read the local train split in a seeded order across all circuits, "
+             "BUFFER_SIZE prompts at a time, loading the next chunk when training reaches "
+             "it; a ledger in OUTPUT_DIR (copied into checkpoints) resumes the exact chunk "
+             "after an interruption. Off: one buffer filled once from the stream. "
+             "Env: BUFFER_ROLLING")
     parser.add_argument("--max_steps", type=int, default=_env('MAX_STEPS', 1),
                         help="Maximum number of training steps")
     parser.add_argument("--per_device_train_batch_size", type=int, default=_env('PER_DEVICE_TRAIN_BATCH_SIZE', 1),

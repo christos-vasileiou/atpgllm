@@ -14,7 +14,7 @@ ensure_data_preprocessing_on_path()
 from fault_sim import OptimizedNetlist
 from .reward_function_factory import RewardFunctionFactory
 from .search_types import CompletionScore, SamplingResult, SearchConfig, PROTOCOL_VERSION, stable_seed
-from .search_verifier import Verifier, assignment, final_fields
+from .search_verifier import Verifier, assignment, final_assignment, final_fields
 from .search_backends import HFGenerator, VLLMGenerator, make_hf_generator, make_vllm_generator
 from .search_policies import SamplingStrategy, BestOfNStrategy, MCTSStrategy, EvolutionaryStrategy
 
@@ -149,7 +149,7 @@ class RandomStrategy:
                             continue
                     else:
                         text = format_random_answer(problem.input_nets, problem.output_nets, problem.fault, rng)
-                        vector = assignment(final_fields(text)["INPUT_VECTOR"], problem.input_nets) if problem.input_nets else {}
+                        vector = final_assignment(final_fields(text)["INPUT_VECTOR"], problem.input_nets) if problem.input_nets else {}
                         seen.add(tuple(vector.items()))
                     state = ConversationState(status="FINAL", final_answer=text, readable=text)
                     score, actual_vector = self.verifier.score_state(problem, state, context)

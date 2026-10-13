@@ -175,7 +175,7 @@ def _fault_detected_at_pos(simulation_df: pd.DataFrame) -> bool:
 _THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
 _TOOL_RESPONSE_BLOCK = re.compile(r"<tool_response>(.*?)</tool_response>", re.DOTALL)
 # Checks on the turn that ends a trajectory; a missing final turn fails all.
-_FINAL_TURN_CHECKS = 6
+_FINAL_TURN_CHECKS = 7
 
 
 class Trajectory:
@@ -308,11 +308,37 @@ def _tool_returned_table(result: Any) -> bool:
 def _pi_agreement(
     pred_input: Optional[str], reference: Any, inputs: List[str]
 ) -> float:
-    """Fraction of primary inputs the answer sets as the reference call did."""
-    pred, ref = dict(vector_key(pred_input) or ()), dict(vector_key(reference) or ())
-    if not pred or not inputs:
+    """Fraction of primary inputs the answer states as the reference call did.
+
+    The answer gives only care bits: an input the reference call set to 0/1
+    must carry the same value, and an input it left as don't-care (``x``) must
+    be omitted, since a missing input is read as ``x``. Writing ``x`` out
+    disagrees. 0 without an INPUT_VECTOR.
+    """
+    if pred_input is None or not inputs:
         return 0.0
-    return sum(pred.get(pi) == ref.get(pi) for pi in inputs) / len(inputs)
+    pred, ref = dict(vector_key(pred_input) or ()), dict(vector_key(reference) or ())
+    if not pred and any(ref.get(pi, "x") != "x" for pi in inputs):
+        return 0.0
+
+    def agrees(pi: str) -> bool:
+        if ref.get(pi, "x") == "x":
+            return pi not in pred
+        return pred.get(pi) == ref[pi]
+
+    return sum(agrees(pi) for pi in inputs) / len(inputs)
+
+
+def care_bits(key: Optional[Tuple[Tuple[str, str], ...]]) -> Optional[Tuple[Tuple[str, str], ...]]:
+    """A vector key without its don't-care (``x``) nets: what a final answer states."""
+    if key is None:
+        return None
+    return tuple(item for item in key if item[1] != "x")
+
+
+def _answer_has_dont_care(*vectors: Optional[str]) -> bool:
+    """Whether a final-answer vector writes ``x`` instead of omitting the net."""
+    return any(value == "x" for vector in vectors for _, value in (vector_key(vector) or ()))
 
 
 def _po_agreement(
@@ -497,6 +523,7 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
             "calls_after_detection_logonly": 0.0,
             "reasoned_call_turns_logonly": 0.0,
             "unverified_answer_logonly": 0.0,
+            "answer_x_free_logonly": 0.0,
         }
 
         dataset_fault = None
@@ -723,11 +750,16 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
                 bool(pred_output),
                 bool(pred_faults),
                 bool(shown) and bool(shown[-1] and shown[-1]["detected"]),
+                # Care bits only: don't-cares are omitted, never written as x.
+                pred_input is not None and not _answer_has_dont_care(pred_input, pred_output),
             ]
         format_score = sum(checks) / len(checks)
 
         answer_key = vector_key(pred_input)
-        verified = {key for key, _ in positives}
+        # The answer states care bits only, so compare it with each detecting
+        # call's care bits (a missing input is read as x).
+        verified = {care_bits(key) for key, _ in positives}
+        answer_care = care_bits(answer_key)
         out["detection"] = detection
         out["activation"] = activation
         out["fidelity"] = fidelity
@@ -742,14 +774,21 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
         out["reasoned_call_turns_logonly"] = (
             sum(reasoned_turns) / len(reasoned_turns) if reasoned_turns else 0.0
         )
-        out["unverified_answer_logonly"] = float(bool(pred_input) and answer_key not in verified)
+        out["unverified_answer_logonly"] = float(bool(pred_input) and answer_care not in verified)
         out["fault_detected_by_pred_input_vector_acc_logonly"] = float(
-            answer_key is not None and answer_key in verified
+            answer_care is not None and answer_care in verified
         )
         out["expected_output_acc_logonly"] = 1.0 if po_agreement >= 0.999 else 0.0
+        out["answer_x_free_logonly"] = float(
+            pred_input is not None and not _answer_has_dont_care(pred_input, pred_output)
+        )
         if canonical_inputs:
+            # Care-bit coverage: inputs the detecting call set to 0/1 (every
+            # input when no call detected) that the answer states as 0/1.
             assigned = dict(answer_key or ())
-            pi_score = sum(assigned.get(pi) in ("0", "1") for pi in canonical_inputs) / len(canonical_inputs)
+            reference_bits = dict(positives[-1][0] or ()) if positives else {}
+            care = [pi for pi in canonical_inputs if reference_bits.get(pi, "0") != "x"]
+            pi_score = (sum(assigned.get(pi) in ("0", "1") for pi in care) / len(care)) if care else 1.0
             out["pi_completeness_logonly"] = pi_score
             out["input_vector_acc_logonly"] = 1.0 if pi_score >= 0.999 else 0.0
 

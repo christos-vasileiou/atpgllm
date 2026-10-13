@@ -30,8 +30,15 @@ def final_fields(text):
     return fields
 
 
-def assignment(value, names):
-    """Parse full binary assignments without silently accepting duplicate nets."""
+def _is_dont_care(bit):
+    return type(bit) is str and bit.strip() in ("x", "X")
+
+
+def assignment(value, names, allow_x=False):
+    """Parse full assignments without silently accepting duplicate nets.
+
+    Values are 0/1; with ``allow_x`` (tool calls) also the don't-care ``x``,
+    kept as ``'x'`` for the 3-valued simulator."""
     if isinstance(value, str):
         value = value.strip()
         if value.startswith("{"):
@@ -48,16 +55,64 @@ def assignment(value, names):
         pairs = list(value.items())
     else:
         raise ValueError("Assignment must be an object or net: bit string")
+    out = _parse_pairs(pairs, allow_x)
+    if set(out) != set(names):
+        raise ValueError(f"Expected exactly these nets: {list(names)}")
+    return {name: out[name] for name in names}
+
+
+def _parse_pairs(pairs, allow_x):
     out = {}
     for key, bit in pairs:
         if key in out or not isinstance(key, str):
             raise ValueError("Duplicate or invalid net name")
+        if allow_x and _is_dont_care(bit):
+            out[key] = "x"
+            continue
         if type(bit) not in (str, int) or bit not in (0, 1, "0", "1"):
             raise ValueError(f"Nonbinary assignment for {key}")
         out[key] = int(bit)
-    if set(out) != set(names):
-        raise ValueError(f"Expected exactly these nets: {list(names)}")
-    return {name: out[name] for name in names}
+    return out
+
+
+def final_assignment(value, names):
+    """A final answer's vector: care bits only, every other net is don't-care.
+
+    The answer lists the nets it needs at 0/1 and omits the rest; each omitted
+    net is returned as ``'x'`` so the 3-valued simulator checks that every fill
+    works. An explicit ``x`` is read the same way. An unknown or repeated net,
+    or a value other than 0/1/x, makes the answer invalid. An empty vector
+    (no input needs a value) is all don't-care.
+    """
+    if isinstance(value, str) and not value.strip():
+        return {name: "x" for name in names}
+    if isinstance(value, str) and not value.strip().startswith("{"):
+        pairs = []
+        for item in value.split(","):
+            if not item.strip():
+                continue
+            key, bit = item.rsplit(":", 1)
+            pairs.append((key.strip().strip("\"'"), bit.strip()))
+        out = _parse_pairs(pairs, allow_x=True)
+    else:
+        # Objects reuse the full parser's syntax checks, then allow omissions.
+        out = assignment(value, list(_object_keys(value)), allow_x=True)
+    unknown = set(out) - set(names)
+    if unknown:
+        raise ValueError(f"Unknown nets in the final answer: {sorted(unknown)[:5]}")
+    return {name: out.get(name, "x") for name in names}
+
+
+def _object_keys(value):
+    if isinstance(value, dict):
+        return value.keys()
+    tree = ast.parse(value.strip(), mode="eval").body
+    if not isinstance(tree, ast.Dict):
+        raise ValueError("Assignment must be an object")
+    keys = [ast.literal_eval(k) for k in tree.keys]
+    if len(set(keys)) != len(keys):
+        raise ValueError("Duplicate or invalid net name")
+    return keys
 
 
 @dataclass(frozen=True)
@@ -144,8 +199,8 @@ class Verifier:
             raise ValueError("Tool arguments must match the fault_simulation_tool schema")
         if str(args["fault"]).strip() != problem.fault or str(args["doc_id"]) != problem.doc_id:
             raise ValueError("Tool target does not match the problem")
-        vector = assignment(args["input_vector"], problem.input_nets)
-        assignment(args["output_vector"], problem.output_nets)
+        vector = assignment(args["input_vector"], problem.input_nets, allow_x=True)
+        assignment(args["output_vector"], problem.output_nets, allow_x=True)
         frame, _ = self.simulate(problem, vector, context)
         return {"vector": vector, "result": frame[["Good Machine", "Bad Machine"]].to_json(),
                 "identity": problem.simulation_identity}
@@ -160,7 +215,7 @@ class Verifier:
             return self.failure(state.status), None
         try:
             fields = final_fields(state.final_answer)
-            vector = assignment(fields["INPUT_VECTOR"], problem.input_nets)
+            vector = final_assignment(fields["INPUT_VECTOR"], problem.input_nets)
         except (ValueError, TypeError, SyntaxError) as exc:
             context.event(kind="invalid_final", error=str(exc))
             return self.failure("INVALID"), None
@@ -197,7 +252,7 @@ class Verifier:
                 input_vector_fn=RF.input_vector_fn, expected_output_fn=RF.expected_output_fn,
                 detected_faults_fn=RF.detected_faults_fn, eval_mode=True)[0]
             try:
-                assignment(fields.get("EXPECTED_OUTPUT"), problem.output_nets)
+                final_assignment(fields.get("EXPECTED_OUTPUT"), problem.output_nets)
             except (ValueError, TypeError, SyntaxError):
                 comps["expected_output_acc_logonly"] = 0.0
             return CompletionScore(bool(comps.get("detection", 0)), self._scalar(comps), comps), vector

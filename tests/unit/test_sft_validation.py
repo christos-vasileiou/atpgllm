@@ -49,11 +49,30 @@ def test_validation_balances_circuits_and_is_deterministic(tmp_path):
 
 
 @pytest.mark.parametrize('max_prompt,max_length', [(1, 100), (100, 1)])
-def test_validation_cannot_silently_lose_a_circuit(tmp_path, max_prompt, max_length):
+def test_validation_fails_only_when_every_circuit_is_skipped(tmp_path, max_prompt, max_length, capsys):
     manifest = write_validation(tmp_path)
-    with pytest.raises(ValueError, match='no examples after SFT filtering'):
+    with pytest.raises(ValueError, match='all 2 validation circuits were skipped'):
         prepare_circuit_validation(tmp_path, manifest, FakeTokenizer(), sft_format='messages',
                                    max_prompt_length=max_prompt, max_model_len=max_length)
+    assert capsys.readouterr().out.count('Skipping validation circuit') == 2
+
+
+def test_unusable_circuit_is_skipped_and_logged(tmp_path, capsys):
+    manifest = write_validation(tmp_path)
+    folder = tmp_path / 'validation'
+    rows = pq.read_table(folder / 'data.parquet').to_pylist()
+    for row in rows:
+        if row['circuit_id'] == 'two':
+            row['user_content'] = 'user ' + 'long ' * 200
+    pq.write_table(pa.Table.from_pylist(rows), folder / 'data.parquet')
+    data, report = prepare_circuit_validation(tmp_path, manifest, FakeTokenizer(), sft_format='messages',
+                                              max_prompt_length=100, max_model_len=1000, per_circuit=2)
+    assert len(data) == 2 and set(report['circuits']) == {'one'}
+    assert report['skipped_circuits']['two']['filtering'] == {'length': 3}
+    log = capsys.readouterr().out
+    assert 'Skipping validation circuit two' in log
+    assert 'prompt reaches max_prompt_length (3 rows)' in log
+    assert 'training data is unaffected' in log
 
 
 def test_resume_requires_matching_repaired_dataset_provenance(tmp_path, monkeypatch):

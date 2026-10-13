@@ -229,7 +229,7 @@ def test_detection_needs_a_tool_call():
     assert reward["uniqueness"] == 0.0
     assert reward["activation"] == 0.0
     assert reward["fidelity"] == 0.0
-    assert reward["format"] == pytest.approx(5 / 6)
+    assert reward["format"] == pytest.approx(6 / 7)
     assert simulated == []
 
 
@@ -288,7 +288,7 @@ def test_failed_tool_execution_is_a_failed_attempt():
 def test_truncated_trajectory_fails_the_final_turn():
     reward, _ = _score(_trace([INACTIVE]))
     assert reward["detection"] == 0.0
-    assert reward["format"] == pytest.approx(2 / 8)
+    assert reward["format"] == pytest.approx(2 / 9)
 
 
 def test_retry_turn_must_reason_before_calling():

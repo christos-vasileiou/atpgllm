@@ -238,6 +238,8 @@ def test_evaluator_writes_versioned_metrics_and_all_slots(tmp_path, monkeypatch,
     import importlib.util
     from test_conversation_search import Generator, Tokenizer, PROMPT, answer
     path = Path(__file__).resolve().parents[2] / 'scripts/eval/evaluate_model.py'
+    # Run as a script, evaluate_model.py finds its sibling fault_difficulty.py on sys.path.
+    monkeypatch.syspath_prepend(str(path.parent))
     spec = importlib.util.spec_from_file_location('eval_search_integration', path)
     evaluator = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(evaluator)
@@ -253,13 +255,15 @@ def test_evaluator_writes_versioned_metrics_and_all_slots(tmp_path, monkeypatch,
     record = {'netlist': {'doc_id': 'doc', 'netlist':
               'module design(a,b,y);\ninput a,b;\noutput y;\nassign y = a;\nendmodule'},
               'fault': 'sa0 y', 'module_name': 'design'}
-    rows = [record, {**record, 'broken': True}]
+    # Selection keeps unique eligible (netlist, fault) problems, so the problem
+    # that fails later is a distinct fault whose netlist cannot be prepared.
+    broken = {'netlist': {'doc_id': 'doc', 'netlist': ''}, 'fault': 'sa1 y', 'module_name': 'design'}
+    rows = [record, broken]
     monkeypatch.setattr(evaluator, 'load_dataset', lambda *a, **k: rows)
     monkeypatch.setattr(evaluator, 'buffer_streaming_dataset', lambda *a, **k: rows)
-    def prompt(record, tok, **kwargs):
-        if record.get('broken'):
-            raise ValueError('bad input')
-        return PROMPT, [{'role': 'user', 'content': 'Find sa0 y'}]
+    def prompt(record, tok, *, return_messages=False):
+        messages = [{'role': 'user', 'content': 'Find sa0 y'}]
+        return (PROMPT, messages) if return_messages else PROMPT
     monkeypatch.setattr(evaluator, 'format_eval_prompt', prompt)
     checkpoint = tmp_path / 'checkpoint'
     checkpoint.mkdir()
@@ -274,8 +278,11 @@ def test_evaluator_writes_versioned_metrics_and_all_slots(tmp_path, monkeypatch,
     assert metrics['aggregate_metrics']['failed_completion_slots'] == 2
     assert len(slots) == 4
     assert len(metrics['per_problem_results']) == 2
-    assert all(s['status'] == 'INFRA_ERROR' for s in slots[2:])
-    assert all(s['usage']['attempts'] == 0 for s in slots[2:])
+    # Selection order is a seeded reservoir, so find the failed problem by fault.
+    failed = [s for s in slots if s['fault'] == 'sa1 y']
+    assert len(failed) == 2
+    assert all(s['status'] == 'INFRA_ERROR' for s in failed)
+    assert all(s['usage']['attempts'] == 0 for s in failed)
     # Missing/failed slots must not disappear from component denominators.
     assert metrics['accuracy_metrics']['fault_detected_by_pred_input_vector_acc'] <= 0.5
 

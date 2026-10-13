@@ -474,8 +474,11 @@ class TrainingStateCheckpointCallback(TrainerCallback):
         launch_skip_buffer_size: int = 0,
         buffer_size: Optional[int] = None,
         num_generations: Optional[int] = None,
+        rolling_buffer: bool = False,
     ):
         self.method = method.lower() if isinstance(method, str) else None
+        # GRPO with the rolling buffer resumes from its ledger, not a stream offset.
+        self.rolling_buffer = bool(rolling_buffer)
         try:
             self.launch_skip_buffer_size = max(0, int(launch_skip_buffer_size or 0))
         except (TypeError, ValueError):
@@ -669,7 +672,10 @@ class TrainingStateCheckpointCallback(TrainerCallback):
                 f"--resume_training_state"
             )
             cumulative = skip_state.get("cumulative_skip_buffer_size")
-            if cumulative is not None:
+            if self.rolling_buffer:
+                print("  Data position: the rolling GRPO buffer resumes from "
+                      "grpo_stream_ledger.json in this checkpoint (SKIP_BUFFER_SIZE unused).")
+            elif cumulative is not None:
                 print(
                     f"  Resume (fresh run on new data): --resume_from "
                     f"{checkpoint_dir} --skip_buffer_size {cumulative} "
