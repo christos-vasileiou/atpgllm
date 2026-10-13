@@ -213,3 +213,18 @@ def test_snapshot_reading_is_three_valued():
                            "Bad Machine": {"n1": 0, "y": 0, "z": 1}})
     reading = read_snapshot(detected, "sa0 n1", ["y", "z"])
     assert reading.detected and reading.differing_outputs == ["y"]
+
+
+def test_po_fault_view_order_does_not_depend_on_the_table_order():
+    # Stored v4 snapshots list nets as declared; live TetraMAX frames list them
+    # in its own order. The model must see one rendering of the same values.
+    from atpgllm.training.tool_feedback import shown_snapshot
+
+    stored = json.dumps({"Good Machine": {"a": 1, "n1": 1, "s[0]": 0, "s[1]": "x"},
+                         "Bad Machine": {"a": 1, "n1": 0, "s[0]": 1, "s[1]": "x"}})
+    live = json.dumps({"Good Machine": {"s[1]": "x", "s[0]": 0, "n1": 1, "a": 1},
+                       "Bad Machine": {"s[1]": "x", "s[0]": 1, "n1": 0, "a": 1}})
+    outputs = ["s[0]", "s[1]"]
+    shown = shown_snapshot(stored, "sa0 n1", outputs, "po_fault")
+    assert shown == shown_snapshot(live, "sa0 n1", outputs, "po_fault")
+    assert list(json.loads(shown)["Good Machine"]) == ["n1", "s[0]", "s[1]"]

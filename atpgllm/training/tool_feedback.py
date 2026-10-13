@@ -13,8 +13,8 @@ from these sentences therefore teach a reading the model can reproduce.
 
 What the model sees is set by the tool view (:data:`TOOL_VIEWS`): ``full`` is
 the simulator's whole table; ``po_fault`` keeps only the primary outputs and
-the fault site, in the table's order (median 511 instead of 1,929 tokens on v3
-train). The inputs are left out because they repeat the call's own vector;
+the fault site, the site first and the outputs in declared order (median 511
+instead of 1,929 tokens on v3 train). The inputs are left out because they repeat the call's own vector;
 the fault site stays so activation remains readable. Rewards run their own
 full simulation, so they do not depend on the view.
 """
@@ -44,8 +44,11 @@ def shown_snapshot(
         raise ValueError(f"Unknown tool view {view!r}; expected one of {TOOL_VIEWS}")
     good, bad = _machines(snapshot)
     _, net = parse_fault(fault)
-    keep = set(output_nets) | {net}
-    names = [name for name in good if name in keep]
+    # A fixed order, whatever order the simulator listed its table in (the
+    # stored v4 snapshots and live TetraMAX frames differ): the fault site
+    # unless it is an output, then the outputs in the order given (declared).
+    order = ([] if net in output_nets else [net]) + list(output_nets)
+    names = [name for name in order if name in good]
     return json.dumps(
         {
             "Good Machine": {name: good[name] for name in names},

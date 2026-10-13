@@ -62,12 +62,15 @@ def tool_view() -> str:
     return os.environ.get('FAULT_SIM_TOOL_VIEW', 'full')
 
 
-def observation(snapshot, fault, view=None) -> str:
-    """The model's view of a simulator table (fast or TetraMAX frame)."""
+def observation(snapshot, fault, view=None, outputs=None) -> str:
+    """The model's view of a simulator table (fast or TetraMAX frame).
+    ``outputs``: the primary outputs in declared order (default: as the table
+    lists them)."""
     from atpgllm.training.tool_feedback import shown_snapshot
     table = snapshot[['Good Machine', 'Bad Machine']].to_json()
-    outputs = list(snapshot.index[snapshot['POs'].astype(bool)]) if 'POs' in snapshot else []
-    return shown_snapshot(table, fault, outputs, view or tool_view())
+    if outputs is None:
+        outputs = list(snapshot.index[snapshot['POs'].astype(bool)]) if 'POs' in snapshot else []
+    return shown_snapshot(table, fault, list(outputs), view or tool_view())
 
 
 def simulation_model(netlist):
@@ -111,13 +114,14 @@ async def fault_simulation_tool_handler(input_vector, output_vector, fault, doc_
     _require_bit_mapping("output_vector", output_vector)
     cancelled = cancel if cancel is not None else threading.Event()
     def execute():
-        snapshot = run_fault_simulation(input_vector, output_vector, fault, netlist,
+        model = simulation_model(netlist)
+        snapshot = run_fault_simulation(input_vector, output_vector, fault, model=model,
                                         doc_id=doc_id, cancel=cancelled)
         if 'error' in snapshot.columns:
             # The simulator rejected the request (malformed vector, unknown net):
             # a model error, labelled like every other rejected call.
             return f"Tool execution failed: {snapshot.loc[0, 'error']}"
-        return observation(snapshot, fault, view)
+        return observation(snapshot, fault, view, outputs=model.output_nets)
     task = asyncio.create_task(asyncio.to_thread(execute))
     try:
         return await asyncio.shield(task)

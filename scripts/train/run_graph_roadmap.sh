@@ -32,6 +32,11 @@ if [ "$FAULT_SIM_BACKEND" = tetramax ]; then
     if ! command -v "${TMAX_BIN:-tmax}" >/dev/null 2>&1 && [ -n "${SYNOPSYS_PROFILE:-}" ]; then
         set +u; source "$SYNOPSYS_PROFILE" >/dev/null; set -u
     fi
+    # Libraries tmax64 links against that a host may lack (eng-tamale2 has no
+    # libXss, libtiff.so.3, libmng or libpng12 installed).
+    if [ -n "${TMAX_LIBRARY_PATH:-}" ]; then
+        export LD_LIBRARY_PATH="$TMAX_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
     _REPO_ROOT="$REPO_ROOT"
     source scripts/train/_tetramax_lifecycle.sh
     # One 3-valued simulation before any GPU work (binary, license, library).
