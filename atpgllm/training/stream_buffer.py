@@ -131,7 +131,7 @@ class RollingPromptBuffer:
                  chunk_size: int, length: int, ledger_path, settings: dict,
                  reorder: Optional[Callable[[list, int], list]] = None,
                  unique_by: str = "prompt", writer: bool = True, resume_ledger=None,
-                 read_block: int = 512):
+                 read_block: int = 4096):
         if chunk_size < 1 or length < chunk_size:
             raise ValueError("RollingPromptBuffer needs chunk_size >= 1 and length >= chunk_size")
         self.source = source
