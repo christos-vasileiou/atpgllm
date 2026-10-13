@@ -73,8 +73,9 @@ def _skip_message(circuit, info, examined, reasons, shortest_prompt, max_prompt_
     return (f"[SFT validation] Skipping validation circuit {circuit[:12]} "
             f"({info.get('source_module_name', '?')}, netlist {str(info.get('netlist_id', '?'))[:12]}): "
             f"0 of {examined} rows usable after filtering. Causes: {causes or 'none recorded'}. "
-            f"Shortest prompt {shortest_prompt} tokens vs max_prompt_length={max_prompt_length}; "
-            f"max_model_len={max_model_len}. The circuit is excluded from validation only; "
+            + (f"Shortest prompt {shortest_prompt} tokens vs max_prompt_length={max_prompt_length}; "
+               if shortest_prompt is not None else f"max_prompt_length={max_prompt_length}; ")
+            + f"max_model_len={max_model_len}. The circuit is excluded from validation only; "
             f"training data is unaffected.")
 
 
