@@ -41,11 +41,12 @@ TOOLS = [FAULT_SIMULATION_TOOL]
 
 def _require_bit_mapping(name, vector):
     """Model-authored vectors must be caught as tool errors: the simulator raises
-    AttributeError/IndexError on them, which would abort training as infrastructure."""
+    AttributeError/IndexError on them, which would abort training as infrastructure.
+    Values are 0, 1 or the don't-care x."""
     if isinstance(vector, str):
         vector = convert_string_to_dict(vector, sep=':' if ':' in vector else '=')
     if not isinstance(vector, dict):
-        raise TypeError(f"{name} must map net names to 0/1")
+        raise TypeError(f"{name} must map net names to 0, 1 or x")
     bad = [net for net, bit in vector.items()
            if not isinstance(bit, bool) and str(bit).strip().lstrip('-').isdigit()
            and int(bit) not in (0, 1)]
@@ -75,7 +76,9 @@ async def fault_simulation_tool_handler(input_vector, output_vector, fault, doc_
             model = prepare_netlist(netlist, gates, RF.DECL_RE, RF.NAME_RE)
             snapshot = runner(input_vector, output_vector, fault, model, gates, module_name=doc_id)
         if 'error' in snapshot.columns:
-            return str(snapshot.loc[0, 'error'])
+            # The simulator rejected the request (malformed vector, unknown net):
+            # a model error, labelled like every other rejected call.
+            return f"Tool execution failed: {snapshot.loc[0, 'error']}"
         return snapshot[['Good Machine', 'Bad Machine']].to_json()
     task = asyncio.create_task(asyncio.to_thread(execute))
     try:
@@ -158,14 +161,15 @@ def _vector_as_read(vector):
 
 def _output_nets(outputs):
     """The output nets in their given order when every claimed value is a
-    valid bit, since the simulator then never reads the values; otherwise the
-    vector exactly as written, because an invalid value is an error."""
+    valid bit or don't-care (x), since the simulator then never reads the
+    values; otherwise the vector exactly as written, because an invalid value
+    is an error."""
     if isinstance(outputs, dict):
-        if all(type(bit) in (int, str) and bit in (0, 1, '0', '1') for bit in outputs.values()):
+        if all(type(bit) in (int, str) and bit in (0, 1, '0', '1', 'x', 'X') for bit in outputs.values()):
             return ('names', tuple(outputs))
     elif isinstance(outputs, str):
         read = _vector_as_read(outputs)
-        if read[0] == 'text' and all(bit in ('0', '1') for _, bit in read[1]):
+        if read[0] == 'text' and all(bit in ('0', '1', 'x', 'X') for _, bit in read[1]):
             return ('names', tuple(net for net, _ in read[1]))
     return ('raw', json.dumps(outputs, default=str))
 

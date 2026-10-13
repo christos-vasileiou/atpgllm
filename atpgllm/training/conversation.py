@@ -27,6 +27,11 @@ INDEXED_BRACKET_PATTERN = re.compile(r"^(.+)\[(\d+)\]$")
 INDEXED_SUFFIX_PATTERN = re.compile(r"^(.+/[A-Za-z_]+)(\d+)$")
 
 
+def is_dont_care(value: Any) -> bool:
+    """An x (don't-care input or unknown output) in a dataset vector."""
+    return isinstance(value, str) and value.strip().lower() == "x"
+
+
 def _parse_csv_tokens(raw: str) -> List[str]:
     """Split a comma-separated list into normalized tokens."""
     if not raw:
@@ -230,11 +235,16 @@ class ConversationExample:
         )
 
         input_vector_dict = json.loads(record.get('input_vector', '{}'))
+        # The final answer states only care bits: don't-care inputs and unknown
+        # outputs (x) are omitted, and a missing input is read back as x. The tool
+        # call keeps the full vectors. Binary rows are unchanged.
         record['input_vector_json'] = ", ".join(
             f"{net}: {value}" for net, value in input_vector_dict.items()
+            if not is_dont_care(value)
         )
         record['expected_output_json'] = ", ".join(
             f"{net}: {value}" for net, value in expected_output_dict.items()
+            if not is_dont_care(value)
         )
         record['input_vector'] = compact_binary_assignment_dict(input_vector_dict)
         record['expected_output'] = compact_binary_assignment_dict(expected_output_dict)

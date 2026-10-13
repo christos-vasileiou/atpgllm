@@ -88,7 +88,7 @@ def test_reward_exposes_only_four_training_objectives():
     assert reward["activation"] == 1.0
     assert reward["fidelity"] == 1.0
     # The call turn holds no reasoning.
-    assert reward["format"] == pytest.approx(7 / 8)
+    assert reward["format"] == pytest.approx(8 / 9)
     assert reward["pi_completeness_logonly"] == 0.5
 
 

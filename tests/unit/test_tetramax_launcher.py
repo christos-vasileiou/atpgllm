@@ -13,6 +13,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def _own_data_preprocessing(monkeypatch):
+    # The launcher fixture builds its own data_preprocessing; an inherited
+    # override would point the scripts at a real checkout instead.
+    monkeypatch.delenv('DATA_PREPROCESSING_ROOT', raising=False)
+
+
 @pytest.fixture
 def launcher(tmp_path):
     repo = tmp_path / 'libatpgllm'
@@ -152,7 +159,7 @@ def test_resume_provenance_checked_before_training_and_service_cleaned_up(launch
     checkpoint = launcher.repo / 'checkpoint-3'
     checkpoint.mkdir()
     (checkpoint / 'trainer_state.json').write_text('{}')
-    provenance = {'backend': 'tetramax', 'reward_contract': 'atpg-rewards-v3',
+    provenance = {'backend': 'tetramax', 'reward_contract': 'atpg-rewards-v4',
                   'objectives': ['detection'], 'weights': [1.0], 'profile': 'po',
                   'simulator': {'schema': 'test', 'tool_version': 'test-version',
                                 'fingerprint': 'test-fingerprint' if mode == 'matching' else 'old-fingerprint'}}
