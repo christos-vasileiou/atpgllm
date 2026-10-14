@@ -28,7 +28,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 # --- activate virtual environment (same resolution as run_training_code.sh) ---
-if [ -f "/work/cxv200006/myenv/bin/activate" ]; then
+if [ -n "${PYTHON_VENV:-}" ]; then
+    # shellcheck source=/dev/null
+    source "$PYTHON_VENV/bin/activate"
+elif [ -f "/work/cxv200006/myenv/bin/activate" ]; then
     # shellcheck source=/dev/null
     source /work/cxv200006/myenv/bin/activate
 elif [ -f "/proj/trela/christos/myenv/bin/activate" ]; then

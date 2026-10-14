@@ -187,6 +187,11 @@ from atpgllm.training.model_utils import (                                      
     load_model_from_adapter,
     patch_chat_template_for_assistant_mask,
 )
+from atpgllm.training.moe_utils import (
+    ExpertLoadCallback,
+    moe_layout,
+    resolve_moe_lora_targets,
+)
 
 
 def _resolve_lora_config(
@@ -204,6 +209,36 @@ def _resolve_lora_config(
     if qwen_moe:
         return get_qwen_moe_lora_config(r=lora_rank, lora_alpha=lora_alpha)
     return get_lora_config(r=lora_rank, lora_alpha=lora_alpha)
+
+
+def _apply_moe_lora_targets(model, lora_config, explicit_targets: bool) -> None:
+    """Point LoRA at the MoE model's own projection names (``--moe``)."""
+    tune_router = os.environ.get("TUNE_MOE_ROUTER", "0").lower() in ("1", "true", "yes")
+    targets, fused = resolve_moe_lora_targets(model, tune_router=tune_router)
+    if lora_config is not None and not explicit_targets:
+        lora_config.target_modules = set(targets)
+        print(f"[MoE] LoRA targets resolved from the model: {targets}")
+    if fused:
+        print(f"[MoE] WARNING: {len(fused)} fused expert parameters (e.g. {fused[0]}) are "
+              "not nn.Linear, so LoRA does not reach the experts of this model.")
+    if tune_router:
+        # Adds the router load-balancing loss to outputs.loss (SFT only;
+        # GRPO computes its loss from logits and ignores it).
+        model.config.output_router_logits = True
+
+
+def _expert_load_callback(model) -> list:
+    layout = moe_layout(model.config)
+    if layout is None:
+        print("[MoE] WARNING: --moe set but the config names no expert count.")
+        return []
+    callback = ExpertLoadCallback(model, *layout)
+    if not callback.handles:
+        print("[MoE] Router is not an nn.Linear; expert-load logging is off.")
+        return []
+    print(f"[MoE] Logging expert load over {len(callback.handles)} routers "
+          f"({layout[0]} experts, top-{layout[1]}).")
+    return [callback]
 
 
 # =====================================================================
@@ -262,6 +297,7 @@ def train_with_sft(
     lora_alpha: int = 16,
     lora_target_modules: list[str] | None = None,
     qwen_moe: bool = False,
+    moe: bool = False,
     assistant_only_loss: bool = True,
     sft_circuit_validation: bool = False,
     sft_eval_steps: int = 10,
@@ -393,6 +429,8 @@ def train_with_sft(
         if not tokenizer.pad_token:
             tokenizer.pad_token = tokenizer.eos_token
         base_model = load_quantised_model(model_name, device_map=device_map)
+        if moe:
+            _apply_moe_lora_targets(base_model, lora_config, lora_target_modules is not None)
         model = prepare_lora_model(base_model, lora_config)
 
     # Synchronize the model's config with the tokenizer's special token IDs
@@ -487,7 +525,8 @@ def train_with_sft(
         max_steps=max_steps,
         logging_steps=5,
         save_steps=10,
-        ddp_find_unused_parameters=False if use_ddp else None,
+        # Experts that receive no token in a micro-batch get no gradient.
+        ddp_find_unused_parameters=(moe or None) if use_ddp else None,
         gradient_checkpointing=True,
         # DDP + gradient checkpointing + LoRA requires non-reentrant
         # checkpointing to avoid "parameter marked ready twice" errors.
@@ -528,6 +567,7 @@ def train_with_sft(
             method="sft",
             launch_skip_buffer_size=skip_buffer_size,
         ),
+        *(_expert_load_callback(model) if moe else []),
     ]
     
     trainer = SFTTrainer(
@@ -644,6 +684,7 @@ def train_with_grpo(
     lora_alpha: int = 16,
     lora_target_modules: list[str] | None = None,
     qwen_moe: bool = False,
+    moe: bool = False,
     netlist_diversity_strategy: str = "even_spacing",
     disable_dropout: bool = True,
     vllm_importance_sampling_mode: str = "token_truncate",
@@ -878,6 +919,9 @@ def train_with_grpo(
 
     # Synchronize model config with tokenizer special tokens
     model = smart_sync_model_config(model, tokenizer)
+    if moe:
+        # lora_config is the object passed on as policy_lora_config or peft_config.
+        _apply_moe_lora_targets(model, lora_config, lora_target_modules is not None)
 
     # Load and format dataset
     print(f"Loading dataset from: {dataset_path}")
@@ -1054,6 +1098,8 @@ def train_with_grpo(
         logging_first_step=True,
         bf16=True,
         deepspeed=deepspeed,
+        # Experts that receive no token in a micro-batch get no gradient.
+        ddp_find_unused_parameters=True if (moe and use_ddp) else None,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to=report_to,
@@ -1113,6 +1159,7 @@ def train_with_grpo(
             num_generations=max(num_generations, 2),
             rolling_buffer=buffer_rolling,
         ),
+        *(_expert_load_callback(model) if moe else []),
     ]
 
     if use_dual_adapter:
@@ -1192,6 +1239,7 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "lora_alpha",
     "lora_target_modules",
     "qwen_moe",
+    "moe",
     "assistant_only_loss",
     "sft_circuit_validation",
     "sft_eval_steps",
@@ -1456,6 +1504,14 @@ def main() -> None:
         default=_env("QWEN_MOE", "0").lower() in ("1", "true", "yes"),
         help="Use Qwen-style MoE LoRA targets (attention + expert MLP; optional "
              "router via TUNE_MOE_ROUTER=1). Env: QWEN_MOE",
+    )
+    parser.add_argument(
+        "--moe",
+        action=argparse.BooleanOptionalAction,
+        default=_env("MOE", "0").lower() in ("1", "true", "yes"),
+        help="Mixture-of-experts model (OLMoE, Qwen-MoE, Mixtral, Nemotron-H): resolve "
+             "LoRA targets from the loaded model, let DDP skip experts that got no "
+             "token, and log expert load. Router via TUNE_MOE_ROUTER=1. Env: MOE",
     )
     parser.add_argument(
         "--assistant_only_loss",

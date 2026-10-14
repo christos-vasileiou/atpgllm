@@ -145,6 +145,14 @@ def get_qwen_moe_lora_config(
     return get_lora_config(r=r, lora_alpha=lora_alpha, target_modules=targets)
 
 
+def base_precision() -> str:
+    """``nf4`` (default, QLoRA) or ``bf16``, from env ``BASE_PRECISION``."""
+    value = os.environ.get("BASE_PRECISION", "nf4").strip().lower() or "nf4"
+    if value not in ("nf4", "bf16"):
+        raise ValueError(f"BASE_PRECISION must be nf4 or bf16, got {value!r}")
+    return value
+
+
 def load_quantised_model(
     model_name: str,
     device_map: str | dict = "auto",
@@ -153,7 +161,8 @@ def load_quantised_model(
     """
     Load a base causal language model in 4-bit quantised form using
     ``BitsAndBytesConfig``.  Gradient checkpointing is enabled to save
-    memory.
+    memory.  With ``BASE_PRECISION=bf16`` the base stays in bfloat16
+    instead (LoRA on a full-precision base, for MoE models that fit one GPU).
     
     Parameters
     ----------
@@ -165,17 +174,19 @@ def load_quantised_model(
         pins to a single device (used in DDP mode).
     """
     from transformers.utils import is_flash_attn_3_available, is_flash_attn_2_available
-    quant_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
     pretrained_kwargs = {
-        "quantization_config": quant_config,
         "device_map": device_map,
         "trust_remote_code": True,
     }
+    if base_precision() == "bf16":
+        pretrained_kwargs["torch_dtype"] = torch.bfloat16
+    else:
+        pretrained_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
     if is_flash_attn_3_available():
         pretrained_kwargs["attn_implementation"] = "flash_attention_3"
     elif is_flash_attn_2_available():
@@ -378,9 +389,14 @@ def prepare_lora_model(
         The LoRA configuration to use.  If *None*, :func:`get_lora_config`
         is called.
     """
-    base_model = prepare_model_for_kbit_training(
-        base_model, use_gradient_checkpointing=True,
-    )
+    if getattr(base_model, "is_loaded_in_4bit", False) or getattr(base_model, "is_loaded_in_8bit", False):
+        base_model = prepare_model_for_kbit_training(
+            base_model, use_gradient_checkpointing=True,
+        )
+    else:
+        # prepare_model_for_kbit_training would upcast a bf16 base to fp32.
+        base_model.gradient_checkpointing_enable()
+        base_model.enable_input_require_grads()
 
     if lora_config is None:
         lora_config = get_lora_config()
@@ -681,7 +697,24 @@ def patch_qwen_chat_template_for_assistant_mask(tokenizer) -> bool:
         "        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n        {%- endgeneration %}\n    {%- elif message.role == \"tool\" %}",
     )
 
-    if new == tpl or new.count("{%- generation %}") != 2 or new.count("{%- endgeneration %}") != 2:
+    if new == tpl:
+        # Qwen3 2507 (Instruct, incl. Qwen3-30B-A3B MoE): one assistant branch
+        # that writes content, tool calls and <|im_end|> in sequence.
+        new = tpl.replace(
+            '{%- elif message.role == "assistant" %}\n'
+            "        {{- '<|im_start|>' + message.role + '\\n' + content }}",
+            '{%- elif message.role == "assistant" %}\n'
+            "        {{- '<|im_start|>' + message.role + '\\n' }}\n"
+            "        {%- generation %}\n"
+            "        {{- content }}",
+        ).replace(
+            "        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}",
+            "        {{- '<|im_end|>\\n' }}\n        {%- endgeneration %}\n    {%- elif message.role == \"tool\" %}",
+        )
+        expected = 1
+    else:
+        expected = 2
+    if new == tpl or new.count("{%- generation %}") != expected or new.count("{%- endgeneration %}") != expected:
         raise RuntimeError(
             "patch_qwen_chat_template_for_assistant_mask: could not locate the "
             "expected Qwen2/2.5/3 template patterns. Inspect "
@@ -941,9 +974,14 @@ def load_model_from_adapter(
         tokenizer.pad_token = tokenizer.eos_token
 
     base_model = load_quantised_model(base_model_name, device_map=device_map)
-    base_model = prepare_model_for_kbit_training(
-        base_model, use_gradient_checkpointing=True,
-    )
+    if getattr(base_model, "is_loaded_in_4bit", False) or getattr(base_model, "is_loaded_in_8bit", False):
+        base_model = prepare_model_for_kbit_training(
+            base_model, use_gradient_checkpointing=True,
+        )
+    else:
+        # prepare_model_for_kbit_training would upcast a bf16 base to fp32.
+        base_model.gradient_checkpointing_enable()
+        base_model.enable_input_require_grads()
 
     # Sanitize adapter_config.json: strip keys that are not valid PEFT/LoRA
     # parameters.  Older checkpoints may contain 'max_model_length' injected
