@@ -526,7 +526,7 @@ def train_with_sft(
         logging_steps=5,
         save_steps=10,
         # Experts that receive no token in a micro-batch get no gradient.
-        ddp_find_unused_parameters=(moe or None) if use_ddp else None,
+        ddp_find_unused_parameters=bool(moe) if use_ddp else None,
         gradient_checkpointing=True,
         # DDP + gradient checkpointing + LoRA requires non-reentrant
         # checkpointing to avoid "parameter marked ready twice" errors.

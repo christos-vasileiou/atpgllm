@@ -21,14 +21,14 @@ Qwen3-30B-A3B is the first model that can learn the v4 protocol. It runs on the 
 
 | Piece | Where | What it does |
 |---|---|---|
-| `MOE=True` (`--moe`) | `training_code.py` | Resolves LoRA targets from the loaded model's own `nn.Linear` names (attention, expert MLP under either `gate/up/down_proj` or Mixtral's `w1/w2/w3`, and Mamba `in_proj/out_proj`). Sets `ddp_find_unused_parameters=True`, because an expert that receives no token in a micro batch has no gradient and plain DDP aborts on that. Adds expert-load logging. |
+| `MOE=True` (`--moe`) | `training_code.py` | Resolves LoRA targets from the loaded model's own `nn.Linear` names (attention, expert MLP under either `gate/up/down_proj` or Mixtral's `w1/w2/w3`, and Mamba `in_proj/out_proj`). Sets `ddp_find_unused_parameters=True` (dense runs keep `False`), because an expert that receives no token in a micro batch has no gradient and plain DDP aborts on that. Adds expert-load logging. |
 | `TUNE_MOE_ROUTER=1` | same | Adds the router (`gate`) to the LoRA targets and turns on `output_router_logits`, so the model's load balancing loss joins the SFT loss. GRPO computes its loss from logits and ignores it. |
 | `BASE_PRECISION=bf16` | `model_utils.load_quantised_model` | Loads the base in bfloat16 instead of NF4. A 30B MoE is about 61GB in bf16 and fits one H200 (141GB) with room for activations, so each DDP rank holds a replica and nothing is sharded. The LoRA preparation skips `prepare_model_for_kbit_training`, which would otherwise upcast the whole base to fp32. vLLM weight sync already handles a base without `quant_state`. |
 | Fused expert warning | `moe_utils.resolve_moe_lora_targets` | GraniteMoE (and many models under transformers v5) store a layer's experts as one 3D parameter. LoRA `target_modules` cannot reach those. The run prints how many such parameters exist instead of silently training attention only. |
 | `ExpertLoadCallback` | `moe_utils.py` | Counts the top-k choices of every `nn.Linear` router during training forwards and logs `moe/load_entropy_mean`, `moe/load_entropy_min` (1.0 is a uniform load), `moe/max_expert_share` and `moe/dead_expert_fraction`. A falling minimum entropy is the early sign of expert collapse. |
 | Qwen3 2507 assistant mask | `patch_qwen_chat_template_for_assistant_mask` | The 2507 template has one assistant branch, which the old patcher did not recognise and refused. The new branch masks the same tokens as Qwen2.5 (checked on the real tokenizer with a tool call turn). |
 | `PYTHON_VENV` | `run_training_code.sh`, `_mn_launch.sh` | Activates another environment on the batch node and on every srun node. |
-| `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`, `NCCL_DEBUG`, `GLOO_SOCKET_IFNAME` | `run_training_code.sh` | Values set in a config are exported, so they reach the other nodes. On juno: `ib0` and `mlx5_0`. |
+| `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`, `NCCL_DEBUG`, `GLOO_SOCKET_IFNAME`, `HF_HOME`, `HF_HUB_OFFLINE` | `run_training_code.sh` | Values set in a config are exported, so they reach the other nodes. On juno: `ib0` and `mlx5_0`, and a model cache on `/work` filled before the job. |
 | `RESUME_ON_REQUEUE` (default True) | `run_training_code.sh` | The h200 partition preempts with `REQUEUE`. A requeued job (`SLURM_RESTART_COUNT > 0`) now resumes from its own latest checkpoint with full trainer state, instead of restarting from the configured start point and overwriting `OUTPUT_DIR`. |
 | Configs | `scripts/train/configs/` | `sft_olmoe_1b_7b_h200_juno_smoke.conf`, `sft_qwen3_30b_a3b_v4_h200_2node_juno.conf`, `grpo_qwen3_30b_a3b_v4_h200_3node_juno_tetramax.conf`, `sft_nemotron3_nano_v4_h200_2node_juno.conf` (blocked, see §4). |
 
@@ -79,6 +79,7 @@ Run each rung on juno before the next. All of them are short jobs.
 
 | Rung | Command / config | Pass when |
 |---|---|---|
+| Setup | On the login node: `HF_HOME=/work/cxv200006/hf_cache hf download <model>` for every model a config names | Weights are on `/work`. The configs then set `HF_HUB_OFFLINE=1`, so no rank or vLLM node downloads during a job |
 | 0. Fabric | 2 node `all_reduce_perf` from `nccl-tests` with `NCCL_SOCKET_IFNAME=ib0 NCCL_IB_HCA=mlx5_0` | Bus bandwidth is IB class (tens of GB/s), not TCP over Ethernet |
 | 1. OLMoE, 1 node | `sft_olmoe_1b_7b_h200_juno_smoke.conf` | Loss falls over 20 steps, `moe/*` metrics logged, no unused parameter error, checkpoint saved |
 | 2. OLMoE, 2 nodes | same with `NUM_NODES=2` | Same, with 4 ranks. `scancel --signal=TERM` then requeue resumes from the checkpoint |
