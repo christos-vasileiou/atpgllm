@@ -609,8 +609,10 @@ build_cmd_args() {
 # --main_process_ip and for the vLLM server URL.
 resolve_ip() {
     local host="$1" ip=""
-    ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1; exit}')
-    [ -z "$ip" ] && ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
+    # Prefer IPv4: on juno a node resolves its own name to an IPv6 link-local
+    # address (fe80::...), which has no zone and cannot be a rendezvous address.
+    ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '$1 !~ /^127\./ {print $1; exit}')
+    [ -z "$ip" ] && ip=$(getent hosts "$host" 2>/dev/null | awk '$1 !~ /^(127\.|::1|fe80:)/ {print $1; exit}')
     echo "${ip:-$host}"
 }
 
