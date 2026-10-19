@@ -127,7 +127,36 @@ export TMAX_MAX_CONCURRENT TMAX_TIMEOUT_S TMAX_ACQUIRE_TIMEOUT_S
 export TMAX_RESULT_CACHE_SIZE TMAX_REWARD_PROFILE TMAX_KEEP_ARTIFACTS TMAX_PIPELINED_TOOLS
 export TMAX_RESUME_FINGERPRINT_TRANSITION
 
+# PYTHON_VENV selects another environment; _mn_launch.sh activates the same one
+# on every node.
+if [ -n "${PYTHON_VENV:-}" ]; then
+    # shellcheck source=/dev/null
+    source "$PYTHON_VENV/bin/activate" || { echo "ERROR: cannot activate PYTHON_VENV=$PYTHON_VENV"; exit 1; }
+    export PYTHON_VENV
+    echo "Python Path (PYTHON_VENV): $(which python)"
+fi
+# Cross-node fabric (on juno: NCCL_SOCKET_IFNAME=ib0, NCCL_IB_HCA=mlx5_0), a
+# pre-filled model cache (HF_HOME on /work, HF_HUB_OFFLINE=1) and offline W&B
+# for compute nodes without internet. Only exported values reach the srun steps
+# on the other nodes.
+for _nccl_var in NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_DEBUG GLOO_SOCKET_IFNAME HF_HOME HF_HUB_OFFLINE WANDB_MODE; do
+    [ -n "${!_nccl_var:-}" ] && export "$_nccl_var"
+done
+
 METHOD=${METHOD:-sft}
+
+# A requeued job (preemption, node failure) continues from its own latest
+# checkpoint instead of restarting from the configured start point and
+# overwriting OUTPUT_DIR. Set RESUME_ON_REQUEUE=False to opt out.
+if [ "${SLURM_RESTART_COUNT:-0}" -gt 0 ] && [ "${RESUME_ON_REQUEUE:-True}" = "True" ] && [ -n "${OUTPUT_DIR:-}" ]; then
+    if _requeue_ckpt="$(python "$_REPO_ROOT/atpgllm/training/checkpoints.py" "$OUTPUT_DIR" 2>/dev/null)"; then
+        RESUME_FROM=latest
+        RESUME_TRAINING_STATE=True
+        echo "Requeue #$SLURM_RESTART_COUNT: resuming from $_requeue_ckpt"
+    else
+        echo "Requeue #$SLURM_RESTART_COUNT: no checkpoint under $OUTPUT_DIR yet; starting from the config."
+    fi
+fi
 
 # Resolve RESUME_FROM=latest -> most recently completed resumable checkpoint.
 # Must run before validate_grpo_resume and the W&B launch snapshot.
@@ -277,6 +306,7 @@ write_launch_config_snapshot() {
         TENSOR_PARALLEL_SIZE DATA_PARALLEL_SIZE VLLM_GPU_MEM_UTIL
         PARTITION NODELIST NUM_NODES GPUS_PER_NODE CPUS_PER_TASK MEM
         LORA_RANK LORA_ALPHA LORA_TARGET_MODULES QWEN_MOE TUNE_MOE_ROUTER MOE_MAX_MEMORY_GIB
+        PYTHON_VENV RESUME_ON_REQUEUE NCCL_SOCKET_IFNAME NCCL_IB_HCA HF_HOME HF_HUB_OFFLINE WANDB_MODE
         FAULT_SIM_BACKEND TMAX_SERVER_FILE TMAX_SERVER_URL TMAX_MAX_CONCURRENT
         TMAX_TIMEOUT_S TMAX_ACQUIRE_TIMEOUT_S TMAX_RESULT_CACHE_SIZE TMAX_REWARD_PROFILE TMAX_PIPELINED_TOOLS
         TMAX_RESUME_FINGERPRINT_TRANSITION
