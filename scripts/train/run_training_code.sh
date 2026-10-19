@@ -64,6 +64,10 @@ _TRAIN_PY="$_SCRIPT_DIR/training_code.py"
 _LAUNCH_CONFIG_DIR="$_REPO_ROOT/jobs/launch_configs"
 mkdir -p "$_LAUNCH_CONFIG_DIR" "$_LAUNCH_CONFIG_DIR/snapshots" "$_REPO_ROOT/jobs" "$_REPO_ROOT/runs"
 cd "$_REPO_ROOT"
+# Import atpgllm from this checkout, not from wherever the environment's
+# editable install points (on juno, an older tree). Exported, so DDP ranks and
+# the srun steps on other nodes inherit it.
+export PYTHONPATH="$_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # Slurm logs relative to repo root
 export SLURM_LOG_FILE="${SLURM_LOG_FILE:-jobs/training_${SLURM_JOB_ID:-local}.out}"
 export SLURM_ERROR_FILE="${SLURM_ERROR_FILE:-jobs/training_${SLURM_JOB_ID:-local}.err}"
