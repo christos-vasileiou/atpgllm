@@ -32,7 +32,13 @@ start_tetramax_service() {
     advertise_host=127.0.0.1
     if [ "${MULTINODE:-false}" == true ]; then
         bind_host=0.0.0.0
-        advertise_host="${TMAX_SERVICE_ADVERTISE_HOST:-$(hostname -f)}"
+        # The service listens on IPv4 only; a node's own name can resolve to an
+        # IPv6 link-local address (juno), so advertise its IPv4 when known.
+        if [ -z "${TMAX_SERVICE_ADVERTISE_HOST:-}" ] && type resolve_ip >/dev/null 2>&1; then
+            advertise_host="$(resolve_ip "$(hostname -f)")"
+        else
+            advertise_host="${TMAX_SERVICE_ADVERTISE_HOST:-$(hostname -f)}"
+        fi
     fi
     local -a command=("$service_python" -u "${DATA_PREPROCESSING_ROOT:-$project_root/data_preprocessing}/tetramax_service.py"
         --host "$bind_host" --advertise-host "$advertise_host"
