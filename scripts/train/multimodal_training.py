@@ -11,8 +11,12 @@ from the snapshot and call the tool again with a fixed pattern
 (:mod:`atpgllm.training.tool_trajectories`).
 
 ``--eval-split`` scores held-out loss (single-call and retry examples
-separately); ``--probe-examples`` runs the model on held-out circuits and
-simulates its tool calls (:mod:`atpgllm.multimodal.tool_probe`).
+separately) and keeps the checkpoint with the lowest single-call loss as
+``best``; ``--probe-examples`` runs the model on held-out circuits and
+simulates its tool calls (:mod:`atpgllm.multimodal.tool_probe`). Under
+torchrun SFT runs data-parallel: each rank holds the whole 4-bit model on its
+GPU and trains on its own share of the sampled rows, so one optimizer step
+sees ``ranks x --batch-size x --grad-accum`` examples.
 
 GRPO (Stage D) rolls out multi-turn tool use: the model writes a turn, a tool
 call in it is simulated (the same handler and view as SFT, with the netlist
@@ -29,17 +33,22 @@ from __future__ import annotations
 import argparse
 import ast
 import collections
+import contextlib
 import copy
 import hashlib
 import json
+import math
+import os
 import random
+import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable
 
 import torch
+import torch.distributed as dist
 from datasets import load_dataset
 from torch_geometric.data import Batch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -183,6 +192,25 @@ def _parse_args() -> argparse.Namespace:
              "new graph-to-LLM projector learns at --lr with the adapters.",
     )
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("constant", "cosine"),
+        default="constant",
+        help="SFT: cosine decays every group from its LR to 0 over --max-steps, "
+             "without warmup (as the text SFT's TRL default).",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        default="sdpa",
+        help="Attention kernel of the LLM (sdpa, flash_attention_2).",
+    )
+    parser.add_argument(
+        "--save-total-limit",
+        type=int,
+        default=0,
+        help="SFT: keep this many most recent step checkpoints (0 = all); the "
+             "best and final checkpoints are always kept.",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
@@ -242,9 +270,12 @@ def _lora_config(args: argparse.Namespace):
 
 
 def _base_llm(args: argparse.Namespace):
+    # One process spreads the model over every visible GPU; a data-parallel
+    # rank holds a full copy on its own GPU.
     kwargs: dict[str, Any] = {
         "torch_dtype": torch.bfloat16,
-        "device_map": "auto",
+        "device_map": {"": args.local_rank} if args.world_size > 1 else "auto",
+        "attn_implementation": args.attn_implementation,
     }
     if args.load_4bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -264,7 +295,11 @@ def _load_sft_llm(
 
     base = _base_llm(args)
     if args.load_4bit:
-        base = prepare_model_for_kbit_training(base)
+        # Non-reentrant checkpointing, which DDP needs to see each parameter's
+        # gradient once.
+        base = prepare_model_for_kbit_training(
+            base, gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
     if adapter_path is not None:
         return PeftModel.from_pretrained(
             base,
@@ -468,6 +503,8 @@ def _record_launch(args: argparse.Namespace) -> None:
         **get_git_info(data_preprocessing, prefix="dp_git_"),
         "dp_root": str(data_preprocessing),
     }
+    if args.rank:
+        return
     with (args.output_dir / "code_provenance.jsonl").open("a") as fh:
         fh.write(json.dumps(record) + "\n")
     print(f"[code_provenance] {record}", flush=True)
@@ -488,12 +525,18 @@ def _load_common(args: argparse.Namespace):
 
 
 def _records(args: argparse.Namespace, split: str, *, per_circuit: int,
-             total: int | None, seed: int, repeat: bool) -> Iterable[dict[str, Any]]:
+             total: int | None, seed: int, repeat: bool,
+             shard: bool = False) -> Iterable[dict[str, Any]]:
+    """Rows of ``split``; with ``shard``, this rank's disjoint share of them."""
+    rank, world_size = (args.rank, args.world_size) if shard else (0, 1)
     if args.load == "parquet":
         return sampled_records(
             args.dataset, split, revision=args.revision, per_circuit=per_circuit,
             total=total, seed=seed, repeat=repeat, columns=None,
+            rank=rank, world_size=world_size,
         )
+    if world_size > 1:
+        raise ValueError("Data-parallel training needs --load parquet.")
     stream = load_dataset(args.dataset, split=split, streaming=True, revision=args.revision)
     return stream.shuffle(seed=seed, buffer_size=args.shuffle_buffer) if repeat else stream
 
@@ -551,24 +594,33 @@ def _held_out(args, gate_funcs, vocab, tokenizer):
 
 
 @torch.no_grad()
-def _held_out_loss(model, examples, pad_token_id, device) -> dict[str, Any]:
+def _held_out_loss(model, examples, pad_token_id, device, *,
+                   rank: int = 0, world_size: int = 1) -> dict[str, Any]:
+    """Mean held-out loss per example kind. Data-parallel ranks score
+    disjoint slices of ``examples`` and sum them."""
     was_training = model.training
     model.eval()
-    losses: dict[str, list[float]] = {"single": [], "retry": []}
-    for example in examples:
+    kinds = ("single", "retry")
+    # Row 0: summed loss, row 1: example count, one column per kind.
+    totals = torch.zeros((2, len(kinds)), dtype=torch.float64, device=device)
+    for example in examples[rank::world_size]:
         batch = collate_tool_sft([example], pad_token_id)
         batch = {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
         loss = model(**batch, use_cache=False).loss
-        losses["retry" if example.retry else "single"].append(float(loss))
+        column = kinds.index("retry" if example.retry else "single")
+        totals[0, column] += float(loss)
+        totals[1, column] += 1
+    if world_size > 1:
+        dist.all_reduce(totals)
     if was_training:
         model.train()
+    sums, counts = totals.tolist()
     out: dict[str, Any] = {
-        f"heldout_loss_{kind}": (sum(v) / len(v) if v else None)
-        for kind, v in losses.items()
+        f"heldout_loss_{kind}": (sums[i] / counts[i] if counts[i] else None)
+        for i, kind in enumerate(kinds)
     }
-    every = losses["single"] + losses["retry"]
-    out["heldout_loss"] = sum(every) / len(every) if every else None
-    out["heldout_examples"] = {kind: len(v) for kind, v in losses.items()}
+    out["heldout_loss"] = sum(sums) / sum(counts) if sum(counts) else None
+    out["heldout_examples"] = {kind: int(counts[i]) for i, kind in enumerate(kinds)}
     return out
 
 
@@ -586,6 +638,8 @@ def train_sft(args: argparse.Namespace) -> None:
         alignment,
         tokenizer,
     ) = _load_common(args)
+    rank, world_size = args.rank, args.world_size
+    main_process = rank == 0
     resume_payload = None
     adapter_path = args.adapter
     if args.resume:
@@ -607,30 +661,43 @@ def train_sft(args: argparse.Namespace) -> None:
     if resume_payload and resume_payload["architecture"] != architecture:
         raise ValueError("SFT resume architecture differs from the checkpoint.")
     optimizer = _optimizer(model, args)
+    # Before loading the optimizer state, which holds already-decayed rates.
+    base_lrs = [group["lr"] for group in optimizer.param_groups]
     if resume_payload and resume_payload.get("optimizer"):
         optimizer.load_state_dict(resume_payload["optimizer"])
     step = int(resume_payload["step"]) if resume_payload else 0
     parent_stage = STAGE_MULTIMODAL_SFT if resume_payload else STAGE_GRAPH_TEXT_ALIGNMENT
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"graph policy={args.graph_policy} trainable params={trainable:,}", flush=True)
+    if main_process:
+        print(f"graph policy={args.graph_policy} trainable params={trainable:,} "
+              f"ranks={world_size}", flush=True)
+    trained = model
+    if world_size > 1:
+        from torch.nn.parallel import DistributedDataParallel
+
+        trained = DistributedDataParallel(model, device_ids=[args.local_rank])
 
     held_out: list = []
     probes: list = []
     metrics_path = args.output_dir / "metrics.jsonl"
     if args.eval_split and args.tool_format:
+        # Every rank builds the same fixed set and scores its slice of it.
         held_out, probes, eval_rejections = _held_out(args, gate_funcs, vocab, tokenizer)
-        print(
-            f"held-out examples={len(held_out)} "
-            f"(retry={sum(e.retry for e in held_out)}) probes={len(probes)} "
-            f"rejected={dict(eval_rejections)}",
-            flush=True,
-        )
+        if main_process:
+            print(
+                f"held-out examples={len(held_out)} "
+                f"(retry={sum(e.retry for e in held_out)}) probes={len(probes)} "
+                f"rejected={dict(eval_rejections)}",
+                flush=True,
+            )
+    best = math.inf
 
-    def evaluate(probe: bool) -> None:
+    def evaluate(probe: bool) -> dict[str, Any]:
         row: dict[str, Any] = {"step": step}
         if held_out:
-            row.update(_held_out_loss(model, held_out, tokenizer.pad_token_id, device))
-        if probe and probes:
+            row.update(_held_out_loss(model, held_out, tokenizer.pad_token_id, device,
+                                      rank=rank, world_size=world_size))
+        if probe and probes and main_process:
             result = run_tool_probe(
                 model, tokenizer, probes, gate_funcs, vocab, device=device,
                 max_new_tokens=args.probe_max_new_tokens, tool_view=args.tool_view,
@@ -640,27 +707,61 @@ def train_sft(args: argparse.Namespace) -> None:
             (args.output_dir / f"probe_samples_step{step}.json").write_text(
                 json.dumps(samples, indent=2)
             )
-        if len(row) > 1:
+        if len(row) > 1 and main_process:
             _append_jsonl(metrics_path, row)
             print("eval " + json.dumps(row), flush=True)
+        return row
 
     def save(name: str) -> None:
-        _save(
-            model,
-            optimizer,
-            path=args.output_dir / f"multimodal_sft_{name}.pt",
-            adapter_path=args.output_dir / f"adapter_{name}",
-            stage=STAGE_MULTIMODAL_SFT,
-            parent_stage=parent_stage,
-            vocab=vocab,
-            architecture=architecture,
-            step=step,
-            args=args,
-        )
+        if main_process:
+            _save(
+                model,
+                optimizer,
+                path=args.output_dir / f"multimodal_sft_{name}.pt",
+                adapter_path=args.output_dir / f"adapter_{name}",
+                stage=STAGE_MULTIMODAL_SFT,
+                parent_stage=parent_stage,
+                vocab=vocab,
+                architecture=architecture,
+                step=step,
+                args=args,
+            )
+        if world_size > 1:
+            dist.barrier()
 
+    def keep_best(row: dict[str, Any]) -> None:
+        # Single-call loss only: like the text SFT's validation, which has no
+        # retry conversations.
+        nonlocal best
+        loss = row.get("heldout_loss_single")
+        if loss is not None and loss < best:
+            best = loss
+            save("best")
+            if main_process:
+                (args.output_dir / "best.json").write_text(
+                    json.dumps({"step": step, "heldout_loss_single": loss}) + "\n"
+                )
+
+    def prune() -> None:
+        if not main_process or args.save_total_limit <= 0:
+            return
+        steps = sorted(
+            int(path.stem.removeprefix("multimodal_sft_step"))
+            for path in args.output_dir.glob("multimodal_sft_step*.pt")
+        )
+        for old in steps[:-args.save_total_limit]:
+            (args.output_dir / f"multimodal_sft_step{old}.pt").unlink()
+            shutil.rmtree(args.output_dir / f"adapter_step{old}", ignore_errors=True)
+
+    # Per rank; 30% spare for examples rejected while building.
     needed = int(1.3 * args.max_steps * args.grad_accum * args.batch_size)
     records = _records(args, args.split, per_circuit=args.max_rows_per_circuit,
-                       total=needed, seed=args.seed, repeat=True)
+                       total=needed * world_size, seed=args.seed, repeat=True,
+                       shard=True)
+    if step:
+        # Resume past the rows already trained on (one row per example; rows
+        # rejected while building make this slightly short).
+        records = islice(records, step * args.grad_accum * args.batch_size, None)
     rejections: collections.Counter = collections.Counter()
     kinds: collections.Counter = collections.Counter()
 
@@ -686,11 +787,18 @@ def train_sft(args: argparse.Namespace) -> None:
             except ValueError:
                 continue
 
+    def set_lr() -> None:
+        # The rate of the update that takes the run from ``step`` to step + 1.
+        if args.lr_schedule == "cosine":
+            factor = 0.5 * (1.0 + math.cos(math.pi * step / args.max_steps))
+            for group, base_lr in zip(optimizer.param_groups, base_lrs):
+                group["lr"] = base_lr * factor
+
     # from_pretrained returns eval mode: gradient checkpointing, LoRA dropout
     # and the graph encoder's BatchNorm statistics need train mode.
     model.train()
     if step == 0:
-        evaluate(probe=args.probe_every > 0)
+        keep_best(evaluate(probe=args.probe_every > 0))
     optimizer.zero_grad(set_to_none=True)
     micro_step = 0
     window: list[float] = []
@@ -700,35 +808,51 @@ def train_sft(args: argparse.Namespace) -> None:
             key: value.to(device) if hasattr(value, "to") else value
             for key, value in batch.items()
         }
-        output = model(**batch, use_cache=False)
-        (output.loss / args.grad_accum).backward()
-        window.append(float(output.loss))
         micro_step += 1
-        if micro_step % args.grad_accum:
+        update = micro_step % args.grad_accum == 0
+        # Gradients are averaged across ranks only on the micro-step that updates.
+        with (trained.no_sync() if world_size > 1 and not update else contextlib.nullcontext()):
+            output = trained(**batch, use_cache=False)
+            (output.loss / args.grad_accum).backward()
+        window.append(float(output.loss))
+        if not update:
             continue
         torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad],
             args.grad_clip,
         )
+        set_lr()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         step += 1
         if step % args.log_every == 0:
-            print(
-                f"step={step} sft_loss={sum(window) / len(window):.4f} "
-                f"sec_per_step={(time.time() - started) / args.log_every:.1f} "
-                f"examples={dict(kinds)} rejected={dict(rejections)}",
-                flush=True,
-            )
+            loss = torch.tensor([sum(window), len(window)], dtype=torch.float64, device=device)
+            if world_size > 1:
+                dist.all_reduce(loss)
+            row = {
+                "step": step,
+                "sft_loss": float(loss[0] / loss[1]),
+                "lr": optimizer.param_groups[-1]["lr"],
+                "sec_per_step": (time.time() - started) / args.log_every,
+            }
+            if main_process:
+                _append_jsonl(metrics_path, row)
+                print(
+                    f"step={step} sft_loss={row['sft_loss']:.4f} lr={row['lr']:.3g} "
+                    f"sec_per_step={row['sec_per_step']:.1f} "
+                    f"examples={dict(kinds)} rejected={dict(rejections)}",
+                    flush=True,
+                )
             window = []
             started = time.time()
         if args.eval_every and step % args.eval_every == 0 and step < args.max_steps:
-            evaluate(probe=bool(args.probe_every) and step % args.probe_every == 0)
+            keep_best(evaluate(probe=bool(args.probe_every) and step % args.probe_every == 0))
         if step % args.save_every == 0:
             save(f"step{step}")
+            prune()
         if step >= args.max_steps:
             break
-    evaluate(probe=True)
+    keep_best(evaluate(probe=True))
     save("final")
 
 
@@ -1078,12 +1202,28 @@ def train_grpo(args: argparse.Namespace) -> None:
     save("final")
 
 
+def _init_distributed() -> tuple[int, int, int]:
+    """(rank, local rank, world size); joins the process group under torchrun."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size == 1:
+        return 0, 0, 1
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    # Long timeout: the other ranks wait while rank 0 alone runs the tool
+    # probe and writes checkpoints.
+    dist.init_process_group("nccl", timeout=timedelta(hours=4))
+    return dist.get_rank(), local_rank, world_size
+
+
 def main() -> None:
     args = _parse_args()
     if args.grad_accum < 1:
         raise ValueError("--grad-accum must be >= 1")
     if args.method == "grpo" and args.num_generations < 2:
         raise ValueError("--num-generations must be >= 2 for GRPO")
+    args.rank, args.local_rank, args.world_size = _init_distributed()
+    if args.world_size > 1 and args.method != "sft":
+        raise ValueError("Only SFT runs data-parallel; launch GRPO as one process.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     _record_launch(args)
     torch.manual_seed(args.seed)
@@ -1091,6 +1231,8 @@ def main() -> None:
         train_sft(args)
     else:
         train_grpo(args)
+    if args.world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

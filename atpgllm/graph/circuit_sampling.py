@@ -124,23 +124,27 @@ def sampled_records(
     repeat: bool = False,
     group_by: Sequence[str] = ("circuit_id",),
     columns: Optional[Sequence[str]] = GRAPH_COLUMNS,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Iterator[Dict[str, Any]]:
     """The sampled rows; with ``repeat``, again in a new order per epoch.
     ``columns=None`` loads every column (captions fill placeholders from any
     of them). Rows are loaded when this is called, so DataLoader workers
-    forked afterwards share them instead of each loading its own copy."""
+    forked afterwards share them instead of each loading its own copy.
+
+    With ``world_size`` > 1 every rank draws the same ``total`` picks and
+    keeps every ``world_size``-th one from ``rank``, so data-parallel ranks
+    train on disjoint rows."""
     files = split_files(dataset, split, revision)
     if columns is None:
         columns = pq.read_schema(files[0]).names
-    records = load_rows(
-        files,
-        choose_rows(
-            files, per_circuit=per_circuit, total=total, seed=seed, group_by=group_by
-        ),
-        columns=columns,
-    )
-    print(f"{dataset}:{split} sampled {len(records)} rows", flush=True)
-    return _epochs(records, repeat=repeat, seed=seed)
+    picks = choose_rows(
+        files, per_circuit=per_circuit, total=total, seed=seed, group_by=group_by
+    )[rank::world_size]
+    records = load_rows(files, picks, columns=columns)
+    print(f"{dataset}:{split} sampled {len(records)} rows"
+          + (f" (rank {rank} of {world_size})" if world_size > 1 else ""), flush=True)
+    return _epochs(records, repeat=repeat, seed=seed + rank)
 
 
 def _epochs(

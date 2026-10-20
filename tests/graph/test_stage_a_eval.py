@@ -194,6 +194,31 @@ def test_split_files_reads_a_local_dataset_directory(tmp_path):
         split_files(str(tmp_path), "test", None)
 
 
+def test_sampled_records_shards_are_disjoint_and_cover_the_sample(tmp_path):
+    # Data-parallel ranks must train on different rows of the same sample.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from atpgllm.graph.circuit_sampling import sampled_records
+
+    (tmp_path / "train").mkdir()
+    pq.write_table(pa.table({
+        "circuit_id": [f"c{i % 3}" for i in range(30)],
+        "fault": [f"sa0 n{i}" for i in range(30)],
+    }), tmp_path / "train" / "data-00000.parquet")
+
+    def faults(**shard):
+        return [r["fault"] for r in sampled_records(
+            str(tmp_path), "train", revision=None, per_circuit=0, total=20,
+            seed=1, columns=("fault",), **shard)]
+
+    whole = faults()
+    shards = [faults(rank=rank, world_size=3) for rank in range(3)]
+    assert sum(map(len, shards)) == len(whole) == 20
+    assert sorted(f for shard in shards for f in shard) == sorted(whole)
+    assert shards[0] == whole[0::3]
+
+
 def test_rows_keep_their_own_netlist_within_a_circuit(tmp_path):
     # A circuit_id groups structurally equal netlists with different port
     # names; each row must keep the netlist its vector was written for.

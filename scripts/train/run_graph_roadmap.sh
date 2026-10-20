@@ -97,7 +97,14 @@ case "${STAGE:?STAGE is required}" in
         ;;
     multimodal_sft|multimodal_grpo)
         METHOD=${STAGE#multimodal_}
-        CMD=(python scripts/train/multimodal_training.py
+        # NPROC_PER_NODE > 1: SFT data-parallel, one rank per GPU (torchrun).
+        NPROC_PER_NODE=${NPROC_PER_NODE:-1}
+        if [ "$NPROC_PER_NODE" -gt 1 ]; then
+            LAUNCH=(torchrun --standalone --nproc-per-node "$NPROC_PER_NODE")
+        else
+            LAUNCH=(python)
+        fi
+        CMD=("${LAUNCH[@]}" scripts/train/multimodal_training.py
             --method "$METHOD" --dataset "$DATASET"
             --sim-config "$SIM_CONFIG" --output-dir "$OUTPUT_DIR"
             --alignment-ckpt "${ALIGNMENT_CHECKPOINT:?ALIGNMENT_CHECKPOINT is required}"
@@ -130,6 +137,12 @@ case "${STAGE:?STAGE is required}" in
         [ -n "${PROBE_EVERY:-}" ] && CMD+=(--probe-every "$PROBE_EVERY")
         [ -n "${LR:-}" ] && CMD+=(--lr "$LR")
         [ -n "${GRAPH_LR:-}" ] && CMD+=(--graph-lr "$GRAPH_LR")
+        [ -n "${WEIGHT_DECAY:-}" ] && CMD+=(--weight-decay "$WEIGHT_DECAY")
+        [ -n "${LR_SCHEDULE:-}" ] && CMD+=(--lr-schedule "$LR_SCHEDULE")
+        [ -n "${ATTN_IMPLEMENTATION:-}" ] && CMD+=(--attn-implementation "$ATTN_IMPLEMENTATION")
+        [ -n "${SAVE_TOTAL_LIMIT:-}" ] && CMD+=(--save-total-limit "$SAVE_TOTAL_LIMIT")
+        [ -n "${EVAL_ROWS_PER_CIRCUIT:-}" ] && CMD+=(--eval-rows-per-circuit "$EVAL_ROWS_PER_CIRCUIT")
+        [ -n "${LOG_EVERY:-}" ] && CMD+=(--log-every "$LOG_EVERY")
         [ -n "${SEED:-}" ] && CMD+=(--seed "$SEED")
         if [ "$METHOD" = grpo ] && [ -z "${RESUME:-}" ]; then
             CMD+=(--sft-ckpt "${SFT_CHECKPOINT:?SFT_CHECKPOINT is required}")
