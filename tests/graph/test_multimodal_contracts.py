@@ -260,8 +260,12 @@ class TinyCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.embedding
 
-    def forward(self, inputs_embeds, attention_mask=None, labels=None, **kwargs):
+    def forward(self, inputs_embeds, attention_mask=None, labels=None,
+                logits_to_keep=0, **kwargs):
+        # Like transformers' causal LMs: an index tensor keeps those positions.
         logits = self.head(inputs_embeds)
+        if torch.is_tensor(logits_to_keep):
+            logits = logits[:, logits_to_keep]
         loss = None
         if labels is not None:
             loss = nn.functional.cross_entropy(
@@ -304,8 +308,13 @@ def test_multimodal_prefix_sft_and_grpo_wiring():
     labels = input_ids.clone()
     labels[:, :2] = -100
     output = model(batch, input_ids, attention_mask, labels)
-    assert output.logits.shape == (2, 5, 17)
-    assert torch.isfinite(output.loss)
+    # Logits only where a token is trained: position 3 (2 graph queries + 2
+    # untrained tokens) predicts the last token; the loss is unchanged.
+    assert output.logits.shape == (2, 1, 17)
+    embeds, _ = model._prefix_and_token_embeddings(batch, input_ids, attention_mask)
+    full_labels = torch.cat([torch.full((2, 2), -100), labels], dim=1)
+    expected = model.llm(inputs_embeds=embeds, labels=full_labels).loss
+    assert torch.allclose(output.loss, expected)
 
     completion_ids = torch.tensor([[6, 7], [8, 9]])
     completion_mask = torch.ones_like(completion_ids)

@@ -107,26 +107,45 @@ class GraphConditionedCausalLM(nn.Module):
             attention_mask,
             prefix=prefix,
         )
-        full_labels = None
-        if labels is not None:
-            prefix_labels = torch.full(
-                (labels.size(0), self.num_queries),
-                -100,
-                dtype=labels.dtype,
-                device=labels.device,
-            )
-            full_labels = torch.cat([prefix_labels, labels], dim=1)
         # Without padding the mask adds nothing to causal attention, and
         # dropping it lets SDPA use a fused causal kernel instead of
         # materializing a [seq, seq] mask (out of memory at 8k tokens).
         if bool(full_mask.all()):
             full_mask = None
-        return self.llm(
+        if labels is None:
+            return self.llm(
+                inputs_embeds=inputs_embeds,
+                attention_mask=full_mask,
+                **kwargs,
+            )
+        # Logits only where a token is trained (position t predicts token
+        # t + 1). Full-vocabulary logits of every position, their float32 copy
+        # and its gradient are the largest tensors of a long conversation,
+        # most of which is untrained prompt and tool output. The loss is the
+        # same token mean as the causal LM's own.
+        targets = torch.cat([
+            torch.full(
+                (labels.size(0), self.num_queries),
+                -100,
+                dtype=labels.dtype,
+                device=labels.device,
+            ),
+            labels,
+        ], dim=1)[:, 1:]
+        positions = (targets != -100).any(dim=0).nonzero(as_tuple=True)[0]
+        output = self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=full_mask,
-            labels=full_labels,
+            logits_to_keep=positions,
             **kwargs,
         )
+        logits = output.logits.float()
+        output.loss = nn.functional.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets[:, positions].reshape(-1),
+            ignore_index=-100,
+        )
+        return output
 
     def completion_log_probs(
         self,
