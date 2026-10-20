@@ -568,28 +568,34 @@ def _held_out(args, gate_funcs, vocab, tokenizer):
     """Fixed held-out SFT examples (one per circuit and fault) and probe items."""
     rejections: collections.Counter = collections.Counter()
     examples, probes, seen = [], [], set()
-    for record in _records(args, args.eval_split, per_circuit=args.eval_rows_per_circuit,
-                           total=None, seed=args.eval_seed, repeat=False):
-        key = (record.get("circuit_id"), record.get("fault"))
-        if key in seen:
-            continue
-        seen.add(key)
-        if len(examples) < args.eval_examples:
-            example = _tool_example(record, args, gate_funcs, vocab, tokenizer,
-                                    rejections, salt="eval")
-            if example is not None:
-                examples.append(example)
-                continue
-        if len(probes) < args.probe_examples:
-            attempt = failed_attempt(record, random.Random(record_seed(record, "probe")),
-                                     max_flips=args.max_flips)
-            if attempt is not None and build_tool_sft_example(
-                record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
-                failed_attempt=attempt, tool_view=args.tool_view,
-            ) is not None:
-                probes.append(ProbeItem(record=record, failed_attempt=attempt))
-        if len(examples) >= args.eval_examples and len(probes) >= args.probe_examples:
+    # A second, differently seeded sample of rows feeds the probe when the
+    # first one fits fewer than --eval-examples and so leaves it nothing.
+    for second in (False, True):
+        if second and len(probes) >= args.probe_examples:
             break
+        for record in _records(args, args.eval_split, per_circuit=args.eval_rows_per_circuit,
+                               total=None, seed=args.eval_seed + second, repeat=False):
+            key = (record.get("circuit_id"), record.get("fault"))
+            if key in seen:
+                continue
+            seen.add(key)
+            if not second and len(examples) < args.eval_examples:
+                example = _tool_example(record, args, gate_funcs, vocab, tokenizer,
+                                        rejections, salt="eval")
+                if example is not None:
+                    examples.append(example)
+                    continue
+            if len(probes) < args.probe_examples:
+                attempt = failed_attempt(record, random.Random(record_seed(record, "probe")),
+                                         max_flips=args.max_flips)
+                if attempt is not None and build_tool_sft_example(
+                    record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
+                    failed_attempt=attempt, tool_view=args.tool_view,
+                ) is not None:
+                    probes.append(ProbeItem(record=record, failed_attempt=attempt))
+            if ((second or len(examples) >= args.eval_examples)
+                    and len(probes) >= args.probe_examples):
+                break
     return examples, probes, rejections
 
 
