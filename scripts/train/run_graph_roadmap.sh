@@ -141,6 +141,7 @@ case "${STAGE:?STAGE is required}" in
         [ -n "${LR_SCHEDULE:-}" ] && CMD+=(--lr-schedule "$LR_SCHEDULE")
         [ -n "${ATTN_IMPLEMENTATION:-}" ] && CMD+=(--attn-implementation "$ATTN_IMPLEMENTATION")
         [ -n "${SAVE_TOTAL_LIMIT:-}" ] && CMD+=(--save-total-limit "$SAVE_TOTAL_LIMIT")
+        [ -n "${MICRO_BATCH_TOKENS:-}" ] && CMD+=(--micro-batch-tokens "$MICRO_BATCH_TOKENS")
         [ -n "${EVAL_ROWS_PER_CIRCUIT:-}" ] && CMD+=(--eval-rows-per-circuit "$EVAL_ROWS_PER_CIRCUIT")
         [ -n "${LOG_EVERY:-}" ] && CMD+=(--log-every "$LOG_EVERY")
         [ -n "${SEED:-}" ] && CMD+=(--seed "$SEED")

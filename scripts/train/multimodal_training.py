@@ -39,8 +39,10 @@ import hashlib
 import json
 import math
 import os
+import queue
 import random
 import shutil
+import threading
 import time
 from datetime import datetime, timedelta
 from itertools import islice
@@ -174,7 +176,21 @@ def _parse_args() -> argparse.Namespace:
         choices=("frozen", "qformer", "last_layer", "full"),
         default="full",
     )
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Examples per micro-batch (an upper bound with --micro-batch-tokens). "
+             "A step trains ranks x --batch-size x --grad-accum examples.",
+    )
+    parser.add_argument(
+        "--micro-batch-tokens",
+        type=int,
+        default=0,
+        help="SFT: pack each step's examples by length into micro-batches of at "
+             "most this many padded tokens (graph prefix included), up to "
+             "--batch-size examples each; 0 = fixed groups of --batch-size.",
+    )
     parser.add_argument("--grad-accum", type=int, default=64)
     parser.add_argument("--max-steps", type=int, default=20_000)
     parser.add_argument("--save-every", type=int, default=1_000)
@@ -760,29 +776,60 @@ def train_sft(args: argparse.Namespace) -> None:
             shutil.rmtree(args.output_dir / f"adapter_step{old}", ignore_errors=True)
 
     # Per rank; 30% spare for examples rejected while building.
-    needed = int(1.3 * args.max_steps * args.grad_accum * args.batch_size)
+    examples_per_step = args.batch_size * args.grad_accum
+    needed = int(1.3 * args.max_steps * examples_per_step)
     records = _records(args, args.split, per_circuit=args.max_rows_per_circuit,
                        total=needed * world_size, seed=args.seed, repeat=True,
                        shard=True)
     if step:
         # Resume past the rows already trained on (one row per example; rows
         # rejected while building make this slightly short).
-        records = islice(records, step * args.grad_accum * args.batch_size, None)
+        records = islice(records, step * examples_per_step, None)
     rejections: collections.Counter = collections.Counter()
     kinds: collections.Counter = collections.Counter()
+    counters = threading.Lock()
 
-    def tool_batches():
-        pending = []
-        for record in records:
-            example = _tool_example(record, args, gate_funcs, vocab, tokenizer,
-                                    rejections, salt=str(args.seed))
-            if example is None:
-                continue
-            kinds["retry" if example.retry else "single"] += 1
-            pending.append(example)
-            if len(pending) == args.batch_size:
-                yield collate_tool_sft(pending, tokenizer.pad_token_id)
-                pending = []
+    def tool_examples():
+        """Examples built in a background thread, so the TetraMAX runs of
+        retry examples overlap with the GPU's work on earlier ones."""
+        buffer: queue.Queue = queue.Queue(maxsize=2 * examples_per_step)
+        done = object()
+
+        def produce() -> None:
+            try:
+                for record in records:
+                    rejected: collections.Counter = collections.Counter()
+                    example = _tool_example(record, args, gate_funcs, vocab, tokenizer,
+                                            rejected, salt=str(args.seed))
+                    with counters:
+                        rejections.update(rejected)
+                    if example is not None:
+                        buffer.put(example)
+            except BaseException as exc:  # raised again in the training thread
+                buffer.put(exc)
+            buffer.put(done)
+
+        threading.Thread(target=produce, daemon=True).start()
+        while (item := buffer.get()) is not done:
+            if isinstance(item, BaseException):
+                raise item
+            kinds["retry" if item.retry else "single"] += 1
+            yield item
+
+    def tool_steps():
+        """Each step's micro-batches, each with its share of the step's examples."""
+        examples = tool_examples()
+        while len(chunk := list(islice(examples, examples_per_step))) == examples_per_step:
+            yield [
+                (collate_tool_sft(group, tokenizer.pad_token_id), len(group) / examples_per_step)
+                for group in _pack(chunk, args.batch_size, args.micro_batch_tokens,
+                                   model.num_queries)
+            ]
+
+    def legacy_steps():
+        batches = legacy_batches()
+        while len(chunk := list(islice(batches, args.grad_accum))) == args.grad_accum:
+            yield [(batch, 1 / args.grad_accum) for batch in chunk]
 
     def legacy_batches():
         for chunk in _batched(records, args.batch_size):
@@ -806,23 +853,23 @@ def train_sft(args: argparse.Namespace) -> None:
     if step == 0:
         keep_best(evaluate(probe=args.probe_every > 0))
     optimizer.zero_grad(set_to_none=True)
-    micro_step = 0
-    window: list[float] = []
+    window_loss, window_steps, window_micro = 0.0, 0, 0
     started = time.time()
-    for batch in (tool_batches() if args.tool_format else legacy_batches()):
-        batch = {
-            key: value.to(device) if hasattr(value, "to") else value
-            for key, value in batch.items()
-        }
-        micro_step += 1
-        update = micro_step % args.grad_accum == 0
-        # Gradients are averaged across ranks only on the micro-step that updates.
-        with (trained.no_sync() if world_size > 1 and not update else contextlib.nullcontext()):
-            output = trained(**batch, use_cache=False)
-            (output.loss / args.grad_accum).backward()
-        window.append(float(output.loss))
-        if not update:
-            continue
+    for micro_batches in (tool_steps() if args.tool_format else legacy_steps()):
+        for index, (batch, weight) in enumerate(micro_batches):
+            batch = {
+                key: value.to(device) if hasattr(value, "to") else value
+                for key, value in batch.items()
+            }
+            # Gradients are averaged across ranks only on the step's last
+            # micro-batch (ranks may pack their examples into different counts).
+            last = index == len(micro_batches) - 1
+            with (trained.no_sync() if world_size > 1 and not last else contextlib.nullcontext()):
+                output = trained(**batch, use_cache=False)
+                (output.loss * weight).backward()
+            window_loss += float(output.loss) * weight
+        window_steps += 1
+        window_micro += len(micro_batches)
         torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad],
             args.grad_clip,
@@ -832,24 +879,29 @@ def train_sft(args: argparse.Namespace) -> None:
         optimizer.zero_grad(set_to_none=True)
         step += 1
         if step % args.log_every == 0:
-            loss = torch.tensor([sum(window), len(window)], dtype=torch.float64, device=device)
+            totals = torch.tensor([window_loss, window_steps, window_micro],
+                                  dtype=torch.float64, device=device)
             if world_size > 1:
-                dist.all_reduce(loss)
+                dist.all_reduce(totals)
             row = {
                 "step": step,
-                "sft_loss": float(loss[0] / loss[1]),
+                "sft_loss": float(totals[0] / totals[1]),
                 "lr": optimizer.param_groups[-1]["lr"],
                 "sec_per_step": (time.time() - started) / args.log_every,
+                "micro_batches_per_step": float(totals[2] / totals[1]),
             }
             if main_process:
                 _append_jsonl(metrics_path, row)
+                with counters:
+                    rejected = dict(rejections)
                 print(
                     f"step={step} sft_loss={row['sft_loss']:.4f} lr={row['lr']:.3g} "
                     f"sec_per_step={row['sec_per_step']:.1f} "
-                    f"examples={dict(kinds)} rejected={dict(rejections)}",
+                    f"micro_batches={row['micro_batches_per_step']:.1f} "
+                    f"examples={dict(kinds)} rejected={rejected}",
                     flush=True,
                 )
-            window = []
+            window_loss, window_steps, window_micro = 0.0, 0, 0
             started = time.time()
         if args.eval_every and step % args.eval_every == 0 and step < args.max_steps:
             keep_best(evaluate(probe=bool(args.probe_every) and step % args.probe_every == 0))
@@ -860,6 +912,27 @@ def train_sft(args: argparse.Namespace) -> None:
             break
     keep_best(evaluate(probe=True))
     save("final")
+
+
+def _pack(examples: list, max_examples: int, max_tokens: int, prefix_tokens: int) -> list[list]:
+    """Micro-batches of at most ``max_examples`` examples. With ``max_tokens``,
+    the examples are sorted by length (little padding) and a micro-batch also
+    stays within ``max_tokens`` padded tokens, graph prefix included; an
+    example longer than that goes alone. ``max_tokens`` 0 keeps the arrival
+    order in groups of ``max_examples``."""
+    if not max_tokens:
+        return [examples[i:i + max_examples] for i in range(0, len(examples), max_examples)]
+    groups: list[list] = []
+    group: list = []
+    for example in sorted(examples, key=lambda e: len(e.input_ids)):
+        width = len(example.input_ids) + prefix_tokens  # the group's longest so far
+        if group and (len(group) == max_examples or (len(group) + 1) * width > max_tokens):
+            groups.append(group)
+            group = []
+        group.append(example)
+    if group:
+        groups.append(group)
+    return groups
 
 
 def _reference_prefix(
@@ -1215,6 +1288,14 @@ def _init_distributed() -> tuple[int, int, int]:
         return 0, 0, 1
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
+    # PyG writes each conv class's generated propagate module to one file
+    # under its home directory; ranks writing it at once can import a
+    # half-written file.
+    import torch_geometric
+
+    torch_geometric.set_home_dir(
+        os.path.join(torch_geometric.get_home_dir(), f"rank{local_rank}")
+    )
     # Long timeout: the other ranks wait while rank 0 alone runs the tool
     # probe and writes checkpoints.
     dist.init_process_group("nccl", timeout=timedelta(hours=4))

@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from atpgllm.graph.models_stage1 import GraphQFormer, NetlistGraphEncoder
 
 
 class GraphConditionedCausalLM(nn.Module):
     """Inject DAG/Q-Former outputs before text tokens in a causal LM."""
+
+    # Trained tokens per chunk of the SFT loss (2,048 x 100k float32 logits
+    # with their gradient is about 1.6 GiB).
+    LOSS_CHUNK = 2048
 
     def __init__(
         self,
@@ -118,11 +124,12 @@ class GraphConditionedCausalLM(nn.Module):
                 attention_mask=full_mask,
                 **kwargs,
             )
-        # Logits only where a token is trained (position t predicts token
+        # Logits only for each row's trained tokens (position t predicts token
         # t + 1). Full-vocabulary logits of every position, their float32 copy
         # and its gradient are the largest tensors of a long conversation,
-        # most of which is untrained prompt and tool output. The loss is the
-        # same token mean as the causal LM's own.
+        # most of which is untrained prompt and tool output. The head is
+        # applied to the decoder's last hidden states as the causal LM does
+        # (Granite divides by logits_scaling).
         targets = torch.cat([
             torch.full(
                 (labels.size(0), self.num_queries),
@@ -132,20 +139,39 @@ class GraphConditionedCausalLM(nn.Module):
             ),
             labels,
         ], dim=1)[:, 1:]
-        positions = (targets != -100).any(dim=0).nonzero(as_tuple=True)[0]
-        output = self.llm(
+        trained = targets != -100
+        base = self.llm.get_base_model() if hasattr(self.llm, "get_base_model") else self.llm
+        hidden = base.get_decoder()(
             inputs_embeds=inputs_embeds,
             attention_mask=full_mask,
-            logits_to_keep=positions,
             **kwargs,
-        )
-        logits = output.logits.float()
-        output.loss = nn.functional.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            targets[:, positions].reshape(-1),
-            ignore_index=-100,
-        )
-        return output
+        ).last_hidden_state[:, :-1]
+        head = base.get_output_embeddings()
+        scale = getattr(base.config, "logits_scaling", 1.0)
+
+        def chunk_losses(states: Tensor, chunk_targets: Tensor) -> Tensor:
+            logits = head(states).float() / scale
+            return nn.functional.cross_entropy(logits, chunk_targets, reduction="none")
+
+        # In chunks whose logits are recomputed in the backward pass, so
+        # memory does not grow with the number of trained tokens.
+        states, kept = hidden[trained], targets[trained]
+        token_losses = torch.cat([
+            checkpoint(chunk_losses, states[i:i + self.LOSS_CHUNK],
+                       kept[i:i + self.LOSS_CHUNK], use_reentrant=False)
+            if torch.is_grad_enabled() else
+            chunk_losses(states[i:i + self.LOSS_CHUNK], kept[i:i + self.LOSS_CHUNK])
+            for i in range(0, states.size(0), self.LOSS_CHUNK)
+        ])
+        # Mean over examples of each example's token mean: with one example,
+        # the causal LM's own loss; with more, padding and length do not
+        # change an example's weight.
+        rows = trained.nonzero(as_tuple=True)[0]
+        sums = torch.zeros(
+            labels.size(0), dtype=token_losses.dtype, device=token_losses.device
+        ).index_add_(0, rows, token_losses)
+        loss = (sums / trained.sum(dim=1).clamp(min=1)).mean()
+        return SimpleNamespace(loss=loss)
 
     def completion_log_probs(
         self,

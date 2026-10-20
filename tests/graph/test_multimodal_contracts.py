@@ -251,21 +251,37 @@ def test_alignment_checkpoint_loads_without_text_encoder(tmp_path):
     assert loaded_qformer.num_queries == 2
 
 
+class TinyDecoder(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.mix = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, inputs_embeds, attention_mask=None, **kwargs):
+        return SimpleNamespace(last_hidden_state=torch.tanh(self.mix(inputs_embeds)))
+
+
 class TinyCausalLM(nn.Module):
+    """Decoder, head and logit scaling laid out like transformers' Granite."""
+
     def __init__(self, vocab_size=17, hidden_size=8):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.model = TinyDecoder(hidden_size)
         self.head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.config = SimpleNamespace(logits_scaling=2.0)
 
     def get_input_embeddings(self):
         return self.embedding
 
-    def forward(self, inputs_embeds, attention_mask=None, labels=None,
-                logits_to_keep=0, **kwargs):
-        # Like transformers' causal LMs: an index tensor keeps those positions.
-        logits = self.head(inputs_embeds)
-        if torch.is_tensor(logits_to_keep):
-            logits = logits[:, logits_to_keep]
+    def get_decoder(self):
+        return self.model
+
+    def get_output_embeddings(self):
+        return self.head
+
+    def forward(self, inputs_embeds, attention_mask=None, labels=None, **kwargs):
+        hidden = self.model(inputs_embeds).last_hidden_state
+        logits = self.head(hidden) / self.config.logits_scaling
         loss = None
         if labels is not None:
             loss = nn.functional.cross_entropy(
@@ -307,14 +323,21 @@ def test_multimodal_prefix_sft_and_grpo_wiring():
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
     labels[:, :2] = -100
+    labels[1, 1] = 4  # rows train 1 and 2 tokens
     output = model(batch, input_ids, attention_mask, labels)
-    # Logits only where a token is trained: position 3 (2 graph queries + 2
-    # untrained tokens) predicts the last token; the loss is unchanged.
-    assert output.logits.shape == (2, 1, 17)
+    # The loss is the mean of each example's own causal LM loss, also when
+    # trained tokens span several loss chunks.
     embeds, _ = model._prefix_and_token_embeddings(batch, input_ids, attention_mask)
     full_labels = torch.cat([torch.full((2, 2), -100), labels], dim=1)
-    expected = model.llm(inputs_embeds=embeds, labels=full_labels).loss
+    expected = torch.stack([
+        model.llm(inputs_embeds=embeds[row:row + 1], labels=full_labels[row:row + 1]).loss
+        for row in range(2)
+    ]).mean()
     assert torch.allclose(output.loss, expected)
+    model.LOSS_CHUNK = 2
+    chunked = model(batch, input_ids, attention_mask, labels)
+    assert torch.allclose(chunked.loss, expected)
+    chunked.loss.backward()
 
     completion_ids = torch.tensor([[6, 7], [8, 9]])
     completion_mask = torch.ones_like(completion_ids)
