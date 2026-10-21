@@ -24,7 +24,12 @@ import torch
 from torch_geometric.data import Batch
 
 from atpgllm.graph.dataset import record_to_pyg
-from atpgllm.multimodal.data import _compact_netlist_payload, _template_ids, template_turns
+from atpgllm.multimodal.data import (
+    _compact_netlist_payload,
+    _template_ids,
+    graph_position,
+    template_turns,
+)
 from atpgllm.training.conversation import ConversationExample
 from atpgllm.training.revert_template import parse_tool_call
 from atpgllm.training.tool_feedback import read_snapshot
@@ -75,6 +80,7 @@ def run_tool_probe(
     device: torch.device,
     max_new_tokens: int = 1024,
     tool_view: str = "po_fault",
+    netlist_view: str = "graph",
 ) -> Dict[str, Any]:
     """Greedy decoding of one assistant turn per probe and question."""
     was_training = model.training
@@ -96,7 +102,7 @@ def run_tool_probe(
         graph = record_to_pyg(record, gate_funcs, vocab)
         if graph is None:
             continue
-        full, compact = _compact_netlist_payload(record)
+        full, compact = _compact_netlist_payload(record, netlist_view)
         conversation = ConversationExample.from_record(
             copy.deepcopy(record), use_tools=True,
             failed_attempt=item.failed_attempt, interpret_results=True,
@@ -110,12 +116,13 @@ def run_tool_probe(
         # First try: system + user. Recovery: + the failed call and its result.
         for name, context in (("first_try", messages[:prompt_end]),
                               ("recovery", messages[: prompt_end + 2])):
-            ids = torch.tensor([_template_ids(tokenizer, context, generation_prompt=True)],
-                               device=device)
+            context_ids = _template_ids(tokenizer, context, generation_prompt=True)
+            ids = torch.tensor([context_ids], device=device)
             output = model.generate(
                 Batch.from_data_list([graph]).to(device),
                 ids,
                 torch.ones_like(ids),
+                graph_at=graph_position(tokenizer, context_ids),
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 eos_token_id=stop,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import collections
 import copy
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -85,20 +86,52 @@ def build_graph_prompt_example(
 # ---------------------------------------------------------------------
 
 GRAPH_CONTEXT = "<GRAPH_CONTEXT>"
+# What the prompt keeps of the netlist as text: nothing (``graph``), or the
+# module header and its input/output declarations (``ports``), so the model
+# reads the names it must write and the graph carries the cells.
+NETLIST_VIEWS = ("graph", "ports")
 
 
-def _compact_netlist_payload(record: Dict[str, Any]) -> tuple[str, str]:
+def port_declarations(netlist: str) -> str:
+    """The module header and input/output declarations of a netlist."""
+    statements = (s.strip() for s in netlist.split(";"))
+    return "".join(f"{s};\n" for s in statements if re.match(r"(module|input|output)\b", s))
+
+
+def _compact_netlist_payload(record: Dict[str, Any], view: str = "graph") -> tuple[str, str]:
     """The netlist payload as the prompt prints it, and its graph stand-in;
     the ``doc_id`` stays so tool calls can name the circuit."""
+    if view not in NETLIST_VIEWS:
+        raise ValueError(f"netlist view must be one of {NETLIST_VIEWS}")
     netlist = record.get("netlist")
     if isinstance(netlist, dict):
         netlist = netlist.get("netlist")
     netlist = netlist or ""
     doc_id = hashlib.sha256(netlist.encode("utf-8")).hexdigest()[:16]
+    stand_in = GRAPH_CONTEXT
+    if view == "ports":
+        stand_in = port_declarations(netlist) + GRAPH_CONTEXT + "\nendmodule\n"
     return (
         str({"doc_id": doc_id, "netlist": netlist}),
-        str({"doc_id": doc_id, "netlist": GRAPH_CONTEXT}),
+        str({"doc_id": doc_id, "netlist": stand_in}),
     )
+
+
+def graph_position(tokenizer, ids: Sequence[int]) -> int:
+    """Index of the first token after the ``<GRAPH_CONTEXT>`` placeholder:
+    where ``prefix_at="placeholder"`` puts the graph tokens. Found on the
+    decoded text, so it holds however the tokenizer merges the placeholder
+    with its neighbours."""
+    if GRAPH_CONTEXT not in tokenizer.decode(list(ids)):
+        raise ValueError("The prompt has no graph placeholder.")
+    low, high = 1, len(ids)
+    while low < high:
+        middle = (low + high) // 2
+        if GRAPH_CONTEXT in tokenizer.decode(list(ids[:middle])):
+            high = middle
+        else:
+            low = middle + 1
+    return low
 
 
 def _template_ids(tokenizer, messages, *, generation_prompt: bool = False) -> List[int]:
@@ -198,6 +231,7 @@ class ToolSFTExample:
     input_ids: List[int]
     labels: List[int]
     retry: bool
+    graph_at: int = 0
 
 
 def build_tool_sft_example(
@@ -210,12 +244,14 @@ def build_tool_sft_example(
     failed_attempt: Any = None,
     rejections: Optional[collections.Counter] = None,
     tool_view: str = "po_fault",
+    netlist_view: str = "graph",
 ) -> Optional[ToolSFTExample]:
     """One graph-conditioned tool-calling SFT example, or None when the record
     is rejected, its snapshot does not detect the fault, or it is longer than
     ``max_seq_len`` (dropped whole: truncation could cut through a tool turn).
 
-    The prompt's netlist is replaced by :data:`GRAPH_CONTEXT`; the graph
+    The prompt's netlist is replaced by :data:`GRAPH_CONTEXT` (with
+    ``netlist_view="ports"``, all but its port declarations); the graph
     reaches the model as the soft prefix instead. ``tool_view`` sets what tool
     messages show (``atpgllm.training.tool_feedback.TOOL_VIEWS``); RL rollouts
     of the model must use the same view.
@@ -225,7 +261,7 @@ def build_tool_sft_example(
     graph = record_to_pyg(record, gate_funcs, vocab, rejections=rejections)
     if graph is None:
         return None
-    full, compact = _compact_netlist_payload(record)
+    full, compact = _compact_netlist_payload(record, netlist_view)
     try:
         conversation = ConversationExample.from_record(
             copy.deepcopy(record),
@@ -248,7 +284,8 @@ def build_tool_sft_example(
             rejections["too_long_retry" if failed_attempt else "too_long"] += 1
         return None
     return ToolSFTExample(
-        graph=graph, input_ids=ids, labels=labels, retry=failed_attempt is not None
+        graph=graph, input_ids=ids, labels=labels, retry=failed_attempt is not None,
+        graph_at=graph_position(tokenizer, ids),
     )
 
 
@@ -268,4 +305,5 @@ def collate_tool_sft(examples: Sequence[ToolSFTExample], pad_token_id: int) -> D
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
+        "graph_at": torch.tensor([example.graph_at for example in examples]),
     }

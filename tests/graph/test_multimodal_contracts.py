@@ -385,3 +385,122 @@ def test_generate_turns_keeps_the_stop_token_when_it_is_also_padding():
         pad_token_id=stop, eos_token_id=stop, max_new_tokens=5,
     )
     assert turns == [[3, 4, stop], [5, 6, 8, 9, 10]]
+
+
+def _tiny_model(**kwargs):
+    vocab = GateAttributeVocab(GATE_FUNCS)
+    graph_encoder = NetlistGraphEncoder(
+        vocab, node_dim=8, gin_hidden_dim=8, gin_num_layers=1,
+        per_attr_dim=2, attr_mlp_hidden=8, dropout=0.0,
+    )
+    q_former = GraphQFormer(
+        d_node=8, hidden_dim=8, num_queries=2, num_layers=2, num_heads=2,
+        ffn_dim=16, cross_attn_every_n=2,
+    )
+    model = GraphConditionedCausalLM(graph_encoder, q_former, TinyCausalLM(), **kwargs)
+    graph = record_to_pyg(_record(), GATE_FUNCS, vocab)
+    return model, Batch.from_data_list([graph, graph])
+
+
+def test_ports_view_keeps_declarations_and_drops_cells():
+    from atpgllm.multimodal.data import GRAPH_CONTEXT, _compact_netlist_payload
+
+    full, graph_only = _compact_netlist_payload(_record())
+    _, ports = _compact_netlist_payload(_record(), "ports")
+    assert full != graph_only and GRAPH_CONTEXT in graph_only and "input" not in graph_only
+    assert "module tiny(a, b, y);" in ports
+    assert "input a, b;" in ports and "output y;" in ports
+    assert GRAPH_CONTEXT in ports and "endmodule" in ports
+    assert "AND2x1" not in ports and "wire" not in ports
+    # Same doc_id, so tool calls name the same circuit.
+    assert full.split("'netlist'")[0] == ports.split("'netlist'")[0]
+
+
+def test_graph_position_is_the_token_after_the_placeholder():
+    from atpgllm.multimodal.data import graph_position
+
+    class CharTokenizer:
+        pieces = ["sys", " {'netlist': '", "<GRAPH", "_CONTEXT>", "'}", " user", " end"]
+
+        def decode(self, ids):
+            return "".join(self.pieces[i] for i in ids)
+
+    assert graph_position(CharTokenizer(), list(range(7))) == 4
+    with pytest.raises(ValueError):
+        graph_position(CharTokenizer(), [0, 1, 2])
+
+
+def test_placeholder_prefix_goes_inside_the_text():
+    model, batch = _tiny_model(prefix_at="placeholder")
+    assert model.architecture_config["prefix_at"] == "placeholder"
+    assert "prefix_at" not in _tiny_model()[0].architecture_config
+    input_ids = torch.tensor([[1, 2, 3, 4], [1, 4, 5, 6]])
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+    labels[:, :3] = -100
+    graph_at = torch.tensor([2, 1])
+    with pytest.raises(ValueError):
+        model(batch, input_ids, attention_mask, labels)
+    output = model(batch, input_ids, attention_mask, labels, graph_at=graph_at)
+
+    prefix = model.graph_soft_prompt(batch)
+    tokens = model.llm.get_input_embeddings()(input_ids)
+    expected = []
+    for row, at in enumerate(graph_at.tolist()):
+        embeds = torch.cat([tokens[row, :at], prefix[row], tokens[row, at:]]).unsqueeze(0)
+        row_labels = torch.cat([labels[row, :at], torch.full((2,), -100), labels[row, at:]])
+        expected.append(model.llm(inputs_embeds=embeds, labels=row_labels.unsqueeze(0)).loss)
+    assert torch.allclose(output.loss, torch.stack(expected).mean())
+
+    # The completion still starts num_queries + prompt_len positions in.
+    completion = torch.tensor([[7, 8], [9, 10]])
+    log_probs = model.completion_log_probs(
+        batch, input_ids, attention_mask, completion, torch.ones_like(completion),
+        graph_at=graph_at,
+    )
+    embeds = torch.cat([tokens[0, :2], prefix[0], tokens[0, 2:],
+                        model.llm.get_input_embeddings()(completion[0])]).unsqueeze(0)
+    logits = model.llm(inputs_embeds=embeds).logits[0]
+    manual = logits[2 + 4 - 1:2 + 4 + 1].log_softmax(-1).gather(-1, completion[0][:, None])[:, 0]
+    assert torch.allclose(log_probs[0], manual)
+
+
+def test_generate_turns_puts_the_graph_at_the_same_prompt_position():
+    captured = {}
+
+    class FakeLLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(16, 4)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def generate(self, inputs_embeds, attention_mask, **kwargs):
+            captured["embeds"], captured["mask"] = inputs_embeds, attention_mask
+            return torch.tensor([[3, 7], [5, 7]])
+
+    fake = SimpleNamespace(llm=FakeLLM(), prefix_at="placeholder")
+    prefix = torch.full((1, 2, 4), 9.0)
+    GraphConditionedCausalLM.generate_turns(
+        fake, prefix, [[1, 2, 3], [1, 2, 3, 4]], pad_token_id=7, eos_token_id=7,
+        graph_at=2, max_new_tokens=2,
+    )
+    embeds, mask = captured["embeds"], captured["mask"]
+    # Row 0 is left-padded by one token: pad, 1, 2, graph, graph, 3.
+    assert mask[0].tolist() == [0, 1, 1, 1, 1, 1]
+    assert torch.all(embeds[0, 3:5] == 9.0) and torch.all(embeds[1, 2:4] == 9.0)
+    assert torch.equal(embeds[0, 5], fake.llm.embed(torch.tensor(3)))
+
+
+def test_frozen_graph_batchnorm_stays_in_eval_mode():
+    model, _ = _tiny_model(freeze_graph_batchnorm=True)
+    model.train()
+    norms = [m for m in model.graph_encoder.modules()
+             if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    assert norms and not any(m.training for m in norms)
+    assert model.q_former.training
+    unfrozen, _ = _tiny_model()
+    unfrozen.train()
+    assert all(m.training for m in unfrozen.graph_encoder.modules()
+               if isinstance(m, nn.modules.batchnorm._BatchNorm))

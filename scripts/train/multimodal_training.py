@@ -78,6 +78,7 @@ from atpgllm.multimodal.data import (
     _template_ids,
     build_tool_sft_example,
     collate_tool_sft,
+    graph_position,
 )
 from atpgllm.multimodal.tool_rollout import reward_text, reward_trace, rollout_group, turn_stop
 from atpgllm.training.conversation import ConversationExample
@@ -148,6 +149,35 @@ def _parse_args() -> argparse.Namespace:
              "and the fault site (default), or the full Good/Bad table. GRPO "
              "rollouts must use the view the SFT model was trained with.",
     )
+    parser.add_argument(
+        "--eval-retry-fraction",
+        type=float,
+        default=None,
+        help="Retry share of the held-out examples (default: --retry-fraction). "
+             "Pin it to compare held-out losses across runs that train with "
+             "different retry shares: the draw decides which rows are single-call.",
+    )
+    parser.add_argument(
+        "--netlist-view",
+        choices=("graph", "ports"),
+        default="graph",
+        help="What the prompt keeps of the netlist as text: nothing, the graph "
+             "carries it all (default), or its port declarations, so the "
+             "model reads the input and output names it writes.",
+    )
+    parser.add_argument(
+        "--prefix-at",
+        choices=("start", "placeholder"),
+        default="start",
+        help="Where the graph tokens go: before the whole chat (default), or "
+             "where the prompt names the netlist.",
+    )
+    parser.add_argument(
+        "--freeze-graph-bn",
+        action="store_true",
+        help="Keep the graph encoder's BatchNorm on its running statistics "
+             "while training, as in evaluation and rollouts.",
+    )
     parser.add_argument("--max-flips", type=int, default=3,
                         help="Inputs flipped to make a failed first call.")
     parser.add_argument("--eval-split", help="Held-out split (v3: validation).")
@@ -206,6 +236,19 @@ def _parse_args() -> argparse.Namespace:
         default=1e-5,
         help="Learning rate of the pretrained graph encoder and Q-Former. The "
              "new graph-to-LLM projector learns at --lr with the adapters.",
+    )
+    parser.add_argument(
+        "--graph-encoder-lr",
+        type=float,
+        default=None,
+        help="Learning rate of the graph encoder alone (default: --graph-lr).",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help="SFT: linear warmup of every group's LR over this many steps, "
+             "then the --lr-schedule.",
     )
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument(
@@ -429,12 +472,15 @@ def _optimizer(
 ) -> torch.optim.Optimizer:
     # The encoder and Q-Former come pretrained (Stages A and B) and move
     # slowly; the projector starts from random weights, like the adapters.
-    graph_parameters = [
-        parameter
-        for module in (model.graph_encoder, model.q_former)
-        for parameter in module.parameters()
-        if parameter.requires_grad
-    ]
+    def trainable(*modules):
+        return [p for module in modules for p in module.parameters() if p.requires_grad]
+
+    encoder_lr = getattr(args, "graph_encoder_lr", None)
+    graph_groups = (
+        [(trainable(model.graph_encoder), encoder_lr), (trainable(model.q_former), args.graph_lr)]
+        if encoder_lr is not None else
+        [(trainable(model.graph_encoder, model.q_former), args.graph_lr)]
+    )
     new_parameters = [
         parameter
         for module in (model.graph_to_llm, model.llm)
@@ -448,9 +494,8 @@ def _optimizer(
             "Expected trainable projector and LoRA parameters; "
             "check --graph-policy and adapter loading."
         )
-    groups = [{"params": new_parameters, "lr": args.lr}]
-    if graph_parameters:
-        groups.insert(0, {"params": graph_parameters, "lr": args.graph_lr})
+    groups = [{"params": params, "lr": lr} for params, lr in graph_groups if params]
+    groups.append({"params": new_parameters, "lr": args.lr})
     return torch.optim.AdamW(groups, weight_decay=args.weight_decay)
 
 
@@ -557,12 +602,16 @@ def _records(args: argparse.Namespace, split: str, *, per_circuit: int,
     return stream.shuffle(seed=seed, buffer_size=args.shuffle_buffer) if repeat else stream
 
 
-def _tool_example(record, args, gate_funcs, vocab, tokenizer, rejections, salt):
-    """One SFT example; a retry with probability --retry-fraction. A retry
-    that does not fit falls back to the single-call example of the record."""
+def _tool_example(record, args, gate_funcs, vocab, tokenizer, rejections, salt,
+                  retry_fraction=None):
+    """One SFT example; a retry with probability ``retry_fraction`` (default
+    --retry-fraction). A retry that does not fit falls back to the
+    single-call example of the record."""
     rng = random.Random(record_seed(record, salt))
     attempt = None
-    if rng.random() < args.retry_fraction:
+    if retry_fraction is None:
+        retry_fraction = args.retry_fraction
+    if rng.random() < retry_fraction:
         attempt = failed_attempt(record, rng, max_flips=args.max_flips)
         if attempt is None:
             rejections["no_failed_attempt"] += 1
@@ -571,11 +620,13 @@ def _tool_example(record, args, gate_funcs, vocab, tokenizer, rejections, salt):
         example = build_tool_sft_example(
             record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
             failed_attempt=attempt, rejections=rejections, tool_view=args.tool_view,
+            netlist_view=args.netlist_view,
         )
     if example is None:
         example = build_tool_sft_example(
             record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
             rejections=rejections, tool_view=args.tool_view,
+            netlist_view=args.netlist_view,
         )
     return example
 
@@ -597,7 +648,8 @@ def _held_out(args, gate_funcs, vocab, tokenizer):
             seen.add(key)
             if not second and len(examples) < args.eval_examples:
                 example = _tool_example(record, args, gate_funcs, vocab, tokenizer,
-                                        rejections, salt="eval")
+                                        rejections, salt="eval",
+                                        retry_fraction=args.eval_retry_fraction)
                 if example is not None:
                     examples.append(example)
                     continue
@@ -607,6 +659,7 @@ def _held_out(args, gate_funcs, vocab, tokenizer):
                 if attempt is not None and build_tool_sft_example(
                     record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
                     failed_attempt=attempt, tool_view=args.tool_view,
+                    netlist_view=args.netlist_view,
                 ) is not None:
                     probes.append(ProbeItem(record=record, failed_attempt=attempt))
             if ((second or len(examples) >= args.eval_examples)
@@ -672,7 +725,8 @@ def train_sft(args: argparse.Namespace) -> None:
         )
         adapter_path = adapter_path or Path(resume_payload["session"]["adapter_path"])
     llm = _load_sft_llm(args, adapter_path)
-    model = GraphConditionedCausalLM(graph_encoder, q_former, llm)
+    model = GraphConditionedCausalLM(graph_encoder, q_former, llm, prefix_at=args.prefix_at,
+                                     freeze_graph_batchnorm=args.freeze_graph_bn)
     model.set_graph_policy(args.graph_policy)
     device = _graph_device(model)
     for module in (model.graph_encoder, model.q_former, model.graph_to_llm):
@@ -723,6 +777,7 @@ def train_sft(args: argparse.Namespace) -> None:
             result = run_tool_probe(
                 model, tokenizer, probes, gate_funcs, vocab, device=device,
                 max_new_tokens=args.probe_max_new_tokens, tool_view=args.tool_view,
+                netlist_view=args.netlist_view,
             )
             samples = result.pop("samples")
             row.update({f"probe_{k}": v for k, v in result.items()})
@@ -842,10 +897,13 @@ def train_sft(args: argparse.Namespace) -> None:
 
     def set_lr() -> None:
         # The rate of the update that takes the run from ``step`` to step + 1.
+        factor = 1.0
         if args.lr_schedule == "cosine":
             factor = 0.5 * (1.0 + math.cos(math.pi * step / args.max_steps))
-            for group, base_lr in zip(optimizer.param_groups, base_lrs):
-                group["lr"] = base_lr * factor
+        if args.warmup_steps:
+            factor *= min(1.0, (step + 1) / args.warmup_steps)
+        for group, base_lr in zip(optimizer.param_groups, base_lrs):
+            group["lr"] = base_lr * factor
 
     # from_pretrained returns eval mode: gradient checkpointing, LoRA dropout
     # and the graph encoder's BatchNorm statistics need train mode.
@@ -945,10 +1003,10 @@ def _reference_prefix(
     return projector(queries)
 
 
-def _grpo_prompt(record: dict[str, Any], tokenizer) -> list[int]:
+def _grpo_prompt(record: dict[str, Any], tokenizer, netlist_view: str = "graph") -> list[int]:
     """System + user turn with the tool schema; the netlist is the graph."""
     messages = ConversationExample.prompt_messages_from_record(copy.deepcopy(record))
-    full, compact = _compact_netlist_payload(record)
+    full, compact = _compact_netlist_payload(record, netlist_view)
     for message in messages:
         if message["role"] == "user":
             message["content"] = message["content"].replace(full, compact)
@@ -1037,6 +1095,12 @@ def train_grpo(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--tool-view {args.tool_view!r} differs from the SFT model's {sft_view!r}."
         )
+    sft_netlist_view = source_payload["session"].get("netlist_view", "graph")
+    if sft_netlist_view != args.netlist_view:
+        raise ValueError(
+            f"--netlist-view {args.netlist_view!r} differs from the SFT model's "
+            f"{sft_netlist_view!r}."
+        )
     # The model learned to read one simulator's answers (TetraMAX and the fast
     # simulator differ on x values, alias wires and TIE nets).
     sft_simulator = source_payload["session"].get("simulator")
@@ -1052,7 +1116,9 @@ def train_grpo(args: argparse.Namespace) -> None:
     for module in llm.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0.0
-    model = GraphConditionedCausalLM(graph_encoder, q_former, llm)
+    # --prefix-at must match the SFT model's (the architecture check below).
+    model = GraphConditionedCausalLM(graph_encoder, q_former, llm, prefix_at=args.prefix_at,
+                                     freeze_graph_batchnorm=args.freeze_graph_bn)
     _load_module_state(model, source_payload["states"])
     model.set_graph_policy(args.graph_policy)
     device = _graph_device(model)
@@ -1120,6 +1186,7 @@ def train_grpo(args: argparse.Namespace) -> None:
         result = run_tool_probe(
             model, tokenizer, probes, gate_funcs, vocab, device=device,
             max_new_tokens=args.probe_max_new_tokens, tool_view=args.tool_view,
+            netlist_view=args.netlist_view,
         )
         samples = result.pop("samples")
         (args.output_dir / f"probe_samples_step{step}.json").write_text(json.dumps(samples, indent=2))
@@ -1144,10 +1211,11 @@ def train_grpo(args: argparse.Namespace) -> None:
         graph = record_to_pyg(record, gate_funcs, vocab, rejections=rejections)
         if graph is None:
             continue
-        prompt_ids = _grpo_prompt(record, tokenizer)
+        prompt_ids = _grpo_prompt(record, tokenizer, args.netlist_view)
         if len(prompt_ids) > args.max_prompt_length:
             rejections["prompt_too_long"] += 1
             continue
+        graph_at = graph_position(tokenizer, prompt_ids)
         graph = Batch.from_data_list([graph]).to(device)
 
         model.eval()
@@ -1156,7 +1224,7 @@ def train_grpo(args: argparse.Namespace) -> None:
 
         def generate_turn(contexts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
             return model.generate_turns(
-                prefix, contexts, pad_token_id=tokenizer.pad_token_id,
+                prefix, contexts, pad_token_id=tokenizer.pad_token_id, graph_at=graph_at,
                 max_new_tokens=max_new_tokens, do_sample=True,
                 temperature=args.temperature, top_p=1.0, top_k=0, eos_token_id=stop,
             )
@@ -1222,12 +1290,12 @@ def train_grpo(args: argparse.Namespace) -> None:
                 model.llm.set_adapter("reference")
                 reference = model.completion_log_probs(
                     graph, prompt, prompt_mask, completion, attention,
-                    prefix=_reference_prefix(reference_modules, graph),
+                    prefix=_reference_prefix(reference_modules, graph), graph_at=graph_at,
                 )
                 model.llm.set_adapter("policy")
             policy = model.completion_log_probs(
                 graph, prompt, prompt_mask, completion, attention,
-                prefix=model.graph_soft_prompt(graph),
+                prefix=model.graph_soft_prompt(graph), graph_at=graph_at,
             )
             loss = graph_grpo_loss(
                 policy,
