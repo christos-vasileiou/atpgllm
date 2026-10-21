@@ -335,6 +335,8 @@ def _shuffled_partner(records, index):
     rng = random.Random(index)
     own = records[index]["circuit_id"]
     others = [i for i, r in enumerate(records) if r["circuit_id"] != own]
+    if not others:
+        raise ValueError("The shuffled condition needs rows from two circuits (raise --limit).")
     return rng.choice(others)
 
 
