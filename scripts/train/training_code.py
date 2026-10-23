@@ -155,6 +155,7 @@ from atpgllm.llm.reward_funcs import (
     ATPG_GDPO_OBJECTIVE_WEIGHTS,
 )
 from atpgllm.training.callbacks import (
+    BestCheckpointRetentionCallback,
     ThroughputMetricsCallback,
     ContextLengthHistogramCallback,
     TrainingStateCheckpointCallback,
@@ -658,6 +659,7 @@ def train_with_grpo(
     fixed_eval_generations: int = 1,
     fixed_eval_batch_size: int = 1,
     buffer_rolling: bool = False,
+    keep_best_checkpoints: int = 0,
     **kwargs,
 ) -> None:
     """
@@ -786,6 +788,8 @@ def train_with_grpo(
 
     if fixed_eval_size < 0 or fixed_eval_steps < 1:
         raise ValueError("fixed_eval_size must be nonnegative and fixed_eval_steps positive")
+    if keep_best_checkpoints < 0 or (keep_best_checkpoints and not fixed_eval_size):
+        raise ValueError("keep_best_checkpoints must be nonnegative and needs the fixed evaluation")
     if grpo_learning_rate <= 0 or grpo_warmup_steps < 0:
         raise ValueError("GRPO learning rate must be positive and warmup steps nonnegative")
     if fixed_eval_size and not (use_dual_adapter and use_vllm and vllm_mode == "server" and resume_from):
@@ -1115,6 +1119,8 @@ def train_with_grpo(
             num_generations=max(num_generations, 2),
             rolling_buffer=buffer_rolling,
         ),
+        # After TrainingStateCheckpointCallback, which marks the new checkpoint resumable.
+        *([BestCheckpointRetentionCallback(keep_best_checkpoints)] if keep_best_checkpoints else []),
     ]
 
     if use_dual_adapter:
@@ -1218,7 +1224,7 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "grpo_learning_rate", "grpo_warmup_steps",
     "fixed_eval_size", "fixed_eval_split", "fixed_eval_manifest", "fixed_eval_seed",
     "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size",
-    "buffer_rolling",
+    "buffer_rolling", "keep_best_checkpoints",
 })
 
 
@@ -1406,6 +1412,9 @@ def main() -> None:
     parser.add_argument("--fixed_eval_steps", type=int, default=_env("FIXED_EVAL_STEPS", 5))
     parser.add_argument("--fixed_eval_generations", type=int, default=_env("FIXED_EVAL_GENERATIONS", 1))
     parser.add_argument("--fixed_eval_batch_size", type=int, default=_env("FIXED_EVAL_BATCH_SIZE", 1))
+    parser.add_argument("--keep_best_checkpoints", type=int, default=_env("KEEP_BEST_CHECKPOINTS", 0),
+                        help="GRPO: keep this many checkpoints ranked by fixed-eval detection, then total "
+                             "reward, plus the latest; 0 keeps all (env: KEEP_BEST_CHECKPOINTS).")
     parser.add_argument(
         "--netlist_diversity_strategy",
         type=str,

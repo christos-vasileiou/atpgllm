@@ -306,7 +306,7 @@ write_launch_config_snapshot() {
         DDP_TIMEOUT
         GRPO_LEARNING_RATE GRPO_WARMUP_STEPS FIXED_EVAL_SIZE FIXED_EVAL_SPLIT
         FIXED_EVAL_MANIFEST FIXED_EVAL_SEED FIXED_EVAL_STEPS
-        FIXED_EVAL_GENERATIONS FIXED_EVAL_BATCH_SIZE
+        FIXED_EVAL_GENERATIONS FIXED_EVAL_BATCH_SIZE KEEP_BEST_CHECKPOINTS
         USE_DUAL_ADAPTER USE_DDP DEEPSPEED_CONFIG USE_VLLM VLLM_MODE PORT
         TENSOR_PARALLEL_SIZE DATA_PARALLEL_SIZE VLLM_GPU_MEM_UTIL
         PARTITION NODELIST NUM_NODES GPUS_PER_NODE CPUS_PER_TASK MEM
@@ -530,6 +530,9 @@ build_cmd_args() {
             )
             if [ -n "${FIXED_EVAL_MANIFEST:-}" ]; then
                 CMD_ARGS+=(--fixed_eval_manifest "$FIXED_EVAL_MANIFEST")
+            fi
+            if [ -n "${KEEP_BEST_CHECKPOINTS:-}" ]; then
+                CMD_ARGS+=(--keep_best_checkpoints "$KEEP_BEST_CHECKPOINTS")
             fi
         fi
         if [[ "${BUFFER_ROLLING:-False}" =~ ^([Tt]rue|1)$ ]]; then
