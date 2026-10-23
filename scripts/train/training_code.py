@@ -547,12 +547,14 @@ def train_with_sft(
 
 def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoint, buffer_size,
                          max_prompt_length, netlist_diversity_strategy, held_out_examples,
-                         prompts_per_step, max_steps, is_main_process):
+                         prompts_per_step, max_steps, is_main_process, difficulty_weights=None):
     """GRPO prompts read from the whole train split, ``buffer_size`` at a time.
 
     See :mod:`atpgllm.training.stream_buffer`. Rows pass the same filters as
     the one-shot buffer (gate filter, prompt length, evaluation-circuit
-    holdout); each chunk is reordered for netlist diversity.
+    holdout); each chunk is reordered for netlist diversity. ``difficulty_weights``
+    ({level: weight}) samples each row with probability proportional to its
+    level's weight.
     """
     import hashlib
     import math
@@ -562,7 +564,8 @@ def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoi
     )
     from atpgllm.training.fixed_eval import circuit_ids
     from atpgllm.training.stream_buffer import (
-        LEDGER_NAME, RollingPromptBuffer, ShardPermutation, ledger_checkpoint_callback,
+        LEDGER_NAME, RollingPromptBuffer, ShardPermutation, difficulty_keep_probability,
+        ledger_checkpoint_callback,
     )
 
     directory = Path(dataset_path)
@@ -601,6 +604,9 @@ def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoi
         "netlist_diversity_strategy": netlist_diversity_strategy,
         "holdout_sha256": sha256(sorted(held_out)),
     }
+    if difficulty_weights:
+        # Only when set, so ledgers of unweighted runs still resume.
+        settings["difficulty_weights"] = dict(difficulty_weights)
     # Twice the prompts max_steps can consume: the sampler never wraps around.
     length = max(1, math.ceil(2 * max(max_steps, 1) * max(prompts_per_step, 1) / buffer_size)) * buffer_size
     resume_ledger = Path(resume_checkpoint) / LEDGER_NAME if resume_checkpoint else None
@@ -608,12 +614,14 @@ def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoi
         ShardPermutation(directory, "train", seed=42), prepare,
         chunk_size=buffer_size, length=length, ledger_path=Path(output_dir) / LEDGER_NAME,
         settings=settings, writer=is_main_process, resume_ledger=resume_ledger,
+        keep_probability=difficulty_keep_probability(difficulty_weights) if difficulty_weights else None,
         reorder=lambda rows, k: interleave_for_field_diversity(
             rows, "netlist", strategy=netlist_diversity_strategy, seed=42 + k),
     )
     print(f"[GRPO buffer] Rolling buffer: {buffer_size} prompts per chunk over "
           f"{buffer.source.total} train rows, {len(held_out)} held-out circuit ids, "
-          f"virtual length {length} (~{prompts_per_step} prompts per optimizer step).")
+          f"virtual length {length} (~{prompts_per_step} prompts per optimizer step)"
+          + (f", difficulty weights {difficulty_weights}." if difficulty_weights else "."))
     return buffer, ledger_checkpoint_callback(buffer)
 
 
@@ -660,6 +668,7 @@ def train_with_grpo(
     fixed_eval_batch_size: int = 1,
     buffer_rolling: bool = False,
     keep_best_checkpoints: int = 0,
+    difficulty_weights: str | None = None,
     **kwargs,
 ) -> None:
     """
@@ -790,6 +799,11 @@ def train_with_grpo(
         raise ValueError("fixed_eval_size must be nonnegative and fixed_eval_steps positive")
     if keep_best_checkpoints < 0 or (keep_best_checkpoints and not fixed_eval_size):
         raise ValueError("keep_best_checkpoints must be nonnegative and needs the fixed evaluation")
+    if difficulty_weights:
+        if not buffer_rolling:
+            raise ValueError("--difficulty_weights needs --buffer_rolling")
+        from atpgllm.training.stream_buffer import parse_difficulty_weights
+        difficulty_weights = parse_difficulty_weights(difficulty_weights)
     if grpo_learning_rate <= 0 or grpo_warmup_steps < 0:
         raise ValueError("GRPO learning rate must be positive and warmup steps nonnegative")
     if fixed_eval_size and not (use_dual_adapter and use_vllm and vllm_mode == "server" and resume_from):
@@ -1020,6 +1034,7 @@ def train_with_grpo(
             prompts_per_step=(per_device_train_batch_size * distributed_state.num_processes
                               * gradient_accumulation_steps // max(num_generations, 2)),
             max_steps=max_steps, is_main_process=distributed_state.is_main_process,
+            difficulty_weights=difficulty_weights or None,
         )
 
     # =========================================================================
@@ -1224,7 +1239,7 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "grpo_learning_rate", "grpo_warmup_steps",
     "fixed_eval_size", "fixed_eval_split", "fixed_eval_manifest", "fixed_eval_seed",
     "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size",
-    "buffer_rolling", "keep_best_checkpoints",
+    "buffer_rolling", "keep_best_checkpoints", "difficulty_weights",
 })
 
 
@@ -1359,6 +1374,11 @@ def main() -> None:
     parser.add_argument("--save_total_limit", type=int, default=_env("SAVE_TOTAL_LIMIT", None),
                         help="SFT: keep at most this many checkpoints (the best one is always kept). "
                              "Env: SAVE_TOTAL_LIMIT (default: keep all)")
+    parser.add_argument(
+        "--difficulty_weights", default=_env("DIFFICULTY_WEIGHTS", None),
+        help="GRPO rolling buffer: relative sampling weight per difficulty level, e.g. "
+             "easy=1,medium=2,hard=3,very_hard=4,random_never_detects=5. Unset samples "
+             "rows uniformly. Env: DIFFICULTY_WEIGHTS")
     parser.add_argument(
         "--buffer_rolling",
         action=argparse.BooleanOptionalAction,
