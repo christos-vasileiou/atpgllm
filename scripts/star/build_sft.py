@@ -4,7 +4,9 @@
     python scripts/star/build_sft.py runs/star_pilot [--require_path_mention] [--max_per_problem 2]
 
 Writes ``report.json`` (per hint mode and difficulty level) and ``sft.jsonl``
-(hint-free ``{"messages", "tools"}`` examples) into the run directory. Only
+(hint-free ``{"messages", "tools"}`` examples) into the run directory.
+Examples longer than ``--max_model_len`` tokens are dropped, as the SFT stream
+drops them, so no answer is truncated away. Only
 hinted slots are kept unless ``--include_unhinted``; unhinted successes are
 ordinary rejection-sampling data.
 """
@@ -27,6 +29,9 @@ def main():
     parser.add_argument("--max_per_problem", type=int, default=2,
                         help="Kept trajectories per problem, preferring distinct answer vectors")
     parser.add_argument("--include_unhinted", action="store_true")
+    parser.add_argument("--max_model_len", type=int, default=14336,
+                        help="SFT sequence budget (MAX_MODEL_LEN of the SFT config)")
+    parser.add_argument("--tokenizer", default=None, help="Defaults to the run's base model")
     args = parser.parse_args()
 
     from atpgllm.training.rationalization import keep, sft_example
@@ -51,6 +56,7 @@ def main():
             solved[key].add(problem)
             s["leak"] += facts["leak"]
             s["first_call_copies_cube"] += facts["first_call_copies_cube"]
+            s["first_call_follows_hint"] += facts.get("first_call_follows_hint", False)
             s["names_internal_path_net"] += facts["names_internal_path_net"]
             s["has_internal_path"] += facts["has_internal_path"]
         if keep(facts, args.require_path_mention) and (args.include_unhinted or slot["hint_mode"] != "none"):
@@ -67,10 +73,14 @@ def main():
             "mean_tool_calls": s["tool_calls"] / n,
             # Shares among detecting slots:
             "leak_rate": s["leak"] / d, "first_call_copies_cube": s["first_call_copies_cube"] / d,
+            "first_call_follows_hint": s["first_call_follows_hint"] / d,
             "names_internal_path_net": s["names_internal_path_net"] / max(s["has_internal_path"], 1),
             "kept_slots": int(s["kept"]),
         }
-    examples = []
+    from transformers import AutoTokenizer
+    base = args.tokenizer or json.loads((run / "run.json").read_text())["base_model"]
+    tokenizer = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
+    examples, too_long = [], 0
     for problem, slots in kept.items():
         chosen, vectors = [], set()
         for slot in sorted(slots, key=lambda x: (x["hint_mode"], x.get("completion_slot", 0))):
@@ -83,6 +93,10 @@ def main():
                 break
         for slot in chosen:
             example = sft_example(slot, slot["prompt_messages"], TOOLS)
+            length = len(tokenizer.apply_chat_template(example["messages"], tools=TOOLS, tokenize=True))
+            if length > args.max_model_len:
+                too_long += 1
+                continue
             example["star"] = {"problem": list(problem), "difficulty": slot["difficulty"],
                                "hint_mode": slot["hint_mode"]}
             examples.append(example)
@@ -90,6 +104,7 @@ def main():
         for example in examples:
             sink.write(json.dumps(example) + "\n")
     summary = {"by_mode_and_level": report, "sft_examples": len(examples),
+               "dropped_over_max_model_len": too_long, "max_model_len": args.max_model_len,
                "sft_problems": len({tuple(e["star"]["problem"]) for e in examples}),
                "require_path_mention": args.require_path_mention}
     (run / "report.json").write_text(json.dumps(summary, indent=1))

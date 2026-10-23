@@ -62,6 +62,65 @@ def read_selected(dataset, counts, seed):
     return rows
 
 
+def prepare_problems(dataset, counts, seed, tokenizer, max_prompt_length):
+    """``[(row, record, clean prompt messages)]`` and the count kept per level.
+
+    Keeps the first ``counts[level]`` candidates per level that pass the gate
+    filter and whose hint-free prompt fits the GRPO prompt budget.
+    """
+    from atpgllm.training.conversation import ConversationExample
+    from atpgllm.training.dataset_utils import _gate_filter_passes
+    from atpgllm.training.tools import TOOLS
+    pool = read_selected(dataset, counts, seed)
+    problems, taken = [], dict.fromkeys(counts, 0)
+    for row in pool:
+        if taken[row["difficulty"]] >= counts[row["difficulty"]] or not _gate_filter_passes(row):
+            continue
+        # The prompt and the verifier both derive doc_id = sha256(netlist)[:16].
+        record = dict(row)
+        clean = ConversationExample.prompt_messages_from_record(dict(record), use_tools=True)
+        prompt = tokenizer.apply_chat_template(clean, tools=TOOLS, tokenize=False, add_generation_prompt=True)
+        if len(tokenizer.encode(prompt, add_special_tokens=False)) >= max_prompt_length:
+            continue
+        taken[row["difficulty"]] += 1
+        problems.append((row, record, clean))
+    print(f"[star] {len(pool)} candidates -> {len(problems)} problems: {taken}", flush=True)
+    return problems, taken
+
+
+def sample_and_write(strategy, problems, modes, tokenizer, sink, *, seed, batch_problems):
+    """Attempt every ``(row, record, clean prompt)`` problem under each hint mode
+    and append one JSON line per completion slot to ``sink``."""
+    from atpgllm.training.rationalization import hint_bits, hint_text, hinted_messages, judge, problem_key
+    from atpgllm.training.tools import TOOLS
+    for mode in modes:
+        for start in range(0, len(problems), batch_problems):
+            batch = problems[start:start + batch_problems]
+            prompts, records, hints = [], [], []
+            for row, record, clean in batch:
+                hint = hint_text(row, mode, seed=seed)
+                messages = hinted_messages(clean, hint)
+                prompts.append(tokenizer.apply_chat_template(
+                    messages, tools=TOOLS, tokenize=False, add_generation_prompt=True))
+                records.append({**record, "_search_messages": messages})
+                hints.append(hint)
+            t = time.time()
+            results = strategy.sample_batch(prompts, records)
+            for (row, _, clean), hint, result in zip(batch, hints, results):
+                for slot in result.slots:
+                    sink.write(json.dumps({
+                        "problem": list(problem_key(row)), "difficulty": row["difficulty"],
+                        "fault": row["fault"], "circuit_id": row["circuit_id"],
+                        "pattern_index": row["pattern_index"],
+                        "random_detection_probability": row["random_detection_probability"],
+                        "hint_mode": mode, "hint": hint, "prompt_messages": clean,
+                        "facts": judge(slot, row, hint_bits(row, mode, seed=seed)), **slot,
+                    }, default=str) + "\n")
+            sink.flush()
+            print(f"[star] {mode}: problems {start}-{start + len(batch)} in {time.time() - t:.0f} s",
+                  flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--adapter", required=True, help="SFT checkpoint (adapter_config.json inside)")
@@ -86,10 +145,7 @@ def main():
                         help="Serve the QLoRA-faithful merged bf16 export (as the evaluator does)")
     args = parser.parse_args()
 
-    from atpgllm.training.rationalization import hint_text, hinted_messages, judge, problem_key
-    from atpgllm.training.conversation import ConversationExample
-    from atpgllm.training.dataset_utils import _gate_filter_passes
-    from atpgllm.training.tools import TOOLS
+    from atpgllm.training.rationalization import hint_text, problem_key
     from transformers import AutoTokenizer
 
     out = Path(args.out)
@@ -101,22 +157,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
 
     t0 = time.time()
-    pool = read_selected(args.dataset, counts, args.seed)
-    print(f"[star] {len(pool)} candidate problems in {sorted(counts)} ({time.time() - t0:.0f} s)", flush=True)
-    # Keep the first counts[level] that pass the gate filter and the GRPO prompt budget.
-    problems, taken = [], dict.fromkeys(counts, 0)
-    for row in pool:
-        if taken[row["difficulty"]] >= counts[row["difficulty"]] or not _gate_filter_passes(row):
-            continue
-        # The prompt and the verifier both derive doc_id = sha256(netlist)[:16].
-        record = dict(row)
-        clean = ConversationExample.prompt_messages_from_record(dict(record), use_tools=True)
-        prompt = tokenizer.apply_chat_template(clean, tools=TOOLS, tokenize=False, add_generation_prompt=True)
-        if len(tokenizer.encode(prompt, add_special_tokens=False)) >= args.max_prompt_length:
-            continue
-        taken[row["difficulty"]] += 1
-        problems.append((row, record, clean))
-    print(f"[star] {len(problems)} problems: {taken}", flush=True)
+    problems, taken = prepare_problems(args.dataset, counts, args.seed, tokenizer, args.max_prompt_length)
+    print(f"[star] selection took {time.time() - t0:.0f} s", flush=True)
     with open(out / "problems.jsonl", "w") as sink:
         for row, _, _ in problems:
             sink.write(json.dumps({"problem": list(problem_key(row)), "difficulty": row["difficulty"],
@@ -137,8 +179,15 @@ def main():
     from atpgllm.training.search_verifier import Verifier
     from atpgllm.training.simulator_provenance import runtime_provenance
 
+    serving = "lora"
     if args.merge_dequant:
-        llm = LLM(model=str(resolve_merged_bf16_dir(adapter)), tensor_parallel_size=args.tp_size,
+        try:
+            merged = resolve_merged_bf16_dir(adapter)
+            serving = "merged_bf16"
+        except Exception as exc:  # the export has its own CUDA subprocess; fall back to LoRA
+            print(f"[star] merged bf16 export failed ({exc}); serving the adapter with LoRA", flush=True)
+    if serving == "merged_bf16":
+        llm = LLM(model=str(merged), tensor_parallel_size=args.tp_size,
                   gpu_memory_utilization=args.gpu_memory_utilization, dtype="bfloat16",
                   max_model_len=args.max_model_len, trust_remote_code=True)
         lora = None
@@ -158,36 +207,12 @@ def main():
                              use_tools=True, max_tool_rounds=args.max_tool_rounds, seed=args.seed,
                              search_config=config)
     (out / "run.json").write_text(json.dumps({
-        "args": vars(args), "base_model": base, "problems": taken,
+        "args": vars(args), "base_model": base, "problems": taken, "serving": serving,
         "simulator": runtime_provenance(), "search_config": asdict(config)}, indent=1, default=str))
 
     with open(out / "slots.jsonl", "a") as sink:
-        for mode in modes:
-            for start in range(0, len(problems), args.batch_problems):
-                batch = problems[start:start + args.batch_problems]
-                prompts, records, hints = [], [], []
-                for row, record, clean in batch:
-                    hint = hint_text(row, mode, seed=args.seed)
-                    messages = hinted_messages(clean, hint)
-                    prompts.append(tokenizer.apply_chat_template(
-                        messages, tools=TOOLS, tokenize=False, add_generation_prompt=True))
-                    records.append({**record, "_search_messages": messages})
-                    hints.append(hint)
-                t = time.time()
-                results = strategy.sample_batch(prompts, records)
-                for (row, _, clean), hint, result in zip(batch, hints, results):
-                    for slot in result.diagnostics:
-                        sink.write(json.dumps({
-                            "problem": list(problem_key(row)), "difficulty": row["difficulty"],
-                            "fault": row["fault"], "circuit_id": row["circuit_id"],
-                            "pattern_index": row["pattern_index"],
-                            "random_detection_probability": row["random_detection_probability"],
-                            "hint_mode": mode, "hint": hint, "prompt_messages": clean,
-                            "facts": judge(slot, row), **slot,
-                        }, default=str) + "\n")
-                sink.flush()
-                print(f"[star] {mode}: problems {start}-{start + len(batch)} in {time.time() - t:.0f} s",
-                      flush=True)
+        sample_and_write(strategy, problems, modes, tokenizer, sink, seed=args.seed,
+                         batch_problems=args.batch_problems)
 
 
 if __name__ == "__main__":

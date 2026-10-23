@@ -27,7 +27,8 @@ HARD_LEVELS = ("hard", "very_hard", "random_never_detects")
 
 # Assistant text that refers to the hint instead of deriving the test.
 LEAK_RE = re.compile(
-    r"\bhints?\b|\bprivate\b|\b(?:the|this|that) note\b|\b(?:was|were|been|am|is) (?:given|provided|told)\b|"
+    r"\bhints?\b|\bprivate\b|\b(?:the|this|that) note\b|"
+    r"\b(?:I|we) (?:was|were|am|are|have been|had been) (?:given|provided|told)\b|"
     r"\b(?:given|provided|known|verified) (?:test|cube|pattern|vector|assignment|bits?)\b",
     re.IGNORECASE)
 
@@ -71,6 +72,18 @@ def _nets(raw) -> list[str]:
     return [token.strip() for token in str(raw or "").split(",") if token.strip()]
 
 
+def hint_bits(row: dict, mode: str, seed: int = 0) -> dict:
+    """The care bits a ``partial`` or ``cube`` hint reveals; empty for other modes."""
+    if mode not in ("partial", "cube"):
+        return {}
+    bits = care_bits(row)
+    names = sorted(bits)
+    if mode == "partial" and names:
+        rng = random.Random(f"{seed}:{problem_key(row)}")
+        names = sorted(rng.sample(names, max(1, len(names) // 2)))
+    return {name: bits[name] for name in names}
+
+
 def hint_text(row: dict, mode: str, seed: int = 0) -> Optional[str]:
     """The hint appended to the user turn, or ``None`` for ``mode="none"``.
 
@@ -93,14 +106,10 @@ def hint_text(row: dict, mode: str, seed: int = 0) -> Optional[str]:
             parts.append(f"the nets to justify include {', '.join(control)}")
         detail = "; ".join(parts)
     else:
-        bits = care_bits(row)
+        bits = hint_bits(row, mode, seed)
         if not bits:
             return None
-        names = sorted(bits)
-        if mode == "partial":
-            rng = random.Random(f"{seed}:{problem_key(row)}")
-            names = sorted(rng.sample(names, max(1, len(names) // 2)))
-        detail = ("one detecting test assigns " + ", ".join(f"{n}: {bits[n]}" for n in names)
+        detail = ("one detecting test assigns " + ", ".join(f"{n}: {v}" for n, v in bits.items())
                   + ("" if mode == "cube" else " (other inputs are yours to choose)"))
     return ("\n\nPrivate note for this attempt: " + detail + ". Work out the test "
             "yourself from the netlist, check it with the fault simulation tool, and "
@@ -120,12 +129,13 @@ def _assistant_text(messages: list[dict]) -> str:
     return "\n".join(str(m.get("content") or "") for m in messages if m["role"] == "assistant")
 
 
-def judge(slot: dict, row: dict) -> dict:
+def judge(slot: dict, row: dict, hinted: Optional[dict] = None) -> dict:
     """Facts about one generated trajectory, used for filtering and the pilot report.
 
     ``slot`` is a search diagnostics entry (``messages``, ``status``,
     ``reward_components``, ``observations``) from
-    :class:`atpgllm.training.search_policies.SamplingStrategy`.
+    :class:`atpgllm.training.search_policies.SamplingStrategy`. ``hinted`` is
+    the care bits the hint revealed (:func:`hint_bits`).
     """
     messages = slot.get("messages") or []
     components = slot.get("reward_components") or {}
@@ -145,6 +155,8 @@ def judge(slot: dict, row: dict) -> dict:
         "leak": bool(LEAK_RE.search(text)),
         "first_call_copies_cube": bool(first) and all(
             str(first.get(net)) == str(value) for net, value in bits.items()),
+        "first_call_follows_hint": bool(first) and bool(hinted) and all(
+            str(first.get(net)) == str(value) for net, value in hinted.items()),
         "names_internal_path_net": any(re.search(rf"(?<![\w\[]){re.escape(n)}(?![\w\]])", text) for n in path),
         "has_internal_path": bool(path),
         "tool_calls": len(calls),
