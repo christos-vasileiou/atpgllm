@@ -268,6 +268,9 @@ def train_with_sft(
     sft_eval_steps: int = 10,
     sft_eval_per_circuit: int = 8,
     save_total_limit: int | None = None,
+    sft_learning_rate: float = 2e-4,
+    sft_extra_messages: str | None = None,
+    sft_extra_fraction: float = 0.5,
     **kwargs,
 ) -> None:
     """
@@ -466,6 +469,16 @@ def train_with_sft(
         max_model_len=max_model_len if sft_format == "messages" else None,
     )
 
+    if sft_extra_messages:
+        # Pre-built conversations (e.g. STaR rationalizations) mixed into the stream.
+        if sft_format != "messages":
+            raise ValueError("--sft_extra_messages needs assistant_only_loss (messages format)")
+        from atpgllm.training.dataset_utils import load_messages_jsonl, mix_in_examples
+        extra = load_messages_jsonl(sft_extra_messages)
+        train_dataset = mix_in_examples(train_dataset, extra, sft_extra_fraction, seed=42)
+        print(f"[SFT] Mixing {len(extra)} examples from {sft_extra_messages} as "
+              f"{sft_extra_fraction:.0%} of the training stream.")
+
     if resume_training_state and skip_buffer_size:
         print(
             "[SFT] Warning: --resume_training_state restores trainer step/checkpoint "
@@ -483,7 +496,7 @@ def train_with_sft(
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         optim="paged_adamw_32bit",
-        learning_rate=2e-4,
+        learning_rate=sft_learning_rate,
         lr_scheduler_type="cosine",
         max_steps=max_steps,
         logging_steps=5,
@@ -1218,7 +1231,7 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "assistant_only_loss",
     "sft_circuit_validation",
     "sft_eval_steps",
-    "sft_eval_per_circuit",
+    "sft_eval_per_circuit", "sft_learning_rate", "sft_extra_messages", "sft_extra_fraction",
     "save_total_limit",
 })
 _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
@@ -1371,6 +1384,14 @@ def main() -> None:
                         help="Audit repaired local circuit splits and enable fixed SFT validation")
     parser.add_argument("--sft_eval_steps", type=int, default=10)
     parser.add_argument("--sft_eval_per_circuit", type=int, default=8)
+    parser.add_argument("--sft_learning_rate", type=float, default=_env("SFT_LEARNING_RATE", 2e-4),
+                        help="SFT peak learning rate (cosine). Env: SFT_LEARNING_RATE (default 2e-4)")
+    parser.add_argument("--sft_extra_messages", default=_env("SFT_EXTRA_MESSAGES", None),
+                        help="SFT: JSONL of pre-built {messages, tools} examples to mix into the "
+                             "training stream. Env: SFT_EXTRA_MESSAGES")
+    parser.add_argument("--sft_extra_fraction", type=float, default=_env("SFT_EXTRA_FRACTION", 0.5),
+                        help="Share of training examples drawn from --sft_extra_messages. "
+                             "Env: SFT_EXTRA_FRACTION (default 0.5)")
     parser.add_argument("--save_total_limit", type=int, default=_env("SAVE_TOTAL_LIMIT", None),
                         help="SFT: keep at most this many checkpoints (the best one is always kept). "
                              "Env: SAVE_TOTAL_LIMIT (default: keep all)")

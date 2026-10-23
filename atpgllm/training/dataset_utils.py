@@ -434,6 +434,53 @@ def _streaming_sft_messages_dataset(
     return IterableDataset.from_generator(_generator)
 
 
+def load_messages_jsonl(path) -> list[dict]:
+    """Pre-built SFT examples, one ``{"messages", "tools"}`` object per line.
+
+    Other keys (provenance such as ``star``) are dropped so every example has
+    the layout ``_format_sft_messages_record`` produces.
+    """
+    import json
+    examples = []
+    with open(path) as handle:
+        for line in handle:
+            if line.strip():
+                example = json.loads(line)
+                examples.append({key: example[key] for key in ("messages", "tools") if key in example})
+    if not examples:
+        raise ValueError(f"No SFT examples in {path}")
+    return examples
+
+
+def mix_in_examples(dataset, examples: list[dict], fraction: float, seed: int = 0) -> IterableDataset:
+    """Stream ``dataset`` with ``examples`` interleaved as ``fraction`` of the output.
+
+    The extra examples repeat in a seeded order, reshuffled after each round,
+    so a small curated set (for example STaR rationalizations) is mixed with
+    the regular stream for as long as it lasts. Every rank builds the same
+    stream from the same seed.
+    """
+    import random
+    if not 0 < fraction < 1:
+        raise ValueError("fraction must be between 0 and 1")
+
+    def generate():
+        rng, order, base = random.Random(seed), [], iter(dataset)
+        while True:
+            if rng.random() < fraction:
+                if not order:
+                    order = list(range(len(examples)))
+                    rng.shuffle(order)
+                yield examples[order.pop()]
+                continue
+            try:
+                yield next(base)
+            except StopIteration:
+                return
+
+    return IterableDataset.from_generator(generate)
+
+
 # =====================================================================
 # Dataset helpers
 # =====================================================================

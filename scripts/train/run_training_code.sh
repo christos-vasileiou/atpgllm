@@ -301,6 +301,7 @@ write_launch_config_snapshot() {
         PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS MAX_STEPS REPORT_TO
         MAX_MODEL_LEN MAX_PROMPT_LENGTH MAX_COMPLETION_LENGTH
         SFT_CIRCUIT_VALIDATION SFT_EVAL_STEPS SFT_EVAL_PER_CIRCUIT
+        SFT_LEARNING_RATE SFT_EXTRA_MESSAGES SFT_EXTRA_FRACTION
         ASSISTANT_ONLY_LOSS BUFFER_SIZE BUFFER_ROLLING SAVE_TOTAL_LIMIT NUM_GENERATIONS TRAIN_BEST_OF_N STEPS_PER_GENERATION
         NETLIST_DIVERSITY_STRATEGY DISABLE_DROPOUT VLLM_IMPORTANCE_SAMPLING_MODE
         DDP_TIMEOUT
@@ -471,6 +472,12 @@ build_cmd_args() {
     fi
     if [ "$METHOD" == "sft" ] && [ -n "${SAVE_TOTAL_LIMIT:-}" ]; then
         CMD_ARGS+=(--save_total_limit "$SAVE_TOTAL_LIMIT")
+    fi
+    if [ "$METHOD" == "sft" ] && [ -n "${SFT_LEARNING_RATE:-}" ]; then
+        CMD_ARGS+=(--sft_learning_rate "$SFT_LEARNING_RATE")
+    fi
+    if [ "$METHOD" == "sft" ] && [ -n "${SFT_EXTRA_MESSAGES:-}" ]; then
+        CMD_ARGS+=(--sft_extra_messages "$SFT_EXTRA_MESSAGES" --sft_extra_fraction "${SFT_EXTRA_FRACTION:-0.5}")
     fi
 
     # SFT only: assistant-only loss (mask system/user/tool-response tokens)
