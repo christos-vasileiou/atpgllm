@@ -795,8 +795,10 @@ def train_with_grpo(
 
     # PartialState is shared: its first initialization fixes the actual NCCL
     # timeout. Do this before any model/dataset helper or fixed-eval setup.
-    from atpgllm.training.distributed_runtime import initialize_grpo_distributed
+    from atpgllm.training.distributed_runtime import initialize_grpo_distributed, pin_vllm_group_port
     distributed_state = initialize_grpo_distributed(ddp_timeout)
+    if os.environ.get("VLLM_GROUP_PORT"):
+        pin_vllm_group_port(int(os.environ["VLLM_GROUP_PORT"]))
 
     # Determine device_map: per-GPU for DDP, "auto" otherwise
     device_map = _get_device_map(use_ddp)

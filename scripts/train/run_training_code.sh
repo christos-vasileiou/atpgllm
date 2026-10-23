@@ -143,7 +143,8 @@ fi
 # pre-filled model cache (HF_HOME on /work, HF_HUB_OFFLINE=1) and offline W&B
 # for compute nodes without internet. Only exported values reach the srun steps
 # on the other nodes.
-for _nccl_var in NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_DEBUG GLOO_SOCKET_IFNAME HF_HOME HF_HUB_OFFLINE WANDB_MODE; do
+# VLLM_GROUP_PORT pins the trainer-to-vLLM weight-sync port (TRL default 51216).
+for _nccl_var in NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_DEBUG GLOO_SOCKET_IFNAME HF_HOME HF_HUB_OFFLINE WANDB_MODE VLLM_GROUP_PORT; do
     [ -n "${!_nccl_var:-}" ] && export "$_nccl_var"
 done
 

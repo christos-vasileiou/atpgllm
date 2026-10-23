@@ -30,6 +30,16 @@ def test_distributed_timeout_reaches_first_state_initialization(monkeypatch):
     assert calls == [{'timeout': timedelta(seconds=7200)}]
 
 
+def test_vllm_group_port_reaches_grpo_trainer_client(monkeypatch):
+    import trl.trainer.grpo_trainer as grpo_trainer
+    from atpgllm.training.distributed_runtime import pin_vllm_group_port
+    monkeypatch.setattr(grpo_trainer, 'VLLMClient', grpo_trainer.VLLMClient)
+    pin_vllm_group_port(29600)
+    assert grpo_trainer.VLLMClient.keywords == {'group_port': 29600}
+    with pytest.raises(ValueError, match='1-65535'):
+        pin_vllm_group_port(0)
+
+
 def method(name, **scope):
     tree = ast.parse(SOURCE.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DualAdapterGRPOTrainer")
