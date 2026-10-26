@@ -1,0 +1,47 @@
+{
+ "_comment": "RFT rounds with STaR rationalization on eng-tamale3 (4x A100 40GB), then GDPO from the best round. See scripts/rft/run_rft.py.",
+ "run_dir": "runs/rft_v4_a100",
+ "start_adapter": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/sft_granite_4.2_8b_v4/checkpoint-250",
+ "dataset": "../data/freeset/dataset.freeset.asap7sc7p5t_28.rvt.tt.v4",
+ "gpus": [0, 1, 2, 3],
+ "seed": 2026,
+ "rounds": 4,
+ "deadline_hours": 160,
+ "round_hours_estimate": 30,
+ "max_failures": 3,
+ "per_level": "easy=400,medium=600,hard=800,very_hard=800,random_never_detects=800",
+ "sample": {
+  "num_samples": 8,
+  "hint_modes": "none,path,partial",
+  "temperature": 1.0,
+  "max_tool_rounds": 4,
+  "max_model_len": 14336,
+  "max_generated_tokens": 12288,
+  "batch_problems": 64
+ },
+ "build": {"max_per_problem": 2, "min_examples": 50},
+ "sft": {
+  "conf": "scripts/train/configs/sft_granite_4.2_8b_v4_rft.conf",
+  "gpus": 4,
+  "gradient_accumulation_steps": 256,
+  "epochs": 2,
+  "extra_fraction": 0.5,
+  "learning_rate": 2e-5,
+  "min_steps": 10,
+  "max_steps": 60,
+  "max_model_len": 14336,
+  "circuit_validation": true
+ },
+ "eval": {
+  "fixed_manifest": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b_v4_a100_tetramax/fixed_eval_manifest.json",
+  "val_per_level": "easy=60,medium=60,hard=60,very_hard=60,random_never_detects=60",
+  "max_tool_rounds": 16,
+  "references": {
+   "gdpo_step2": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b_v4_a100_tetramax/checkpoint-2/policy"
+  }
+ },
+ "gdpo": {
+  "conf": "scripts/train/configs/grpo_granite_4.2_8b_v4_a100_tetramax_after_rft.conf",
+  "output_dir": "runs/grpo_granite_4.2_8b_v4_a100_tetramax_after_rft"
+ }
+}

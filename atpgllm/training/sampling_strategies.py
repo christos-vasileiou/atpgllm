@@ -198,7 +198,7 @@ def list_available_strategies():
 
 def make_strategy(name, generator, verifier, *, num_completions, width=None,
                   use_tools=False, max_tool_rounds=1, seed=42,
-                  threshold_mode="fault_detected", search_config=None):
+                  threshold_mode="fault_detected", search_config=None, tool_workers=1):
     if name in MODEL_FREE_STRATEGY_NAMES:
         if name == "vector_evolutionary" and (width is None or width < 1):
             raise ValueError("vector_evolutionary requires a positive budget")
@@ -215,7 +215,7 @@ def make_strategy(name, generator, verifier, *, num_completions, width=None,
     return cls(generator, verifier, num_completions=num_completions,
                budget=1 if name == "single_completion" else width, use_tools=use_tools,
                max_tool_rounds=max_tool_rounds, seed=seed,
-               threshold_mode=threshold_mode, search_config=search_config)
+               threshold_mode=threshold_mode, search_config=search_config, tool_workers=tool_workers)
 
 
 def select_for_pass_at_k(result, num_completions):

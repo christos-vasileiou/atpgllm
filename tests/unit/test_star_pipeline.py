@@ -84,10 +84,48 @@ def test_rationalization_job_path_writes_judged_slots_and_sft_examples(tmp_path,
     assert len(slots) == 2 * 2 * 2 and all(s["status"] == "FINAL" and s["facts"]["detected"] for s in slots)
     # The scripted model mentions the hint only on the hinted hard problem.
     assert {(s["hint_mode"], s["difficulty"]) for s in slots if s["facts"]["leak"]} == {("partial", "hard")}
-    subprocess.run([sys.executable, str(REPO / "scripts/star/build_sft.py"), str(OUT)], check=True,
-                   capture_output=True, env={**__import__("os").environ, "PYTHONPATH": str(REPO)})
-    report = json.loads((OUT / "report.json").read_text())
-    examples = [json.loads(line) for line in open(OUT / "sft.jsonl")]
-    assert report["sft_examples"] == len(examples) == 1  # two identical RND answers, one kept
+    def build(*flags):
+        subprocess.run([sys.executable, str(REPO / "scripts/star/build_sft.py"), str(OUT), *flags], check=True,
+                       capture_output=True, env={**__import__("os").environ, "PYTHONPATH": str(REPO)})
+        return (json.loads((OUT / "report.json").read_text()),
+                [json.loads(line) for line in open(OUT / "sft.jsonl")])
+
+    # Both problems were solved without a hint, so only unhinted attempts are
+    # used, one per problem because each problem's two answers are identical.
+    report, examples = build()
+    assert report["sft_examples"] == len(examples) == 2
+    assert {e["star"]["hint_mode"] for e in examples} == {"none"}
+    # The rationalizations alone: the hard one mentions the hint and is dropped.
+    report, examples = build("--hinted_only")
+    assert report["sft_examples"] == len(examples) == 1
     assert examples[0]["star"]["difficulty"] == "random_never_detects"
     assert all("Private note" not in str(m["content"]) for m in examples[0]["messages"])
+
+    # A second run into the same directory resumes: nothing is left to sample.
+    done, solved = R.load_progress(OUT / "slots.jsonl", 2)
+    assert len(done) == 4 and len(solved) == 2
+    with open(OUT / "slots.jsonl", "a") as sink:
+        R.sample_and_write(strategy, problems, ["none", "partial"], tok, sink, seed=1729, batch_problems=64,
+                           done=done, solved=solved)
+    assert sum(1 for _ in open(OUT / "slots.jsonl")) == 8
+    # With escalation, a hinted mode only visits problems no earlier mode solved.
+    with open(OUT / "escalated.jsonl", "w") as sink:
+        R.sample_and_write(strategy, problems, ["none", "partial"], tok, sink, seed=1729, batch_problems=64,
+                           escalate=True)
+    assert {json.loads(line)["hint_mode"] for line in open(OUT / "escalated.jsonl")} == {"none"}
+
+    # Concurrent simulations (tool calls and final answers) change nothing but speed.
+    threaded = make_strategy("single_completion", Scripted(), verifier, num_completions=2, use_tools=True,
+                             max_tool_rounds=4, seed=1729, search_config=SearchConfig(max_generated_tokens=24576),
+                             tool_workers=4)
+    with open(OUT / "threaded.jsonl", "w") as sink:
+        R.sample_and_write(threaded, problems, ["none", "partial"], tok, sink, seed=1729, batch_problems=64)
+
+    def comparable(path):
+        out = []
+        for line in open(path):
+            slot = json.loads(line)
+            out.append((slot["hint_mode"], slot["problem"], slot["completion_slot"], slot["messages"],
+                        slot["vector"], slot["reward_components"], slot["facts"]))
+        return sorted(out, key=json.dumps)
+    assert comparable(OUT / "threaded.jsonl") == comparable(OUT / "slots.jsonl")

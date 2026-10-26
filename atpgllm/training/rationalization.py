@@ -23,6 +23,8 @@ from typing import Iterable, Optional
 from .conversation import is_dont_care
 
 HINT_MODES = ("none", "path", "partial", "cube")
+# How much each mode gives away; less is preferred when choosing what to train on.
+MODE_RANK = {mode: rank for rank, mode in enumerate(HINT_MODES)}
 HARD_LEVELS = ("hard", "very_hard", "random_never_detects")
 
 # Assistant text that refers to the hint instead of deriving the test.
@@ -38,16 +40,19 @@ def problem_key(row: dict) -> tuple:
     return str(row.get("netlist_id") or row.get("netlist")), str(row.get("fault"))
 
 
-def select_problems(rows: Iterable[dict], per_level: dict, seed: int = 0) -> list[dict]:
+def select_problems(rows: Iterable[dict], per_level: dict, seed: int = 0,
+                    exclude: Iterable[tuple] = ()) -> list[dict]:
     """One seeded row per problem, ``per_level[level]`` problems per difficulty level.
 
     The row kept for a problem supplies its hint, so it is drawn uniformly
-    among that problem's rows.
+    among that problem's rows. Problems in ``exclude`` (keys from
+    :func:`problem_key`, e.g. earlier rounds) are never chosen.
     """
+    excluded = {tuple(map(str, key)) for key in exclude}
     by_level: dict[str, dict[tuple, list[dict]]] = {level: {} for level in per_level}
     for row in rows:
         level = row.get("difficulty")
-        if level in by_level:
+        if level in by_level and problem_key(row) not in excluded:
             by_level[level].setdefault(problem_key(row), []).append(row)
     rng = random.Random(seed)
     chosen = []
@@ -160,6 +165,8 @@ def judge(slot: dict, row: dict, hinted: Optional[dict] = None) -> dict:
         "names_internal_path_net": any(re.search(rf"(?<![\w\[]){re.escape(n)}(?![\w\]])", text) for n in path),
         "has_internal_path": bool(path),
         "tool_calls": len(calls),
+        # Ran out of tokens, actions or tool rounds rather than answering wrongly.
+        "truncated": slot.get("status") == "EXHAUSTED",
     }
 
 
@@ -170,6 +177,29 @@ def keep(facts: dict, require_path_mention: bool = False) -> bool:
     if require_path_mention and facts["has_internal_path"]:
         ok = ok and facts["names_internal_path_net"]
     return ok
+
+
+def choose_for_training(slots: list[dict], max_per_problem: int, *, require_path_mention: bool = False,
+                        hinted_only_if_unsolved: bool = True) -> list[dict]:
+    """The slots of one problem to train on, as STaR chooses them.
+
+    Kept unhinted slots (plain rejection sampling) come first. Hinted slots are
+    used only when no unhinted slot was kept, unless ``hinted_only_if_unsolved``
+    is off, and the least revealing hint mode wins. Answers repeat at most once.
+    """
+    kept = [s for s in slots if keep(s["facts"], require_path_mention)]
+    if hinted_only_if_unsolved and any(s["hint_mode"] == "none" for s in kept):
+        kept = [s for s in kept if s["hint_mode"] == "none"]
+    chosen, vectors = [], set()
+    for slot in sorted(kept, key=lambda s: (MODE_RANK[s["hint_mode"]], s.get("completion_slot", 0))):
+        vector = json.dumps(slot.get("vector"), sort_keys=True)
+        if vector in vectors:
+            continue
+        vectors.add(vector)
+        chosen.append(slot)
+        if len(chosen) == max_per_problem:
+            break
+    return chosen
 
 
 def sft_example(slot: dict, prompt_messages: list[dict], tools) -> dict:

@@ -159,3 +159,34 @@ def test_extra_examples_are_mixed_at_the_requested_fraction(tmp_path):
     share = sum(t.startswith("star") for t in mixed) / len(mixed)
     assert 0.17 < share < 0.23
     assert mixed == [m["messages"][0]["content"] for m in mix_in_examples(base, extra, 0.2, seed=7)]
+
+
+def _judged(mode, slot_index, vector, *, detection=1.0, text="Setting a=1 activates n2."):
+    slot = _slot(text, detection=detection, vector=vector)
+    return {**slot, "hint_mode": mode, "completion_slot": slot_index, "vector": vector,
+            "facts": judge(slot, ROW)}
+
+
+def test_choose_for_training_prefers_unhinted_then_the_least_revealing_hint():
+    from atpgllm.training.rationalization import choose_for_training
+    a, b, c = {"a": 1, "c": 0, "d": 1}, {"a": 1, "c": 0, "d": 0}, {"a": 1, "b": 1, "c": 0, "d": 1}
+    hinted = [_judged("partial", 0, a), _judged("path", 1, b), _judged("cube", 0, c)]
+    # No unhinted success: path, then partial, then cube (not alphabetical).
+    assert [s["hint_mode"] for s in choose_for_training(hinted, 3)] == ["path", "partial", "cube"]
+    # An unhinted success excludes every hinted attempt of that problem.
+    slots = hinted + [_judged("none", 3, a), _judged("none", 1, a), _judged("none", 2, b, detection=0.0)]
+    chosen = choose_for_training(slots, 2)
+    assert [(s["hint_mode"], s["completion_slot"]) for s in chosen] == [("none", 1)]  # same answer twice
+    assert len(choose_for_training(slots, 2, hinted_only_if_unsolved=False)) == 2
+
+
+def test_selection_excludes_earlier_problems():
+    rows = [dict(ROW, netlist_id=f"n{i}", fault="sa0 x", difficulty="hard") for i in range(10)]
+    first = select_problems(rows, {"hard": 4}, seed=1)
+    second = select_problems(rows, {"hard": 10}, seed=2, exclude=[(r["netlist_id"], r["fault"]) for r in first])
+    assert len(second) == 6 and not {r["netlist_id"] for r in first} & {r["netlist_id"] for r in second}
+
+
+def test_truncated_fact():
+    slot = dict(_slot("x"), status="EXHAUSTED")
+    assert judge(slot, ROW)["truncated"] and not judge(_slot("x"), ROW)["truncated"]
