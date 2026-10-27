@@ -39,17 +39,22 @@ exec 9>"$HOME/.rft_watchdog.lock"
 chgrp trela "$HOME/.rft_watchdog.lock" 2>/dev/null
 flock -n 9 || exit 0
 
-if [ -f "$RUN_DIR/driver.pid" ]; then
-    pid="$(cat "$RUN_DIR/driver.pid")"
-    if kill -0 "$pid" 2>/dev/null && grep -q run_rft.py "/proc/$pid/cmdline" 2>/dev/null; then
-        exit 0
-    fi
-fi
+alive() {  # alive <pid file> <script name>
+    [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null && grep -q "$2" "/proc/$(cat "$1")/cmdline" 2>/dev/null
+}
+status=""
 if [ -f "$RUN_DIR/state.json" ]; then
     status="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print("finished" if s.get("finished") else "halted" if s.get("halted") else "")' "$RUN_DIR/state.json")"
-    if [ -n "$status" ]; then
-        exit 0
-    fi
+fi
+# The W&B mirror (RFT_WANDB=0 turns it off) runs beside the driver and stops
+# by itself after a final sync once the run finishes or halts.
+if [ -z "$status" ] && [ "${RFT_WANDB:-1}" != 0 ] && [ -d "$RUN_DIR/logs" ] \
+        && ! alive "$RUN_DIR/wandb_logger.pid" wandb_log.py; then
+    say "starting the W&B logger (log $RUN_DIR/logs/wandb_log.log)"
+    "$REPO/scripts/rft/start_logger.sh" "$RUN_DIR" "$RUN_DIR/logs/wandb_log.log" "$VENV"
+fi
+if alive "$RUN_DIR/driver.pid" run_rft.py || [ -n "$status" ]; then
+    exit 0
 fi
 
 stamp="$(date +%Y%m%d_%H%M)"
