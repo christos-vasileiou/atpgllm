@@ -55,7 +55,9 @@ chmod g+s "$RUN_DIR" "$RUN_DIR/logs" 2>/dev/null
 if [ -z "$status" ] && [ "${RFT_WANDB:-1}" != 0 ] \
         && ! alive "$RUN_DIR/wandb_logger.pid" wandb_log.py; then
     say "starting the W&B logger (log $RUN_DIR/logs/wandb_log.log)"
-    "$REPO/scripts/rft/start_logger.sh" "$RUN_DIR" "$RUN_DIR/logs/wandb_log.log" "$VENV"
+    # 9>&-: the detached logger must not inherit the lock, or every later
+    # pass finds it held and exits without restarting a dead driver.
+    "$REPO/scripts/rft/start_logger.sh" "$RUN_DIR" "$RUN_DIR/logs/wandb_log.log" "$VENV" 9>&-
 fi
 if alive "$RUN_DIR/driver.pid" run_rft.py || [ -n "$status" ]; then
     exit 0
