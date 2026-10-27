@@ -103,7 +103,7 @@ class Run:
     def path(self, *parts):
         return self.dir.joinpath(*parts)
 
-    def stage(self, name, function, *args):
+    def stage(self, name, function, *args, **kwargs):
         """Run ``function`` once; skip it when it already finished."""
         if name in self.state["done"]:
             return self.state["done"][name].get("result")
@@ -113,12 +113,13 @@ class Run:
         log(f"stage {name} starts (earlier failures: {failures})")
         start = time.time()
         try:
-            result = function(*args)
+            result = function(*args, **kwargs)
         except Exception as exc:
             if TERMINATING:
                 log(f"stage {name} interrupted by shutdown")
                 raise SystemExit(143)
             self.state["failures"][name] = failures + 1
+            exc.rft_stage_failure = True  # capped here, not as a driver crash
             self.save()
             log(f"stage {name} FAILED: {exc}")
             raise
@@ -403,8 +404,9 @@ def main():
         if TERMINATING:
             raise SystemExit(143)
         # Stage failures are capped per stage; anything else is capped here.
-        r.state["driver_crashes"] = r.state.get("driver_crashes", 0) + 1
-        if r.state["driver_crashes"] >= 2 * r.plan.get("max_failures", 3):
+        if not getattr(exc, "rft_stage_failure", False):
+            r.state["driver_crashes"] = r.state.get("driver_crashes", 0) + 1
+        if r.state.get("driver_crashes", 0) >= 2 * r.plan.get("max_failures", 3):
             r.state["halted"] = f"{now()} driver crashed {r.state['driver_crashes']} times: {exc}"
         r.save()
         raise

@@ -830,7 +830,11 @@ cleanup() {
         echo "Stopping vLLM server (PID: $VLLM_PID)..."
         if kill -0 "$VLLM_PID" 2>/dev/null; then
             kill "$VLLM_PID" 2>/dev/null || true
-            wait "$VLLM_PID" 2>/dev/null || true
+            # A server cut off mid-generation can ignore TERM; do not wait forever.
+            for _ in $(seq 1 60); do
+                kill -0 "$VLLM_PID" 2>/dev/null || break
+                sleep 1
+            done
         fi
         # vLLM's engine core and TP workers outlive the API server; single-node
         # starts them under setsid, so their process group id is VLLM_PID.
