@@ -134,3 +134,13 @@ def test_greedy_eval_settings_reach_initial_and_tool_continuation_requests():
         assert result[1] == [[2]]
     assert len(requests) == 2
     assert trainer.temperature == 1.0  # logprob scaling never divides by zero
+
+
+def test_sft_sets_distributed_timeout_before_validation_cache():
+    # cached_circuit_validation creates PartialState with NCCL's ten-minute
+    # default unless the timeout was fixed first.
+    source = (Path(__file__).resolve().parents[2] / "scripts/train/training_code.py").read_text()
+    function = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "train_with_sft")
+    body = ast.get_source_segment(source, function)
+    assert body.index("initialize_grpo_distributed(") < body.index("cached_circuit_validation(")

@@ -352,6 +352,14 @@ def train_with_sft(
         Ignored when ``resume_from`` loads an existing adapter (architecture
         comes from the checkpoint).
     """
+    if use_ddp:
+        # PartialState is shared: its first initialization fixes the actual
+        # NCCL timeout. The validation cache and TRL's main_process_first
+        # create it otherwise with the ten-minute default, while rank zero
+        # alone re-reads the skipped stream prefix.
+        from atpgllm.training.distributed_runtime import initialize_grpo_distributed
+        initialize_grpo_distributed(int(kwargs.get("ddp_timeout") or 3600))
+
     data_manifest = dataset_fingerprint = None
     if sft_circuit_validation:
         from atpgllm.training.sft_validation import (
@@ -1486,7 +1494,7 @@ def main() -> None:
     parser.add_argument("--grpo_learning_rate", type=float, default=_env("GRPO_LEARNING_RATE", 5e-6))
     parser.add_argument("--grpo_warmup_steps", type=int, default=_env("GRPO_WARMUP_STEPS", 10))
     parser.add_argument("--ddp_timeout", type=int, default=_env("DDP_TIMEOUT", 3600),
-                        help="GRPO collective timeout in seconds, including vLLM generation waits (default: 3600)")
+                        help="DDP collective timeout in seconds for SFT and GRPO, including vLLM generation waits (default: 3600)")
     parser.add_argument("--fixed_eval_size", type=int, default=_env("FIXED_EVAL_SIZE", 0),
                         help="Frozen held-out faults; 0 disables the in-training evaluation pilot.")
     parser.add_argument("--fixed_eval_split", default=_env("FIXED_EVAL_SPLIT", "test"))
