@@ -253,11 +253,24 @@ def _sft_messages_stream(
     num_workers: int,
     max_model_len: Optional[int] = None,
     vectors_as_text: bool = False,
+    skip_state: Optional[dict] = None,
 ) -> Iterator[dict]:
-    """Fused gate filter, prompt/sequence-length filters, optional skip, and SFT formatting."""
+    """Fused gate filter, prompt/sequence-length filters, optional skip, and SFT formatting.
+
+    ``skip_state`` remembers how many raw rows the skip consumed. The trainer
+    iterates the stream more than once (it peeks at the first example before
+    training), and each pass would otherwise classify the whole skipped prefix
+    again; with a remembered offset a later pass drops those raw rows unread
+    by the tokenizer and yields the same examples.
+    """
     skip_count = int(skip_count)
     batch_size = max(1, int(batch_size))
     num_workers = max(1, int(num_workers))
+    if skip_count and skip_state is not None and skip_state.get("skip_count") == skip_count:
+        print(f"[SFT] Fast-forwarding {skip_state['raw_offset']} raw row(s) to the end of the "
+              f"{skip_count} example skip.")
+        raw_iter = itertools.islice(raw_iter, skip_state["raw_offset"], None)
+        skip_count = 0
 
     skipped_valid = 0
     skip_done = skip_count == 0
@@ -283,9 +296,10 @@ def _sft_messages_stream(
         nonlocal skipped_valid, skip_done
         if not batch:
             return
+        first_raw = stats["raw"]
         stats["raw"] += len(batch)
         to_format: list[dict] = []
-        for raw, status in zip(batch, statuses):
+        for index, (raw, status) in enumerate(zip(batch, statuses)):
             if status == "gate":
                 stats["gate"] += 1
                 continue
@@ -302,6 +316,8 @@ def _sft_messages_stream(
                     skip_pbar.update(1)
                 if skipped_valid >= skip_count:
                     skip_done = True
+                    if skip_state is not None:
+                        skip_state.update(skip_count=skip_count, raw_offset=first_raw + index + 1)
                     if skip_pbar is not None:
                         skip_pbar.close()
                     print(
@@ -417,6 +433,8 @@ def _streaming_sft_messages_dataset(
             f"(batch_size={skip_batch_size}, num_workers={skip_num_workers})."
         )
 
+    skip_state: dict = {}
+
     def _generator():
         yield from _sft_messages_stream(
             iter(raw_dataset),
@@ -428,6 +446,7 @@ def _streaming_sft_messages_dataset(
             num_workers=skip_num_workers,
             max_model_len=max_model_len,
             vectors_as_text=vectors_as_text,
+            skip_state=skip_state,
         )
 
     vectors_as_text = use_tools and tool_vectors_as_text(tokenizer)

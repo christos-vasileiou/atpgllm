@@ -532,6 +532,9 @@ def train_with_sft(
         # concatenate batches from all workers on the main process, which
         # fails when sequences have different lengths.
         sft_kwargs["accelerator_config"] = {"dispatch_batches": False}
+        # Ranks build (and skip into) their streams independently before the
+        # first collective, which can take longer than the 1800 s default.
+        sft_kwargs["ddp_timeout"] = int(kwargs.get("ddp_timeout") or 3600)
 
     training_args = SFTConfig(**sft_kwargs)
 
