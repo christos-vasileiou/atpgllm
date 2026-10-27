@@ -1296,6 +1296,14 @@ class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
                     (agg_tool_failure_count / agg_tool_call_count).item() if agg_tool_call_count > 0 else 0.0
                 )
                 self._metrics[mode]["tools/failure_frequency"].append(failure_frequency)
+                # Totals over ranks (each rank runs the tool loop on its own slice).
+                agg_tool_reused_count = self.accelerator.gather(
+                    torch.tensor(getattr(self, "_tool_reused_count", 0), device=device)).sum()
+                if agg_tool_call_count > 0:
+                    self._metrics[mode]["tools/call_count"].append(agg_tool_call_count.item())
+                    self._metrics[mode]["tools/failure_count"].append(agg_tool_failure_count.item())
+                    self._metrics[mode]["tools/reused_count"].append(agg_tool_reused_count.item())
+                    self._metrics[mode]["tools/failure_rate"].append(failure_frequency)
 
             generation_elapsed = time.perf_counter() - generation_start_time
             if generation_elapsed > 0 and total_completion_tokens.item() > 0:
@@ -1611,15 +1619,9 @@ class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
                 tool_calls = new_tool_calls_filtered
             
             # Log tool call metrics
-        mode = "train" if self.model.training else "eval"
-        if tool_call_count > 0:
-            self._metrics[mode]["tools/call_count"].append(tool_call_count)
-            self._metrics[mode]["tools/failure_count"].append(tool_failure_count)
-            # Repeated calls answered from an earlier observation, not simulated.
-            self._metrics[mode]["tools/reused_count"].append(scheduler.reused)
-            self._metrics[mode]["tools/failure_rate"].append(
-                tool_failure_count / tool_call_count if tool_call_count > 0 else 0.0
-            )
+        # Repeated calls answered from an earlier observation, not simulated.
+        # The counts are this rank's; _generate logs them summed over ranks.
+        self._tool_reused_count = scheduler.reused
 
         # Ensure tool_mask, logprobs, and completion_ids all have identical lengths per sequence.
         # Mismatches cause shape errors when these are padded into tensors downstream.

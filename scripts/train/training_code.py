@@ -1287,6 +1287,45 @@ def _code_provenance() -> dict:
             "dp_root": str(DATA_PREPROCESSING)}
 
 
+def _wandb_run_identity(output_dir: str, resume_training_state: bool) -> tuple[str, str]:
+    """``(run id, resume mode)`` for this job's single W&B run (call on rank 0 only).
+
+    The id is kept in ``<output_dir>/wandb_run_id``. A launch that resumes the
+    training state continues that run, so a restart after a reboot extends the
+    same curves; any other launch (a fresh start, or new weights from another
+    run's checkpoint) gets a new id.
+    """
+    path = Path(output_dir) / "wandb_run_id"
+    if resume_training_state and path.is_file() and path.read_text().strip():
+        return path.read_text().strip(), "allow"
+    run_id = wandb.util.generate_id()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(run_id + "\n")
+    return run_id, "allow"
+
+
+def _init_wandb(method: str, args_dict: dict, run_config: dict, default_name: str):
+    """Start this job's single W&B run.
+
+    Only global rank 0 reports. The trainers reduce their metrics across ranks
+    before logging, and the HF WandbCallback logs from rank 0 only, so the
+    other ranks get a disabled run (every wandb call on them is a no-op)
+    instead of a run of their own.
+    """
+    reporting = int(os.environ.get("RANK", "0")) == 0
+    run_id, resume = (_wandb_run_identity(args_dict["output_dir"], args_dict.get("resume_training_state"))
+                      if reporting else (None, None))
+    return wandb.init(
+        project=os.environ.get("WANDB_PROJECT", f"{method}-training"),
+        config=run_config,
+        name=os.environ.get("WANDB_NAME") or default_name,
+        id=run_id,
+        resume=resume,
+        mode=None if reporting else "disabled",
+        settings=wandb.Settings(console="wrap"),  # Forces capture of Python stdout/stderr
+    )
+
+
 def _record_code_provenance(output_dir: str, provenance: dict) -> None:
     """Append this launch's code provenance to <output_dir>/code_provenance.jsonl (rank 0 only)."""
     if os.environ.get("RANK", "0") != "0":
@@ -1629,12 +1668,7 @@ def main() -> None:
     run_config = _wandb_run_config(method, args_dict, code_provenance, launch_config)
 
     # 2. Initialize wandb explicitly to capture everything from this point forward
-    wandb.init(
-        project=os.environ.get("WANDB_PROJECT", f"{method}-training"),
-        config=run_config,
-        name=wandb_name,
-        settings=wandb.Settings(console="wrap") # Forces capture of Python stdout/stderr
-    )
+    _init_wandb(method, args_dict, run_config, wandb_name)
     # Transformers rewrites eval_fixed/* to eval/fixed/* for W&B. Use the
     # restored optimizer step, not W&B's per-process/profiling event counter.
     wandb.define_metric("eval/fixed/global_step")

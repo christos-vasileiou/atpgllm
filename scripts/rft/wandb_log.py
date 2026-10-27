@@ -244,6 +244,8 @@ def sync(run, run_dir, logged, tails, completions):
     import wandb
     state = read_json(run_dir / "state.json", {})
     plan = read_json(run_dir / "plan.json", {})
+    if plan and not run.config.get("plan"):  # the logger may start before the driver copies the plan
+        run.config.update({"plan": plan}, allow_val_change=True)
     done, results = state.get("done", {}), state.get("results", {})
     durations, sft_steps = state.get("durations", {}), state.get("sft_steps", {})
 

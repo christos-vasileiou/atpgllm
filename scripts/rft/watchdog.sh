@@ -46,9 +46,13 @@ status=""
 if [ -f "$RUN_DIR/state.json" ]; then
     status="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print("finished" if s.get("finished") else "halted" if s.get("halted") else "")' "$RUN_DIR/state.json")"
 fi
-# The W&B mirror (RFT_WANDB=0 turns it off) runs beside the driver and stops
-# by itself after a final sync once the run finishes or halts.
-if [ -z "$status" ] && [ "${RFT_WANDB:-1}" != 0 ] && [ -d "$RUN_DIR/logs" ] \
+mkdir -p "$RUN_DIR/logs"
+chgrp trela "$RUN_DIR" "$RUN_DIR/logs" 2>/dev/null
+chmod g+s "$RUN_DIR" "$RUN_DIR/logs" 2>/dev/null
+# The W&B mirror (RFT_WANDB=0 turns it off) runs beside the driver, starting
+# in the same pass as a fresh driver, and stops by itself after a final sync
+# once the run finishes or halts.
+if [ -z "$status" ] && [ "${RFT_WANDB:-1}" != 0 ] \
         && ! alive "$RUN_DIR/wandb_logger.pid" wandb_log.py; then
     say "starting the W&B logger (log $RUN_DIR/logs/wandb_log.log)"
     "$REPO/scripts/rft/start_logger.sh" "$RUN_DIR" "$RUN_DIR/logs/wandb_log.log" "$VENV"
@@ -58,9 +62,6 @@ if alive "$RUN_DIR/driver.pid" run_rft.py || [ -n "$status" ]; then
 fi
 
 stamp="$(date +%Y%m%d_%H%M)"
-mkdir -p "$RUN_DIR/logs"
-chgrp trela "$RUN_DIR" "$RUN_DIR/logs" 2>/dev/null
-chmod g+s "$RUN_DIR" "$RUN_DIR/logs" 2>/dev/null
 driver_log="$RUN_DIR/logs/driver_$stamp.log"
 say "starting the driver (log $driver_log)"
 cmd="bash -ic '$REPO/scripts/rft/start_driver.sh $PLAN $driver_log $VENV' </dev/null; exec bash"
