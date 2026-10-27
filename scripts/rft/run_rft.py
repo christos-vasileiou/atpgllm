@@ -10,7 +10,9 @@ TetraMAX verifies, fine tunes, and evaluates:
    earlier rounds.
 2. ``generate``: ``num_samples`` unhinted attempts per problem on every GPU
    (``rationalize.py --escalate``). Problems all of them fail get hinted
-   attempts, the least revealing hint (path) first, then partial.
+   attempts, the least revealing hint (path) first, then partial. With
+   ``sample.max_hours`` the problems go in chunks of ``batch_problems`` and
+   no chunk starts after that many hours, so ``per_level`` is an upper bound.
 3. ``build``: per problem, unhinted successes when there are any, otherwise
    rationalizations with the hint removed (``build_sft.py``).
 4. ``sft``: ``epochs`` passes over those examples as ``extra_fraction`` of an
@@ -240,6 +242,12 @@ def generate(r, n, adapter):
     plan, sample = r.plan, r.plan["sample"]
     out = r.path(f"round_{n}", "gen")
     wait_for_free_gpus(plan)
+    # The deadline is fixed when the stage first starts, so a restart keeps it.
+    deadline = []
+    if sample.get("max_hours"):
+        at = r.state.setdefault("generate_deadline", {}).setdefault(str(n), time.time() + sample["max_hours"] * 3600)
+        r.save()
+        deadline = ["--chunk_problems", sample["batch_problems"], "--deadline", at]
     run(["bash", "scripts/rft/with_tetramax.sh", PYTHON, "scripts/rft/fanout.py", "--gpus", gpu_list(plan),
          "--log_dir", out / "logs", "--", PYTHON, "scripts/star/rationalize.py", "--adapter", adapter,
          "--dataset", plan["dataset"], "--problems_file", r.path(f"round_{n}", "problems.parquet"),
@@ -247,7 +255,7 @@ def generate(r, n, adapter):
          "--seed", plan["seed"] + n, "--temperature", sample["temperature"],
          "--max_tool_rounds", sample["max_tool_rounds"], "--max_model_len", sample["max_model_len"],
          "--max_generated_tokens", sample["max_generated_tokens"],
-         "--batch_problems", sample["batch_problems"], "--out", out,
+         "--batch_problems", sample["batch_problems"], "--out", out, *deadline,
          "--shard", "{shard}", "--num_shards", "{num_shards}"],
         r.path("logs", f"round_{n}_generate.log"), env={"PYTHONPATH": str(REPO)})
     return str(out)

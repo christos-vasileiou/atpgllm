@@ -1,15 +1,20 @@
 {
- "_comment": "RFT rounds with STaR rationalization on eng-tamale3 (4x A100 40GB), then GDPO from the best round. See scripts/rft/run_rft.py.",
+ "_comment": "RFT rounds with STaR rationalization on eng-tamale3 (4x A100 40GB), then GDPO from the best round. See scripts/rft/run_rft.py. Sizing (2026-10-26): v4 SFT here takes ~35 min per step at GA 256 x 4 GPUs, so SFT is capped at 30 steps (~18 h); generation stops starting chunks after sample.max_hours, so per_level is an upper bound.",
  "run_dir": "runs/rft_v4_a100",
  "start_adapter": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/sft_granite_4.2_8b_v4/checkpoint-250",
  "dataset": "../data/freeset/dataset.freeset.asap7sc7p5t_28.rvt.tt.v4",
- "gpus": [0, 1, 2, 3],
+ "gpus": [
+  0,
+  1,
+  2,
+  3
+ ],
  "seed": 2026,
  "rounds": 4,
  "deadline_hours": 160,
  "round_hours_estimate": 30,
  "max_failures": 3,
- "per_level": "easy=400,medium=600,hard=800,very_hard=800,random_never_detects=800",
+ "per_level": "easy=1000,medium=1500,hard=2000,very_hard=2000,random_never_detects=2000",
  "sample": {
   "num_samples": 8,
   "hint_modes": "none,path,partial",
@@ -17,18 +22,22 @@
   "max_tool_rounds": 4,
   "max_model_len": 14336,
   "max_generated_tokens": 12288,
-  "batch_problems": 64
+  "batch_problems": 64,
+  "max_hours": 10
  },
- "build": {"max_per_problem": 2, "min_examples": 50},
+ "build": {
+  "max_per_problem": 2,
+  "min_examples": 50
+ },
  "sft": {
   "conf": "scripts/train/configs/sft_granite_4.2_8b_v4_rft.conf",
   "gpus": 4,
   "gradient_accumulation_steps": 256,
   "epochs": 2,
   "extra_fraction": 0.5,
-  "learning_rate": 2e-5,
+  "learning_rate": 2e-05,
   "min_steps": 10,
-  "max_steps": 60,
+  "max_steps": 30,
   "max_model_len": 14336,
   "circuit_validation": true
  },

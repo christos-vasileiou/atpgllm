@@ -129,3 +129,17 @@ def test_rationalization_job_path_writes_judged_slots_and_sft_examples(tmp_path,
                         slot["vector"], slot["reward_components"], slot["facts"]))
         return sorted(out, key=json.dumps)
     assert comparable(OUT / "threaded.jsonl") == comparable(OUT / "slots.jsonl")
+
+    # In chunks, every mode finishes on one problem before the next starts,
+    # and the result is the same set of slots.
+    with open(OUT / "chunked.jsonl", "w") as sink:
+        assert R.sample_and_write(strategy, problems, ["none", "partial"], tok, sink, seed=1729,
+                                  batch_problems=64, chunk_problems=1)
+    order = [(json.loads(line)["problem"], json.loads(line)["hint_mode"]) for line in open(OUT / "chunked.jsonl")]
+    assert [mode for _, mode in order] == ["none", "none", "partial", "partial"] * 2
+    assert comparable(OUT / "chunked.jsonl") == comparable(OUT / "slots.jsonl")
+    # A passed deadline starts no chunk.
+    with open(OUT / "late.jsonl", "w") as sink:
+        assert not R.sample_and_write(strategy, problems, ["none", "partial"], tok, sink, seed=1729,
+                                      batch_problems=64, chunk_problems=1, deadline=0)
+    assert (OUT / "late.jsonl").read_text() == ""

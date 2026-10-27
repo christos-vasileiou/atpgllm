@@ -17,13 +17,16 @@ With ``--escalate`` a hint mode is tried only on problems that every earlier
 mode failed, which is how STaR uses rationalization. ``--write_problems``
 stores the selection (CPU only) so several ``--shard`` processes, one per GPU,
 can share it through ``--problems_file``. A rerun into the same ``--out``
-continues where the last one stopped.
+continues where the last one stopped. ``--chunk_problems`` with ``--deadline``
+bounds the wall time: every mode finishes on a chunk before the next one, and
+no chunk starts after the deadline.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from collections import Counter
@@ -158,17 +161,33 @@ def load_progress(path, num_samples):
 
 
 def sample_and_write(strategy, problems, modes, tokenizer, sink, *, seed, batch_problems,
-                     escalate=False, done=(), solved=()):
+                     escalate=False, done=(), solved=(), chunk_problems=None, deadline=None):
     """Attempt every ``(row, record, clean prompt)`` problem under each hint mode
     and append one JSON line per completion slot to ``sink``.
 
     ``done`` holds (problem, mode) pairs already written; with ``escalate`` a
     mode after the first skips problems in ``solved`` or solved by an earlier
     mode. A hinted mode skips problems for which it has no hint.
+
+    With ``chunk_problems`` the problems are taken that many at a time, and
+    every mode finishes on a chunk before the next chunk starts, so hinted
+    attempts keep pace with unhinted ones. No chunk starts after ``deadline``
+    (seconds since the epoch). Returns False when the deadline cut it short.
     """
+    done, solved = set(done), set(solved)
+    size = chunk_problems or len(problems) or 1
+    for start in range(0, len(problems), size):
+        if deadline is not None and time.time() >= deadline:
+            print(f"[star] deadline reached after {start} of {len(problems)} problems", flush=True)
+            return False
+        _sample_modes(strategy, problems[start:start + size], modes, tokenizer, sink, seed=seed,
+                      batch_problems=batch_problems, escalate=escalate, done=done, solved=solved)
+    return True
+
+
+def _sample_modes(strategy, problems, modes, tokenizer, sink, *, seed, batch_problems, escalate, done, solved):
     from atpgllm.training.rationalization import hint_bits, hint_text, hinted_messages, judge, problem_key
     from atpgllm.training.tools import TOOLS
-    done, solved = set(done), set(solved)
     for index, mode in enumerate(modes):
         todo = []
         for problem in problems:
@@ -280,6 +299,10 @@ def main():
     parser.add_argument("--max_model_len", type=int, default=32768)
     parser.add_argument("--max_generated_tokens", type=int, default=24576)
     parser.add_argument("--batch_problems", type=int, default=64)
+    parser.add_argument("--chunk_problems", type=int, default=None,
+                        help="Finish every hint mode on this many problems before taking more")
+    parser.add_argument("--deadline", type=float, default=None,
+                        help="Start no chunk after this time (seconds since the epoch)")
     parser.add_argument("--tool_workers", type=int, default=16,
                         help="Concurrent TetraMAX simulations (tool calls and final answers)")
     parser.add_argument("--tp_size", type=int, default=1)
@@ -335,6 +358,9 @@ def main():
     if args.select_only:
         return
     problems = problems[args.shard::args.num_shards]
+    if args.deadline is not None:
+        # A deadline may cut the list short; mix the levels so the cut is even.
+        random.Random(args.seed + args.shard).shuffle(problems)
     name = "slots.jsonl" if args.num_shards == 1 else f"slots.shard{args.shard}.jsonl"
     done, solved = load_progress(out / name, args.num_samples)
 
@@ -351,10 +377,11 @@ def main():
             indent=1, default=str))
 
     with open(out / name, "a") as sink:
-        sample_and_write(strategy, problems, modes, tokenizer, sink, seed=args.seed,
-                         batch_problems=args.batch_problems, escalate=args.escalate,
-                         done=done, solved=solved)
-    (out / f"{name}.done").write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"))
+        complete = sample_and_write(strategy, problems, modes, tokenizer, sink, seed=args.seed,
+                                    batch_problems=args.batch_problems, escalate=args.escalate,
+                                    done=done, solved=solved, chunk_problems=args.chunk_problems,
+                                    deadline=args.deadline)
+    (out / f"{name}.done").write_text(time.strftime("%Y-%m-%d %H:%M:%S") + ("" if complete else " deadline") + "\n")
 
 
 if __name__ == "__main__":
