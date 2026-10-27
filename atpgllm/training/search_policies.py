@@ -48,7 +48,7 @@ class SamplingStrategy:
 
     def __init__(self, generator, verifier, num_completions=1, *, budget=1, width=None,
                  use_tools=True, max_tool_rounds=1, seed=42, threshold_mode="fault_detected",
-                 search_config=None):
+                 search_config=None, tool_workers=1):
         if num_completions < 1 or (width if width is not None else budget) < 1:
             raise ValueError("num_completions and search budget must be positive")
         accepted({}, threshold_mode)
@@ -59,7 +59,7 @@ class SamplingStrategy:
         self.config = SearchConfig.load(search_config)
         self.runner = CompletionRunner(generator, verifier,
             max_tool_rounds=max_tool_rounds if use_tools else 0,
-            temperature=generator.temperature, top_p=generator.top_p)
+            temperature=generator.temperature, top_p=generator.top_p, tool_workers=tool_workers)
 
     def plan(self, slot):
         return slot.initial, self.gen.temperature, "seed", None
@@ -154,7 +154,13 @@ class SamplingStrategy:
                     plans[index] = ("mcts", child)
                 jobs = [(s, *job[1:]) for s, job in zip(states, jobs)]
             results = self.runner.complete_many(jobs)
-            for slot, (state, checkpoints), (operator, parent), job in zip(active, results, plans, jobs):
+            # Final answers are simulated concurrently (see CompletionRunner.map).
+            # MCTS keeps the serial path because it skips some duplicates.
+            scored = None if self.name == "mcts" else self.runner.map(
+                lambda item: self.verifier.score_state(item[0].problem, item[1][0], item[0].context),
+                zip(active, results))
+            for index, (slot, (state, checkpoints), (operator, parent), job) in enumerate(
+                    zip(active, results, plans, jobs)):
                 if self.name == "mcts" and job[0].status == "READY" and job[0].observations:
                     checkpoints = (job[0],) + checkpoints
                 if self.name == "mcts" and parent.closed and parent.candidate is not None:
@@ -162,7 +168,8 @@ class SamplingStrategy:
                     # independent observation of the same terminal outcome.
                     self._record(slot, parent.candidate, None)
                     continue
-                score, vector = self.verifier.score_state(slot.problem, state, slot.context)
+                score, vector = (scored[index] if scored is not None
+                                 else self.verifier.score_state(slot.problem, state, slot.context))
                 candidate = Candidate(state, score, vector, checkpoints, operator)
                 if self.name == "mcts" and parent.closed:
                     parent.candidate = candidate

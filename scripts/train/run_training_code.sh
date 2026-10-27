@@ -64,6 +64,10 @@ _TRAIN_PY="$_SCRIPT_DIR/training_code.py"
 _LAUNCH_CONFIG_DIR="$_REPO_ROOT/jobs/launch_configs"
 mkdir -p "$_LAUNCH_CONFIG_DIR" "$_LAUNCH_CONFIG_DIR/snapshots" "$_REPO_ROOT/jobs" "$_REPO_ROOT/runs"
 cd "$_REPO_ROOT"
+# Import atpgllm from this checkout, not from wherever the environment's
+# editable install points (on juno, an older tree). Exported, so DDP ranks and
+# the srun steps on other nodes inherit it.
+export PYTHONPATH="$_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # Slurm logs relative to repo root
 export SLURM_LOG_FILE="${SLURM_LOG_FILE:-jobs/training_${SLURM_JOB_ID:-local}.out}"
 export SLURM_ERROR_FILE="${SLURM_ERROR_FILE:-jobs/training_${SLURM_JOB_ID:-local}.err}"
@@ -127,7 +131,37 @@ export TMAX_MAX_CONCURRENT TMAX_TIMEOUT_S TMAX_ACQUIRE_TIMEOUT_S
 export TMAX_RESULT_CACHE_SIZE TMAX_REWARD_PROFILE TMAX_KEEP_ARTIFACTS TMAX_PIPELINED_TOOLS
 export TMAX_RESUME_FINGERPRINT_TRANSITION
 
+# PYTHON_VENV selects another environment; _mn_launch.sh activates the same one
+# on every node.
+if [ -n "${PYTHON_VENV:-}" ]; then
+    # shellcheck source=/dev/null
+    source "$PYTHON_VENV/bin/activate" || { echo "ERROR: cannot activate PYTHON_VENV=$PYTHON_VENV"; exit 1; }
+    export PYTHON_VENV
+    echo "Python Path (PYTHON_VENV): $(which python)"
+fi
+# Cross-node fabric (on juno: NCCL_SOCKET_IFNAME=ib0, NCCL_IB_HCA=mlx5_0), a
+# pre-filled model cache (HF_HOME on /work, HF_HUB_OFFLINE=1) and offline W&B
+# for compute nodes without internet. Only exported values reach the srun steps
+# on the other nodes.
+# VLLM_GROUP_PORT pins the trainer-to-vLLM weight-sync port (TRL default 51216).
+for _nccl_var in NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_DEBUG GLOO_SOCKET_IFNAME HF_HOME HF_HUB_OFFLINE WANDB_MODE VLLM_GROUP_PORT; do
+    [ -n "${!_nccl_var:-}" ] && export "$_nccl_var"
+done
+
 METHOD=${METHOD:-sft}
+
+# A requeued job (preemption, node failure) continues from its own latest
+# checkpoint instead of restarting from the configured start point and
+# overwriting OUTPUT_DIR. Set RESUME_ON_REQUEUE=False to opt out.
+if [ "${SLURM_RESTART_COUNT:-0}" -gt 0 ] && [ "${RESUME_ON_REQUEUE:-True}" = "True" ] && [ -n "${OUTPUT_DIR:-}" ]; then
+    if _requeue_ckpt="$(python "$_REPO_ROOT/atpgllm/training/checkpoints.py" "$OUTPUT_DIR" 2>/dev/null)"; then
+        RESUME_FROM=latest
+        RESUME_TRAINING_STATE=True
+        echo "Requeue #$SLURM_RESTART_COUNT: resuming from $_requeue_ckpt"
+    else
+        echo "Requeue #$SLURM_RESTART_COUNT: no checkpoint under $OUTPUT_DIR yet; starting from the config."
+    fi
+fi
 
 # Resolve RESUME_FROM=latest -> most recently completed resumable checkpoint.
 # Must run before validate_grpo_resume and the W&B launch snapshot.
@@ -267,16 +301,18 @@ write_launch_config_snapshot() {
         PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS MAX_STEPS REPORT_TO
         MAX_MODEL_LEN MAX_PROMPT_LENGTH MAX_COMPLETION_LENGTH
         SFT_CIRCUIT_VALIDATION SFT_EVAL_STEPS SFT_EVAL_PER_CIRCUIT
+        SFT_LEARNING_RATE SFT_EXTRA_MESSAGES SFT_EXTRA_FRACTION
         ASSISTANT_ONLY_LOSS BUFFER_SIZE BUFFER_ROLLING SAVE_TOTAL_LIMIT NUM_GENERATIONS TRAIN_BEST_OF_N STEPS_PER_GENERATION
         NETLIST_DIVERSITY_STRATEGY DISABLE_DROPOUT VLLM_IMPORTANCE_SAMPLING_MODE
         DDP_TIMEOUT
         GRPO_LEARNING_RATE GRPO_WARMUP_STEPS FIXED_EVAL_SIZE FIXED_EVAL_SPLIT
         FIXED_EVAL_MANIFEST FIXED_EVAL_SEED FIXED_EVAL_STEPS
-        FIXED_EVAL_GENERATIONS FIXED_EVAL_BATCH_SIZE
+        FIXED_EVAL_GENERATIONS FIXED_EVAL_BATCH_SIZE KEEP_BEST_CHECKPOINTS DIFFICULTY_WEIGHTS
         USE_DUAL_ADAPTER USE_DDP DEEPSPEED_CONFIG USE_VLLM VLLM_MODE PORT
         TENSOR_PARALLEL_SIZE DATA_PARALLEL_SIZE VLLM_GPU_MEM_UTIL
         PARTITION NODELIST NUM_NODES GPUS_PER_NODE CPUS_PER_TASK MEM
         LORA_RANK LORA_ALPHA LORA_TARGET_MODULES QWEN_MOE TUNE_MOE_ROUTER MOE_MAX_MEMORY_GIB
+        PYTHON_VENV RESUME_ON_REQUEUE NCCL_SOCKET_IFNAME NCCL_IB_HCA HF_HOME HF_HUB_OFFLINE WANDB_MODE
         FAULT_SIM_BACKEND TMAX_SERVER_FILE TMAX_SERVER_URL TMAX_MAX_CONCURRENT
         TMAX_TIMEOUT_S TMAX_ACQUIRE_TIMEOUT_S TMAX_RESULT_CACHE_SIZE TMAX_REWARD_PROFILE TMAX_PIPELINED_TOOLS
         TMAX_RESUME_FINGERPRINT_TRANSITION
@@ -437,6 +473,12 @@ build_cmd_args() {
     if [ "$METHOD" == "sft" ] && [ -n "${SAVE_TOTAL_LIMIT:-}" ]; then
         CMD_ARGS+=(--save_total_limit "$SAVE_TOTAL_LIMIT")
     fi
+    if [ "$METHOD" == "sft" ] && [ -n "${SFT_LEARNING_RATE:-}" ]; then
+        CMD_ARGS+=(--sft_learning_rate "$SFT_LEARNING_RATE")
+    fi
+    if [ "$METHOD" == "sft" ] && [ -n "${SFT_EXTRA_MESSAGES:-}" ]; then
+        CMD_ARGS+=(--sft_extra_messages "$SFT_EXTRA_MESSAGES" --sft_extra_fraction "${SFT_EXTRA_FRACTION:-0.5}")
+    fi
 
     # SFT only: assistant-only loss (mask system/user/tool-response tokens)
     if [ "$METHOD" == "sft" ]; then
@@ -496,9 +538,15 @@ build_cmd_args() {
             if [ -n "${FIXED_EVAL_MANIFEST:-}" ]; then
                 CMD_ARGS+=(--fixed_eval_manifest "$FIXED_EVAL_MANIFEST")
             fi
+            if [ -n "${KEEP_BEST_CHECKPOINTS:-}" ]; then
+                CMD_ARGS+=(--keep_best_checkpoints "$KEEP_BEST_CHECKPOINTS")
+            fi
         fi
         if [[ "${BUFFER_ROLLING:-False}" =~ ^([Tt]rue|1)$ ]]; then
             CMD_ARGS+=(--buffer_rolling)
+        fi
+        if [ -n "${DIFFICULTY_WEIGHTS:-}" ]; then
+            CMD_ARGS+=(--difficulty_weights "$DIFFICULTY_WEIGHTS")
         fi
         if [ "${DISABLE_DROPOUT:-True}" == "False" ]; then
             CMD_ARGS+=(--no-disable_dropout)
@@ -575,8 +623,10 @@ build_cmd_args() {
 # --main_process_ip and for the vLLM server URL.
 resolve_ip() {
     local host="$1" ip=""
-    ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1; exit}')
-    [ -z "$ip" ] && ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
+    # Prefer IPv4: on juno a node resolves its own name to an IPv6 link-local
+    # address (fe80::...), which has no zone and cannot be a rendezvous address.
+    ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '$1 !~ /^127\./ {print $1; exit}')
+    [ -z "$ip" ] && ip=$(getent hosts "$host" 2>/dev/null | awk '$1 !~ /^(127\.|::1|fe80:)/ {print $1; exit}')
     echo "${ip:-$host}"
 }
 
@@ -780,7 +830,11 @@ cleanup() {
         echo "Stopping vLLM server (PID: $VLLM_PID)..."
         if kill -0 "$VLLM_PID" 2>/dev/null; then
             kill "$VLLM_PID" 2>/dev/null || true
-            wait "$VLLM_PID" 2>/dev/null || true
+            # A server cut off mid-generation can ignore TERM; do not wait forever.
+            for _ in $(seq 1 60); do
+                kill -0 "$VLLM_PID" 2>/dev/null || break
+                sleep 1
+            done
         fi
         # vLLM's engine core and TP workers outlive the API server; single-node
         # starts them under setsid, so their process group id is VLLM_PID.

@@ -714,6 +714,39 @@ class TrainingStateCheckpointCallback(TrainerCallback):
             )
 
 
+class BestCheckpointRetentionCallback(TrainerCallback):
+    """Keep the ``keep`` best checkpoints by fixed evaluation, plus the latest.
+
+    Ranking is ``eval_fixed/detection``, then the total reward on the same
+    evaluation, then the later step (``checkpoints.rank_checkpoints``). Register
+    it after TrainingStateCheckpointCallback so the new checkpoint is already
+    marked resumable. The current ranking is written to
+    ``<output_dir>/best_checkpoints.json``.
+    """
+
+    def __init__(self, keep: int):
+        if isinstance(keep, bool) or not isinstance(keep, int) or keep < 1:
+            raise ValueError("keep must be a positive integer")
+        self.keep = keep
+
+    def on_save(self, args, state, control, **kwargs):
+        if (torch.distributed.is_available() and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() != 0):
+            return
+        import shutil
+        from atpgllm.training.checkpoints import rank_checkpoints
+        from atpgllm.training.fixed_eval import write_json_atomic
+
+        ranking, prune = rank_checkpoints(args.output_dir, state.log_history, self.keep)
+        for directory in prune:
+            shutil.rmtree(directory)
+            print(f"[BestCheckpointRetention] Deleted {directory.name} (outside the best {self.keep})")
+        if ranking:
+            write_json_atomic(os.path.join(args.output_dir, "best_checkpoints.json"),
+                              {"keep": self.keep, "global_step": state.global_step,
+                               "ranking": ranking})
+
+
 def _read_skip_summary_int(checkpoint_dir: str, key: str) -> Optional[int]:
     """Internal: read a non-negative integer field from ``training_state_summary.json``.
 

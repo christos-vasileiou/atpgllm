@@ -10,7 +10,9 @@ positions at a time and only the shards that block touches.
 GRPOTrainer needs. It holds ``chunk_size`` prompts at a time and loads the
 next chunk when training reaches it. A ledger records where each chunk starts
 in the permutation and a digest of its rows, so an interrupted run rebuilds
-the exact chunk it stopped in and continues from there.
+the exact chunk it stopped in and continues from there. An optional
+``keep_probability`` thins the order row by row (for example, to sample harder
+faults more often) with a draw that is also fixed by seed, pass and position.
 """
 from __future__ import annotations
 
@@ -24,10 +26,44 @@ from typing import Callable, Iterator, Optional
 import numpy as np
 
 LEDGER_NAME = "grpo_stream_ledger.json"
+# The v4 ``difficulty`` labels, from p = chance that one uniform random vector
+# detects the fault: easy p >= 1/4, medium >= 1/16, hard >= 1/256, very_hard > 0,
+# random_never_detects when no random vector detected it.
+DIFFICULTY_LEVELS = ("easy", "medium", "hard", "very_hard", "random_never_detects")
 
 
 def _digest(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def parse_difficulty_weights(spec: str) -> dict:
+    """``"easy=1,medium=2,..."`` -> ``{level: weight}``, one positive weight per v4 level."""
+    weights = {}
+    for item in filter(None, (part.strip() for part in spec.split(","))):
+        level, _, value = item.partition("=")
+        level = level.strip()
+        if level not in DIFFICULTY_LEVELS or level in weights:
+            raise ValueError(f"Unknown or repeated difficulty level {level!r} in {spec!r}")
+        weights[level] = float(value)
+        if not weights[level] > 0:
+            raise ValueError(f"Difficulty weight for {level} must be positive: {value!r}")
+    missing = [level for level in DIFFICULTY_LEVELS if level not in weights]
+    if missing:
+        raise ValueError(f"Difficulty weights need every level; missing {', '.join(missing)}")
+    return weights
+
+
+def difficulty_keep_probability(weights: dict) -> Callable[[dict], float]:
+    """Keep probability per row: its level's weight over the largest weight."""
+    top = max(weights.values())
+
+    def keep(row):
+        level = row.get("difficulty")
+        if level not in weights:
+            raise ValueError(f"Row difficulty {level!r} has no sampling weight")
+        return weights[level] / top
+
+    return keep
 
 
 class ShardPermutation:
@@ -60,12 +96,20 @@ class ShardPermutation:
         self.starts = np.concatenate([[0], np.cumsum(counts)])
         self.total = int(self.starts[-1])
         self._order = (None, None)
+        self._uniform = (None, None)
 
     def order(self, pass_index: int) -> np.ndarray:
         if self._order[0] != pass_index:
             rng = np.random.default_rng([self.seed, int(pass_index)])
             self._order = (pass_index, rng.permutation(self.total))
         return self._order[1]
+
+    def uniform(self, pass_index: int) -> np.ndarray:
+        """One U[0, 1) draw per permutation position of a pass, independent of the order."""
+        if self._uniform[0] != pass_index:
+            rng = np.random.default_rng([self.seed, int(pass_index), 0x5EED])
+            self._uniform = (pass_index, rng.random(self.total))
+        return self._uniform[1]
 
     def rows(self, pass_index: int, start: int, stop: int) -> Iterator[tuple[int, dict]]:
         """``(position, row)`` for permutation positions ``start <= p < stop`` of one pass."""
@@ -119,6 +163,10 @@ class RollingPromptBuffer:
     boundary. ``prepare`` turns a block of raw rows into training rows (format,
     filters, holdout), returning ``None`` for each row it drops; prompts
     repeated within a chunk are dropped too. Each chunk is reordered for netlist diversity.
+    With ``keep_probability``, the row at a position is read only when that
+    position's draw (:meth:`ShardPermutation.uniform`) is below the row's keep
+    probability, so relative sampling weights hold and the chunk stays a pure
+    function of its start.
 
     The ledger (``<output_dir>/grpo_stream_ledger.json``, also copied into
     every checkpoint) records each chunk's start and end positions and the
@@ -131,7 +179,8 @@ class RollingPromptBuffer:
                  chunk_size: int, length: int, ledger_path, settings: dict,
                  reorder: Optional[Callable[[list, int], list]] = None,
                  unique_by: str = "prompt", writer: bool = True, resume_ledger=None,
-                 read_block: int = 4096):
+                 read_block: int = 4096,
+                 keep_probability: Optional[Callable[[dict], float]] = None):
         if chunk_size < 1 or length < chunk_size:
             raise ValueError("RollingPromptBuffer needs chunk_size >= 1 and length >= chunk_size")
         self.source = source
@@ -143,6 +192,7 @@ class RollingPromptBuffer:
         self.unique_by = unique_by
         self.writer = writer
         self.read_block = int(read_block)
+        self.keep_probability = keep_probability
         self.settings = dict(settings, chunk_size=self.chunk_size, seed=source.seed,
                              rows_in_split=source.total)
         self.ledger = {"settings": self.settings, "chunks": {}}
@@ -203,10 +253,13 @@ class RollingPromptBuffer:
                 pass_index, position = pass_index + 1, 0
                 print(f"[GRPO buffer] Split exhausted; starting pass {pass_index} in a new order")
             block = list(self.source.rows(pass_index, position, position + self.read_block))
+            position = block[-1][0] + 1
+            if self.keep_probability is not None:
+                draws = self.source.uniform(pass_index)
+                block = [(p, row) for p, row in block if draws[p] < self.keep_probability(row)]
             prepared = self.prepare([row for _, row in block])
             if len(prepared) != len(block):
                 raise ValueError("prepare must return one entry (or None) per raw row")
-            position = block[-1][0] + 1
             for (p, _), row in zip(block, prepared):
                 if row is None:
                     continue
