@@ -12,12 +12,14 @@
 # terminal (TetraMAX on PATH, its license, HF_HOME, LD_LIBRARY_PATH), under
 # sg trela so new files belong to group trela.
 set -uo pipefail
+# cron's umask would hide new run directories from the group.
+umask 002
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PLAN="${RFT_PLAN:-$REPO/scripts/rft/configs/rft_v4_a100.json}"
 SESSION="${RFT_TMUX_SESSION:-rft_v4}"
 VENV="${RFT_VENV:-/proj/trela/christos/myenv}"
 LOG="$HOME/.rft_watchdog.log"
-say() { echo "[watchdog $(date '+%F %T')] $*" >> "$LOG"; }
+say() { echo "[watchdog $(date '+%F %T')] $*" >> "$LOG"; chgrp trela "$LOG" 2>/dev/null; }
 
 if [ "${1:-}" = "boot" ]; then
     # NFS and the NVIDIA driver can come up after cron starts.
@@ -34,6 +36,7 @@ RUN_DIR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_
 case "$RUN_DIR" in /*) ;; *) RUN_DIR="$REPO/$RUN_DIR" ;; esac
 
 exec 9>"$HOME/.rft_watchdog.lock"
+chgrp trela "$HOME/.rft_watchdog.lock" 2>/dev/null
 flock -n 9 || exit 0
 
 if [ -f "$RUN_DIR/driver.pid" ]; then
@@ -51,6 +54,8 @@ fi
 
 stamp="$(date +%Y%m%d_%H%M)"
 mkdir -p "$RUN_DIR/logs"
+chgrp trela "$RUN_DIR" "$RUN_DIR/logs" 2>/dev/null
+chmod g+s "$RUN_DIR" "$RUN_DIR/logs" 2>/dev/null
 driver_log="$RUN_DIR/logs/driver_$stamp.log"
 say "starting the driver (log $driver_log)"
 cmd="bash -ic '$REPO/scripts/rft/start_driver.sh $PLAN $driver_log $VENV' </dev/null; exec bash"
