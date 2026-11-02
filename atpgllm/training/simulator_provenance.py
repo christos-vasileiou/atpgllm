@@ -14,9 +14,13 @@ def runtime_provenance():
     from atpgllm.llm.reward_funcs import active_reward_objectives
     native = resolve_fault_sim_runner().__name__ == 'tetramax_fault_sim'
     keys, weights = active_reward_objectives()
-    result = {'backend': 'tetramax' if native else 'fast', 'reward_contract': 'atpg-rewards-v4',
+    # The staged profile (propagation and controlling stages, answer-verified detection)
+    # is its own contract; a v4 checkpoint cannot resume under it, nor the reverse.
+    staged = 'propagation' in keys
+    result = {'backend': 'tetramax' if native else 'fast',
+              'reward_contract': 'atpg-rewards-staged' if staged else 'atpg-rewards-v4',
               'objectives': list(keys), 'weights': list(weights),
-              'profile': os.environ.get('TMAX_REWARD_PROFILE', 'po') if native else 'full'}
+              'profile': 'staged' if staged else os.environ.get('TMAX_REWARD_PROFILE', 'po') if native else 'full'}
     if native:
         from tetramax_backend import configuration, _identity, VERSION
         if os.environ.get('TMAX_SERVER_FILE') or os.environ.get('TMAX_SERVER_URL'):

@@ -20,6 +20,7 @@ import os
 import math
 
 from fault_sim import convert_string_to_dict, _use_tetramax_backend as using_native_simulator
+from .propagation_signals import attempt_signals, sensitize, signal_graph
 
 warnings.filterwarnings("ignore")
 
@@ -32,9 +33,28 @@ REWARD_LOGONLY_SUFFIX = "_logonly"
 ATPG_GDPO_OBJECTIVE_KEYS = ("detection", "activation", "fidelity", "format", "uniqueness")
 ATPG_GDPO_OBJECTIVE_WEIGHTS = (1.0, 0.25, 0.20, 0.05, 0.10)
 
+# Contract ``atpg-rewards-staged``, selected with ``TMAX_REWARD_PROFILE=staged`` on either
+# backend. The profiles above keep the v4 scoring unchanged. ``staged`` adds the two
+# continuous stages between activation and detection and aligns the reward with
+# deployment: detection and fidelity are judged on the final answer vector.
+STAGED_OBJECTIVE_KEYS = (
+    "detection", "activation", "propagation", "controlling", "fidelity", "format", "uniqueness",
+)
+STAGED_OBJECTIVE_WEIGHTS = (1.0, 0.25, 0.25, 0.15, 0.20, 0.05, 0.10)
+
+
+def reward_profile():
+    """The active reward profile name."""
+    profile = os.environ.get('TMAX_REWARD_PROFILE')
+    if profile == 'staged':
+        return profile
+    return (profile or 'po') if using_native_simulator() else 'full'
+
 
 def active_reward_objectives():
     """A fixed per-run profile; unavailable internals are not negative rewards."""
+    if reward_profile() == 'staged':
+        return STAGED_OBJECTIVE_KEYS, STAGED_OBJECTIVE_WEIGHTS
     if not using_native_simulator():
         return ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS
     profile = os.environ.get('TMAX_REWARD_PROFILE', 'po')
@@ -49,7 +69,8 @@ def active_reward_objectives():
 def train_scalar_from_reward_components(components: Dict[str, float]) -> float:
     """Weighted scalar fallback for callers that cannot consume GDPO objectives."""
     objective_weights = dict(
-        zip(ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS)
+        zip(*((STAGED_OBJECTIVE_KEYS, STAGED_OBJECTIVE_WEIGHTS) if reward_profile() == 'staged'
+              else (ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS)))
     )
     total = 0.0
     for key, value in components.items():
@@ -409,6 +430,59 @@ def _mentions_target_fault(text: str, fault: str, fault_net: str) -> float:
     return 0.0
 
 
+# --- Contract atpg-rewards-staged (profile ``staged``) --------------------------------------
+
+_CLAIM_RE = re.compile(r"\b(sa[01])\s+([^\s,\"']+)")
+# Final-turn checks of the structural format: no pending call, thinking closed, the three
+# fields, and the target fault named.
+_STAGED_FINAL_CHECKS = 6
+_NO_SIGNALS = {"propagation": 0.0, "controlling": 0.0, "depth": 0.0}
+
+
+def _fault_claims(text: Optional[str]) -> List[Tuple[str, str]]:
+    """The ``saV net`` faults a DETECTED_FAULTS field lists, once each, in order."""
+    return list(dict.fromkeys(_CLAIM_RE.findall(text or "")))
+
+
+def _claims_validity(claims: List[Tuple[str, str]], fault: str, net: str,
+                     outcome: Dict[str, Any]) -> float:
+    """Share of the listed faults the answer's own simulation supports.
+
+    The target must be listed (it is detected because the answer detects). Any other
+    claim ``saV x`` needs net ``x`` to carry a definite good/bad difference whose bad
+    value is V, which is how the dataset lists the faults on the propagation path.
+    Evidence, not proof: a changed net alone does not show its own fault is detected.
+    """
+    if (fault, net) not in claims:
+        return 0.0
+
+    def supported(claim: Tuple[str, str]) -> bool:
+        if claim == (fault, net):
+            return True
+        stuck, claimed = claim
+        g, b = _cell_to_int(outcome["good"].get(claimed)), _cell_to_int(outcome["bad"].get(claimed))
+        return g is not None and b is not None and g != b and b == int(stuck[-1])
+
+    return sum(supported(claim) for claim in claims) / len(claims)
+
+
+def _answer_inputs(answer_key: Optional[Tuple[Tuple[str, str], ...]],
+                   canonical_inputs: List[str]) -> Optional[Dict[str, str]]:
+    """The full input vector the answer states: its care bits, every other input x.
+
+    None when the answer names a net that is not a primary input or gives a care bit
+    other than 0 or 1 (the answer is free text and must not reach a simulator as is).
+    """
+    assigned = dict(care_bits(answer_key) or ())
+    if any(value not in ("0", "1") for value in assigned.values()):
+        return None
+    if not canonical_inputs:
+        return assigned
+    if not set(assigned) <= set(canonical_inputs):
+        return None
+    return {pi: assigned.get(pi, "x") for pi in canonical_inputs}
+
+
 def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> List[Dict[str, float]]:
     """
     ATPG reward with five explicit GDPO objectives over a tool-call trajectory.
@@ -433,6 +507,17 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
     three fields and no further call.
     ``uniqueness``: distinct vectors among the attempts divided by the number
     of attempts, 0 without a tool call.
+    Profile ``staged`` (contract ``atpg-rewards-staged``) changes the scoring as follows.
+    The final answer is simulated from its care bits (a missing input is x), and
+    ``detection`` is 1 / (number of attempts) only if that answer vector detects the
+    fault. ``fidelity`` is 0 unless the answer detects, else the mean of the share of
+    known POs EXPECTED_OUTPUT gives as the answer simulation's good values and the
+    share of DETECTED_FAULTS claims that simulation supports (the target must be
+    listed). ``format`` is structure only: reasoning and a well-formed call per call,
+    then the three fields and the target fault in the final turn. ``propagation`` and
+    ``controlling`` (see ``propagation_signals``) are the sensitized ratios of the
+    best attempt, and ``activation`` is also the best attempt, so a retry that does
+    worse costs nothing on the stages.
     ``*_logonly`` keys are diagnostics only.
     ``fault_detected_by_pred_input_vector_acc_logonly`` is 1 when the answer's
     vector is one a call showed to detect the fault.
@@ -468,6 +553,7 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
         raise ValueError("expected_output_fn and detected_faults_fn must be provided")
 
     lib_gate_funcs = kwargs.get("lib_gate_funcs", None)
+    staged = reward_profile() == 'staged'
 
     if using_native_simulator():
         from fault_sim import resolve_fault_sim_runner
@@ -525,6 +611,18 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
             "unverified_answer_logonly": 0.0,
             "answer_x_free_logonly": 0.0,
         }
+        if staged:
+            out.update({
+                "propagation": 0.0,
+                "controlling": 0.0,
+                "propagation_ratio_logonly": 0.0,
+                "controlling_ratio_logonly": 0.0,
+                "propagation_depth_logonly": 0.0,
+                "answer_detects_logonly": 0.0,
+                "detected_by_call_logonly": 0.0,
+                "claims_count_logonly": 0.0,
+                "claims_valid_logonly": 0.0,
+            })
 
         dataset_fault = None
         if isinstance(dataset_faults, str):
@@ -792,6 +890,85 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
             out["pi_completeness_logonly"] = pi_score
             out["input_vector_acc_logonly"] = 1.0 if pi_score >= 0.999 else 0.0
 
+        if staged:
+            # The answer is the deliverable. Simulate its care bits like a call (a call
+            # with the same care bits is reused, so the usual case costs nothing) and
+            # judge detection, outputs and fault claims on that table.
+            answer_outcome = None
+            answer_inputs = _answer_inputs(answer_key, canonical_inputs) if answer_key is not None else None
+            if answer_inputs is not None:
+                care = care_bits(vector_key(answer_inputs))
+                if care is not None:
+                    answer_outcome = next((o for _, key, o in scored
+                                           if o is not None and care_bits(key) == care), None)
+                if answer_outcome is None:
+                    try:
+                        answer_outcome = simulate(answer_inputs)
+                    except _SimulatorFailure:
+                        for objective in STAGED_OBJECTIVE_KEYS:
+                            out[objective] = 0.0
+                        out["simulator_error_logonly"] = 1.0
+                        rewards.append(out)
+                        continue
+                    out["simulated_calls_logonly"] = float(len(simulated))
+            answer_detects = bool(answer_outcome and answer_outcome["detected"])
+            claims = _fault_claims(pred_faults)
+            claim_validity = (_claims_validity(claims, fault, net, answer_outcome)
+                              if answer_detects else 0.0)
+
+            fidelity = 0.0
+            if answer_detects:
+                po_part = _po_agreement(pred_output, answer_outcome["good"], outputs) if pred_output else 0.0
+                parts = [p for p in (po_part, claim_validity) if math.isfinite(p)]
+                fidelity = sum(parts) / len(parts)
+
+            # Structure only: reasoning, a well-formed call, the three fields. What the
+            # vectors hold (0, 1 or x) and what the calls found belong to the other objectives.
+            structure = []
+            for k, call in enumerate(calls):
+                turn = trajectory.turns[k] if k < len(trajectory.turns) else ""
+                arguments = call.get("arguments") if isinstance(call, dict) else None
+                structure.append(_reasoned(turn, opened))
+                structure.append(isinstance(arguments, dict) and set(arguments) == _TOOL_ARGUMENTS)
+            if final_turn is None:
+                structure += [False] * _STAGED_FINAL_CHECKS
+            else:
+                structure += [
+                    not pending,
+                    _thinking_closed(final_turn, opened),
+                    bool(pred_input),
+                    bool(pred_output),
+                    bool(pred_faults),
+                    (fault, net) in claims,
+                ]
+
+            graph = signal_graph(netlist, lib_gate_funcs)
+            if graph is None:
+                out["propagation"] = out["controlling"] = float("nan")
+            else:
+                signals = [
+                    attempt_signals(graph, o["good"], o["bad"], net,
+                                    o["activated"] == 1.0, o["detected"]) if o else _NO_SIGNALS
+                    for o in attempts
+                ]
+                if signals:
+                    out["propagation"] = max(sensitize(s["propagation"]) for s in signals)
+                    out["controlling"] = max(sensitize(s["controlling"]) for s in signals)
+                    out["propagation_ratio_logonly"] = max(s["propagation"] for s in signals)
+                    out["controlling_ratio_logonly"] = max(s["controlling"] for s in signals)
+                    out["propagation_depth_logonly"] = max(s["depth"] for s in signals)
+
+            known = [a for a in activations if math.isfinite(a)]
+            out["activation"] = max(known) if known else (float("nan") if activations else 0.0)
+            out["detection"] = detection if answer_detects else 0.0
+            out["fidelity"] = fidelity
+            out["format"] = sum(structure) / len(structure)
+            out["format_compliance_logonly"] = out["format"]
+            out["answer_detects_logonly"] = float(answer_detects)
+            out["detected_by_call_logonly"] = float(detected_any)
+            out["claims_count_logonly"] = float(len(claims))
+            out["claims_valid_logonly"] = claim_validity
+
         last = next((o for o in reversed(resimulated) if o is not None), None)
         if last is None:
             rewards.append(out)
@@ -835,9 +1012,9 @@ def test_generation_grpo_reward(prompts: list, completions: list, **kwargs) -> L
         rewards.append(out)
 
     active, _ = active_reward_objectives()
-    if using_native_simulator():
+    if using_native_simulator() or staged:
         for row in rewards:
-            for objective in ATPG_GDPO_OBJECTIVE_KEYS:
+            for objective in dict.fromkeys(ATPG_GDPO_OBJECTIVE_KEYS + STAGED_OBJECTIVE_KEYS):
                 if objective not in active:
                     row.pop(objective, None)
             row.setdefault('known_po_fraction_logonly', 0.0)

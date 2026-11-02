@@ -150,10 +150,7 @@ from transformers import AutoTokenizer
 
 from atpgllm.training.tools import TOOLS, fault_simulation_tool_handler
 from atpgllm.training.reward_function_factory import RewardFunctionFactory
-from atpgllm.llm.reward_funcs import (
-    ATPG_GDPO_OBJECTIVE_KEYS,
-    ATPG_GDPO_OBJECTIVE_WEIGHTS,
-)
+from atpgllm.llm.reward_funcs import active_reward_objectives
 from atpgllm.training.callbacks import (
     BestCheckpointRetentionCallback,
     ThroughputMetricsCallback,
@@ -1070,9 +1067,7 @@ def train_with_grpo(
     if fixed_eval_size:
         from atpgllm.training.fixed_eval import capture_rewards
         reward_fn = capture_rewards(reward_fn, eval_records)
-    gdpo_priorities = dict(
-        zip(ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS, strict=True)
-    )
+    gdpo_priorities = dict(zip(*active_reward_objectives(), strict=True))
     print(f"[GDPO] normalize-then-sum objectives: {gdpo_priorities}")
     
     # Set up training arguments using GRPOConfig.  RL typically requires more
