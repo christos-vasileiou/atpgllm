@@ -190,3 +190,22 @@ def test_selection_excludes_earlier_problems():
 def test_truncated_fact():
     slot = dict(_slot("x"), status="EXHAUSTED")
     assert judge(slot, ROW)["truncated"] and not judge(_slot("x"), ROW)["truncated"]
+
+
+def _facts(**changes):
+    return {"final": True, "detected": True, "tool_calls": 1, "single_user_turn": True, "leak": False,
+            "has_internal_path": False, "names_internal_path_net": False, **changes}
+
+
+def test_keep_requires_a_real_tool_call():
+    assert keep(_facts())
+    assert keep(_facts(tool_calls=2))
+    assert not keep(_facts(tool_calls=0))
+
+
+def test_choose_for_training_drops_an_answer_that_skipped_the_tool():
+    from atpgllm.training.rationalization import choose_for_training
+    skipped = {"hint_mode": "none", "completion_slot": 0, "vector": {"a": 1}, "facts": _facts(tool_calls=0)}
+    called = {"hint_mode": "none", "completion_slot": 1, "vector": {"a": 0}, "facts": _facts()}
+    assert choose_for_training([skipped, called], 2) == [called]
+    assert choose_for_training([skipped], 2) == []

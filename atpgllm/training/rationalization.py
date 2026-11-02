@@ -171,9 +171,15 @@ def judge(slot: dict, row: dict, hinted: Optional[dict] = None) -> dict:
 
 
 def keep(facts: dict, require_path_mention: bool = False) -> bool:
-    """A trajectory is kept when its answer detects the fault, it took no
-    controller repair turn, and no assistant turn refers to the hint."""
-    ok = facts["final"] and facts["detected"] and facts["single_user_turn"] and not facts["leak"]
+    """A trajectory is kept when its answer detects the fault, it executed at
+    least one real tool call, it took no controller repair turn, and no
+    assistant turn refers to the hint.
+
+    The verifier also grades an answer that never called the simulator, so
+    ``detected`` alone would train the model to skip the tool.
+    """
+    ok = (facts["final"] and facts["detected"] and facts["tool_calls"] >= 1
+          and facts["single_user_turn"] and not facts["leak"])
     if require_path_mention and facts["has_internal_path"]:
         ok = ok and facts["names_internal_path_net"]
     return ok
