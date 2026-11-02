@@ -1,0 +1,135 @@
+{
+ "stored_slots": {
+  "final_slots": 3755,
+  "slots_with_more_than_one_call": 0,
+  "rescored": 400,
+  "skipped_unparsed": 0,
+  "values_compared": 2800,
+  "differences": 0,
+  "largest_gap": 0.0
+ },
+ "real_attempts_pilot_start": {
+  "easy": {
+   "activation": 0.6975,
+   "propagation": 0.6045561772792962,
+   "controlling": 0.6250799250753483,
+   "detection": 0.5725
+  },
+  "all": {
+   "activation": 0.50725,
+   "propagation": 0.30063724460772995,
+   "controlling": 0.3597850750571475,
+   "detection": 0.23425
+  },
+  "medium": {
+   "activation": 0.46375,
+   "propagation": 0.2546852346413918,
+   "controlling": 0.2904555910273,
+   "detection": 0.20125
+  },
+  "hard": {
+   "activation": 0.46875,
+   "propagation": 0.24489838406720107,
+   "controlling": 0.3107594680683126,
+   "detection": 0.1775
+  },
+  "very_hard": {
+   "activation": 0.4425,
+   "propagation": 0.16588502353358506,
+   "controlling": 0.26119867883908476,
+   "detection": 0.0975
+  },
+  "random_never_detects": {
+   "activation": 0.46375,
+   "propagation": 0.23316140351716416,
+   "controlling": 0.31143171227569616,
+   "detection": 0.1225
+  }
+ },
+ "constants": {
+  "easy": {
+   "zeros_activation": 0.6,
+   "ones_activation": 0.7,
+   "best_of_both_activation": 0.96,
+   "mean_of_both_activation": 0.65,
+   "zeros_propagation": 0.5105836640211641,
+   "ones_propagation": 0.616114368325005,
+   "best_of_both_propagation": 0.8247116318832061,
+   "mean_of_both_propagation": 0.5633490161730845,
+   "zeros_controlling": 0.5523771345272803,
+   "ones_controlling": 0.6350732420128081,
+   "best_of_both_controlling": 0.8710796754818874,
+   "mean_of_both_controlling": 0.5937251882700442
+  },
+  "all": {
+   "zeros_activation": 0.464,
+   "ones_activation": 0.5,
+   "best_of_both_activation": 0.836,
+   "mean_of_both_activation": 0.482,
+   "zeros_propagation": 0.25276911471386454,
+   "ones_propagation": 0.2940926149432016,
+   "best_of_both_propagation": 0.4708328429014604,
+   "mean_of_both_propagation": 0.2734308648285325,
+   "zeros_controlling": 0.31619452176645696,
+   "ones_controlling": 0.31630247346796536,
+   "best_of_both_controlling": 0.5575790703184774,
+   "mean_of_both_controlling": 0.316248497617211
+  },
+  "medium": {
+   "zeros_activation": 0.4,
+   "ones_activation": 0.54,
+   "best_of_both_activation": 0.78,
+   "mean_of_both_activation": 0.47,
+   "zeros_propagation": 0.1925696357564478,
+   "ones_propagation": 0.3111276725637887,
+   "best_of_both_propagation": 0.4630620333300504,
+   "mean_of_both_propagation": 0.25184865416011837,
+   "zeros_controlling": 0.17559770535610164,
+   "ones_controlling": 0.3394396865889213,
+   "best_of_both_controlling": 0.5123141776593085,
+   "mean_of_both_controlling": 0.2575186959725114
+  },
+  "hard": {
+   "zeros_activation": 0.32,
+   "ones_activation": 0.48,
+   "best_of_both_activation": 0.78,
+   "mean_of_both_activation": 0.4,
+   "zeros_propagation": 0.0874363921890253,
+   "ones_propagation": 0.19143322050500292,
+   "best_of_both_propagation": 0.2738867555511711,
+   "mean_of_both_propagation": 0.13943480634701413,
+   "zeros_controlling": 0.1843179395607889,
+   "ones_controlling": 0.23226365033523383,
+   "best_of_both_controlling": 0.4062112195256525,
+   "mean_of_both_controlling": 0.2082907949480114
+  },
+  "very_hard": {
+   "zeros_activation": 0.48,
+   "ones_activation": 0.34,
+   "best_of_both_activation": 0.76,
+   "mean_of_both_activation": 0.41,
+   "zeros_propagation": 0.2503136726866084,
+   "ones_propagation": 0.13182651873541595,
+   "best_of_both_propagation": 0.36670979537179355,
+   "mean_of_both_propagation": 0.1910700957110122,
+   "zeros_controlling": 0.3521329088330325,
+   "ones_controlling": 0.15326256528289584,
+   "best_of_both_controlling": 0.49158975983021413,
+   "mean_of_both_controlling": 0.2526977370579642
+  },
+  "random_never_detects": {
+   "zeros_activation": 0.52,
+   "ones_activation": 0.44,
+   "best_of_both_activation": 0.9,
+   "mean_of_both_activation": 0.48,
+   "zeros_propagation": 0.22294220891607658,
+   "ones_propagation": 0.21996129458679625,
+   "best_of_both_propagation": 0.4257939983710875,
+   "mean_of_both_propagation": 0.2214517517514364,
+   "zeros_controlling": 0.3165469205550814,
+   "ones_controlling": 0.22147322311996745,
+   "best_of_both_controlling": 0.5067005190953258,
+   "mean_of_both_controlling": 0.2690100718375244
+  }
+ }
+}
