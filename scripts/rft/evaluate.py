@@ -35,9 +35,13 @@ sys.path.insert(0, str(REPO / "scripts" / "eval"))
 def manifest_items(path):
     """``(example id, level, rendered prompt, record)`` for a GDPO fixed-eval manifest."""
     manifest = json.loads(Path(path).read_text())
+    # A stratified manifest says each problem's level in a sidecar file.
+    sidecar = Path(str(path) + ".reference.json")
+    reference = json.loads(sidecar.read_text()) if sidecar.exists() else {}
     for example in manifest["examples"]:
         record = dict(example)
-        yield example["_fixed_eval_id"], "fixed", example["prompt"], record
+        level = reference.get(example["_fixed_eval_id"], {}).get("level", "fixed")
+        yield example["_fixed_eval_id"], level, example["prompt"], record
 
 
 def problem_items(path, tokenizer):
@@ -50,6 +54,13 @@ def problem_items(path, tokenizer):
         messages = ConversationExample.prompt_messages_from_record(dict(row), use_tools=True)
         prompt = tokenizer.apply_chat_template(messages, tools=TOOLS, tokenize=False, add_generation_prompt=True)
         yield "|".join(problem_key(row)), row["difficulty"], prompt, {**row, "_search_messages": messages}
+
+
+def _line_id(line):
+    try:
+        return json.loads(line)["example_id"]
+    except (json.JSONDecodeError, KeyError):
+        return None
 
 
 def detected(slot):
@@ -99,6 +110,9 @@ def main():
     parser.add_argument("--batch_problems", type=int, default=128)
     parser.add_argument("--tool_workers", type=int, default=16)
     parser.add_argument("--seed", type=int, default=1729)
+    parser.add_argument("--num_samples", type=int, default=1, help="Slots per problem (direct sampling above 1)")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--limit", type=int, default=None, help="Only the first N examples (smoke tests)")
     parser.add_argument("--summarize", action="store_true", help="Merge the shard files into metrics.json")
     args = parser.parse_args()
@@ -112,7 +126,8 @@ def main():
 
     from rationalize import build_strategy
     strategy, tokenizer, info = build_strategy(
-        args.adapter, num_samples=1, temperature=0.0, top_p=1.0, max_tool_rounds=args.max_tool_rounds,
+        args.adapter, num_samples=args.num_samples, temperature=args.temperature, top_p=args.top_p,
+        max_tool_rounds=args.max_tool_rounds,
         max_model_len=args.max_model_len, max_generated_tokens=args.max_generated_tokens, seed=args.seed,
         tool_workers=args.tool_workers)
     items = list(manifest_items(args.manifest) if args.manifest else problem_items(args.problems_file, tokenizer))
@@ -120,13 +135,15 @@ def main():
     name = out / ("slots.jsonl" if args.num_shards == 1 else f"slots.shard{args.shard}.jsonl")
     seen = set()
     if name.exists():
+        counts = defaultdict(int)
         for line in open(name):
             try:
-                seen.add(json.loads(line)["example_id"])
+                counts[json.loads(line)["example_id"]] += 1
             except json.JSONDecodeError:
                 pass
-        # Drop a torn last line before appending.
-        lines = [line for line in open(name) if line.endswith("\n")]
+        # A problem is done only with all its slots; drop a torn last line and a partial problem.
+        seen = {example_id for example_id, count in counts.items() if count >= args.num_samples}
+        lines = [line for line in open(name) if line.endswith("\n") and _line_id(line) in seen]
         name.write_text("".join(lines))
     items = [item for item in items if item[0] not in seen]
     if args.shard == 0:
@@ -139,13 +156,15 @@ def main():
             t = time.time()
             results = strategy.sample_batch([p for _, _, p, _ in batch], [r for _, _, _, r in batch])
             for (example_id, level, _, _), result in zip(batch, results):
-                slot = result.slots[0]
-                sink.write(json.dumps({"example_id": example_id, "level": level,
-                                       "status": slot.get("status"), "stop_reason": slot.get("stop_reason"),
-                                       "reward_components": slot.get("reward_components"),
-                                       "vector": slot.get("vector"), "final_answer": slot.get("final_answer"),
-                                       "usage": slot.get("usage"), "messages": slot.get("messages")},
-                                      default=str) + "\n")
+                for slot in result.slots:
+                    sink.write(json.dumps({"example_id": example_id, "level": level,
+                                           "completion_slot": slot.get("completion_slot", 0),
+                                           "status": slot.get("status"), "stop_reason": slot.get("stop_reason"),
+                                           "reward_components": slot.get("reward_components"),
+                                           "vector": slot.get("vector"), "final_answer": slot.get("final_answer"),
+                                           "usage": slot.get("usage"), "messages": slot.get("messages"),
+                                           "observations": slot.get("observations")},
+                                          default=str) + "\n")
             sink.flush()
             print(f"[eval] {start + len(batch)}/{len(items)} in {time.time() - t:.0f} s", flush=True)
     (out / f"{name.name}.done").write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"))

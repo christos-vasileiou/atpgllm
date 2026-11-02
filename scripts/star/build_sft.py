@@ -74,6 +74,7 @@ def main():
             s["first_call_follows_hint"] += facts.get("first_call_follows_hint", False)
             s["names_internal_path_net"] += facts["names_internal_path_net"]
             s["has_internal_path"] += facts["has_internal_path"]
+            s["detected_without_tool_call"] += facts["tool_calls"] == 0
         if keep(facts, args.require_path_mention):
             s["kept"] += 1
         if not (args.hinted_only and slot["hint_mode"] == "none"):
@@ -93,6 +94,8 @@ def main():
             "first_call_follows_hint": s["first_call_follows_hint"] / d,
             "names_internal_path_net": s["names_internal_path_net"] / max(s["has_internal_path"], 1),
             "kept_slots": int(s["kept"]),
+            # Graded as detecting but never called the simulator, so not trained on.
+            "detected_without_tool_call": int(s["detected_without_tool_call"]),
         }
     from transformers import AutoTokenizer
     base = args.tokenizer or json.loads((run / "run.json").read_text())["base_model"]

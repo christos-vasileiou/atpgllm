@@ -38,7 +38,9 @@ def main():
         log = open(log_dir / f"shard{shard}.log", "a")
         log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} GPU {gpu}: {' '.join(argv)}\n")
         log.flush()
-        env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu}
+        # The shards start together and vLLM writes its shared compile cache
+        # in place, so one can load another's half-written artifact and die.
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu, "VLLM_DISABLE_COMPILE_CACHE": "1"}
         children.append(subprocess.Popen(argv, env=env, stdout=log, stderr=subprocess.STDOUT,
                                           start_new_session=True))
 

@@ -1,5 +1,5 @@
 {
- "_comment": "RFT rounds with STaR rationalization on eng-tamale3 (4x A100 40GB), then GDPO from the best round. See scripts/rft/run_rft.py. Sizing (2026-10-26): v4 SFT here takes ~35 min per step at GA 256 x 4 GPUs, so SFT is capped at 30 steps (~18 h); generation stops starting chunks after sample.max_hours, so per_level is an upper bound.",
+ "_comment": "RFT rounds with STaR rationalization on eng-tamale3 (4x A100 40GB), then GDPO from the best round. See scripts/rft/run_rft.py. Sizing (2026-10-26): v4 SFT here takes ~35 min per step at GA 256 x 4 GPUs, so SFT is capped at 30 steps (~18 h); generation stops starting chunks after sample.max_hours, so per_level is an upper bound. Since 2026-10-30 rounds run until val_level_mean has not risen over the round before for 3 consecutive rounds; rounds and deadline_hours are only backstops.",
  "run_dir": "runs/rft_v4_a100",
  "start_adapter": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/sft_granite_4.2_8b_v4/checkpoint-250",
  "dataset": "../data/freeset/dataset.freeset.asap7sc7p5t_28.rvt.tt.v4",
@@ -10,8 +10,9 @@
   3
  ],
  "seed": 2026,
- "rounds": 4,
- "deadline_hours": 160,
+ "rounds": 100,
+ "patience": 3,
+ "deadline_hours": 2400,
  "round_hours_estimate": 30,
  "max_failures": 3,
  "per_level": "easy=1000,medium=1500,hard=2000,very_hard=2000,random_never_detects=2000",
@@ -47,10 +48,23 @@
   "max_tool_rounds": 16,
   "references": {
    "gdpo_step2": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b_v4_a100_tetramax/checkpoint-2/policy"
+  },
+  "bench": {
+   "manifest": "/proj/trela/christos/transformers_atpg/libatpgllm_hard-faults/runs/rft_v4_a100/eval/robust_eval_manifest.json",
+   "from_round": 6,
+   "num_samples": 16,
+   "temperature": 0.7,
+   "top_p": 0.95,
+   "max_tool_rounds": 5,
+   "max_generated_tokens": 16384,
+   "reward_profile": "staged"
   }
  },
  "gdpo": {
   "conf": "scripts/train/configs/grpo_granite_4.2_8b_v4_a100_tetramax_after_rft.conf",
-  "output_dir": "runs/grpo_granite_4.2_8b_v4_a100_tetramax_after_rft"
+  "output_dir": "runs/grpo_granite_4.2_8b_v4_a100_tetramax_after_rft",
+  "hold": true,
+  "eval_every": 2,
+  "max_steps": 100
  }
 }
