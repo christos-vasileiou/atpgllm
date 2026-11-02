@@ -150,12 +150,10 @@ from transformers import AutoTokenizer
 
 from atpgllm.training.tools import TOOLS, fault_simulation_tool_handler
 from atpgllm.training.reward_function_factory import RewardFunctionFactory
-from atpgllm.llm.reward_funcs import (
-    ATPG_GDPO_OBJECTIVE_KEYS,
-    ATPG_GDPO_OBJECTIVE_WEIGHTS,
-)
+from atpgllm.llm.reward_funcs import active_reward_objectives
 from atpgllm.training.callbacks import (
     BestCheckpointRetentionCallback,
+    StopAfterStepCallback,
     ThroughputMetricsCallback,
     ContextLengthHistogramCallback,
     TrainingStateCheckpointCallback,
@@ -690,6 +688,8 @@ def train_with_grpo(
     fixed_eval_steps: int = 5,
     fixed_eval_generations: int = 1,
     fixed_eval_batch_size: int = 1,
+    fixed_eval_selection: str = None,
+    stop_after_step: int = 0,
     buffer_rolling: bool = False,
     keep_best_checkpoints: int = 0,
     difficulty_weights: str | None = None,
@@ -971,7 +971,7 @@ def train_with_grpo(
     if fixed_eval_size:
         from datasets import Dataset
         from atpgllm.training.fixed_eval import (
-            digest, load_or_create_manifest, training_indices_without_holdout,
+            digest, fixed_eval_protocol, load_or_create_manifest, training_indices_without_holdout,
             validate_eval_layout, checkpoint_manifest, circuit_ids,
             training_buffer_state, validate_resume_buffer,
         )
@@ -993,28 +993,19 @@ def train_with_grpo(
             set().union(*(circuit_ids(row) for row in train_dataset))
             if holdout_policy == "preserve_training_buffer" else set()
         )
-        protocol = {
-            "dataset": dataset_path, "split": fixed_eval_split,
-            "size": fixed_eval_size, "seed": fixed_eval_seed,
-            "candidate_pool_size": fixed_eval_size * 8,
-            "tokenizer_vocab_sha256": digest(tokenizer.get_vocab()),
-            "special_tokens_sha256": digest(tokenizer.special_tokens_map),
-            "chat_template_sha256": digest(tokenizer.chat_template),
-            "max_prompt_length": max_prompt_length,
-            "max_completion_length": max_completion_length,
-            "max_model_len": max_model_len,
-            "generations": fixed_eval_generations,
-            "per_device_batch_size": fixed_eval_batch_size,
-            "world_size": state.num_processes,
-            "temperature": 0.0, "top_p": 1.0, "sampling_method": "greedy",
-            "fault_sim_backend": os.environ.get("FAULT_SIM_BACKEND", "fast"),
-            "prompt_pipeline": "single_generation_prefix_v1",
-            "training_holdout_policy": holdout_policy,
-        }
-        if buffer_rolling:
-            protocol["training_buffer"] = "rolling"
+        protocol = fixed_eval_protocol(
+            dataset=dataset_path, split=fixed_eval_split, size=fixed_eval_size, seed=fixed_eval_seed,
+            tokenizer=tokenizer, max_prompt_length=max_prompt_length,
+            max_completion_length=max_completion_length, max_model_len=max_model_len,
+            generations=fixed_eval_generations, per_device_batch_size=fixed_eval_batch_size,
+            world_size=state.num_processes, holdout_policy=holdout_policy,
+            rolling_buffer=buffer_rolling, selection=fixed_eval_selection,
+        )
 
         def eval_candidates():
+            if fixed_eval_selection:
+                raise ValueError(f"A {fixed_eval_selection} manifest is built by scripts/rft/build_eval_manifest.py; "
+                                 "none was found at the manifest path")
             raw = load_dataset(dataset_path, split=fixed_eval_split, streaming=True)
             formatted = format_dataset_for_training(raw, tokenizer, TrainingMode.GRPO)
             if training_circuits:
@@ -1070,9 +1061,7 @@ def train_with_grpo(
     if fixed_eval_size:
         from atpgllm.training.fixed_eval import capture_rewards
         reward_fn = capture_rewards(reward_fn, eval_records)
-    gdpo_priorities = dict(
-        zip(ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS, strict=True)
-    )
+    gdpo_priorities = dict(zip(*active_reward_objectives(), strict=True))
     print(f"[GDPO] normalize-then-sum objectives: {gdpo_priorities}")
     
     # Set up training arguments using GRPOConfig.  RL typically requires more
@@ -1106,7 +1095,8 @@ def train_with_grpo(
         lr_scheduler_kwargs={'num_cycles': 0.4},
         warmup_steps=grpo_warmup_steps,
         eval_strategy="steps" if fixed_eval_size else "no",
-        eval_on_start=bool(fixed_eval_size),
+        # A resumed chunk has already scored this checkpoint.
+        eval_on_start=bool(fixed_eval_size) and not resume_training_state,
         eval_steps=fixed_eval_steps if fixed_eval_size else None,
         per_device_eval_batch_size=fixed_eval_batch_size,
         num_generations_eval=fixed_eval_generations if fixed_eval_size else None,
@@ -1160,6 +1150,7 @@ def train_with_grpo(
         ),
         # After TrainingStateCheckpointCallback, which marks the new checkpoint resumable.
         *([BestCheckpointRetentionCallback(keep_best_checkpoints)] if keep_best_checkpoints else []),
+        *([StopAfterStepCallback(stop_after_step)] if stop_after_step else []),
     ]
 
     if use_dual_adapter:
@@ -1262,7 +1253,7 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "ddp_timeout",
     "grpo_learning_rate", "grpo_warmup_steps",
     "fixed_eval_size", "fixed_eval_split", "fixed_eval_manifest", "fixed_eval_seed",
-    "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size",
+    "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size", "fixed_eval_selection", "stop_after_step",
     "buffer_rolling", "keep_best_checkpoints", "difficulty_weights",
 })
 
@@ -1503,6 +1494,10 @@ def main() -> None:
     parser.add_argument("--fixed_eval_steps", type=int, default=_env("FIXED_EVAL_STEPS", 5))
     parser.add_argument("--fixed_eval_generations", type=int, default=_env("FIXED_EVAL_GENERATIONS", 1))
     parser.add_argument("--fixed_eval_batch_size", type=int, default=_env("FIXED_EVAL_BATCH_SIZE", 1))
+    parser.add_argument("--fixed_eval_selection", default=_env("FIXED_EVAL_SELECTION", None),
+                        help="Selection named in the manifest protocol; unset for the original prefix selection")
+    parser.add_argument("--stop_after_step", type=int, default=_env("STOP_AFTER_STEP", 0),
+                        help="GRPO: save and exit after this global step; max_steps and the LR schedule stay the same")
     parser.add_argument("--keep_best_checkpoints", type=int, default=_env("KEEP_BEST_CHECKPOINTS", 0),
                         help="GRPO: keep this many checkpoints ranked by fixed-eval detection, then total "
                              "reward, plus the latest; 0 keeps all (env: KEEP_BEST_CHECKPOINTS).")

@@ -880,6 +880,23 @@ def patch_trainer_cpu_optimizer_resume(trainer) -> None:
     trainer._load_optimizer_and_scheduler = _load_optimizer_and_scheduler_cpu
 
 
+class StopAfterStepCallback(TrainerCallback):
+    """End this process after ``step``, saving a checkpoint, without touching ``max_steps``.
+
+    The learning rate schedule spans ``max_steps``, so a run stopped here and
+    resumed later follows the same schedule as one that was never stopped.
+    """
+
+    def __init__(self, step: int):
+        self.step = step
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step >= self.step:
+            control.should_training_stop = True
+            control.should_save = True
+        return control
+
+
 # =====================================================================
 # SFTStoppingCallback
 # =====================================================================

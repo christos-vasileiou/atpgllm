@@ -18,6 +18,10 @@ and can be stopped or restarted at any time. One W&B run per run directory
   each round's ``trainer_state.json``.
 * ``completions/round_<n>``: once round n is built, 3 trajectories it trains
   on and 3 it dropped, with the reason each was dropped.
+* ``eval/*`` against ``eval_index``, ``eval_tables/*`` and ``eval_figures/*``:
+  the direct sampling benchmark of every RFT round and GDPO chunk
+  (``scripts/rft/report_eval.py``); ``history_*``: rounds measured on other
+  problems, from stored evaluations.
 
 ``<run_dir>/wandb_logged.json`` records what was sent, so a restart does not
 log a round twice. With ``--every`` it repeats until the run finishes or
@@ -121,6 +125,8 @@ def drop_reason(slot, solved_unhinted):
         return f"no final answer ({slot.get('status')}: {slot.get('stop_reason') or 'stopped'})"
     if not facts["detected"]:
         return "the answer does not detect the fault"
+    if facts["tool_calls"] < 1:
+        return "detected, but the simulator was never called"
     if not facts["single_user_turn"]:
         return "detected, but needed a protocol repair turn"
     if facts["leak"]:
@@ -213,7 +219,9 @@ def render(slot, outcome, reason):
 
 
 def round_metrics(run_dir, n, result, durations, sft_steps):
-    metrics = {"round": n, "round/fixed_detection": result["fixed"], "round/val_level_mean": result["val"]}
+    metrics = {"round": n, "round/val_level_mean": result["val"]}
+    if result.get("fixed") is not None:  # rounds scored on the old two-netlist set
+        metrics["round/fixed_detection"] = result["fixed"]
     for level, value in (result.get("val_by_level") or {}).items():
         metrics[f"round/val_{level}"] = value
     if n == 0:
@@ -240,6 +248,76 @@ def round_metrics(run_dir, n, result, durations, sft_steps):
     return metrics
 
 
+REPORT_TABLES = ("effort", "mechanism", "inputs", "outcomes", "calls", "reward", "reasoning")
+
+
+def report_table(results, name):
+    """One W&B table with the rows of every evaluation, or None when there are none."""
+    import wandb
+    rows = [row for result in results for row in result.get(name) or []]
+    if not rows:
+        return None
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+    table = wandb.Table(columns=columns)
+    for row in rows:
+        table.add_data(*[row.get(column) for column in columns])
+    return table
+
+
+def report_scalars(result, index):
+    """``eval/<bin>/<measure>`` of one evaluation, against ``eval_index``."""
+    scalars = {"eval_index": index, "eval/simulator_disagreements": result.get("simulator_disagreements", 0)}
+    for row in result["effort"]:
+        if row["k"] in (1, 16):
+            scalars[f"eval/{row['bin']}/pass_at_{row['k']}"] = row["pass_at_k"]
+            scalars[f"eval/{row['bin']}/strict_pass_at_{row['k']}"] = row["strict_pass_at_k"]
+            scalars[f"eval/{row['bin']}/uniform_at_{row['k']}"] = row["uniform_at_k_vectors"]
+    for table in ("mechanism", "inputs", "outcomes", "calls", "reward", "reasoning"):
+        for row in result.get(table) or []:
+            for key, value in row.items():
+                if key not in ("tag", "bin", "problems") and isinstance(value, (int, float)) and value == value:
+                    scalars[f"eval/{row['bin']}/{key}"] = value
+    return scalars
+
+
+def sync_reports(run_dir, logged):
+    """The benchmark of every RFT round and GDPO chunk, and the history from stored evaluations."""
+    import wandb
+    logged.setdefault("reports", [])
+    reports = run_dir / "reports"
+    index = read_json(reports / "index.json", []) or []
+    results = [read_json(reports / tag / "metrics.json") for tag in index]
+    results = [r for r in results if r]
+    fresh = [r for r in results if r["tag"] not in logged["reports"]]
+    for result in fresh:
+        wandb.log(report_scalars(result, index.index(result["tag"])))
+        if result["tag"].startswith("round_"):
+            pass1 = next((row["pass_at_k"] for row in result["effort"] if row["bin"] == "all" and row["k"] == 1), None)
+            wandb.log({"round": int(result["tag"].split("_")[1]), "round/robust_detection": pass1})
+        logged["reports"].append(result["tag"])
+    if fresh:
+        payload = {f"eval_tables/{name}": report_table(results, name) for name in REPORT_TABLES}
+        payload = {key: value for key, value in payload.items() if value is not None}
+        for name in ("detection_effort", "mechanism", "tool_calls"):
+            figure = reports / "figures" / f"{name}.png"
+            if figure.exists():
+                payload[f"eval_figures/{name}"] = wandb.Image(str(figure))
+        wandb.log(payload)
+    # History is measured on other problems, so it has its own panels.
+    history = run_dir / "reports_history"
+    names = sorted(path.parent.name for path in history.glob("*/metrics.json"))
+    if names and names != logged.get("history"):
+        for prefix, label in (("val_", "validation"), ("gen_", "generation")):
+            group = [read_json(history / name / "metrics.json") for name in names if name.startswith(prefix)]
+            payload = {f"history_tables/{label}_{table}": report_table(group, table) for table in REPORT_TABLES}
+            wandb.log({key: value for key, value in payload.items() if value is not None})
+        figures = {f"history_figures/{path.stem}": wandb.Image(str(path))
+                   for path in sorted((history / "figures").glob("*.png"))}
+        if figures:
+            wandb.log(figures)
+        logged["history"] = names
+
+
 def sync(run, run_dir, logged, tails, completions):
     import wandb
     state = read_json(run_dir / "state.json", {})
@@ -260,16 +338,19 @@ def sync(run, run_dir, logged, tails, completions):
         run.summary[f"reference/{tag}/val_level_mean"] = ref["val"]
     table_rows = len(logged["rounds"]) + len(state.get("references") or {})
     if results and table_rows != logged.get("eval_table_rows"):
-        columns = ["model", "adapter", "fixed_detection", "val_level_mean", *[f"val_{lv}" for lv in LEVELS]]
+        columns = ["model", "adapter", "fixed_detection", "robust_detection", "val_level_mean",
+                   *[f"val_{lv}" for lv in LEVELS]]
         table = wandb.Table(columns=columns)
         rows = [(f"round {n}", r) for n, r in sorted(results.items(), key=lambda kv: int(kv[0]))
                 if n in logged["rounds"]]
         rows += [(f"reference {tag}", r) for tag, r in (state.get("references") or {}).items()]
         for name, r in rows:
-            table.add_data(name, r["adapter"], r["fixed"], r["val"],
+            table.add_data(name, r["adapter"], r.get("fixed"), r.get("robust"), r["val"],
                            *[(r.get("val_by_level") or {}).get(lv) for lv in LEVELS])
         wandb.log({"evaluations": table})
         logged["eval_table_rows"] = table_rows
+
+    sync_reports(run_dir, logged)
 
     # Completions, once a round is built.
     for n in range(1, plan.get("rounds", 0) + 1):
@@ -364,7 +445,7 @@ def main():
     run = wandb.init(project=args.project, entity=args.entity, id=id_path.read_text().strip(),
                      resume="allow", name=run_dir.name, dir=str(run_dir),
                      config={"plan": read_json(run_dir / "plan.json", {}), "run_dir": str(run_dir)})
-    for axis, pattern in (("round", "round/*"), ("hours", "live/*"), ("sft_step", "sft/*")):
+    for axis, pattern in (("round", "round/*"), ("hours", "live/*"), ("sft_step", "sft/*"), ("eval_index", "eval/*")):
         wandb.define_metric(axis)
         wandb.define_metric(pattern, step_metric=axis)
     logged = read_json(run_dir / "wandb_logged.json", None) or {"rounds": [], "completions": [], "sft": {}}

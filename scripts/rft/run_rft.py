@@ -6,8 +6,8 @@
 Each round r samples the current model on fresh train faults, keeps what
 TetraMAX verifies, fine tunes, and evaluates:
 
-1. ``select``: ``per_level`` problems per difficulty level, disjoint from
-   earlier rounds.
+1. ``select``: ``per_level`` problems per difficulty level, none of them
+   sampled by an earlier round.
 2. ``generate``: ``num_samples`` unhinted attempts per problem on every GPU
    (``rationalize.py --escalate``). Problems all of them fail get hinted
    attempts, the least revealing hint (path) first, then partial. With
@@ -21,10 +21,12 @@ TetraMAX verifies, fine tunes, and evaluates:
 5. ``eval``: greedy detection on the GDPO fixed evaluation (72 faults) and
    on a stratified validation set, scored the same way for every round.
 
-Rounds stop at ``rounds``, when a round fails to beat the best validation
-score, or when the next round would end after ``deadline_hours`` (measured
-from the first launch). GDPO then starts from the best checkpoint (round 0 is
-the starting SFT checkpoint) and runs to the end of its config.
+Rounds stop at ``rounds``, when the validation score has not risen over the
+round before for ``patience`` consecutive rounds, or when the next round would
+end after ``deadline_hours`` (measured from the first launch). Each round
+continues from the previous one, whatever its score. GDPO then starts from the
+best checkpoint (round 0 is the starting SFT checkpoint) and runs to the end
+of its config.
 
 Every stage writes a marker when it finishes, so a rerun (after a reboot or a
 crash) skips finished stages and continues an interrupted one where it
@@ -131,6 +133,35 @@ class Run:
         log(f"stage {name} done in {(time.time() - start) / 3600:.2f} h")
         return result
 
+    def optional(self, name, function, *args, **kwargs):
+        """Like :meth:`stage`, but a failure is logged and training goes on.
+
+        For measurements: reporting must never stop or halt a run. A failed
+        stage is tried again when the driver next passes it, up to ``max_failures``.
+        """
+        if name in self.state["done"]:
+            return self.state["done"][name].get("result")
+        failures = self.state["failures"].get(name, 0)
+        if failures >= self.plan.get("max_failures", 3):
+            return None
+        log(f"stage {name} starts (optional, earlier failures: {failures})")
+        start = time.time()
+        try:
+            result = function(*args, **kwargs)
+        except Exception as exc:
+            if TERMINATING:
+                log(f"stage {name} interrupted by shutdown")
+                raise SystemExit(143)
+            self.state["failures"][name] = failures + 1
+            self.save()
+            log(f"stage {name} FAILED, continuing: {exc}")
+            return None
+        self.state["done"][name] = {"at": now(), "seconds": time.time() - start, "result": result}
+        self.state["failures"].pop(name, None)
+        self.save()
+        log(f"stage {name} done in {(time.time() - start) / 3600:.2f} h")
+        return result
+
 
 def run(cmd, logfile, env=None, cwd=REPO):
     """Run ``cmd`` in its own process group, appending its output to ``logfile``."""
@@ -159,12 +190,16 @@ def on_signal(signum, _):
 def wait_for_free_gpus(plan):
     """Block until no compute process holds a planned GPU (another run, a stale server)."""
     gpus = plan["gpus"]
+    waited = 0
     while True:
         out = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"],
                              capture_output=True, text=True).stdout.strip()
         if not out:
             return
-        log(f"waiting for GPUs {gpus} to be free: {out.splitlines()[:4]}")
+        # A launcher that did not clean up leaves its vLLM server holding the GPUs.
+        level = "ERROR, a stale server may hold them: " if waited >= 6 else ""
+        log(f"{level}waiting for GPUs {gpus} to be free: {out.splitlines()[:4]}")
+        waited += 1
         time.sleep(300)
 
 
@@ -197,7 +232,7 @@ def merge_export(r, adapter, name):
     return str(Path(adapter).parent / f"{Path(adapter).name}_merged_bf16")
 
 
-def evaluate(r, adapter, out, *, manifest=None, problems=None):
+def evaluate(r, adapter, out, *, manifest=None, problems=None, extra=(), profile=None):
     plan = r.plan
     out = Path(out)
     what = ["--manifest", manifest] if manifest else ["--problems_file", problems]
@@ -206,8 +241,9 @@ def evaluate(r, adapter, out, *, manifest=None, problems=None):
          "--log_dir", out / "logs", "--", PYTHON, "scripts/rft/evaluate.py", "--adapter", adapter, *what,
          "--out", out, "--shard", "{shard}", "--num_shards", "{num_shards}",
          "--max_tool_rounds", plan["eval"]["max_tool_rounds"],
-         *(["--limit", plan["eval"]["limit"]] if plan["eval"].get("limit") else [])],
-        r.path("logs", f"eval_{out.parent.name}_{out.name}.log"), env={"PYTHONPATH": str(REPO)})
+         *(["--limit", plan["eval"]["limit"]] if plan["eval"].get("limit") else []), *extra],
+        r.path("logs", f"eval_{out.parent.name}_{out.name}.log"),
+        env={"PYTHONPATH": str(REPO), **({"TMAX_REWARD_PROFILE": profile} if profile else {})})
     run([PYTHON, "scripts/rft/evaluate.py", "--out", out, "--summarize"],
         r.path("logs", f"eval_{out.parent.name}_{out.name}.log"))
     return read_json(out / "metrics.json")
@@ -216,20 +252,80 @@ def evaluate(r, adapter, out, *, manifest=None, problems=None):
 def evaluate_model(r, tag, adapter):
     plan = r.plan
     r.stage(f"{tag}/export", merge_export, r, adapter, f"{tag.replace('/', '_')}_export")
-    fixed = r.stage(f"{tag}/eval_fixed", evaluate, r, adapter, r.path(tag, "eval_fixed"),
-                    manifest=plan["eval"]["fixed_manifest"])
+    # The benchmark replaces the old fixed evaluation.
+    fixed = (None if plan["eval"].get("bench") else
+             r.stage(f"{tag}/eval_fixed", evaluate, r, adapter, r.path(tag, "eval_fixed"),
+                     manifest=plan["eval"]["fixed_manifest"]))
     val = r.stage(f"{tag}/eval_val", evaluate, r, adapter, r.path(tag, "eval_val"),
                   problems=str(r.path("eval", "val_problems.parquet")))
-    return {"adapter": str(adapter), "fixed": fixed["all"]["detection"],
+    return {"adapter": str(adapter), "fixed": fixed["all"]["detection"] if fixed else None,
             "val": val["level_mean_detection"],
             "val_by_level": {k: v["detection"] for k, v in val["by_level"].items()}}
+
+
+def run_benchmark(r, adapter, out):
+    """Direct sampling on the frozen benchmark manifest, on every GPU."""
+    bench = r.plan["eval"]["bench"]
+    metrics = evaluate(r, adapter, out, manifest=bench["manifest"], profile=bench.get("reward_profile"),
+                       extra=["--num_samples", bench.get("num_samples", 16),
+                              "--temperature", bench.get("temperature", 0.7), "--top_p", bench.get("top_p", 0.95),
+                              "--max_tool_rounds", bench.get("max_tool_rounds", 5),
+                              "--max_generated_tokens", bench.get("max_generated_tokens", 16384),
+                              "--batch_problems", bench.get("batch_problems", 16)])
+    return {"robust": metrics["all"]["detection"], "level_mean": metrics["level_mean_detection"]}
+
+
+def write_report(r, tag, directory):
+    """Tables and figures of one benchmark, read by the W&B mirror. CPU only."""
+    bench = r.plan["eval"]["bench"]
+    run([PYTHON, "scripts/rft/report_eval.py", "--run_dir", r.dir, "--tag", tag, "--eval_dir", directory,
+         "--reference", str(bench["manifest"]) + ".reference.json"],
+        r.path("logs", f"report_{tag.replace('/', '_')}.log"),
+        env={"PYTHONPATH": str(REPO), "FAULT_SIM_BACKEND": "fast"})
+    return True
+
+
+def benchmark_model(r, tag, adapter, directory, report_tag):
+    """The benchmark and its report; failures are logged and never stop training."""
+    result = r.optional(f"{tag}/bench", run_benchmark, r, adapter, directory)
+    if result:
+        r.optional(f"{tag}/report", write_report, r, report_tag, directory)
+    return result
+
+
+def rank_key(result):
+    """Validation score, then the benchmark, which rounds before it do not have."""
+    return (result["val"], result.get("robust") or 0.0)
+
+
+def attempted_problems(r, n):
+    """Write the problems finished round ``n`` sampled, for ``--exclude_problems``.
+
+    A time-boxed round samples only part of its selection; the rest stays
+    available to later rounds, since the hard levels hold few problems.
+    """
+    target = r.path(f"round_{n}", "attempted.parquet")
+    if not target.exists():
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        keys = set()
+        for path in r.path(f"round_{n}", "gen").glob("slots*.jsonl"):
+            with open(path) as handle:
+                keys.update(tuple(json.loads(line)["problem"]) for line in handle if line.endswith("\n"))
+        keys = sorted(keys)
+        table = pa.table({"netlist_id": pa.array([k[0] for k in keys], pa.string()),
+                          "fault": pa.array([k[1] for k in keys], pa.string())})
+        tmp = target.with_suffix(".parquet.tmp")
+        pq.write_table(table, tmp)
+        os.replace(tmp, target)
+    return str(target)
 
 
 def select_round(r, n):
     plan = r.plan
     target = r.path(f"round_{n}", "problems.parquet")
     target.parent.mkdir(exist_ok=True)
-    earlier = [str(r.path(f"round_{i}", "problems.parquet")) for i in range(1, n)]
+    earlier = [attempted_problems(r, i) for i in range(1, n)]
     run([PYTHON, "scripts/star/rationalize.py", "--adapter", plan["start_adapter"], "--dataset", plan["dataset"],
          "--per_level", plan["per_level"], "--seed", plan["seed"] + n, "--select_only",
          "--write_problems", target, "--exclude_problems", ",".join(earlier),
@@ -316,19 +412,68 @@ def gdpo(r, adapter):
     out = out if out.is_absolute() else REPO / out
     out.mkdir(parents=True, exist_ok=True)
     manifest = out / "fixed_eval_manifest.json"
+    bench = plan["eval"].get("bench")
     if not manifest.exists():
-        shutil.copy2(plan["eval"]["fixed_manifest"], manifest)
-    resumable = subprocess.run([PYTHON, "atpgllm/training/checkpoints.py", str(out)], cwd=REPO,
-                               capture_output=True).returncode == 0
-    env = {"OUTPUT_DIR": str(out), "RESUME_FROM": "latest" if resumable else str(adapter),
-           "RESUME_TRAINING_STATE": "True" if resumable else "False"}
-    wait_for_free_gpus(plan)
-    log(f"GDPO from {env['RESUME_FROM']} into {out}")
-    run(["bash", "scripts/train/run_training_code.sh", g["conf"]], r.path("logs", "gdpo.log"), env=env)
+        shutil.copy2(bench["manifest"] if bench else plan["eval"]["fixed_manifest"], manifest)
+    every = g.get("eval_every") if bench else None
+    while True:
+        latest = latest_gdpo_step(out)
+        target = None
+        if every:
+            if latest is not None and latest >= g["max_steps"]:
+                break
+            target = min(g["max_steps"], ((latest or 0) // every + 1) * every)
+        env = {"OUTPUT_DIR": str(out), "RESUME_FROM": "latest" if latest is not None else str(adapter),
+               "RESUME_TRAINING_STATE": "True" if latest is not None else "False"}
+        if target:
+            env["STOP_AFTER_STEP"] = str(target)
+        wait_for_free_gpus(plan)
+        log(f"GDPO from {env['RESUME_FROM']} into {out}" + (f" until step {target}" if target else ""))
+        run(["bash", "scripts/train/run_training_code.sh", g["conf"]], r.path("logs", "gdpo.log"), env=env)
+        if not every:
+            break
+        step = latest_gdpo_step(out)
+        if step is None or step < target:
+            raise RuntimeError(f"GDPO stopped at step {step}, expected {target}")
+        # The launcher has exited, so its GPUs are free for the shards.
+        policy = out / f"checkpoint-{step}" / "policy"
+        tag = f"gdpo_{step}"
+        r.optional(f"{tag}/export", merge_export, r, policy, f"{tag}_export")
+        benchmark_model(r, tag, policy, r.path(tag, "eval_bench"), tag)
     return str(out)
 
 
+def latest_gdpo_step(out):
+    """The step of the newest complete GDPO checkpoint, or None before the first."""
+    found = subprocess.run([PYTHON, "atpgllm/training/checkpoints.py", str(out)], cwd=REPO,
+                           capture_output=True, text=True)
+    if found.returncode != 0 or not found.stdout.strip():
+        return None
+    return int(Path(found.stdout.strip().splitlines()[-1]).name.split("-")[1])
+
+
+def wait_while_held(r):
+    """Rounds are over, and GDPO starts only when the plan's ``gdpo.hold`` is cleared."""
+    announced = False
+    while (r.plan.get("gdpo") or {}).get("hold"):
+        if TERMINATING:
+            raise SystemExit(143)
+        if not announced:
+            log("rounds finished; GDPO is on hold until plan.json clears gdpo.hold")
+            announced = True
+        time.sleep(60)
+
+
 # ------------------------------------------------------------------ driver
+
+
+def stalled_rounds(results, n):
+    """Consecutive rounds up to ``n`` whose validation score did not rise over the round before."""
+    stalled = 0
+    # Rounded: equal detection counts can differ in the last float bits across levels.
+    while n - stalled > 0 and round(results[str(n - stalled)]["val"], 9) <= round(results[str(n - stalled - 1)]["val"], 9):
+        stalled += 1
+    return stalled
 
 
 def rounds(r):
@@ -340,7 +485,7 @@ def rounds(r):
     for tag, adapter in plan["eval"].get("references", {}).items():
         r.state.setdefault("references", {})[tag] = r.stage(f"{tag}/evaluate", evaluate_model, r, tag, adapter)
         r.save()
-    best = max(results, key=lambda k: (results[k]["val"], results[k]["fixed"]))
+    best = max(results, key=lambda k: rank_key(results[k]))
     for n in range(1, plan["rounds"] + 1):
         if r.state.get("rounds_stopped"):
             break
@@ -363,14 +508,22 @@ def rounds(r):
         results[str(n)] = r.stage(f"round_{n}/evaluate", evaluate_model, r, f"round_{n}", adapter)
         r.state["durations"].setdefault(str(n), time.time() - started)
         r.save()
-        log(f"round {n}: fixed {results[str(n)]['fixed']:.3f} val {results[str(n)]['val']:.3f} "
+        # Earlier rounds stay as they are: the driver replays them at every restart.
+        bench = r.plan["eval"].get("bench")
+        if bench and n >= bench.get("from_round", 0):
+            scored = benchmark_model(r, f"round_{n}", adapter, r.path(f"round_{n}", "eval_bench"), f"round_{n}")
+            if scored:
+                results[str(n)]["robust"] = scored["robust"]
+                r.save()
+        log(f"round {n}: val {results[str(n)]['val']:.3f} "
             f"(best so far round {best}: val {results[best]['val']:.3f})")
-        if (results[str(n)]["val"], results[str(n)]["fixed"]) <= (results[best]["val"], results[best]["fixed"]):
-            r.state["rounds_stopped"] = f"round {n} did not beat round {best}"
+        stalled = stalled_rounds(results, n)
+        if stalled >= plan.get("patience", 1):
+            r.state["rounds_stopped"] = f"val did not rise for {stalled} consecutive rounds, ending at round {n}"
             r.save()
             break
-        best = str(n)
-    best = max(results, key=lambda k: (results[k]["val"], results[k]["fixed"]))
+        best = max(results, key=lambda k: rank_key(results[k]))
+    best = max(results, key=lambda k: rank_key(results[k]))
     r.state["best"] = {"round": best, **results[best]}
     r.save()
     write_json(r.path("best.json"), r.state["best"])
@@ -397,6 +550,7 @@ def main():
             r.state["finished"] = now()
             r.save()
             return
+        wait_while_held(r)
         r.stage("gdpo", gdpo, r, best)
         r.state["finished"] = now()
         r.save()
