@@ -30,6 +30,16 @@ def test_distributed_timeout_reaches_first_state_initialization(monkeypatch):
     assert calls == [{'timeout': timedelta(seconds=7200)}]
 
 
+def test_vllm_group_port_reaches_grpo_trainer_client(monkeypatch):
+    import trl.trainer.grpo_trainer as grpo_trainer
+    from atpgllm.training.distributed_runtime import pin_vllm_group_port
+    monkeypatch.setattr(grpo_trainer, 'VLLMClient', grpo_trainer.VLLMClient)
+    pin_vllm_group_port(29600)
+    assert grpo_trainer.VLLMClient.keywords == {'group_port': 29600}
+    with pytest.raises(ValueError, match='1-65535'):
+        pin_vllm_group_port(0)
+
+
 def method(name, **scope):
     tree = ast.parse(SOURCE.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DualAdapterGRPOTrainer")
@@ -124,3 +134,13 @@ def test_greedy_eval_settings_reach_initial_and_tool_continuation_requests():
         assert result[1] == [[2]]
     assert len(requests) == 2
     assert trainer.temperature == 1.0  # logprob scaling never divides by zero
+
+
+def test_sft_sets_distributed_timeout_before_validation_cache():
+    # cached_circuit_validation creates PartialState with NCCL's ten-minute
+    # default unless the timeout was fixed first.
+    source = (Path(__file__).resolve().parents[2] / "scripts/train/training_code.py").read_text()
+    function = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "train_with_sft")
+    body = ast.get_source_segment(source, function)
+    assert body.index("initialize_grpo_distributed(") < body.index("cached_circuit_validation(")

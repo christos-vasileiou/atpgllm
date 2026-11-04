@@ -404,3 +404,11 @@ def test_calls_without_a_readable_vector_differ_by_their_arguments():
     assert call_identity({"arguments": None}) == call_identity({"arguments": None})
     assert call_identity({"arguments": {"input_vector": "a=1, b=0"}}) == \
         call_identity({"arguments": {"input_vector": "b:0,a:1", "fault": "sa1 x"}})
+
+
+def test_gdpo_gives_no_detection_to_an_answer_that_never_called_the_tool():
+    # Plain text that looks like a call is not a call: GDPO scores executed calls.
+    text = 'Tool call: {"input_vector": "' + DETECTS + '"}\n' + _answer(DETECTS)
+    reward, simulated = _score(_trace([], text))
+    assert reward["detection"] == 0.0
+    assert simulated == []

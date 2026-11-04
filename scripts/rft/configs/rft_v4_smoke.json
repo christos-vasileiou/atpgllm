@@ -1,0 +1,50 @@
+{
+ "_comment": "Smoke test of scripts/rft/run_rft.py: tiny round, short SFT, no GDPO. Run with --no_gdpo.",
+ "run_dir": "runs/rft_v4_smoke",
+ "start_adapter": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/sft_granite_4.2_8b_v4/checkpoint-250",
+ "dataset": "../data/freeset/dataset.freeset.asap7sc7p5t_28.rvt.tt.v4",
+ "gpus": [
+  0,
+  1,
+  2,
+  3
+ ],
+ "seed": 2026,
+ "rounds": 1,
+ "deadline_hours": 160,
+ "round_hours_estimate": 1,
+ "max_failures": 3,
+ "per_level": "easy=4,medium=4,hard=4,very_hard=4,random_never_detects=4",
+ "sample": {
+  "num_samples": 4,
+  "hint_modes": "none,path,partial",
+  "temperature": 1.0,
+  "max_tool_rounds": 4,
+  "max_model_len": 14336,
+  "max_generated_tokens": 12288,
+  "batch_problems": 8
+ },
+ "build": {
+  "max_per_problem": 2,
+  "min_examples": 1
+ },
+ "sft": {
+  "conf": "scripts/train/configs/sft_granite_4.2_8b_v4_rft.conf",
+  "gpus": 4,
+  "gradient_accumulation_steps": 4,
+  "epochs": 1,
+  "extra_fraction": 0.5,
+  "learning_rate": 2e-05,
+  "min_steps": 10,
+  "max_steps": 10,
+  "max_model_len": 14336,
+  "circuit_validation": false
+ },
+ "eval": {
+  "fixed_manifest": "/proj/trela/christos/transformers_atpg/libatpgllm/runs/grpo_granite_4.2_8b_v4_a100_tetramax/fixed_eval_manifest.json",
+  "val_per_level": "easy=2,medium=2,hard=2,very_hard=2,random_never_detects=2",
+  "max_tool_rounds": 16,
+  "references": {},
+  "limit": 8
+ }
+}

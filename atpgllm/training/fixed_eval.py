@@ -12,8 +12,9 @@ import json
 import math
 import os
 import random
+import re
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from functools import wraps
 from pathlib import Path
 
@@ -120,6 +121,127 @@ def select_examples(candidates, size: int, seed: int) -> list[dict]:
             raise ValueError(f"Only {len(selected)} unique evaluation faults; requested {size}")
         depth += 1
     return selected
+
+
+def family_of(module_name: str) -> str:
+    """The generator family of a module: numeric suffixes and operator instances removed.
+
+    ``snax_req_handler_equal_1u_22_1`` and ``wideexpr_00956`` become
+    ``snax_req_handler_equal`` and ``wideexpr``, so that siblings of one
+    generator count as one circuit family when measuring generalization.
+    """
+    name = re.sub(r"_(add|equal|lt|gt|mul|sub)_.*", r"_\1", str(module_name or ""))
+    return re.sub(r"(_?\d+[a-z]*)+", "", name) or str(module_name or "")
+
+
+def select_stratified(candidates, per_level: dict, seed: int, *, seen_families=(), eligible=None,
+                      family_share: float = 0.15) -> list[dict]:
+    """A frozen problem set spread over difficulty levels, families and netlists.
+
+    ``candidates`` are rows with ``difficulty``, ``module_name``, ``netlist_id``
+    and ``fault``, one per problem. Each level gets ``per_level[level]`` problems,
+    half from families seen in ``seen_families`` and half from unseen ones when
+    both are available, taken round robin over families, then netlists, then
+    faults in a seeded order. A family holds at most ``family_share`` of a level
+    while another family can still supply a problem. ``eligible(row)`` can reject
+    a row (a prompt that is too long), and the walk then moves to the next one.
+    """
+    seen_families = set(seen_families)
+    levels = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    unique = set()
+    for row in candidates:
+        key = (str(row["netlist_id"]), str(row["fault"]))
+        if key not in unique:
+            unique.add(key)
+            levels[row["difficulty"]][family_of(row["module_name"])][str(row["netlist_id"])].append(row)
+
+    selected = []
+    for level, quota in per_level.items():
+        # For each family, its netlists in a seeded order, each with its faults in a seeded order.
+        walkers = {}
+        for family, netlists in levels.get(level, {}).items():
+            walkers[family] = deque(
+                deque(sorted(netlists[n], key=lambda r: digest([seed, n, str(r["fault"])])))
+                for n in sorted(netlists, key=lambda n: digest([seed, n])))
+        order = sorted(walkers, key=lambda f: digest([seed, f]))
+        groups = {"unseen": [f for f in order if f not in seen_families],
+                  "seen": [f for f in order if f in seen_families]}
+
+        def next_row(family):
+            """The family's next eligible row, taking its netlists in turn."""
+            netlists = walkers[family]
+            while netlists:
+                faults = netlists.popleft()
+                row = faults.popleft() if faults else None
+                if faults:
+                    netlists.append(faults)
+                if row is not None and (eligible is None or eligible(row)):
+                    return row
+            return None
+
+        cap = max(1, math.ceil(quota * family_share))
+        counts, chosen = Counter(), []
+
+        def fill(families, target):
+            """Round robin over ``families`` until ``chosen`` reaches ``target`` or no row can be added."""
+            while len(chosen) < target:
+                progressed = False
+                for family in families:
+                    if len(chosen) == target:
+                        break
+                    if counts[family] < cap:
+                        row = next_row(family)
+                        if row is not None:
+                            chosen.append(row)
+                            counts[family] += 1
+                            progressed = True
+                if not progressed:
+                    return
+
+        fill(groups["unseen"], quota - quota // 2)
+        fill(groups["seen"], quota)
+        # A short group leaves room for the other one, then the family cap gives way.
+        while len(chosen) < quota:
+            fill(order, quota)
+            if len(chosen) < quota:
+                if cap >= quota:
+                    raise ValueError(f"Only {len(chosen)} eligible problems for level {level}; requested {quota}")
+                cap += 1
+        selected.extend(chosen)
+    return selected
+
+
+def fixed_eval_protocol(*, dataset, split, size, seed, tokenizer, max_prompt_length, max_completion_length,
+                        max_model_len, generations, per_device_batch_size, world_size, holdout_policy,
+                        rolling_buffer, selection=None) -> dict:
+    """What a frozen manifest promises. A resumed run must compute the same dict.
+
+    ``selection`` is absent for the original prefix selection, so manifests
+    written before it existed still load.
+    """
+    protocol = {
+        "dataset": dataset, "split": split,
+        "size": size, "seed": seed,
+        "candidate_pool_size": size * 8,
+        "tokenizer_vocab_sha256": digest(tokenizer.get_vocab()),
+        "special_tokens_sha256": digest(tokenizer.special_tokens_map),
+        "chat_template_sha256": digest(tokenizer.chat_template),
+        "max_prompt_length": max_prompt_length,
+        "max_completion_length": max_completion_length,
+        "max_model_len": max_model_len,
+        "generations": generations,
+        "per_device_batch_size": per_device_batch_size,
+        "world_size": world_size,
+        "temperature": 0.0, "top_p": 1.0, "sampling_method": "greedy",
+        "fault_sim_backend": os.environ.get("FAULT_SIM_BACKEND", "fast"),
+        "prompt_pipeline": "single_generation_prefix_v1",
+        "training_holdout_policy": holdout_policy,
+    }
+    if rolling_buffer:
+        protocol["training_buffer"] = "rolling"
+    if selection:
+        protocol["selection"] = selection
+    return protocol
 
 
 def load_or_create_manifest(path, protocol: dict, candidates_factory, *, resume_checkpoint=None) -> dict:

@@ -130,6 +130,46 @@ def test_fast_stream_skip_matches_lazy_skip():
     assert all("messages" in ex for ex in fast_list)
 
 
+def test_fast_stream_skip_is_classified_once_per_process(capsys):
+    """A second pass (the trainer peeks before training) fast-forwards raw rows."""
+    tok = _FakeTokenizer()
+
+    def _raw(i: int, gates: int = 10) -> dict:
+        return {
+            "netlist": "BUF_X1 u0 ( .A(a) );\n" * gates,
+            "system_content": "s",
+            "user_content": f"u{i}",
+            "reasoning_content": "",
+            "answer_content": "ans {fault}",
+            "fault": "sa0 n1",
+            "input_vector": "{}",
+            "expected_output": "{}",
+            "module_name": "m",
+        }
+
+    def _gen():
+        # Row 1 fails the gate filter, so the skip of 3 ends at raw row 4.
+        for i in range(9):
+            yield _raw(i, gates=1 if i == 1 else 10)
+
+    fast = format_dataset_for_training(
+        IterableDataset.from_generator(_gen),
+        tok,
+        TrainingMode.SFT,
+        sft_format="messages",
+        max_prompt_length=100,
+        skip_buffer_size=3,
+        skip_batch_size=2,
+        skip_num_workers=1,
+    )
+    first = list(fast)
+    assert capsys.readouterr().out.count("Skip complete") == 1
+    second = list(fast)
+    out = capsys.readouterr().out
+    assert "Skip complete" not in out and "Fast-forwarding 4 raw row(s)" in out
+    assert second == first and len(first) == 5
+
+
 def test_filter_streaming_dataset_by_prompt_length():
     tok = _FakeTokenizer()
 

@@ -15,12 +15,29 @@ CALL_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
 
 
 class CompletionRunner:
-    def __init__(self, generator, verifier, *, max_tool_rounds=1, temperature=0.7, top_p=0.95):
+    def __init__(self, generator, verifier, *, max_tool_rounds=1, temperature=0.7, top_p=0.95,
+                 tool_workers=1):
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must be nonnegative")
+        if tool_workers < 1:
+            raise ValueError("tool_workers must be positive")
         self.gen, self.verifier = generator, verifier
         self.max_tool_rounds = max_tool_rounds
         self.temperature, self.top_p = temperature, top_p
+        self.tool_workers = tool_workers
+
+    def map(self, function, items):
+        """``list(map(function, items))``, on ``tool_workers`` threads when above one.
+
+        Each item belongs to its own slot (context, cache, usage), so simulator
+        calls of different slots can run concurrently, as GDPO's ToolScheduler does.
+        """
+        items = list(items)
+        if self.tool_workers == 1 or len(items) < 2:
+            return [function(item) for item in items]
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(self.tool_workers, len(items))) as pool:
+            return list(pool.map(function, items))
 
     def initial(self, prompt, messages=None):
         if messages is None:
@@ -58,7 +75,26 @@ class CompletionRunner:
         return self.instruct(base, f"The previous action was invalid: {reason}. "
                              "Return one complete valid tool call, or one final answer.")
 
-    def _tool_boundary(self, state, problem, context):
+    def _simulate_call(self, state, problem, context):
+        """``(observation, error)`` for the one valid tool call in ``state``, else ``None``.
+
+        Applies the same checks as :meth:`_tool_boundary` before simulating, so
+        that method can consume the result instead of calling the verifier.
+        """
+        if self.tool_workers == 1 or state.open_text.count("<tool_call>") != 1:
+            return None
+        matches = list(CALL_RE.finditer(state.open_text))
+        if len(matches) != 1 or state.tool_rounds >= self.max_tool_rounds:
+            return None
+        call = parse_tool_call(matches[0].group())
+        if call is None:
+            return None
+        try:
+            return self.verifier.tool(call, problem, context), None
+        except Exception as exc:
+            return None, exc
+
+    def _tool_boundary(self, state, problem, context, prefetched=None):
         matches = list(CALL_RE.finditer(state.open_text))
         if len(matches) > 1 or state.open_text.count("<tool_call>") > 1:
             return self._invalid(state, context, "Only one tool call is allowed per action")
@@ -80,7 +116,12 @@ class CompletionRunner:
         assistant = {"role": "assistant", "content": restore_generation_prefix(keep[:match.start()], self.gen.tokenizer), "tool_calls": [{
             "id": call_id, "type": "function", "function": deepcopy(call)}]}
         try:
-            observation = self.verifier.tool(call, problem, context)
+            if prefetched is None:
+                observation = self.verifier.tool(call, problem, context)
+            else:
+                observation, error = prefetched
+                if error is not None:
+                    raise error
         except BudgetExceeded as exc:
             return replace(state, status="EXHAUSTED", reason=str(exc))
         except (ValueError, TypeError, SyntaxError) as exc:
@@ -146,7 +187,7 @@ class CompletionRunner:
             outputs = self.gen.generate_requests(requests)
             if len(outputs) != len(requests):
                 raise RuntimeError("Generator returned a different number of results than requests")
-            pending = []
+            pending, generated = [], []
             for i, request, result in zip(indices, requests, outputs):
                 state = states[i]
                 _, problem, context, _ = jobs[i]
@@ -175,7 +216,15 @@ class CompletionRunner:
                                 mean_logprob=log_sum / log_count if log_count and not missing else None,
                                 open_logprob_sum=log_sum, open_logprob_tokens=log_count, open_logprob_missing=missing,
                                 actions=state.actions + 1, status="GENERATING")
-                boundary = self._tool_boundary(state, problem, context)
+                generated.append((i, state, result))
+            # Simulations are the slow part, so they run concurrently. Only the
+            # simulator call is threaded (the tokenizer is not thread safe), and
+            # states are then advanced in the original order.
+            simulated = self.map(lambda item: self._simulate_call(item[1], *jobs[item[0]][1:3]), generated)
+            for (i, state, result), prefetched in zip(generated, simulated):
+                _, problem, context, _ = jobs[i]
+                count = len(result.token_ids)
+                boundary = self._tool_boundary(state, problem, context, prefetched)
                 if boundary is not None:
                     states[i] = boundary
                     continue

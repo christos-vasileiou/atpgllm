@@ -1,0 +1,134 @@
+{
+ "easy": {
+  "k1": {
+   "activation": 0.6975,
+   "propagation": 0.6045561772792964,
+   "controlling": 0.625079925075348
+  },
+  "k2": {
+   "activation": 0.8731666666666668,
+   "propagation": 0.7885465278007422,
+   "controlling": 0.8093415383144951
+  },
+  "k3": {
+   "activation": 0.9313928571428569,
+   "propagation": 0.8627218314971624,
+   "controlling": 0.8817364737202225
+  },
+  "k5": {
+   "activation": 0.9657280219780222,
+   "propagation": 0.9177171771078654,
+   "controlling": 0.9328185452199168
+  }
+ },
+ "all": {
+  "k1": {
+   "activation": 0.50725,
+   "propagation": 0.3006372446077283,
+   "controlling": 0.35978507505714824
+  },
+  "k2": {
+   "activation": 0.6537999999999993,
+   "propagation": 0.4302802319615175,
+   "controlling": 0.5053108203986076
+  },
+  "k3": {
+   "activation": 0.7212499999999995,
+   "propagation": 0.50654818713445,
+   "controlling": 0.5855564570667352
+  },
+  "k5": {
+   "activation": 0.7892463369963365,
+   "propagation": 0.59792172012044,
+   "controlling": 0.6751511631370832
+  }
+ },
+ "medium": {
+  "k1": {
+   "activation": 0.46375,
+   "propagation": 0.25468523464139187,
+   "controlling": 0.29045559102729984
+  },
+  "k2": {
+   "activation": 0.6244999999999999,
+   "propagation": 0.3936334664791712,
+   "controlling": 0.4441500363919221
+  },
+  "k3": {
+   "activation": 0.7020000000000001,
+   "propagation": 0.4853148609012689,
+   "controlling": 0.5402384165584777
+  },
+  "k5": {
+   "activation": 0.7816163003663003,
+   "propagation": 0.6031383378567593,
+   "controlling": 0.6569685853715633
+  }
+ },
+ "hard": {
+  "k1": {
+   "activation": 0.46875,
+   "propagation": 0.24489838406720135,
+   "controlling": 0.31075946806831306
+  },
+  "k2": {
+   "activation": 0.6068333333333333,
+   "propagation": 0.3658002027343384,
+   "controlling": 0.45429423662455304
+  },
+  "k3": {
+   "activation": 0.6748928571428572,
+   "propagation": 0.4441386724321758,
+   "controlling": 0.5391835621234256
+  },
+  "k5": {
+   "activation": 0.7492719780219781,
+   "propagation": 0.5447811183455208,
+   "controlling": 0.637269484070618
+  }
+ },
+ "very_hard": {
+  "k1": {
+   "activation": 0.4425,
+   "propagation": 0.16588502353358575,
+   "controlling": 0.26119867883908493
+  },
+  "k2": {
+   "activation": 0.5606666666666668,
+   "propagation": 0.25667021136859836,
+   "controlling": 0.3813291445783485
+  },
+  "k3": {
+   "activation": 0.62375,
+   "propagation": 0.321198985457073,
+   "controlling": 0.4557912566631808
+  },
+  "k5": {
+   "activation": 0.6985485347985348,
+   "propagation": 0.41011833135016373,
+   "controlling": 0.5495735021235325
+  }
+ },
+ "random_never_detects": {
+  "k1": {
+   "activation": 0.46375,
+   "propagation": 0.23316140351716438,
+   "controlling": 0.3114317122756965
+  },
+  "k2": {
+   "activation": 0.6038333333333334,
+   "propagation": 0.3467507514247378,
+   "controlling": 0.43743914608372186
+  },
+  "k3": {
+   "activation": 0.6742142857142858,
+   "propagation": 0.4193665853845706,
+   "controlling": 0.5108325762683694
+  },
+  "k5": {
+   "activation": 0.7510668498168499,
+   "propagation": 0.5138536359418929,
+   "controlling": 0.5991256988997882
+  }
+ }
+}

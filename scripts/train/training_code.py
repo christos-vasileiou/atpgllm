@@ -150,11 +150,10 @@ from transformers import AutoTokenizer
 
 from atpgllm.training.tools import TOOLS, fault_simulation_tool_handler
 from atpgllm.training.reward_function_factory import RewardFunctionFactory
-from atpgllm.llm.reward_funcs import (
-    ATPG_GDPO_OBJECTIVE_KEYS,
-    ATPG_GDPO_OBJECTIVE_WEIGHTS,
-)
+from atpgllm.llm.reward_funcs import active_reward_objectives
 from atpgllm.training.callbacks import (
+    BestCheckpointRetentionCallback,
+    StopAfterStepCallback,
     ThroughputMetricsCallback,
     ContextLengthHistogramCallback,
     TrainingStateCheckpointCallback,
@@ -303,6 +302,9 @@ def train_with_sft(
     sft_eval_steps: int = 10,
     sft_eval_per_circuit: int = 8,
     save_total_limit: int | None = None,
+    sft_learning_rate: float = 2e-4,
+    sft_extra_messages: str | None = None,
+    sft_extra_fraction: float = 0.5,
     **kwargs,
 ) -> None:
     """
@@ -384,6 +386,14 @@ def train_with_sft(
         Ignored when ``resume_from`` loads an existing adapter (architecture
         comes from the checkpoint).
     """
+    if use_ddp:
+        # PartialState is shared: its first initialization fixes the actual
+        # NCCL timeout. The validation cache and TRL's main_process_first
+        # create it otherwise with the ten-minute default, while rank zero
+        # alone re-reads the skipped stream prefix.
+        from atpgllm.training.distributed_runtime import initialize_grpo_distributed
+        initialize_grpo_distributed(int(kwargs.get("ddp_timeout") or 3600))
+
     data_manifest = dataset_fingerprint = None
     if sft_circuit_validation:
         from atpgllm.training.sft_validation import (
@@ -503,6 +513,16 @@ def train_with_sft(
         max_model_len=max_model_len if sft_format == "messages" else None,
     )
 
+    if sft_extra_messages:
+        # Pre-built conversations (e.g. STaR rationalizations) mixed into the stream.
+        if sft_format != "messages":
+            raise ValueError("--sft_extra_messages needs assistant_only_loss (messages format)")
+        from atpgllm.training.dataset_utils import load_messages_jsonl, mix_in_examples
+        extra = load_messages_jsonl(sft_extra_messages)
+        train_dataset = mix_in_examples(train_dataset, extra, sft_extra_fraction, seed=42)
+        print(f"[SFT] Mixing {len(extra)} examples from {sft_extra_messages} as "
+              f"{sft_extra_fraction:.0%} of the training stream.")
+
     if resume_training_state and skip_buffer_size:
         print(
             "[SFT] Warning: --resume_training_state restores trainer step/checkpoint "
@@ -520,7 +540,7 @@ def train_with_sft(
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         optim="paged_adamw_32bit",
-        learning_rate=2e-4,
+        learning_rate=sft_learning_rate,
         lr_scheduler_type="cosine",
         max_steps=max_steps,
         logging_steps=5,
@@ -557,6 +577,9 @@ def train_with_sft(
         # concatenate batches from all workers on the main process, which
         # fails when sequences have different lengths.
         sft_kwargs["accelerator_config"] = {"dispatch_batches": False}
+        # Ranks build (and skip into) their streams independently before the
+        # first collective, which can take longer than the 1800 s default.
+        sft_kwargs["ddp_timeout"] = int(kwargs.get("ddp_timeout") or 3600)
 
     training_args = SFTConfig(**sft_kwargs)
 
@@ -586,12 +609,14 @@ def train_with_sft(
 
 def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoint, buffer_size,
                          max_prompt_length, netlist_diversity_strategy, held_out_examples,
-                         prompts_per_step, max_steps, is_main_process):
+                         prompts_per_step, max_steps, is_main_process, difficulty_weights=None):
     """GRPO prompts read from the whole train split, ``buffer_size`` at a time.
 
     See :mod:`atpgllm.training.stream_buffer`. Rows pass the same filters as
     the one-shot buffer (gate filter, prompt length, evaluation-circuit
-    holdout); each chunk is reordered for netlist diversity.
+    holdout); each chunk is reordered for netlist diversity. ``difficulty_weights``
+    ({level: weight}) samples each row with probability proportional to its
+    level's weight.
     """
     import hashlib
     import math
@@ -601,7 +626,8 @@ def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoi
     )
     from atpgllm.training.fixed_eval import circuit_ids
     from atpgllm.training.stream_buffer import (
-        LEDGER_NAME, RollingPromptBuffer, ShardPermutation, ledger_checkpoint_callback,
+        LEDGER_NAME, RollingPromptBuffer, ShardPermutation, difficulty_keep_probability,
+        ledger_checkpoint_callback,
     )
 
     directory = Path(dataset_path)
@@ -640,6 +666,9 @@ def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoi
         "netlist_diversity_strategy": netlist_diversity_strategy,
         "holdout_sha256": sha256(sorted(held_out)),
     }
+    if difficulty_weights:
+        # Only when set, so ledgers of unweighted runs still resume.
+        settings["difficulty_weights"] = dict(difficulty_weights)
     # Twice the prompts max_steps can consume: the sampler never wraps around.
     length = max(1, math.ceil(2 * max(max_steps, 1) * max(prompts_per_step, 1) / buffer_size)) * buffer_size
     resume_ledger = Path(resume_checkpoint) / LEDGER_NAME if resume_checkpoint else None
@@ -647,12 +676,14 @@ def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoi
         ShardPermutation(directory, "train", seed=42), prepare,
         chunk_size=buffer_size, length=length, ledger_path=Path(output_dir) / LEDGER_NAME,
         settings=settings, writer=is_main_process, resume_ledger=resume_ledger,
+        keep_probability=difficulty_keep_probability(difficulty_weights) if difficulty_weights else None,
         reorder=lambda rows, k: interleave_for_field_diversity(
             rows, "netlist", strategy=netlist_diversity_strategy, seed=42 + k),
     )
     print(f"[GRPO buffer] Rolling buffer: {buffer_size} prompts per chunk over "
           f"{buffer.source.total} train rows, {len(held_out)} held-out circuit ids, "
-          f"virtual length {length} (~{prompts_per_step} prompts per optimizer step).")
+          f"virtual length {length} (~{prompts_per_step} prompts per optimizer step)"
+          + (f", difficulty weights {difficulty_weights}." if difficulty_weights else "."))
     return buffer, ledger_checkpoint_callback(buffer)
 
 
@@ -698,7 +729,11 @@ def train_with_grpo(
     fixed_eval_steps: int = 5,
     fixed_eval_generations: int = 1,
     fixed_eval_batch_size: int = 1,
+    fixed_eval_selection: str = None,
+    stop_after_step: int = 0,
     buffer_rolling: bool = False,
+    keep_best_checkpoints: int = 0,
+    difficulty_weights: str | None = None,
     **kwargs,
 ) -> None:
     """
@@ -827,6 +862,13 @@ def train_with_grpo(
 
     if fixed_eval_size < 0 or fixed_eval_steps < 1:
         raise ValueError("fixed_eval_size must be nonnegative and fixed_eval_steps positive")
+    if keep_best_checkpoints < 0 or (keep_best_checkpoints and not fixed_eval_size):
+        raise ValueError("keep_best_checkpoints must be nonnegative and needs the fixed evaluation")
+    if difficulty_weights:
+        if not buffer_rolling:
+            raise ValueError("--difficulty_weights needs --buffer_rolling")
+        from atpgllm.training.stream_buffer import parse_difficulty_weights
+        difficulty_weights = parse_difficulty_weights(difficulty_weights)
     if grpo_learning_rate <= 0 or grpo_warmup_steps < 0:
         raise ValueError("GRPO learning rate must be positive and warmup steps nonnegative")
     if fixed_eval_size and not (use_dual_adapter and use_vllm and vllm_mode == "server" and resume_from):
@@ -836,8 +878,10 @@ def train_with_grpo(
 
     # PartialState is shared: its first initialization fixes the actual NCCL
     # timeout. Do this before any model/dataset helper or fixed-eval setup.
-    from atpgllm.training.distributed_runtime import initialize_grpo_distributed
+    from atpgllm.training.distributed_runtime import initialize_grpo_distributed, pin_vllm_group_port
     distributed_state = initialize_grpo_distributed(ddp_timeout)
+    if os.environ.get("VLLM_GROUP_PORT"):
+        pin_vllm_group_port(int(os.environ["VLLM_GROUP_PORT"]))
 
     # Determine device_map: per-GPU for DDP, "auto" otherwise
     device_map = _get_device_map(use_ddp)
@@ -971,7 +1015,7 @@ def train_with_grpo(
     if fixed_eval_size:
         from datasets import Dataset
         from atpgllm.training.fixed_eval import (
-            digest, load_or_create_manifest, training_indices_without_holdout,
+            digest, fixed_eval_protocol, load_or_create_manifest, training_indices_without_holdout,
             validate_eval_layout, checkpoint_manifest, circuit_ids,
             training_buffer_state, validate_resume_buffer,
         )
@@ -993,28 +1037,19 @@ def train_with_grpo(
             set().union(*(circuit_ids(row) for row in train_dataset))
             if holdout_policy == "preserve_training_buffer" else set()
         )
-        protocol = {
-            "dataset": dataset_path, "split": fixed_eval_split,
-            "size": fixed_eval_size, "seed": fixed_eval_seed,
-            "candidate_pool_size": fixed_eval_size * 8,
-            "tokenizer_vocab_sha256": digest(tokenizer.get_vocab()),
-            "special_tokens_sha256": digest(tokenizer.special_tokens_map),
-            "chat_template_sha256": digest(tokenizer.chat_template),
-            "max_prompt_length": max_prompt_length,
-            "max_completion_length": max_completion_length,
-            "max_model_len": max_model_len,
-            "generations": fixed_eval_generations,
-            "per_device_batch_size": fixed_eval_batch_size,
-            "world_size": state.num_processes,
-            "temperature": 0.0, "top_p": 1.0, "sampling_method": "greedy",
-            "fault_sim_backend": os.environ.get("FAULT_SIM_BACKEND", "fast"),
-            "prompt_pipeline": "single_generation_prefix_v1",
-            "training_holdout_policy": holdout_policy,
-        }
-        if buffer_rolling:
-            protocol["training_buffer"] = "rolling"
+        protocol = fixed_eval_protocol(
+            dataset=dataset_path, split=fixed_eval_split, size=fixed_eval_size, seed=fixed_eval_seed,
+            tokenizer=tokenizer, max_prompt_length=max_prompt_length,
+            max_completion_length=max_completion_length, max_model_len=max_model_len,
+            generations=fixed_eval_generations, per_device_batch_size=fixed_eval_batch_size,
+            world_size=state.num_processes, holdout_policy=holdout_policy,
+            rolling_buffer=buffer_rolling, selection=fixed_eval_selection,
+        )
 
         def eval_candidates():
+            if fixed_eval_selection:
+                raise ValueError(f"A {fixed_eval_selection} manifest is built by scripts/rft/build_eval_manifest.py; "
+                                 "none was found at the manifest path")
             raw = load_dataset(dataset_path, split=fixed_eval_split, streaming=True)
             formatted = format_dataset_for_training(raw, tokenizer, TrainingMode.GRPO)
             if training_circuits:
@@ -1058,6 +1093,7 @@ def train_with_grpo(
             prompts_per_step=(per_device_train_batch_size * distributed_state.num_processes
                               * gradient_accumulation_steps // max(num_generations, 2)),
             max_steps=max_steps, is_main_process=distributed_state.is_main_process,
+            difficulty_weights=difficulty_weights or None,
         )
 
     # =========================================================================
@@ -1069,9 +1105,7 @@ def train_with_grpo(
     if fixed_eval_size:
         from atpgllm.training.fixed_eval import capture_rewards
         reward_fn = capture_rewards(reward_fn, eval_records)
-    gdpo_priorities = dict(
-        zip(ATPG_GDPO_OBJECTIVE_KEYS, ATPG_GDPO_OBJECTIVE_WEIGHTS, strict=True)
-    )
+    gdpo_priorities = dict(zip(*active_reward_objectives(), strict=True))
     print(f"[GDPO] normalize-then-sum objectives: {gdpo_priorities}")
     
     # Set up training arguments using GRPOConfig.  RL typically requires more
@@ -1107,7 +1141,8 @@ def train_with_grpo(
         lr_scheduler_kwargs={'num_cycles': 0.4},
         warmup_steps=grpo_warmup_steps,
         eval_strategy="steps" if fixed_eval_size else "no",
-        eval_on_start=bool(fixed_eval_size),
+        # A resumed chunk has already scored this checkpoint.
+        eval_on_start=bool(fixed_eval_size) and not resume_training_state,
         eval_steps=fixed_eval_steps if fixed_eval_size else None,
         per_device_eval_batch_size=fixed_eval_batch_size,
         num_generations_eval=fixed_eval_generations if fixed_eval_size else None,
@@ -1160,6 +1195,9 @@ def train_with_grpo(
             rolling_buffer=buffer_rolling,
         ),
         *(_expert_load_callback(model) if moe else []),
+        # After TrainingStateCheckpointCallback, which marks the new checkpoint resumable.
+        *([BestCheckpointRetentionCallback(keep_best_checkpoints)] if keep_best_checkpoints else []),
+        *([StopAfterStepCallback(stop_after_step)] if stop_after_step else []),
     ]
 
     if use_dual_adapter:
@@ -1243,7 +1281,7 @@ _WANDB_CONFIG_KEYS_SFT = frozenset({
     "assistant_only_loss",
     "sft_circuit_validation",
     "sft_eval_steps",
-    "sft_eval_per_circuit",
+    "sft_eval_per_circuit", "sft_learning_rate", "sft_extra_messages", "sft_extra_fraction",
     "save_total_limit",
 })
 _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
@@ -1263,8 +1301,8 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "ddp_timeout",
     "grpo_learning_rate", "grpo_warmup_steps",
     "fixed_eval_size", "fixed_eval_split", "fixed_eval_manifest", "fixed_eval_seed",
-    "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size",
-    "buffer_rolling",
+    "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size", "fixed_eval_selection", "stop_after_step",
+    "buffer_rolling", "keep_best_checkpoints", "difficulty_weights",
 })
 
 
@@ -1294,6 +1332,45 @@ def _code_provenance() -> dict:
     """Branch/commit/dirty state of the libatpgllm and data_preprocessing checkouts in use."""
     return {**get_git_info(LIBATPGLLM_ROOT), **get_git_info(DATA_PREPROCESSING, prefix="dp_git_"),
             "dp_root": str(DATA_PREPROCESSING)}
+
+
+def _wandb_run_identity(output_dir: str, resume_training_state: bool) -> tuple[str, str]:
+    """``(run id, resume mode)`` for this job's single W&B run (call on rank 0 only).
+
+    The id is kept in ``<output_dir>/wandb_run_id``. A launch that resumes the
+    training state continues that run, so a restart after a reboot extends the
+    same curves; any other launch (a fresh start, or new weights from another
+    run's checkpoint) gets a new id.
+    """
+    path = Path(output_dir) / "wandb_run_id"
+    if resume_training_state and path.is_file() and path.read_text().strip():
+        return path.read_text().strip(), "allow"
+    run_id = wandb.util.generate_id()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(run_id + "\n")
+    return run_id, "allow"
+
+
+def _init_wandb(method: str, args_dict: dict, run_config: dict, default_name: str):
+    """Start this job's single W&B run.
+
+    Only global rank 0 reports. The trainers reduce their metrics across ranks
+    before logging, and the HF WandbCallback logs from rank 0 only, so the
+    other ranks get a disabled run (every wandb call on them is a no-op)
+    instead of a run of their own.
+    """
+    reporting = int(os.environ.get("RANK", "0")) == 0
+    run_id, resume = (_wandb_run_identity(args_dict["output_dir"], args_dict.get("resume_training_state"))
+                      if reporting else (None, None))
+    return wandb.init(
+        project=os.environ.get("WANDB_PROJECT", f"{method}-training"),
+        config=run_config,
+        name=os.environ.get("WANDB_NAME") or default_name,
+        id=run_id,
+        resume=resume,
+        mode=None if reporting else "disabled",
+        settings=wandb.Settings(console="wrap"),  # Forces capture of Python stdout/stderr
+    )
 
 
 def _record_code_provenance(output_dir: str, provenance: dict) -> None:
@@ -1396,9 +1473,22 @@ def main() -> None:
                         help="Audit repaired local circuit splits and enable fixed SFT validation")
     parser.add_argument("--sft_eval_steps", type=int, default=10)
     parser.add_argument("--sft_eval_per_circuit", type=int, default=8)
+    parser.add_argument("--sft_learning_rate", type=float, default=_env("SFT_LEARNING_RATE", 2e-4),
+                        help="SFT peak learning rate (cosine). Env: SFT_LEARNING_RATE (default 2e-4)")
+    parser.add_argument("--sft_extra_messages", default=_env("SFT_EXTRA_MESSAGES", None),
+                        help="SFT: JSONL of pre-built {messages, tools} examples to mix into the "
+                             "training stream. Env: SFT_EXTRA_MESSAGES")
+    parser.add_argument("--sft_extra_fraction", type=float, default=_env("SFT_EXTRA_FRACTION", 0.5),
+                        help="Share of training examples drawn from --sft_extra_messages. "
+                             "Env: SFT_EXTRA_FRACTION (default 0.5)")
     parser.add_argument("--save_total_limit", type=int, default=_env("SAVE_TOTAL_LIMIT", None),
                         help="SFT: keep at most this many checkpoints (the best one is always kept). "
                              "Env: SAVE_TOTAL_LIMIT (default: keep all)")
+    parser.add_argument(
+        "--difficulty_weights", default=_env("DIFFICULTY_WEIGHTS", None),
+        help="GRPO rolling buffer: relative sampling weight per difficulty level, e.g. "
+             "easy=1,medium=2,hard=3,very_hard=4,random_never_detects=5. Unset samples "
+             "rows uniformly. Env: DIFFICULTY_WEIGHTS")
     parser.add_argument(
         "--buffer_rolling",
         action=argparse.BooleanOptionalAction,
@@ -1443,7 +1533,7 @@ def main() -> None:
     parser.add_argument("--grpo_learning_rate", type=float, default=_env("GRPO_LEARNING_RATE", 5e-6))
     parser.add_argument("--grpo_warmup_steps", type=int, default=_env("GRPO_WARMUP_STEPS", 10))
     parser.add_argument("--ddp_timeout", type=int, default=_env("DDP_TIMEOUT", 3600),
-                        help="GRPO collective timeout in seconds, including vLLM generation waits (default: 3600)")
+                        help="DDP collective timeout in seconds for SFT and GRPO, including vLLM generation waits (default: 3600)")
     parser.add_argument("--fixed_eval_size", type=int, default=_env("FIXED_EVAL_SIZE", 0),
                         help="Frozen held-out faults; 0 disables the in-training evaluation pilot.")
     parser.add_argument("--fixed_eval_split", default=_env("FIXED_EVAL_SPLIT", "test"))
@@ -1452,6 +1542,13 @@ def main() -> None:
     parser.add_argument("--fixed_eval_steps", type=int, default=_env("FIXED_EVAL_STEPS", 5))
     parser.add_argument("--fixed_eval_generations", type=int, default=_env("FIXED_EVAL_GENERATIONS", 1))
     parser.add_argument("--fixed_eval_batch_size", type=int, default=_env("FIXED_EVAL_BATCH_SIZE", 1))
+    parser.add_argument("--fixed_eval_selection", default=_env("FIXED_EVAL_SELECTION", None),
+                        help="Selection named in the manifest protocol; unset for the original prefix selection")
+    parser.add_argument("--stop_after_step", type=int, default=_env("STOP_AFTER_STEP", 0),
+                        help="GRPO: save and exit after this global step; max_steps and the LR schedule stay the same")
+    parser.add_argument("--keep_best_checkpoints", type=int, default=_env("KEEP_BEST_CHECKPOINTS", 0),
+                        help="GRPO: keep this many checkpoints ranked by fixed-eval detection, then total "
+                             "reward, plus the latest; 0 keeps all (env: KEEP_BEST_CHECKPOINTS).")
     parser.add_argument(
         "--netlist_diversity_strategy",
         type=str,
@@ -1630,12 +1727,7 @@ def main() -> None:
     run_config = _wandb_run_config(method, args_dict, code_provenance, launch_config)
 
     # 2. Initialize wandb explicitly to capture everything from this point forward
-    wandb.init(
-        project=os.environ.get("WANDB_PROJECT", f"{method}-training"),
-        config=run_config,
-        name=wandb_name,
-        settings=wandb.Settings(console="wrap") # Forces capture of Python stdout/stderr
-    )
+    _init_wandb(method, args_dict, run_config, wandb_name)
     # Transformers rewrites eval_fixed/* to eval/fixed/* for W&B. Use the
     # restored optimizer step, not W&B's per-process/profiling event counter.
     wandb.define_metric("eval/fixed/global_step")

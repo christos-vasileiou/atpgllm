@@ -1,0 +1,17 @@
+{
+ "rows": 200,
+ "rendered": 200,
+ "claim_truth_mean": 1.0,
+ "claim_truth_all_one": 1.0,
+ "implication_truth_mean": 1.0,
+ "implication_truth_all_one": 1.0,
+ "implication_covered": 0.385,
+ "corrupted_claim_truth_mean": 0.5227532143626946,
+ "corrupted_implication_truth_mean": 0.4553184910327767,
+ "added_tokens_median": -224.5,
+ "added_tokens_p90": -78,
+ "fits_budget_now": 0.94,
+ "fits_budget_with_trace": 0.94,
+ "audit_failures": 0,
+ "failure_examples": []
+}
