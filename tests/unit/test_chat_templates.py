@@ -149,6 +149,26 @@ def test_patch_qwen_stub_still_works():
     assert patch_qwen_chat_template_for_assistant_mask(tok) is False
 
 
+# Qwen3 2507 Instruct (incl. the Qwen3-30B-A3B MoE): one assistant branch.
+_QWEN3_2507_STUB = (
+    '    {%- elif message.role == "assistant" %}\n'
+    "        {{- '<|im_start|>' + message.role + '\\n' + content }}\n"
+    "        {%- if message.tool_calls %}\n"
+    "        {%- endif %}\n"
+    "        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}"
+)
+
+
+def test_patch_qwen3_2507_wraps_the_single_assistant_branch():
+    tok = _Tok(_QWEN3_2507_STUB)
+    assert patch_qwen_chat_template_for_assistant_mask(tok) is True
+    tpl = tok.chat_template
+    assert tpl.count("{%- generation %}") == 1 and tpl.count("{%- endgeneration %}") == 1
+    # The role header stays outside the block, the closing <|im_end|> inside.
+    assert tpl.index("'<|im_start|>' + message.role + '\\n' }}") < tpl.index("{%- generation %}")
+    assert tpl.index("{{- '<|im_end|>\\n' }}") < tpl.index("{%- endgeneration %}")
+
+
 def test_dispatcher_routes_granite_and_qwen():
     g = _Tok(_GRANITE_STUB)
     q = _Tok(_QWEN_STUB)
