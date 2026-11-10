@@ -12,6 +12,14 @@ from torch.utils.checkpoint import checkpoint
 from atpgllm.graph.models_stage1 import GraphQFormer, NetlistGraphEncoder
 
 
+def query_tokens(q_former: nn.Module, encoded: dict, graph) -> Tensor:
+    """Run the Q-Former, giving a fault-seeded one (``uses_fault``) the
+    graph's fault features."""
+    if getattr(q_former, "uses_fault", False):
+        return q_former(encoded["node_embs"], graph.batch, graph.fault_feats)
+    return q_former(encoded["node_embs"], graph.batch)
+
+
 class GraphConditionedCausalLM(nn.Module):
     """Inject DAG/Q-Former outputs into the text tokens of a causal LM.
 
@@ -19,9 +27,22 @@ class GraphConditionedCausalLM(nn.Module):
     ``"placeholder"`` puts them where the prompt names the netlist (each
     row's ``graph_at``: the index of the first token after the
     ``<GRAPH_CONTEXT>`` placeholder, see :func:`atpgllm.multimodal.data.graph_position`).
+
+    ``fusion`` sets how the graph reaches the LLM:
+
+    - ``prefix``: the Q-Former's queries, projected, fill the graph slot.
+    - ``anchored``: the slot holds zeros (same token layout). Each input
+      bit's vector is added to the prompt tokens that spell its name (the
+      batch's ``anchors``), through a gate that starts at zero. The vector
+      is the node's embedding joined with the care queries that point at it,
+      which is what the R3 value head reads. A prefix of 16 anonymous
+      queries must tell the LLM which port each value belongs to; here the
+      name token itself carries its port's vector.
+    - ``both``: the queries in the slot and the anchors.
     """
 
     PREFIX_POSITIONS = ("start", "placeholder")
+    FUSIONS = ("prefix", "anchored", "both")
 
     # Trained tokens per chunk of the SFT loss (2,048 x 100k float32 logits
     # with their gradient is about 1.6 GiB).
@@ -35,11 +56,17 @@ class GraphConditionedCausalLM(nn.Module):
         *,
         prefix_at: str = "start",
         freeze_graph_batchnorm: bool = False,
+        fusion: str = "prefix",
     ) -> None:
         super().__init__()
         if prefix_at not in self.PREFIX_POSITIONS:
             raise ValueError(f"prefix_at must be one of {self.PREFIX_POSITIONS}")
+        if fusion not in self.FUSIONS:
+            raise ValueError(f"fusion must be one of {self.FUSIONS}")
+        if fusion != "prefix" and not getattr(q_former, "uses_fault", False):
+            raise ValueError("Anchored fusion needs the re-test Q-Former's care pointer.")
         self.prefix_at = prefix_at
+        self.fusion = fusion
         # Keep the encoder's BatchNorm on its running statistics in train
         # mode: micro-batches hold 1-8 graphs, while evaluation and rollouts
         # use the running statistics.
@@ -64,6 +91,11 @@ class GraphConditionedCausalLM(nn.Module):
         # Only when not the default, so earlier checkpoints still match.
         if prefix_at != "start":
             self.architecture_config["prefix_at"] = prefix_at
+        if fusion != "prefix":
+            from atpgllm.multimodal.anchored import AnchoredFusion
+
+            self.port_anchor = AnchoredFusion(2 * q_former.hidden_dim, self.llm_embed_dim)
+            self.architecture_config["fusion"] = fusion
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -89,13 +121,51 @@ class GraphConditionedCausalLM(nn.Module):
             if self.graph_encoder.dag_gin.jk_proj is not None:
                 for parameter in self.graph_encoder.dag_gin.jk_proj.parameters():
                     parameter.requires_grad = True
+        # With anchors only, the slot holds zeros and its projector is unused
+        # (two-GPU training fails on trainable parameters without a gradient).
         for parameter in self.graph_to_llm.parameters():
-            parameter.requires_grad = True
+            parameter.requires_grad = getattr(self, "fusion", "prefix") != "anchored"
+        for name in getattr(self.q_former, "DECODER_HEADS", ()):
+            for parameter in getattr(self.q_former, name).parameters():
+                parameter.requires_grad = False
+
+    def graph_context(self, graph) -> tuple[Tensor, Optional[Tensor]]:
+        """The graph slot's tokens ``[B, Q, D]`` and, with anchors, one
+        vector per node of the batched graph ``[N, 2H]`` (else None)."""
+        weight = self.graph_to_llm[0].weight
+        zeros = weight.new_zeros((int(graph.num_graphs), self.num_queries, self.llm_embed_dim))
+        if getattr(self, "graph_off", False):
+            # Ports-only control: same token layout, the graph slot holds zeros.
+            return zeros, None
+        encoded = self.graph_encoder(graph)
+        queries = query_tokens(self.q_former, encoded, graph)
+        prefix = zeros if getattr(self, "fusion", "prefix") == "anchored" else self.graph_to_llm(queries)
+        if getattr(self, "fusion", "prefix") == "prefix":
+            return prefix, None
+        former = self.q_former
+        nodes, node_mask = former.last["nodes"], former.last["node_mask"]
+        # Per node, the care queries weighted by how strongly each points at it.
+        attention = former.pointer_scores("care", queries, nodes).softmax(dim=1)
+        care = torch.einsum("bsn,bsh->bnh", attention, queries[:, former.role_slice("care")])
+        return prefix, torch.cat([nodes, care], dim=-1)[node_mask]
 
     def graph_soft_prompt(self, graph) -> Tensor:
-        encoded = self.graph_encoder(graph)
-        queries = self.q_former(encoded["node_embs"], graph.batch)
-        return self.graph_to_llm(queries)
+        return self.graph_context(graph)[0]
+
+    def anchor_gate(self) -> float:
+        """How much of each anchor vector reaches its tokens (0 at the start)."""
+        return float(torch.tanh(self.port_anchor.alpha.detach()))
+
+    def _anchor(self, embeddings: Tensor, node_vectors: Tensor, anchors) -> Tensor:
+        """``embeddings [B, L, D]`` plus each anchored token's gated, projected
+        node vector. ``anchors`` comes from :func:`atpgllm.multimodal.data.collate_anchors`."""
+        index, weight = (value.to(embeddings.device) for value in anchors)
+        fusion = self.port_anchor
+        added = fusion.proj(node_vectors.to(fusion.proj.weight.dtype)[index[:, 2]])
+        added = added * weight.unsqueeze(-1) * torch.tanh(fusion.alpha)
+        return embeddings.index_put(
+            (index[:, 0], index[:, 1]), added.to(embeddings.dtype), accumulate=True
+        )
 
     def _graph_at(self, graph_at, rows: int, device) -> Optional[Tensor]:
         """Each row's insertion index, or None to put the graph first."""
@@ -127,9 +197,19 @@ class GraphConditionedCausalLM(nn.Module):
         *,
         prefix: Optional[Tensor] = None,
         graph_at=None,
+        anchors=None,
+        node_vectors: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
+        """``prefix`` and ``node_vectors`` are :meth:`graph_context`'s pair
+        when the caller computed it (evaluation conditions, shared rollouts);
+        otherwise both come from ``graph``."""
         token_embeddings = self.llm.get_input_embeddings()(input_ids)
-        prefix = self.graph_soft_prompt(graph) if prefix is None else prefix
+        if prefix is None:
+            prefix, node_vectors = self.graph_context(graph)
+        if getattr(self, "fusion", "prefix") != "prefix" and node_vectors is not None:
+            if anchors is None:
+                raise ValueError("Anchored fusion needs the batch's anchors.")
+            token_embeddings = self._anchor(token_embeddings, node_vectors, anchors)
         prefix = prefix.to(
             device=token_embeddings.device,
             dtype=token_embeddings.dtype,
@@ -159,6 +239,8 @@ class GraphConditionedCausalLM(nn.Module):
         *,
         prefix: Optional[Tensor] = None,
         graph_at=None,
+        anchors=None,
+        node_vectors: Optional[Tensor] = None,
         **kwargs,
     ):
         inputs_embeds, full_mask = self._prefix_and_token_embeddings(
@@ -167,6 +249,8 @@ class GraphConditionedCausalLM(nn.Module):
             attention_mask,
             prefix=prefix,
             graph_at=graph_at,
+            anchors=anchors,
+            node_vectors=node_vectors,
         )
         # Without padding the mask adds nothing to causal attention, and
         # dropping it lets SDPA use a fused causal kernel instead of
@@ -265,11 +349,11 @@ class GraphConditionedCausalLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, graph, input_ids: Tensor, attention_mask: Tensor, *,
-                 graph_at=None, **kwargs) -> Tensor:
+                 graph_at=None, anchors=None, **kwargs) -> Tensor:
         """``llm.generate`` after the graph prefix, with a KV cache; returns
         only the new tokens."""
         inputs_embeds, full_mask = self._prefix_and_token_embeddings(
-            graph, input_ids, attention_mask, graph_at=graph_at
+            graph, input_ids, attention_mask, graph_at=graph_at, anchors=anchors
         )
         return self.llm.generate(
             inputs_embeds=inputs_embeds, attention_mask=full_mask, **kwargs
@@ -290,6 +374,8 @@ class GraphConditionedCausalLM(nn.Module):
         the same ``graph_at`` of every context (with ``prefix_at="start"``,
         first). Each row is left-padded, so its positions run contiguously;
         returns the new tokens of each row, unpadded."""
+        if getattr(self, "fusion", "prefix") != "prefix":
+            raise NotImplementedError("Rollouts do not carry anchors yet.")
         if getattr(self, "prefix_at", "start") == "start":
             graph_at = 0
         embed = self.llm.get_input_embeddings()
@@ -343,6 +429,8 @@ class GraphConditionedCausalLM(nn.Module):
         graph_at=None,
     ) -> tuple[Tensor, Tensor]:
         """Sample a GRPO group for one graph/prompt without vLLM."""
+        if getattr(self, "fusion", "prefix") != "prefix":
+            raise NotImplementedError("Rollouts do not carry anchors yet.")
         if prompt_ids.size(0) != 1:
             raise ValueError("sample_group currently accepts one prompt at a time.")
         if num_generations < 2:

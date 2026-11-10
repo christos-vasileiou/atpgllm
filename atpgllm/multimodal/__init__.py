@@ -7,7 +7,7 @@ from .data import (  # noqa: F401
 )
 from .grpo import graph_grpo_loss, group_relative_advantages  # noqa: F401
 from .loading import load_aligned_graph_stack  # noqa: F401
-from .model import GraphConditionedCausalLM  # noqa: F401
+from .model import GraphConditionedCausalLM, query_tokens  # noqa: F401
 
 __all__ = [
     "GraphConditionedCausalLM",
@@ -17,6 +17,7 @@ __all__ = [
     "graph_grpo_loss",
     "group_relative_advantages",
     "load_aligned_graph_stack",
+    "query_tokens",
 ]
 """
 Reserved package for cross-modal integration of ``atpgllm.llm`` and

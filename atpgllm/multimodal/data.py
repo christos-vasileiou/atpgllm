@@ -5,8 +5,10 @@ from __future__ import annotations
 import collections
 import copy
 import hashlib
+import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
@@ -92,25 +94,142 @@ GRAPH_CONTEXT = "<GRAPH_CONTEXT>"
 NETLIST_VIEWS = ("graph", "ports")
 
 
+# What the assistant turns train on: everything (``full``), or with the
+# ``<think>`` reasoning removed (``answer``), so the turns keep only the tool
+# call with its vector and the final INPUT_VECTOR and EXPECTED_OUTPUT block.
+# With the ports view the reasoning names internal gates the prompt no longer
+# shows. The BRIDGES re-test trains on ``answer``.
+SFT_TARGETS = ("full", "answer")
+_THINK = re.compile(r"<think>.*?</think>\s*", re.S)
+
+
+def drop_reasoning(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Copies of ``messages`` with ``<think>`` blocks removed from assistant turns."""
+    out = []
+    for message in messages:
+        message = dict(message)
+        if message.get("role") == "assistant" and isinstance(message.get("content"), str):
+            message["content"] = _THINK.sub("", message["content"]).lstrip()
+        out.append(message)
+    return out
+
+
 def port_declarations(netlist: str) -> str:
     """The module header and input/output declarations of a netlist."""
     statements = (s.strip() for s in netlist.split(";"))
     return "".join(f"{s};\n" for s in statements if re.match(r"(module|input|output)\b", s))
 
 
-def _compact_netlist_payload(record: Dict[str, Any], view: str = "graph") -> tuple[str, str]:
+# Lines the ports view can add after the graph slot. Bus ports are declared
+# as ``input [3:0] a;``, so the declarations never spell a bit such as
+# ``a[3]``, the name the model must write.
+#   PORT_BITS  every input bit by name. Anchored fusion adds each bit's graph
+#              vector to the tokens of its name here.
+#   HINT       the graph model's decoded suggestion as plain text (the hint
+#              arm): the inputs its care head marks, with the value head's
+#              values, for example ``a[3]=1 sel=1``.
+PORT_BITS = "// input bits:"
+PORT_BITS_END = " ;"
+HINT = "// suggested inputs:"
+
+
+def netlist_key(record: Dict[str, Any]) -> str:
+    """The prompt's ``doc_id``, and the key of the re-test labels and hints."""
+    netlist = record.get("netlist")
+    if isinstance(netlist, dict):
+        netlist = netlist.get("netlist")
+    return hashlib.sha256((netlist or "").encode("utf-8")).hexdigest()[:16]
+
+
+def hint_text(vector: Dict[str, Any]) -> str:
+    """``a[3]=1 sel=1`` for the chosen inputs of ``vector``; ``none`` when it chooses none."""
+    chosen = [f"{name}={value}" for name, value in vector.items() if str(value).lower() != "x"]
+    return " ".join(chosen) or "none"
+
+
+def load_hints(path) -> Dict[tuple, str]:
+    """``(netlist key, fault) -> hint text`` from the JSONL files that
+    ``atpgllm.graph.scripts.retest_hints`` writes (one file or a directory)."""
+    path = Path(path)
+    files = sorted(path.glob("*.jsonl")) if path.is_dir() else [path]
+    if not files:
+        raise FileNotFoundError(f"no hint files under {path}")
+    hints: Dict[tuple, str] = {}
+    for file in files:
+        with file.open() as fh:
+            for line in fh:
+                row = json.loads(line)
+                hints[(row["netlist_key"], row["fault"])] = hint_text(row["hint"])
+    return hints
+
+
+def ports_extra(record: Dict[str, Any], graph, *, port_bits: bool = False,
+                hints: Optional[Dict[tuple, str]] = None) -> Optional[str]:
+    """The lines to add after the graph slot, or None when a hint is asked
+    for and the record's problem has none."""
+    extra = ""
+    if port_bits:
+        names = [name for name, is_pi in zip(graph.node_names, graph.pi_node_mask.tolist()) if is_pi]
+        extra += f"{PORT_BITS} {' '.join(names)}{PORT_BITS_END}\n"
+    if hints is not None:
+        hint = hints.get((netlist_key(record), str(record["fault"]).strip()))
+        if hint is None:
+            return None
+        extra += f"{HINT} {hint}\n"
+    return extra
+
+
+def port_anchors(tokenizer, ids: Sequence[int], graph_at: int, graph) -> List[tuple]:
+    """``(token index, node index, weight)`` for the tokens that spell each
+    input bit in the :data:`PORT_BITS` line, which follows the graph slot.
+
+    The weights of one name's tokens sum to 1. The line is read back from
+    the tokens themselves (decoded one by one from ``graph_at``), so the map
+    holds however the chat template escapes the payload."""
+    from atpgllm.multimodal.anchored import token_net_map
+
+    start = max(0, graph_at - 1)
+    text, offsets, found = "", [], -1
+    for token in ids[start:]:
+        piece = tokenizer.decode([token], clean_up_tokenization_spaces=False)
+        offsets.append((len(text), len(text) + len(piece)))
+        text += piece
+        found = text.find(PORT_BITS)
+        if found >= 0 and text.find(PORT_BITS_END, found + len(PORT_BITS)) >= 0:
+            break
+    else:
+        raise ValueError("The prompt has no input-bits line after the graph slot.")
+    end = text.find(PORT_BITS_END, found + len(PORT_BITS))
+    spans, at = [], found + len(PORT_BITS)
+    for node, is_pi in enumerate(graph.pi_node_mask.tolist()):
+        if not is_pi:
+            continue
+        name = graph.node_names[node]
+        where = text.find(name, at, end)
+        if where < 0:        # a name the template escaped: no anchor
+            continue
+        spans.append((where, where + len(name), node))
+        at = where + len(name)
+    return [(start + token, node, weight) for token, node, weight in token_net_map(offsets, spans)]
+
+
+def _compact_netlist_payload(record: Dict[str, Any], view: str = "graph",
+                             extra: str = "") -> tuple[str, str]:
     """The netlist payload as the prompt prints it, and its graph stand-in;
-    the ``doc_id`` stays so tool calls can name the circuit."""
+    the ``doc_id`` stays so tool calls can name the circuit. ``extra``
+    (:func:`ports_extra`) goes after the graph slot of the ports view."""
     if view not in NETLIST_VIEWS:
         raise ValueError(f"netlist view must be one of {NETLIST_VIEWS}")
+    if extra and view != "ports":
+        raise ValueError("Input-bit and hint lines need --netlist-view ports.")
     netlist = record.get("netlist")
     if isinstance(netlist, dict):
         netlist = netlist.get("netlist")
     netlist = netlist or ""
-    doc_id = hashlib.sha256(netlist.encode("utf-8")).hexdigest()[:16]
+    doc_id = netlist_key(record)
     stand_in = GRAPH_CONTEXT
     if view == "ports":
-        stand_in = port_declarations(netlist) + GRAPH_CONTEXT + "\nendmodule\n"
+        stand_in = port_declarations(netlist) + GRAPH_CONTEXT + "\n" + extra + "endmodule\n"
     return (
         str({"doc_id": doc_id, "netlist": netlist}),
         str({"doc_id": doc_id, "netlist": stand_in}),
@@ -232,6 +351,8 @@ class ToolSFTExample:
     labels: List[int]
     retry: bool
     graph_at: int = 0
+    # (token index, node index, weight): see :func:`port_anchors`.
+    anchors: Sequence[tuple] = ()
 
 
 def build_tool_sft_example(
@@ -245,6 +366,9 @@ def build_tool_sft_example(
     rejections: Optional[collections.Counter] = None,
     tool_view: str = "po_fault",
     netlist_view: str = "graph",
+    target: str = "full",
+    port_bits: bool = False,
+    hints: Optional[Dict[tuple, str]] = None,
 ) -> Optional[ToolSFTExample]:
     """One graph-conditioned tool-calling SFT example, or None when the record
     is rejected, its snapshot does not detect the fault, or it is longer than
@@ -254,14 +378,21 @@ def build_tool_sft_example(
     ``netlist_view="ports"``, all but its port declarations); the graph
     reaches the model as the soft prefix instead. ``tool_view`` sets what tool
     messages show (``atpgllm.training.tool_feedback.TOOL_VIEWS``); RL rollouts
-    of the model must use the same view.
+    of the model must use the same view. ``port_bits`` lists every input bit
+    after the graph slot and returns the example's ``anchors``; ``hints``
+    adds the problem's text hint (a problem without one is rejected).
     """
     from atpgllm.training.conversation import ConversationExample
 
     graph = record_to_pyg(record, gate_funcs, vocab, rejections=rejections)
     if graph is None:
         return None
-    full, compact = _compact_netlist_payload(record, netlist_view)
+    extra = ports_extra(record, graph, port_bits=port_bits, hints=hints)
+    if extra is None:
+        if rejections is not None:
+            rejections["no_hint"] += 1
+        return None
+    full, compact = _compact_netlist_payload(record, netlist_view, extra)
     try:
         conversation = ConversationExample.from_record(
             copy.deepcopy(record),
@@ -274,6 +405,10 @@ def build_tool_sft_example(
         if rejections is not None:
             rejections["snapshot_not_detecting"] += 1
         return None
+    if target not in SFT_TARGETS:
+        raise ValueError(f"target must be one of {SFT_TARGETS}")
+    if target == "answer":
+        conversation.messages = drop_reasoning(conversation.messages)
     messages = template_turns(conversation.messages, tokenizer)
     for message in messages:
         if message["role"] == "user":
@@ -283,10 +418,25 @@ def build_tool_sft_example(
         if rejections is not None:
             rejections["too_long_retry" if failed_attempt else "too_long"] += 1
         return None
+    graph_at = graph_position(tokenizer, ids)
     return ToolSFTExample(
         graph=graph, input_ids=ids, labels=labels, retry=failed_attempt is not None,
-        graph_at=graph_position(tokenizer, ids),
+        graph_at=graph_at,
+        anchors=port_anchors(tokenizer, ids, graph_at, graph) if port_bits else (),
     )
+
+
+def collate_anchors(examples: Sequence[ToolSFTExample]) -> tuple[Tensor, Tensor]:
+    """The anchors of a batch: ``[M, 3]`` (row, token, node index in the
+    batched graph) and their weights ``[M]``."""
+    index, weight, first_node = [], [], 0
+    for row, example in enumerate(examples):
+        for token, node, w in example.anchors:
+            index.append((row, token, first_node + node))
+            weight.append(w)
+        first_node += int(example.graph.num_nodes)
+    return (torch.tensor(index, dtype=torch.long).reshape(-1, 3),
+            torch.tensor(weight, dtype=torch.float32))
 
 
 def collate_tool_sft(examples: Sequence[ToolSFTExample], pad_token_id: int) -> Dict[str, Any]:
@@ -300,10 +450,13 @@ def collate_tool_sft(examples: Sequence[ToolSFTExample], pad_token_id: int) -> D
         input_ids[row, :n] = torch.tensor(example.input_ids)
         attention_mask[row, :n] = 1
         labels[row, :n] = torch.tensor(example.labels)
-    return {
+    batch = {
         "graph": Batch.from_data_list([example.graph for example in examples]),
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
         "graph_at": torch.tensor([example.graph_at for example in examples]),
     }
+    if any(example.anchors for example in examples):
+        batch["anchors"] = collate_anchors(examples)
+    return batch

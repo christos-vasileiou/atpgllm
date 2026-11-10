@@ -403,7 +403,7 @@ def parsed_to_pyg(
 
     - ``edge_index`` : ``[2, E]`` — one driver → sink edge per reading pin
     - ``structural_feats`` : ``[N, NUM_STRUCTURAL_FEATURES]`` float32 — depth / degree / port features
-    - ``gate_node_mask`` / ``po_node_mask`` : ``[N]`` bool — node kinds
+    - ``gate_node_mask`` / ``po_node_mask`` / ``pi_node_mask`` : ``[N]`` bool — node kinds
     - ``node_names`` : instance names, or net names for ``<PI>``/``<PO>`` nodes
 
     These are consumed by :class:`AttributeDecompositionEncoder` and
@@ -487,6 +487,9 @@ def parsed_to_pyg(
         ),
         po_node_mask=torch.tensor(
             [ct == "<PO>" for ct in cell_types], dtype=torch.bool
+        ),
+        pi_node_mask=torch.tensor(
+            [ct == "<PI>" for ct in cell_types], dtype=torch.bool
         ),
         node_names=inst_names,
     )

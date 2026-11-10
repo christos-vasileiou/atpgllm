@@ -34,6 +34,7 @@ import argparse
 import ast
 import collections
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
 import json
@@ -65,6 +66,7 @@ from atpgllm.graph.checkpoints import (
 from atpgllm.graph.gate_features import GateAttributeVocab
 from atpgllm.multimodal import (
     GraphConditionedCausalLM,
+    query_tokens,
     build_multimodal_sft_batch,
     graph_grpo_loss,
     group_relative_advantages,
@@ -78,6 +80,7 @@ from atpgllm.multimodal.data import (
     _template_ids,
     build_tool_sft_example,
     collate_tool_sft,
+    load_hints,
     graph_position,
 )
 from atpgllm.multimodal.tool_rollout import reward_text, reward_trace, rollout_group, turn_stop
@@ -96,6 +99,7 @@ from atpgllm.training.tools import (
     fault_simulation_tool_handler,
 )
 from atpgllm.multimodal.tool_probe import ProbeItem, run_tool_probe
+from atpgllm.multimodal.loading import local_pretrained
 from atpgllm.training._paths import (
     LIBATPGLLM_ROOT,
     ensure_data_preprocessing_on_path,
@@ -166,6 +170,48 @@ def _parse_args() -> argparse.Namespace:
              "model reads the input and output names it writes.",
     )
     parser.add_argument(
+        "--graph-off",
+        action="store_true",
+        help="Control run: the graph slot holds zeros and the graph stack is "
+             "frozen, so only the prompt (with --netlist-view ports, the "
+             "ports) informs the model.",
+    )
+    parser.add_argument(
+        "--fusion",
+        choices=("prefix", "anchored", "both"),
+        default="prefix",
+        help="How the graph reaches the LLM: the Q-Former queries in the graph "
+             "slot (default), each input bit's vector added to the tokens of "
+             "its name with the slot left at zero (anchored), or both. The "
+             "anchors need --netlist-view ports and a re-test alignment "
+             "checkpoint.",
+    )
+    parser.add_argument(
+        "--anchor-gate-lr",
+        type=float,
+        default=1e-2,
+        help="Learning rate of the anchors' gate (one scalar, starting at 0). "
+             "Adam moves it by about this much per step. Granite's token "
+             "embeddings and the projected anchor vectors both have norm about "
+             "32, so at --lr the gate would pass under 3%% of an embedding by "
+             "step 300 (measured 11-10).",
+    )
+    parser.add_argument(
+        "--hints",
+        type=Path,
+        help="Text-hint arm: JSONL files of the graph model's decoded care "
+             "inputs (atpgllm.graph.scripts.retest_hints), written into the "
+             "prompt after the port declarations. Use with --graph-off.",
+    )
+    parser.add_argument(
+        "--target",
+        choices=("full", "answer"),
+        default="full",
+        help="What assistant turns train on: everything (default), or with the "
+             "<think> reasoning removed, keeping the tool call and the final "
+             "INPUT_VECTOR and EXPECTED_OUTPUT (the BRIDGES re-test).",
+    )
+    parser.add_argument(
         "--prefix-at",
         choices=("start", "placeholder"),
         default="start",
@@ -180,6 +226,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-flips", type=int, default=3,
                         help="Inputs flipped to make a failed first call.")
+    parser.add_argument("--example-workers", type=int, default=1,
+                        help="Threads per rank that search for failed first calls "
+                             "(TetraMAX runs) while training examples are built.")
     parser.add_argument("--eval-split", help="Held-out split (v3: validation).")
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--eval-examples", type=int, default=64)
@@ -343,7 +392,7 @@ def _base_llm(args: argparse.Namespace):
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
-    return AutoModelForCausalLM.from_pretrained(args.llm, **kwargs)
+    return AutoModelForCausalLM.from_pretrained(local_pretrained(args.llm), **kwargs)
 
 
 def _load_sft_llm(
@@ -418,21 +467,28 @@ def _load_grpo_llm(
     return llm
 
 
-def _module_state(model: GraphConditionedCausalLM) -> dict[str, Any]:
-    return {
-        "graph_encoder": model.graph_encoder.state_dict(),
-        "q_former": model.q_former.state_dict(),
-        "graph_to_llm": model.graph_to_llm.state_dict(),
+def _graph_modules(model: GraphConditionedCausalLM) -> dict[str, torch.nn.Module]:
+    """The graph-side modules a checkpoint stores next to the LoRA adapter."""
+    modules = {
+        "graph_encoder": model.graph_encoder,
+        "q_former": model.q_former,
+        "graph_to_llm": model.graph_to_llm,
     }
+    if model.fusion != "prefix":
+        modules["port_anchor"] = model.port_anchor
+    return modules
+
+
+def _module_state(model: GraphConditionedCausalLM) -> dict[str, Any]:
+    return {name: module.state_dict() for name, module in _graph_modules(model).items()}
 
 
 def _load_module_state(
     model: GraphConditionedCausalLM,
     states: dict[str, Any],
 ) -> None:
-    model.graph_encoder.load_state_dict(states["graph_encoder"], strict=True)
-    model.q_former.load_state_dict(states["q_former"], strict=True)
-    model.graph_to_llm.load_state_dict(states["graph_to_llm"], strict=True)
+    for name, module in _graph_modules(model).items():
+        module.load_state_dict(states[name], strict=True)
 
 
 def _architecture(
@@ -481,9 +537,16 @@ def _optimizer(
         if encoder_lr is not None else
         [(trainable(model.graph_encoder, model.q_former), args.graph_lr)]
     )
+    new_modules = [model.graph_to_llm, model.llm]
+    gate = []
+    if model.fusion != "prefix":
+        # The anchors' projection learns like the other new weights; their
+        # gate has its own rate (see --anchor-gate-lr).
+        new_modules.append(model.port_anchor.proj)
+        gate = [(([model.port_anchor.alpha]), getattr(args, "anchor_gate_lr", 1e-2))]
     new_parameters = [
         parameter
-        for module in (model.graph_to_llm, model.llm)
+        for module in new_modules
         for parameter in module.parameters()
         if parameter.requires_grad
     ]
@@ -494,7 +557,8 @@ def _optimizer(
             "Expected trainable projector and LoRA parameters; "
             "check --graph-policy and adapter loading."
         )
-    groups = [{"params": params, "lr": lr} for params, lr in graph_groups if params]
+    groups = [{"params": params, "lr": lr} for params, lr in graph_groups + gate if params]
+    # Last, so the logged rate is the adapters'.
     groups.append({"params": new_parameters, "lr": args.lr})
     return torch.optim.AdamW(groups, weight_decay=args.weight_decay)
 
@@ -579,7 +643,7 @@ def _load_common(args: argparse.Namespace):
         args.alignment_ckpt,
         vocab,
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.llm)
+    tokenizer = AutoTokenizer.from_pretrained(local_pretrained(args.llm))
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     return gate_funcs, vocab, graph_encoder, q_former, alignment, tokenizer
@@ -602,31 +666,80 @@ def _records(args: argparse.Namespace, split: str, *, per_circuit: int,
     return stream.shuffle(seed=seed, buffer_size=args.shuffle_buffer) if repeat else stream
 
 
-def _tool_example(record, args, gate_funcs, vocab, tokenizer, rejections, salt,
-                  retry_fraction=None):
-    """One SFT example; a retry with probability ``retry_fraction`` (default
-    --retry-fraction). A retry that does not fit falls back to the
-    single-call example of the record."""
+_NO_RETRY = object()
+_HINTS: dict[str, dict] = {}
+
+
+def _prompt_extras(args: argparse.Namespace) -> dict[str, Any]:
+    """What the fusion and the hint arm add to the ports prompt
+    (``build_tool_sft_example`` and the tool probe take these)."""
+    hints = getattr(args, "hints", None)
+    if hints and str(hints) not in _HINTS:
+        _HINTS[str(hints)] = load_hints(hints)
+    return {
+        "port_bits": getattr(args, "fusion", "prefix") != "prefix",
+        "hints": _HINTS[str(hints)] if hints else None,
+    }
+
+
+def _tool_attempt(record, args, salt, retry_fraction=None):
+    """The simulator half of :func:`_tool_example`: the failed first call of a
+    retry example, ``None`` when the search found none, or ``_NO_RETRY`` for a
+    single-call example. Safe to run in worker threads."""
     rng = random.Random(record_seed(record, salt))
-    attempt = None
     if retry_fraction is None:
         retry_fraction = args.retry_fraction
     if rng.random() < retry_fraction:
-        attempt = failed_attempt(record, rng, max_flips=args.max_flips)
-        if attempt is None:
-            rejections["no_failed_attempt"] += 1
+        return failed_attempt(record, rng, max_flips=args.max_flips)
+    return _NO_RETRY
+
+
+def _searched(records, args, salt):
+    """(record, :func:`_tool_attempt` result) in record order. The TetraMAX
+    search for failed attempts runs in ``args.example_workers`` threads: with
+    one, it was nearly the whole cost of a step (21 minutes on juno, 11-09)."""
+    if args.example_workers <= 1:
+        for record in records:
+            yield record, _tool_attempt(record, args, salt)
+        return
+    with ThreadPoolExecutor(args.example_workers) as pool:
+        window: collections.deque = collections.deque()
+        for record in records:
+            window.append((record, pool.submit(_tool_attempt, record, args, salt)))
+            if len(window) >= 4 * args.example_workers:
+                head, future = window.popleft()
+                yield head, future.result()
+        while window:
+            head, future = window.popleft()
+            yield head, future.result()
+
+
+def _tool_example(record, args, gate_funcs, vocab, tokenizer, rejections, salt,
+                  retry_fraction=None, attempt=_NO_RETRY, searched=False):
+    """One SFT example; a retry with probability ``retry_fraction`` (default
+    --retry-fraction). A retry that does not fit falls back to the
+    single-call example of the record. ``searched`` means ``attempt`` already
+    holds :func:`_tool_attempt`'s result for this record."""
+    if not searched:
+        attempt = _tool_attempt(record, args, salt, retry_fraction)
+    if attempt is _NO_RETRY:
+        attempt = None
+    elif attempt is None:
+        rejections["no_failed_attempt"] += 1
     example = None
     if attempt is not None:
         example = build_tool_sft_example(
             record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
             failed_attempt=attempt, rejections=rejections, tool_view=args.tool_view,
-            netlist_view=args.netlist_view,
+            netlist_view=args.netlist_view, target=args.target,
+            **_prompt_extras(args),
         )
     if example is None:
         example = build_tool_sft_example(
             record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
             rejections=rejections, tool_view=args.tool_view,
-            netlist_view=args.netlist_view,
+            netlist_view=args.netlist_view, target=args.target,
+            **_prompt_extras(args),
         )
     return example
 
@@ -659,7 +772,8 @@ def _held_out(args, gate_funcs, vocab, tokenizer):
                 if attempt is not None and build_tool_sft_example(
                     record, gate_funcs, vocab, tokenizer, max_seq_len=args.max_seq_len,
                     failed_attempt=attempt, tool_view=args.tool_view,
-                    netlist_view=args.netlist_view,
+                    netlist_view=args.netlist_view, target=args.target,
+                    **_prompt_extras(args),
                 ) is not None:
                     probes.append(ProbeItem(record=record, failed_attempt=attempt))
             if ((second or len(examples) >= args.eval_examples)
@@ -725,11 +839,19 @@ def train_sft(args: argparse.Namespace) -> None:
         )
         adapter_path = adapter_path or Path(resume_payload["session"]["adapter_path"])
     llm = _load_sft_llm(args, adapter_path)
+    if args.graph_off and args.fusion != "prefix":
+        raise ValueError("--graph-off is the no-graph control; it takes no --fusion.")
     model = GraphConditionedCausalLM(graph_encoder, q_former, llm, prefix_at=args.prefix_at,
-                                     freeze_graph_batchnorm=args.freeze_graph_bn)
+                                     freeze_graph_batchnorm=args.freeze_graph_bn,
+                                     fusion=args.fusion)
     model.set_graph_policy(args.graph_policy)
+    if args.graph_off:
+        model.graph_off = True
+        for module in (model.graph_encoder, model.q_former, model.graph_to_llm):
+            for parameter in module.parameters():
+                parameter.requires_grad = False
     device = _graph_device(model)
-    for module in (model.graph_encoder, model.q_former, model.graph_to_llm):
+    for module in _graph_modules(model).values():
         module.to(device)
     if resume_payload:
         _load_module_state(model, resume_payload["states"])
@@ -777,7 +899,7 @@ def train_sft(args: argparse.Namespace) -> None:
             result = run_tool_probe(
                 model, tokenizer, probes, gate_funcs, vocab, device=device,
                 max_new_tokens=args.probe_max_new_tokens, tool_view=args.tool_view,
-                netlist_view=args.netlist_view,
+                netlist_view=args.netlist_view, **_prompt_extras(args),
             )
             samples = result.pop("samples")
             row.update({f"probe_{k}": v for k, v in result.items()})
@@ -852,10 +974,12 @@ def train_sft(args: argparse.Namespace) -> None:
 
         def produce() -> None:
             try:
-                for record in records:
+                # Tokenizing and graph building stay in this one thread.
+                for record, attempt in _searched(records, args, str(args.seed)):
                     rejected: collections.Counter = collections.Counter()
                     example = _tool_example(record, args, gate_funcs, vocab, tokenizer,
-                                            rejected, salt=str(args.seed))
+                                            rejected, salt=str(args.seed),
+                                            attempt=attempt, searched=True)
                     with counters:
                         rejections.update(rejected)
                     if example is not None:
@@ -948,6 +1072,8 @@ def train_sft(args: argparse.Namespace) -> None:
                 "sec_per_step": (time.time() - started) / args.log_every,
                 "micro_batches_per_step": float(totals[2] / totals[1]),
             }
+            if model.fusion != "prefix":
+                row["anchor_gate"] = model.anchor_gate()
             if main_process:
                 _append_jsonl(metrics_path, row)
                 with counters:
@@ -999,7 +1125,7 @@ def _reference_prefix(
 ) -> torch.Tensor:
     graph_encoder, q_former, projector = reference_modules
     encoded = graph_encoder(graph)
-    queries = q_former(encoded["node_embs"], graph.batch)
+    queries = query_tokens(q_former, encoded, graph)
     return projector(queries)
 
 

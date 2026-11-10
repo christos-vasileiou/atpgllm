@@ -286,10 +286,13 @@ def _token_nll(decoder, head, scale, inputs_embeds, targets_at, positions):
     return torch.cat(losses).tolist()
 
 
-def sequence_nll(model, input_ids, turns, *, prefix=None, graph_at: int = 0) -> List[List[float]]:
+def sequence_nll(model, input_ids, turns, *, prefix=None, graph_at: int = 0,
+                 anchors=None, node_vectors=None) -> List[List[float]]:
     """Per-turn lists of per-token NLL. ``prefix`` (``[1, Q, D]``) is the
     graph soft prompt for Stage C, placed by the model itself (before the
-    chat, or before token ``graph_at``); None for the text model."""
+    chat, or before token ``graph_at``); None for the text model. ``anchors``
+    and ``node_vectors`` are the anchored fusion's inputs, when the model
+    has it."""
     import torch
 
     llm = model.llm if prefix is not None else model
@@ -302,7 +305,8 @@ def sequence_nll(model, input_ids, turns, *, prefix=None, graph_at: int = 0) -> 
         embeds = embed(ids)
     else:
         embeds, _ = model._prefix_and_token_embeddings(
-            None, ids, torch.ones_like(ids), prefix=prefix, graph_at=[graph_at])
+            None, ids, torch.ones_like(ids), prefix=prefix, graph_at=[graph_at],
+            anchors=anchors, node_vectors=node_vectors)
         width = prefix.size(1)
         at = graph_at if model.prefix_at == "placeholder" else 0
     # Token t sits at t, or t + Q once past the graph; position p predicts p + 1.

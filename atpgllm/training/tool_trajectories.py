@@ -16,6 +16,7 @@ import collections
 import hashlib
 import json
 import random
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,6 +38,8 @@ class FailedAttempt:
 
 
 _MODELS: "collections.OrderedDict[tuple, Any]" = collections.OrderedDict()
+# Training builds retry examples from several threads at once.
+_MODELS_LOCK = threading.Lock()
 
 
 def _netlist_text(record: Dict[str, Any]) -> str:
@@ -52,14 +55,17 @@ def _simulator_model(netlist: str):
         resolve_fault_sim_runner().__name__,
         hashlib.sha256(netlist.encode("utf-8")).hexdigest(),
     )
-    model = _MODELS.get(key)
-    if model is None:
-        model = simulation_model(netlist)
+    with _MODELS_LOCK:
+        model = _MODELS.get(key)
+        if model is not None:
+            _MODELS.move_to_end(key)
+            return model
+    # Parsed outside the lock; two threads may parse the same netlist once each.
+    model = simulation_model(netlist)
+    with _MODELS_LOCK:
         _MODELS[key] = model
         if len(_MODELS) > 256:
             _MODELS.popitem(last=False)
-    else:
-        _MODELS.move_to_end(key)
     return model
 
 
