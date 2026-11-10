@@ -272,6 +272,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--grad-accum", type=int, default=64)
     parser.add_argument("--max-steps", type=int, default=20_000)
+    parser.add_argument(
+        "--stop-after",
+        type=int,
+        default=0,
+        help="SFT: stop once this step is trained, evaluated and saved, with "
+             "--max-steps and so the learning-rate schedule of the full run "
+             "unchanged. A later run with --resume continues it. Use a "
+             "multiple of --eval-every. For a decision point before a long run.",
+    )
     parser.add_argument("--save-every", type=int, default=1_000)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--shuffle-buffer", type=int, default=2_048)
@@ -1029,6 +1038,11 @@ def train_sft(args: argparse.Namespace) -> None:
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr * factor
 
+    stop_after = getattr(args, "stop_after", 0)
+    if stop_after and step >= stop_after:
+        if main_process:
+            print(f"step {step} is already at --stop-after {stop_after}; nothing to train", flush=True)
+        return
     # from_pretrained returns eval mode: gradient checkpointing, LoRA dropout
     # and the graph encoder's BatchNorm statistics need train mode.
     model.train()
@@ -1094,6 +1108,15 @@ def train_sft(args: argparse.Namespace) -> None:
             prune()
         if step >= args.max_steps:
             break
+        if stop_after and step >= stop_after:
+            # A decision point, not the end of the run: no final evaluation,
+            # probe or "final" checkpoint.
+            if step % args.save_every:
+                save(f"step{step}")
+            if main_process:
+                print(f"stopped after step {step} of {args.max_steps} (--stop-after); "
+                      "resume from its checkpoint to continue", flush=True)
+            return
     keep_best(evaluate(probe=True))
     save("final")
 

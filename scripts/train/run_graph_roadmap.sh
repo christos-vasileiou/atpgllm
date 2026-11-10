@@ -132,6 +132,7 @@ case "${STAGE:?STAGE is required}" in
         [ -n "${PREFIX_AT:-}" ] && CMD+=(--prefix-at "$PREFIX_AT")
         [ -n "${TARGET:-}" ] && CMD+=(--target "$TARGET")
         [ "${GRAPH_OFF:-False}" = True ] && CMD+=(--graph-off)
+        [ -n "${STOP_AFTER:-}" ] && CMD+=(--stop-after "$STOP_AFTER")
         [ -n "${FUSION:-}" ] && CMD+=(--fusion "$FUSION")
         [ -n "${ANCHOR_GATE_LR:-}" ] && CMD+=(--anchor-gate-lr "$ANCHOR_GATE_LR")
         [ -n "${HINTS:-}" ] && CMD+=(--hints "$HINTS")

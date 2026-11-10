@@ -18,6 +18,11 @@
 #                                         # needs runs/bridges_retest/hints for train and validation
 #   ARM=graph SMOKE=1 sbatch --gres=gpu:1 -t 01:00:00 scripts/train/juno_retest_stage_c.sbatch
 #
+# STOP_AFTER=40 stops an arm after step 40 with the 300-step schedule kept,
+# for the comparison of all arms at step 40 (rule of 11-10). Submitting the
+# arm again without STOP_AFTER continues it to step 300.
+#   ARM=anchored STOP_AFTER=40 sbatch -t 12:00:00 scripts/train/juno_retest_stage_c.sbatch
+#
 # A run cut off by the 2-day limit continues from its latest step checkpoint
 # when submitted again (for example with --dependency=afterany:<job>); a run
 # that already saved its last step exits at once.
