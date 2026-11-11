@@ -35,6 +35,20 @@ def raw_netlist(record):
     return value.get("netlist", "") if isinstance(value, dict) else value
 
 
+def combinational_view(text):
+    """A v5 full-scan netlist as its cut view (each flop a pseudo input on its QN net and a
+    pseudo output on its D net), where the dataset's random-pattern labels were computed;
+    other netlists unchanged."""
+    try:
+        from scan_view import cut_view, is_scan_netlist, scan_cells_from_netlist
+    except ImportError:
+        return text
+    if not is_scan_netlist(text):
+        return text
+    cells, clocks = scan_cells_from_netlist(text)
+    return cut_view(text, cells, clocks).netlist
+
+
 def identity(record):
     return digest([raw_netlist(record), str(record.get("fault", "")).strip()])
 
@@ -279,6 +293,7 @@ class Analyzer:
     def analyze(self, record):
         text = raw_netlist(record)
         cid = digest(text)
+        text = combinational_view(text)
         base = dict(problem_id=identity(record), circuit_id=cid, module_name=record.get("module_name", ""),
                     fault=record.get("fault", ""), version=VERSION)
         try:
