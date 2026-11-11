@@ -98,7 +98,10 @@ def test_builder_defaults_match_the_after_rft_config():
         return re.search(rf"^{key}=(.*)$", conf, re.M).group(1).strip()
 
     assert value("FIXED_EVAL_SIZE") == "250" and value("FIXED_EVAL_SELECTION") == "stratified_family_v2"
-    assert f'selection="{value("FIXED_EVAL_SELECTION")}"' in builder
+    # v4 configs use the family selection, v5 (--kind_shares) the kind-split one.
+    assert f'"stratified_family_kind_v1" if kind_shares else "{value("FIXED_EVAL_SELECTION")}"' in builder
+    v5 = (repo / "scripts/train/configs/grpo_granite_4.2_8b_v5_juno_h100_tetramax_after_rft.conf").read_text()
+    assert "FIXED_EVAL_SELECTION=stratified_family_kind_v1" in v5
     assert f'"--dataset", default="{value("TRAIN_DATASET")}"' in builder
     assert f'"--split", default="{value("FIXED_EVAL_SPLIT")}"' in builder
     for key, flag in (("MAX_PROMPT_LENGTH", "max_prompt_length"), ("MAX_COMPLETION_LENGTH", "max_completion_length"),

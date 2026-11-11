@@ -71,9 +71,16 @@ class ShardPermutation:
 
     Row counts come from ``split_manifest.json`` when it lists the shards, so
     no shard is opened to build the order; otherwise from parquet metadata.
+
+    When the shards hold more than one ``circuit_kind`` (v5), each pass is the
+    seeded permutation with the kinds merged by even spacing
+    (:func:`atpgllm.training.kinds.even_spacing_order`): every window of
+    consecutive rows holds both kinds in their split proportions, and each
+    kind keeps its random order. One-kind splits (v4) keep the plain permutation.
     """
 
-    def __init__(self, directory, split: str = "train", seed: int = 0, block_size: int = 20000):
+    def __init__(self, directory, split: str = "train", seed: int = 0, block_size: int = 20000,
+                 stratify_kinds: bool = True):
         import pyarrow.parquet as pq
 
         self.directory = Path(directory)
@@ -97,11 +104,23 @@ class ShardPermutation:
         self.total = int(self.starts[-1])
         self._order = (None, None)
         self._uniform = (None, None)
+        self.kind_names, self.row_kinds = (), None
+        if stratify_kinds:
+            from .kinds import shard_kinds
+            kinds = shard_kinds(self.paths)
+            if kinds and len(set(kinds)) > 1:
+                self.kind_names = tuple(sorted(set(kinds)))
+                code = {k: i for i, k in enumerate(self.kind_names)}
+                self.row_kinds = np.repeat(np.array([code[k] for k in kinds], dtype=np.int8), counts)
 
     def order(self, pass_index: int) -> np.ndarray:
         if self._order[0] != pass_index:
             rng = np.random.default_rng([self.seed, int(pass_index)])
-            self._order = (pass_index, rng.permutation(self.total))
+            order = rng.permutation(self.total)
+            if self.row_kinds is not None:
+                from .kinds import even_spacing_order
+                order = order[even_spacing_order(self.row_kinds[order])]
+            self._order = (pass_index, order)
         return self._order[1]
 
     def uniform(self, pass_index: int) -> np.ndarray:

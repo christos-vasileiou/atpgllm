@@ -210,12 +210,23 @@ def gpu_list(plan):
 # ------------------------------------------------------------------ stages
 
 
+def selection_args(plan, kind_shares=None):
+    """Prompt budget and circuit-kind split shared by every selection (v5 sets both)."""
+    extra = []
+    if plan["sample"].get("max_prompt_length"):
+        extra += ["--max_prompt_length", plan["sample"]["max_prompt_length"]]
+    if kind_shares:
+        extra += ["--kind_shares", kind_shares]
+    return extra
+
+
 def select_validation(r):
     plan = r.plan
     target = r.path("eval", "val_problems.parquet")
     target.parent.mkdir(exist_ok=True)
     run([PYTHON, "scripts/star/rationalize.py", "--adapter", plan["start_adapter"], "--dataset", plan["dataset"],
          "--split", "validation", "--per_level", plan["eval"]["val_per_level"], "--seed", plan["seed"],
+         *selection_args(plan, plan["eval"].get("val_kind_shares")),
          "--select_only", "--write_problems", target, "--out", r.path("eval", "val_select")],
         r.path("logs", "select_validation.log"))
     return str(target)
@@ -258,9 +269,15 @@ def evaluate_model(r, tag, adapter):
                      manifest=plan["eval"]["fixed_manifest"]))
     val = r.stage(f"{tag}/eval_val", evaluate, r, adapter, r.path(tag, "eval_val"),
                   problems=str(r.path("eval", "val_problems.parquet")))
-    return {"adapter": str(adapter), "fixed": fixed["all"]["detection"] if fixed else None,
-            "val": val["level_mean_detection"],
-            "val_by_level": {k: v["detection"] for k, v in val["by_level"].items()}}
+    result = {"adapter": str(adapter), "fixed": fixed["all"]["detection"] if fixed else None,
+              "val": val["level_mean_detection"],
+              "val_by_level": {k: v["detection"] for k, v in val["by_level"].items()}}
+    if "kind_level_mean_detection" in val:
+        # v5: each kind weighs the same in the score that ranks rounds.
+        result["val"] = val["kind_level_mean_detection"]
+        result["val_level_mean"] = val["level_mean_detection"]
+        result["val_by_kind"] = {k: v["level_mean_detection"] for k, v in val["by_kind"].items()}
+    return result
 
 
 def run_benchmark(r, adapter, out):
@@ -272,7 +289,11 @@ def run_benchmark(r, adapter, out):
                               "--max_tool_rounds", bench.get("max_tool_rounds", 5),
                               "--max_generated_tokens", bench.get("max_generated_tokens", 16384),
                               "--batch_problems", bench.get("batch_problems", 16)])
-    return {"robust": metrics["all"]["detection"], "level_mean": metrics["level_mean_detection"]}
+    result = {"robust": metrics["all"]["detection"], "level_mean": metrics["level_mean_detection"]}
+    if "kind_level_mean_detection" in metrics:
+        result["kind_level_mean"] = metrics["kind_level_mean_detection"]
+        result["by_kind"] = {k: v["level_mean_detection"] for k, v in metrics["by_kind"].items()}
+    return result
 
 
 def write_report(r, tag, directory):
@@ -333,6 +354,7 @@ def select_round(r, n):
     earlier = [p for p in (attempted_problems(r, i) for i in range(1, n)) if p]
     run([PYTHON, "scripts/star/rationalize.py", "--adapter", plan["start_adapter"], "--dataset", plan["dataset"],
          "--per_level", plan["per_level"], "--seed", plan["seed"] + n, "--select_only",
+         *selection_args(plan, plan.get("kind_shares")),
          "--write_problems", target, "--exclude_problems", ",".join(earlier),
          "--hint_modes", plan["sample"]["hint_modes"], "--out", r.path(f"round_{n}", "gen")],
         r.path("logs", f"round_{n}_select.log"))
@@ -355,7 +377,7 @@ def generate(r, n, adapter):
          "--hint_modes", sample["hint_modes"], "--escalate", "--num_samples", sample["num_samples"],
          "--seed", plan["seed"] + n, "--temperature", sample["temperature"],
          "--max_tool_rounds", sample["max_tool_rounds"], "--max_model_len", sample["max_model_len"],
-         "--max_generated_tokens", sample["max_generated_tokens"],
+         "--max_generated_tokens", sample["max_generated_tokens"], *selection_args(plan),
          "--batch_problems", sample["batch_problems"], "--out", out, *deadline,
          "--shard", "{shard}", "--num_shards", "{num_shards}"],
         r.path("logs", f"round_{n}_generate.log"), env={"PYTHONPATH": str(REPO)})
@@ -446,6 +468,38 @@ def gdpo(r, adapter):
         r.optional(f"{tag}/export", merge_export, r, policy, f"{tag}_export")
         benchmark_model(r, tag, policy, r.path(tag, "eval_bench"), tag)
     return str(out)
+
+
+def bench_score(result):
+    """The benchmark score that ranks GDPO checkpoints: the kind x level mean on v5, else the level mean."""
+    return result.get("kind_level_mean", result["level_mean"])
+
+
+def best_gdpo(r):
+    """The best benchmarked GDPO checkpoint that still exists, earliest on ties; None without any.
+
+    Written to ``state["gdpo_best"]`` and ``gdpo_best.json``; the schedule
+    (``run_schedule.py``) starts the next RFT phase from its policy.
+    """
+    g = r.plan["gdpo"]
+    out = Path(g["output_dir"])
+    out = out if out.is_absolute() else REPO / out
+    scored = []
+    for name, done in r.state["done"].items():
+        if name.startswith("gdpo_") and name.endswith("/bench") and done.get("result"):
+            step = int(name.split("/")[0].split("_")[1])
+            policy = out / f"checkpoint-{step}" / "policy"
+            if policy.is_dir():
+                scored.append((-bench_score(done["result"]), step, str(policy), done["result"]))
+    if not scored:
+        return None
+    _, step, policy, result = min(scored)
+    best = {"step": step, "policy": policy, "score": bench_score(result), "bench": result}
+    r.state["gdpo_best"] = best
+    r.save()
+    write_json(r.path("gdpo_best.json"), best)
+    log(f"best GDPO checkpoint: step {step} (score {best['score']:.3f}) {policy}")
+    return best
 
 
 def latest_gdpo_step(out):
@@ -566,6 +620,7 @@ def main():
             return
         wait_while_held(r)
         r.stage("gdpo", gdpo, r, best)
+        best_gdpo(r)
         r.state["finished"] = now()
         r.save()
         log("GDPO finished; the plan is complete")

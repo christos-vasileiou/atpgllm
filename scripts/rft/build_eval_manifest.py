@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts" / "eval"))
 
 LEVELS = ("easy", "medium", "hard", "very_hard", "random_never_detects")
-EXAMPLE_KEYS = ("prompt", "fault", "netlist", "module_name", "doc_id")
+EXAMPLE_KEYS = ("prompt", "fault", "netlist", "module_name", "doc_id", "circuit_kind")
 
 
 def train_families(dataset):
@@ -50,7 +50,9 @@ def split_keys(dataset, split, seed):
     seen = Counter()
     columns = ["difficulty", "module_name", "netlist_id", "circuit_id", "fault", "random_detection_probability"]
     for index, path in enumerate(sorted((Path(dataset) / split).glob("*.parquet"))):
-        for offset, row in enumerate(pq.read_table(path, columns=columns).to_pylist()):
+        have = pq.read_schema(path).names
+        wanted = columns + (["circuit_kind"] if "circuit_kind" in have else [])
+        for offset, row in enumerate(pq.read_table(path, columns=wanted).to_pylist()):
             key = (str(row["netlist_id"]), str(row["fault"]))
             seen[key] += 1
             # Reservoir of one: every row of a problem is equally likely to supply it.
@@ -84,6 +86,9 @@ def main():
     parser.add_argument("--world_size", type=int, default=2)
     parser.add_argument("--backend", default="tetramax", help="FAULT_SIM_BACKEND of the GDPO config")
     parser.add_argument("--analyzer_samples", type=int, default=65536)
+    parser.add_argument("--kind_shares", default="",
+                        help="v5: split --per_level across circuit kinds, e.g. combinational=0.5,sequential=0.5. "
+                             "The GDPO config then sets FIXED_EVAL_SELECTION=stratified_family_kind_v1")
     args = parser.parse_args()
 
     os.environ["FAULT_SIM_BACKEND"] = args.backend
@@ -116,8 +121,18 @@ def main():
         rendered[(str(key_row["netlist_id"]), str(key_row["fault"]))] = (raw, record)
         return True
 
-    chosen = select_stratified(keys, {level: args.per_level for level in LEVELS}, args.seed,
-                               seen_families=seen_families, eligible=eligible)
+    from atpgllm.training.kinds import parse_kind_shares, row_kind, split_counts
+    kind_shares = parse_kind_shares(args.kind_shares)
+    if kind_shares:
+        chosen = []
+        targets = split_counts({level: args.per_level for level in LEVELS}, kind_shares)
+        for kind in kind_shares:
+            pool = [k for k in keys if row_kind(k) == kind]
+            chosen += select_stratified(pool, {level: targets[(kind, level)] for level in LEVELS}, args.seed,
+                                        seen_families=seen_families, eligible=eligible)
+    else:
+        chosen = select_stratified(keys, {level: args.per_level for level in LEVELS}, args.seed,
+                                   seen_families=seen_families, eligible=eligible)
     print(f"[manifest] selected {len(chosen)}, rejected {dict(rejected)}", flush=True)
 
     # The reference always uses the Python simulator, whatever the GDPO config scores with.
@@ -132,6 +147,7 @@ def main():
         example_id = digest([net_id, record["fault"]])
         examples.append({**{k: record[k] for k in EXAMPLE_KEYS if k in record}, "_fixed_eval_id": example_id})
         reference[example_id] = reference_entry(raw, simulator, seen_families=seen_families, analyzer=analyzer)
+        reference[example_id]["kind"] = row_kind(raw)
 
     size = len(examples)
     protocol = fixed_eval_protocol(
@@ -139,7 +155,7 @@ def main():
         max_prompt_length=args.max_prompt_length, max_completion_length=args.max_completion_length,
         max_model_len=args.max_model_len, generations=1, per_device_batch_size=args.per_device_batch_size,
         world_size=args.world_size, holdout_policy="exclude_evaluation_circuits", rolling_buffer=True,
-        selection="stratified_family_v2")
+        selection="stratified_family_kind_v1" if kind_shares else "stratified_family_v2")
     protocol["fault_sim_backend"] = args.backend
     manifest = {"version": 1, "protocol": protocol, "examples": examples, "examples_sha256": digest(examples)}
     out = Path(args.out)
@@ -147,6 +163,8 @@ def main():
     write_json_atomic(out, manifest)
     write_json_atomic(str(out) + ".reference.json", reference)
 
+    for kind in sorted({r["kind"] for r in reference.values()}):
+        print(f"[manifest] {kind}: {sum(r['kind'] == kind for r in reference.values())} problems", flush=True)
     for level in LEVELS:
         group = [r for r in reference.values() if r["level"] == level]
         families = Counter(r["family"] for r in group)

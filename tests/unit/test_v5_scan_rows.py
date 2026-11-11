@@ -96,3 +96,28 @@ def test_signal_graph_never_crosses_a_flop(monkeypatch):
     qn = {c["QN"] for c in model.scan_cells}
     assert not qn & produced  # QN nets are sources, never driven through a flop
     assert not any(str(r[0]).startswith("v5_") for r in graph.records)
+
+
+BUS_ROW = json.loads((Path(__file__).with_name("fixtures") / "v5_scan_row_bus_clock.json").read_text())
+
+
+def test_bus_clock_row_simulates_without_the_clock(monkeypatch):
+    """A one-bit bus clock (input [0:0] clk, .CLK(clk[0])): row patched by clock-keys-v1."""
+    monkeypatch.setenv("FAULT_SIM_BACKEND", "fast")
+    from fault_sim import fast_fault_sim, prepare_netlist
+    from atpgllm.training.reward_function_factory import RewardFunctionFactory as RF
+    assert ".CLK(clk[0])" in BUS_ROW["netlist"].replace(" ", "").replace("\n", "")
+    model = prepare_netlist(BUS_ROW["netlist"], _gates(), RF.DECL_RE, RF.NAME_RE)
+    assert isinstance(model, scan_view.ScanModel) and model.clock_ports == ["clk[0]"]
+    vector, expected = json.loads(BUS_ROW["input_vector"]), json.loads(BUS_ROW["expected_output"])
+    assert set(vector) == set(model.input_nets) and not any(n.startswith("clk") for n in model.input_nets)
+    frame = fast_fault_sim(vector, expected, BUS_ROW["fault"], model, _gates())
+    good, bad = frame["Good Machine"], frame["Bad Machine"]
+    assert any(good[n] in (0, 1) and bad[n] in (0, 1) and good[n] != bad[n] for n in model.output_nets)
+    out = asyncio.run(fault_simulation_tool_handler_for(BUS_ROW, dict(vector, **{"clk[0]": 0})))
+    assert out.startswith("Tool execution failed")  # the clock is set by the scan procedure
+
+
+def fault_simulation_tool_handler_for(row, vector):
+    from atpgllm.training.tools import fault_simulation_tool_handler
+    return fault_simulation_tool_handler(vector, json.loads(row["expected_output"]), row["fault"], "doc", row["netlist"])

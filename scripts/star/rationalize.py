@@ -71,22 +71,30 @@ def problem_keys(paths):
     return keys
 
 
-def read_selected(dataset, counts, seed, split="train", exclude=()):
+def read_selected(dataset, counts, seed, split="train", exclude=(), kind_shares=None):
     """One seeded row per problem, ``3 * counts[level]`` problems per level.
 
     Selection reads only the key columns; full rows (netlists) are read for the
     chosen problems alone. The surplus covers the gate and prompt-length filters.
+    With ``kind_shares`` ({circuit_kind: share}), each level's count is split
+    across the kinds and every kind is selected from its own problems.
     """
     import pyarrow.parquet as pq
+    from atpgllm.training.kinds import row_kind
     from atpgllm.training.rationalization import select_problems
     paths = sorted((Path(dataset) / split).glob("*.parquet"))
     keys = []
     for index, path in enumerate(paths):
-        table = pq.read_table(path, columns=["difficulty", "netlist_id", "fault"])
+        names = pq.read_schema(path).names
+        columns = ["difficulty", "netlist_id", "fault"] + (["circuit_kind"] if "circuit_kind" in names else [])
+        table = pq.read_table(path, columns=columns)
         for offset, row in enumerate(table.to_pylist()):
             if row["difficulty"] in counts:
                 keys.append(dict(row, _file=index, _offset=offset))
-    chosen = select_problems(keys, {k: 3 * v for k, v in counts.items()}, seed=seed, exclude=exclude)
+    chosen = []
+    for kind, per_level in kind_targets(counts, kind_shares).items():
+        pool = keys if kind is None else [k for k in keys if row_kind(k) == kind]
+        chosen += select_problems(pool, {k: 3 * v for k, v in per_level.items()}, seed=seed, exclude=exclude)
     by_file = {}
     for order, key in enumerate(chosen):
         by_file.setdefault(key["_file"], []).append((order, key["_offset"]))
@@ -98,23 +106,43 @@ def read_selected(dataset, counts, seed, split="train", exclude=()):
     return rows
 
 
-def prepare_problems(dataset, counts, seed, tokenizer, max_prompt_length, *, split="train",
-                     exclude=(), rows=None):
-    """``[(row, record, clean prompt messages)]`` and the count kept per level.
+def kind_targets(counts, kind_shares):
+    """``{kind: {level: n}}`` (kind None without shares)."""
+    from atpgllm.training.kinds import split_counts
+    targets = {}
+    for (kind, level), n in split_counts(counts, kind_shares).items():
+        targets.setdefault(kind, {})[level] = n
+    return targets
 
-    Keeps the first ``counts[level]`` candidates per level that pass the gate
-    filter and whose hint-free prompt fits the GRPO prompt budget. ``rows``
-    (a stored selection) replaces reading the dataset; all of them are kept.
+
+def stratum(row, kind_shares):
+    """The selection stratum of a row: its level, or ``kind/level`` with kind shares."""
+    from atpgllm.training.kinds import row_kind
+    return f"{row_kind(row)}/{row['difficulty']}" if kind_shares else row["difficulty"]
+
+
+def prepare_problems(dataset, counts, seed, tokenizer, max_prompt_length, *, split="train",
+                     exclude=(), rows=None, kind_shares=None):
+    """``[(row, record, clean prompt messages)]`` and the count kept per stratum.
+
+    Keeps the first ``counts[level]`` candidates per level (per kind and level
+    with ``kind_shares``) that pass the gate filter and whose hint-free prompt
+    fits the prompt budget. ``rows`` (a stored selection) replaces reading the
+    dataset; all of them are kept.
     """
     from atpgllm.training.conversation import ConversationExample
     from atpgllm.training.dataset_utils import _gate_filter_passes
     from atpgllm.training.tools import TOOLS
-    pool = read_selected(dataset, counts, seed, split, exclude) if rows is None else rows
+    pool = read_selected(dataset, counts, seed, split, exclude, kind_shares) if rows is None else rows
     if rows is not None:
-        counts = Counter(row["difficulty"] for row in rows)
+        counts = Counter(stratum(row, kind_shares) for row in rows)
+    else:
+        counts = {(f"{kind}/{level}" if kind else level): n
+                  for kind, per_level in kind_targets(counts, kind_shares).items() for level, n in per_level.items()}
     problems, taken = [], dict.fromkeys(counts, 0)
     for row in pool:
-        if taken[row["difficulty"]] >= counts[row["difficulty"]] or not _gate_filter_passes(row):
+        key = stratum(row, kind_shares)
+        if taken[key] >= counts[key] or not _gate_filter_passes(row):
             continue
         # The prompt and the verifier both derive doc_id = sha256(netlist)[:16].
         record = dict(row)
@@ -122,7 +150,7 @@ def prepare_problems(dataset, counts, seed, tokenizer, max_prompt_length, *, spl
         prompt = tokenizer.apply_chat_template(clean, tools=TOOLS, tokenize=False, add_generation_prompt=True)
         if len(tokenizer.encode(prompt, add_special_tokens=False)) >= max_prompt_length:
             continue
-        taken[row["difficulty"]] += 1
+        taken[key] += 1
         problems.append((row, record, clean))
     print(f"[star] {len(pool)} candidates -> {len(problems)} problems: {taken}", flush=True)
     return problems, taken
@@ -286,6 +314,8 @@ def main():
     parser.add_argument("--dataset", required=True, help="Local v4 dataset directory with train/")
     parser.add_argument("--split", default="train", help="Split to select from (validation for an eval set)")
     parser.add_argument("--per_level", default="hard=100,very_hard=100,random_never_detects=100")
+    parser.add_argument("--kind_shares", default="",
+                        help="Split each level's count across circuit kinds, e.g. combinational=0.5,sequential=0.5 (v5)")
     parser.add_argument("--hint_modes", default="none,partial", help="Comma list of none,path,partial,cube")
     parser.add_argument("--escalate", action="store_true",
                         help="Try each mode after the first only on problems all earlier modes failed")
@@ -340,8 +370,10 @@ def main():
         import pyarrow.parquet as pq
         rows = pq.read_table(args.problems_file).to_pylist()
     exclude = problem_keys([p for p in args.exclude_problems.split(",") if p])
+    from atpgllm.training.kinds import parse_kind_shares
+    kind_shares = parse_kind_shares(args.kind_shares)
     problems, taken = prepare_problems(args.dataset, counts, args.seed, tokenizer, args.max_prompt_length,
-                                       split=args.split, exclude=exclude, rows=rows)
+                                       split=args.split, exclude=exclude, rows=rows, kind_shares=kind_shares)
     print(f"[star] selection took {time.time() - t0:.0f} s", flush=True)
     if args.write_problems:
         import pyarrow as pa
@@ -353,6 +385,7 @@ def main():
         with open(out / "problems.jsonl", "w") as sink:
             for row, _, _ in problems:
                 sink.write(json.dumps({"problem": list(problem_key(row)), "difficulty": row["difficulty"],
+                                       "circuit_kind": row.get("circuit_kind") or "combinational",
                                        "random_detection_probability": row["random_detection_probability"],
                                        "hints": {m: hint_text(row, m, seed=args.seed) for m in modes}}) + "\n")
     if args.select_only:
