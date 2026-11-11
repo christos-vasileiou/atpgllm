@@ -100,8 +100,8 @@ def read_selected(dataset, counts, seed, split="train", exclude=(), kind_shares=
         by_file.setdefault(key["_file"], []).append((order, key["_offset"]))
     rows = [None] * len(chosen)
     for index, wanted in by_file.items():
-        table = pq.read_table(paths[index]).take([offset for _, offset in wanted])
-        for (order, _), row in zip(wanted, table.to_pylist()):
+        from atpgllm.training.stream_buffer import read_rows
+        for (order, _), row in zip(wanted, read_rows(paths[index], [offset for _, offset in wanted])):
             rows[order] = row
     return rows
 

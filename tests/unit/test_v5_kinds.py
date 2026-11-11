@@ -248,3 +248,11 @@ def test_phase_handover_excludes_problems_and_continues_the_stream(tmp_path):
     run_rft.complete_checkpoint = lambda d, s: bool(seen)
     run_rft.train(r, 1, str(tmp_path / "gdpo/checkpoint-8/policy"), 100)
     assert seen[0]["SKIP_BUFFER_SIZE"] == "123456"
+
+
+def test_read_rows_picks_rows_across_row_groups(tmp_path):
+    from atpgllm.training.stream_buffer import read_rows
+    path = tmp_path / "s.parquet"
+    pq.write_table(pa.table({"i": list(range(25)), "s": [f"x{i}" * 3 for i in range(25)]}), path, row_group_size=4)
+    rows = read_rows(path, [24, 0, 5, 5, 13])
+    assert [r["i"] for r in rows] == [24, 0, 5, 5, 13] and rows[2]["s"] == "x5x5x5"

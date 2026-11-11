@@ -66,6 +66,30 @@ def difficulty_keep_probability(weights: dict) -> Callable[[dict], float]:
     return keep
 
 
+def read_rows(path, offsets) -> list[dict]:
+    """Rows at ``offsets`` of one parquet shard, in the order given.
+
+    Reads only the row groups that hold them, and picks each row by a
+    zero-copy slice: ``Table.take`` concatenates a column's chunks, which
+    overflows 32-bit string offsets past 2 GB (v5 sequential shards repeat
+    the netlist in every row, up to 6 GB in one row group).
+    """
+    import pyarrow.parquet as pq
+    offsets = np.asarray(offsets, dtype=np.int64)
+    pf = pq.ParquetFile(path)
+    sizes = [pf.metadata.row_group(g).num_rows for g in range(pf.metadata.num_row_groups)]
+    starts = np.concatenate([[0], np.cumsum(sizes)])
+    group = np.searchsorted(starts, offsets, side="right") - 1
+    out: list = [None] * len(offsets)
+    for g in np.unique(group):
+        where = np.flatnonzero(group == g)
+        table = pf.read_row_group(int(g))
+        for i in where.tolist():
+            out[i] = table.slice(int(offsets[i] - starts[g]), 1).to_pylist()[0]
+        del table
+    return out
+
+
 class ShardPermutation:
     """Every row of ``<directory>/<split>/*.parquet``, in a seeded order per pass.
 
@@ -147,8 +171,7 @@ class ShardPermutation:
             rows: dict[int, dict] = {}
             for s in np.unique(shard):
                 mask = shard == s
-                table = pq.read_table(self.paths[s]).take(local[mask])
-                for gid, row in zip(ids[mask].tolist(), table.to_pylist()):
+                for gid, row in zip(ids[mask].tolist(), read_rows(self.paths[s], local[mask])):
                     rows[gid] = row
             for offset, gid in enumerate(ids.tolist()):
                 yield block_start + offset, rows[gid]
