@@ -269,6 +269,16 @@ def _get_device_map(use_ddp: bool) -> str | dict:
     if torch.cuda.device_count() <= 1:
         return {"": "cuda:0"}
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    # Make "cuda" mean this rank's GPU. PEFT's load_adapter (Trainer
+    # load_best_model_at_end) loads to the default device; without this every
+    # rank loaded onto cuda:0 and ranks 1-3 ran out of memory after the last
+    # step (reasoning_pilot/sft, W&B rft-training/go69rrkq, 2026-11-04).
+    torch.cuda.set_device(local_rank)
+    # set_device alone is not enough: PEFT loads adapters to infer_device() == "cuda",
+    # which safetensors reads as cuda:0 on every rank (checked on eng-tamale2). Name
+    # this rank's GPU instead.
+    import peft.peft_model as peft_model
+    peft_model.infer_device = lambda: f"cuda:{local_rank}"
     return {"": f"cuda:{local_rank}"}
 
 

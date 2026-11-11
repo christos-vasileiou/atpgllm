@@ -21,8 +21,8 @@ TetraMAX verifies, fine tunes, and evaluates:
 5. ``eval``: greedy detection on the GDPO fixed evaluation (72 faults) and
    on a stratified validation set, scored the same way for every round.
 
-Rounds stop at ``rounds``, when the validation score has not risen over the
-round before for ``patience`` consecutive rounds, or when the next round would
+Rounds stop at ``rounds``, when the validation score has not risen above the
+best earlier score for ``patience`` consecutive rounds, or when the next round would
 end after ``deadline_hours`` (measured from the first launch). Each round
 continues from the previous one, whatever its score. GDPO then starts from the
 best checkpoint (round 0 is the starting SFT checkpoint) and runs to the end
@@ -305,6 +305,11 @@ def attempted_problems(r, n):
     available to later rounds, since the hard levels hold few problems.
     """
     target = r.path(f"round_{n}", "attempted.parquet")
+    if not target.exists() and not r.path(f"round_{n}").is_dir():
+        # A round directory removed to free disk takes its sampled problems
+        # with it, so those problems become eligible again.
+        log(f"round_{n} is gone; its sampled problems are not excluded")
+        return None
     if not target.exists():
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -325,7 +330,7 @@ def select_round(r, n):
     plan = r.plan
     target = r.path(f"round_{n}", "problems.parquet")
     target.parent.mkdir(exist_ok=True)
-    earlier = [attempted_problems(r, i) for i in range(1, n)]
+    earlier = [p for p in (attempted_problems(r, i) for i in range(1, n)) if p]
     run([PYTHON, "scripts/star/rationalize.py", "--adapter", plan["start_adapter"], "--dataset", plan["dataset"],
          "--per_level", plan["per_level"], "--seed", plan["seed"] + n, "--select_only",
          "--write_problems", target, "--exclude_problems", ",".join(earlier),
@@ -468,11 +473,20 @@ def wait_while_held(r):
 
 
 def stalled_rounds(results, n):
-    """Consecutive rounds up to ``n`` whose validation score did not rise over the round before."""
-    stalled = 0
+    """Consecutive rounds up to ``n`` whose validation score did not rise above the best before them.
+
+    A plateau rule: a round that improves on the round before it but stays at
+    or below the best earlier score still counts as stalled.
+    """
     # Rounded: equal detection counts can differ in the last float bits across levels.
-    while n - stalled > 0 and round(results[str(n - stalled)]["val"], 9) <= round(results[str(n - stalled - 1)]["val"], 9):
-        stalled += 1
+    best = round(results["0"]["val"], 9)
+    stalled = 0
+    for k in range(1, n + 1):
+        val = round(results[str(k)]["val"], 9)
+        if val > best:
+            best, stalled = val, 0
+        else:
+            stalled += 1
     return stalled
 
 
