@@ -70,6 +70,19 @@ def phase_start(state, index):
     return best["policy"]
 
 
+def handover(previous):
+    """What a phase takes from the one before it: the problems it sampled (never chosen
+    again) and its last SFT checkpoint, whose stream offset the next SFT continues."""
+    prev_dir = Path(previous["run_dir"])
+    prev = run_rft.Run(prev_dir / "plan.json", prev_dir)
+    rounds = sorted(int(p.name.split("_")[1]) for p in prev_dir.glob("round_*") if p.name.split("_")[1].isdigit())
+    exclude = [p for p in (run_rft.attempted_problems(prev, n) for n in rounds if n > 0) if p]
+    results = prev.state.get("results", {})
+    trained = [int(k) for k, v in results.items() if int(k) > 0 and "/sft/checkpoint-" in str(v.get("adapter"))]
+    return {"exclude_problems": exclude,
+            "skip_from": results[str(max(trained))]["adapter"] if trained else None}
+
+
 def run_phase(schedule, run_dir, state, index):
     phase = schedule["phases"][index]
     name = phase.get("name", f"phase_{index + 1}")
@@ -83,6 +96,9 @@ def run_phase(schedule, run_dir, state, index):
     if not source.exists():
         plan = read_json(resolve(phase["plan"]))
         plan.update({"run_dir": str(phase_dir), "start_adapter": start})
+        if index > 0:
+            plan.update(handover(state["phases"][str(index - 1)]))
+            plan["sft"]["skip_from"] = plan.pop("skip_from", None)
         write_json(source, plan)
     state["phases"][str(index)] = recorded = {"name": name, "run_dir": str(phase_dir), "start_adapter": start}
     write_json(run_dir / "state.json", state)

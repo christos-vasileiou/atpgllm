@@ -619,7 +619,8 @@ def train_with_sft(
 
 def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoint, buffer_size,
                          max_prompt_length, netlist_diversity_strategy, held_out_examples,
-                         prompts_per_step, max_steps, is_main_process, difficulty_weights=None):
+                         prompts_per_step, max_steps, is_main_process, difficulty_weights=None,
+                         buffer_seed=42):
     """GRPO prompts read from the whole train split, ``buffer_size`` at a time.
 
     See :mod:`atpgllm.training.stream_buffer`. Rows pass the same filters as
@@ -679,6 +680,9 @@ def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoi
     if difficulty_weights:
         # Only when set, so ledgers of unweighted runs still resume.
         settings["difficulty_weights"] = dict(difficulty_weights)
+    if buffer_seed != 42:
+        # A later GDPO phase reads the split in its own order (not the first phase's prompts again).
+        settings["buffer_seed"] = buffer_seed
     from atpgllm.training.kinds import dataset_kinds, interleave_by_kind
     mixed_kinds = len(dataset_kinds(dataset_path)) > 1
     if mixed_kinds:
@@ -686,13 +690,13 @@ def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoi
         settings["kind_interleave"] = "even_spacing"
 
     def reorder(rows, k):
-        rows = interleave_for_field_diversity(rows, "netlist", strategy=netlist_diversity_strategy, seed=42 + k)
+        rows = interleave_for_field_diversity(rows, "netlist", strategy=netlist_diversity_strategy, seed=buffer_seed + k)
         return interleave_by_kind(rows) if mixed_kinds else rows
     # Twice the prompts max_steps can consume: the sampler never wraps around.
     length = max(1, math.ceil(2 * max(max_steps, 1) * max(prompts_per_step, 1) / buffer_size)) * buffer_size
     resume_ledger = Path(resume_checkpoint) / LEDGER_NAME if resume_checkpoint else None
     buffer = RollingPromptBuffer(
-        ShardPermutation(directory, "train", seed=42), prepare,
+        ShardPermutation(directory, "train", seed=buffer_seed), prepare,
         chunk_size=buffer_size, length=length, ledger_path=Path(output_dir) / LEDGER_NAME,
         settings=settings, writer=is_main_process, resume_ledger=resume_ledger,
         keep_probability=difficulty_keep_probability(difficulty_weights) if difficulty_weights else None,
@@ -753,6 +757,7 @@ def train_with_grpo(
     buffer_rolling: bool = False,
     keep_best_checkpoints: int = 0,
     difficulty_weights: str | None = None,
+    grpo_buffer_seed: int = 42,
     **kwargs,
 ) -> None:
     """
@@ -1118,6 +1123,7 @@ def train_with_grpo(
                               * gradient_accumulation_steps // max(num_generations, 2)),
             max_steps=max_steps, is_main_process=distributed_state.is_main_process,
             difficulty_weights=difficulty_weights or None,
+            buffer_seed=int(grpo_buffer_seed),
         )
 
     # =========================================================================
@@ -1326,7 +1332,7 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "grpo_learning_rate", "grpo_warmup_steps",
     "fixed_eval_size", "fixed_eval_split", "fixed_eval_manifest", "fixed_eval_seed",
     "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size", "fixed_eval_selection", "stop_after_step",
-    "buffer_rolling", "keep_best_checkpoints", "difficulty_weights",
+    "buffer_rolling", "keep_best_checkpoints", "difficulty_weights", "grpo_buffer_seed",
 })
 
 
@@ -1508,6 +1514,11 @@ def main() -> None:
     parser.add_argument("--save_total_limit", type=int, default=_env("SAVE_TOTAL_LIMIT", None),
                         help="SFT: keep at most this many checkpoints (the best one is always kept). "
                              "Env: SAVE_TOTAL_LIMIT (default: keep all)")
+    parser.add_argument(
+        "--grpo_buffer_seed", type=int, default=int(_env("GRPO_BUFFER_SEED", "42")),
+        help="GRPO rolling buffer: seed of the split order (and of each chunk's netlist interleave). "
+             "A later GDPO phase sets its own so it does not replay the first phase's prompts. "
+             "Env: GRPO_BUFFER_SEED (default 42)")
     parser.add_argument(
         "--difficulty_weights", default=_env("DIFFICULTY_WEIGHTS", None),
         help="GRPO rolling buffer: relative sampling weight per difficulty level, e.g. "

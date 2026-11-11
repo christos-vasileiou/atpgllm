@@ -79,6 +79,20 @@ def test_shard_permutation_spaces_kinds_on_v5(tmp_path):
         assert [i for i in order if perm.row_kinds[i] == code] == [i for i in plain if perm.row_kinds[i] == code]
 
 
+def test_shard_permutation_reads_kinds_from_the_manifest(tmp_path, monkeypatch):
+    root = dataset(tmp_path)
+    manifest = json.loads((root / "split_manifest.json").read_text())
+    for name, entry in manifest["shards"].items():
+        entry["kind"] = "sequential" if "/seq-" in name else "combinational"
+    (root / "split_manifest.json").write_text(json.dumps(manifest))
+    import atpgllm.training.kinds as kinds
+    monkeypatch.setattr(kinds, "shard_kinds", lambda paths: pytest.fail("footers must not be read"))
+    with_manifest = ShardPermutation(root, "train", seed=3)
+    assert with_manifest.kind_names == ("combinational", "sequential")
+    monkeypatch.undo()
+    assert np.array_equal(with_manifest.order(0), ShardPermutation(dataset(tmp_path / "b"), "train", seed=3).order(0))
+
+
 def test_shard_permutation_unchanged_for_one_kind(tmp_path):
     root = dataset(tmp_path, kinds=(("data", "combinational", [4, 9, 2]),), version="v4")
     a = ShardPermutation(root, "train", seed=1).order(0)
@@ -179,3 +193,58 @@ def test_v5_configs_agree():
         assert "SFT_CIRCUIT_VALIDATION=True" in sft
     warm = (REPO / schedule["warmup"]["conf"]).read_text()
     assert "SFT_CIRCUIT_VALIDATION=True" in warm and "MAX_PROMPT_LENGTH=14336" in warm
+
+
+def test_gdpo_phases_read_different_prompts():
+    schedule = json.loads((REPO / "scripts/rft/configs/schedule_v5_juno_h100.json").read_text())
+    seeds = [json.loads((REPO / p["plan"]).read_text())["gdpo"].get("env", {}).get("GRPO_BUFFER_SEED", 42)
+             for p in schedule["phases"]]
+    assert len(set(seeds)) == len(seeds)
+
+
+def test_gdpo_stage_passes_the_phase_env(tmp_path, monkeypatch):
+    run_rft = load("run_rft", "scripts/rft/run_rft.py")
+    out = tmp_path / "gdpo"
+    plan = {"run_dir": str(tmp_path / "run"), "gpus": [], "eval": {"fixed_manifest": str(tmp_path / "m.json")},
+            "gdpo": {"conf": "c.conf", "output_dir": str(out), "env": {"GRPO_BUFFER_SEED": 4242}}}
+    (tmp_path / "m.json").write_text("{}")
+    (tmp_path / "plan.json").write_text(json.dumps(plan))
+    r = run_rft.Run(tmp_path / "plan.json")
+    seen = []
+    monkeypatch.setattr(run_rft, "wait_for_free_gpus", lambda plan: None)
+    monkeypatch.setattr(run_rft, "latest_gdpo_step", lambda out: None)
+    monkeypatch.setattr(run_rft, "run", lambda cmd, log, env=None, cwd=None: seen.append(env))
+    run_rft.gdpo(r, "/adapter")
+    assert seen[0]["GRPO_BUFFER_SEED"] == "4242" and seen[0]["RESUME_FROM"] == "/adapter"
+
+
+def test_phase_handover_excludes_problems_and_continues_the_stream(tmp_path):
+    run_rft = load("run_rft", "scripts/rft/run_rft.py")
+    run_schedule = load("run_schedule", "scripts/rft/run_schedule.py")
+    prev = tmp_path / "phase_1"
+    for n in (1, 2):
+        (prev / f"round_{n}").mkdir(parents=True)
+        pq.write_table(pa.table({"netlist_id": [f"n{n}"], "fault": ["sa0 a"]}), prev / f"round_{n}" / "attempted.parquet")
+    (prev / "plan.json").write_text(json.dumps({"run_dir": str(prev)}))
+    (prev / "state.json").write_text(json.dumps({"results": {
+        "0": {"adapter": "/warm/checkpoint-100"},
+        "1": {"adapter": str(prev / "round_1/sft/checkpoint-10")},
+        "2": {"adapter": str(prev / "round_2/sft/checkpoint-10")}}}))
+    out = run_schedule.handover({"run_dir": str(prev)})
+    assert out["skip_from"].endswith("round_2/sft/checkpoint-10")
+    assert sorted(Path(p).parent.name for p in out["exclude_problems"]) == ["round_1", "round_2"]
+
+    # The first SFT round of the next phase takes the stream offset from skip_from.
+    ck = prev / "round_2/sft/checkpoint-10"
+    ck.mkdir(parents=True)
+    (ck / "training_state_summary.json").write_text(json.dumps({"cumulative_skip_buffer_size": 123456}))
+    plan = {"run_dir": str(tmp_path / "phase_2"), "gpus": [], "sft": {"conf": "c", "gpus": 4, "epochs": 1,
+            "extra_fraction": 0.5, "learning_rate": 1e-5, "skip_from": str(ck)}}
+    (tmp_path / "p2.json").write_text(json.dumps(plan))
+    r = run_rft.Run(tmp_path / "p2.json")
+    seen = []
+    run_rft.wait_for_free_gpus = lambda plan: None
+    run_rft.run = lambda cmd, log, env=None, cwd=None: seen.append(env)
+    run_rft.complete_checkpoint = lambda d, s: bool(seen)
+    run_rft.train(r, 1, str(tmp_path / "gdpo/checkpoint-8/policy"), 100)
+    assert seen[0]["SKIP_BUFFER_SIZE"] == "123456"

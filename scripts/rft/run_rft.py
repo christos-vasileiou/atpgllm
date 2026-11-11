@@ -352,6 +352,8 @@ def select_round(r, n):
     target = r.path(f"round_{n}", "problems.parquet")
     target.parent.mkdir(exist_ok=True)
     earlier = [p for p in (attempted_problems(r, i) for i in range(1, n)) if p]
+    # Problems an earlier phase of the schedule sampled (run_schedule.py fills this in).
+    earlier += [p for p in plan.get("exclude_problems", []) if Path(p).exists()]
     run([PYTHON, "scripts/star/rationalize.py", "--adapter", plan["start_adapter"], "--dataset", plan["dataset"],
          "--per_level", plan["per_level"], "--seed", plan["seed"] + n, "--select_only",
          *selection_args(plan, plan.get("kind_shares")),
@@ -393,7 +395,9 @@ def build(r, n):
     report = read_json(out / "report.json")
     if report["sft_examples"] < plan["build"].get("min_examples", 1):
         raise RuntimeError(f"only {report['sft_examples']} SFT examples")
-    return {"sft_examples": report["sft_examples"], "by_level_and_mode": report["sft_examples_by_level_and_mode"]}
+    return {"sft_examples": report["sft_examples"], "by_level_and_mode": report["sft_examples_by_level_and_mode"],
+            "by_kind": report.get("sft_examples_by_kind"),
+            "dropped_over_max_model_len_by_kind": report.get("dropped_over_max_model_len_by_kind")}
 
 
 def sft_steps(plan, examples):
@@ -418,7 +422,15 @@ def train(r, n, start_adapter, examples):
         return str(out / f"checkpoint-{steps}")
     has_checkpoint = subprocess.run([PYTHON, "atpgllm/training/checkpoints.py", str(out)], cwd=REPO,
                                     capture_output=True).returncode == 0 if out.exists() else False
-    env = {"OUTPUT_DIR": str(out), "MAX_STEPS": str(steps),
+    skip = {}
+    summary = Path(start_adapter) / "training_state_summary.json"
+    if not has_checkpoint and sft.get("skip_from") and not summary.exists():
+        # A GDPO policy has no SFT stream offset; continue the earlier phase's stream
+        # instead of starting it over (the config reads SKIP_BUFFER_SIZE from the environment).
+        offset = read_json(Path(sft["skip_from"]) / "training_state_summary.json", {}).get("cumulative_skip_buffer_size")
+        if offset:
+            skip = {"SKIP_BUFFER_SIZE": str(int(offset))}
+    env = {"OUTPUT_DIR": str(out), "MAX_STEPS": str(steps), **skip,
            "SFT_EXTRA_MESSAGES": str(r.path(f"round_{n}", "gen", "sft.jsonl")),
            "SFT_EXTRA_FRACTION": str(sft["extra_fraction"]), "SFT_LEARNING_RATE": str(sft["learning_rate"]),
            "GRADIENT_ACCUMULATION_STEPS": str(sft.get("gradient_accumulation_steps", 256)),
@@ -451,7 +463,9 @@ def gdpo(r, adapter):
                 break
             target = min(g["max_steps"], ((latest or 0) // every + 1) * every)
         env = {"OUTPUT_DIR": str(out), "RESUME_FROM": "latest" if latest is not None else str(adapter),
-               "RESUME_TRAINING_STATE": "True" if latest is not None else "False"}
+               "RESUME_TRAINING_STATE": "True" if latest is not None else "False",
+               # Per-phase settings, e.g. GRPO_BUFFER_SEED so phase 2 reads other prompts.
+               **{k: str(v) for k, v in g.get("env", {}).items()}}
         if target:
             env["STOP_AFTER_STEP"] = str(target)
         wait_for_free_gpus(plan)

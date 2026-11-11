@@ -102,15 +102,25 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
     examples, too_long = [], 0
     trained = defaultdict(lambda: defaultdict(int))
+    # Circuit kind per problem (v5), from the selection rationalize.py wrote beside the slots.
+    kind_of = {}
+    if (run / "problems.jsonl").exists():
+        for line in open(run / "problems.jsonl"):
+            entry = json.loads(line)
+            kind_of[tuple(entry["problem"])] = entry.get("circuit_kind", "combinational")
+    by_kind, too_long_by_kind = defaultdict(int), defaultdict(int)
     for problem, slots in sorted(by_problem.items()):
         for slot in choose_for_training(slots, args.max_per_problem,
                                         require_path_mention=args.require_path_mention,
                                         hinted_only_if_unsolved=not args.hinted_even_if_solved):
             example = sft_example(slot, slot["prompt_messages"], TOOLS)
             length = len(tokenizer.apply_chat_template(example["messages"], tools=TOOLS, tokenize=True))
+            kind = kind_of.get(tuple(problem), "combinational")
             if length > args.max_model_len:
                 too_long += 1
+                too_long_by_kind[kind] += 1
                 continue
+            by_kind[kind] += 1
             example["star"] = {"problem": list(problem), "difficulty": slot["difficulty"],
                                "hint_mode": slot["hint_mode"], "tokens": length}
             trained[slot["difficulty"]][slot["hint_mode"]] += 1
@@ -121,6 +131,7 @@ def main():
     summary = {"by_mode_and_level": report, "sft_examples": len(examples),
                "sft_examples_by_level_and_mode": {k: dict(v) for k, v in sorted(trained.items())},
                "dropped_over_max_model_len": too_long, "max_model_len": args.max_model_len,
+               "sft_examples_by_kind": dict(by_kind), "dropped_over_max_model_len_by_kind": dict(too_long_by_kind),
                "sft_problems": len({tuple(e["star"]["problem"]) for e in examples}),
                "require_path_mention": args.require_path_mention, "hinted_only": args.hinted_only,
                "hinted_even_if_solved": args.hinted_even_if_solved}

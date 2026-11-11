@@ -65,6 +65,9 @@
   "output_dir": "runs/v5_schedule/phase_2_gdpo",
   "hold": false,
   "eval_every": 2,
-  "max_steps": 40
+  "max_steps": 40,
+  "env": {
+   "GRPO_BUFFER_SEED": 4242
+  }
  }
 }

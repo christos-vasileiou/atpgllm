@@ -88,7 +88,7 @@ class ShardPermutation:
         self.seed = int(seed)
         self.block_size = int(block_size)
         manifest_path = self.directory / "split_manifest.json"
-        shards = []
+        shards, listed = [], {}
         if manifest_path.is_file():
             listed = json.loads(manifest_path.read_text()).get("shards", {})
             shards = sorted((name, int(info["rows"])) for name, info in listed.items()
@@ -107,7 +107,11 @@ class ShardPermutation:
         self.kind_names, self.row_kinds = (), None
         if stratify_kinds:
             from .kinds import shard_kinds
-            kinds = shard_kinds(self.paths)
+            # The manifest's kind per shard when it lists one for every shard (v5 since
+            # patch shard-kinds); otherwise parquet footers, which take minutes over NFS.
+            names = [name for name, _ in shards]
+            kinds = ([listed[n]["kind"] for n in names] if names and all("kind" in listed.get(n, {}) for n in names)
+                     else shard_kinds(self.paths))
             if kinds and len(set(kinds)) > 1:
                 self.kind_names = tuple(sorted(set(kinds)))
                 code = {k: i for i, k in enumerate(self.kind_names)}
