@@ -66,14 +66,45 @@ def difficulty_keep_probability(weights: dict) -> Callable[[dict], float]:
     return keep
 
 
+def read_rows(path, offsets) -> list[dict]:
+    """Rows at ``offsets`` of one parquet shard, in the order given.
+
+    Reads only the row groups that hold them, and picks each row by a
+    zero-copy slice: ``Table.take`` concatenates a column's chunks, which
+    overflows 32-bit string offsets past 2 GB (v5 sequential shards repeat
+    the netlist in every row, up to 6 GB in one row group).
+    """
+    import pyarrow.parquet as pq
+    offsets = np.asarray(offsets, dtype=np.int64)
+    pf = pq.ParquetFile(path)
+    sizes = [pf.metadata.row_group(g).num_rows for g in range(pf.metadata.num_row_groups)]
+    starts = np.concatenate([[0], np.cumsum(sizes)])
+    group = np.searchsorted(starts, offsets, side="right") - 1
+    out: list = [None] * len(offsets)
+    for g in np.unique(group):
+        where = np.flatnonzero(group == g)
+        table = pf.read_row_group(int(g))
+        for i in where.tolist():
+            out[i] = table.slice(int(offsets[i] - starts[g]), 1).to_pylist()[0]
+        del table
+    return out
+
+
 class ShardPermutation:
     """Every row of ``<directory>/<split>/*.parquet``, in a seeded order per pass.
 
     Row counts come from ``split_manifest.json`` when it lists the shards, so
     no shard is opened to build the order; otherwise from parquet metadata.
+
+    When the shards hold more than one ``circuit_kind`` (v5), each pass is the
+    seeded permutation with the kinds merged by even spacing
+    (:func:`atpgllm.training.kinds.even_spacing_order`): every window of
+    consecutive rows holds both kinds in their split proportions, and each
+    kind keeps its random order. One-kind splits (v4) keep the plain permutation.
     """
 
-    def __init__(self, directory, split: str = "train", seed: int = 0, block_size: int = 20000):
+    def __init__(self, directory, split: str = "train", seed: int = 0, block_size: int = 20000,
+                 stratify_kinds: bool = True):
         import pyarrow.parquet as pq
 
         self.directory = Path(directory)
@@ -81,7 +112,7 @@ class ShardPermutation:
         self.seed = int(seed)
         self.block_size = int(block_size)
         manifest_path = self.directory / "split_manifest.json"
-        shards = []
+        shards, listed = [], {}
         if manifest_path.is_file():
             listed = json.loads(manifest_path.read_text()).get("shards", {})
             shards = sorted((name, int(info["rows"])) for name, info in listed.items()
@@ -97,11 +128,27 @@ class ShardPermutation:
         self.total = int(self.starts[-1])
         self._order = (None, None)
         self._uniform = (None, None)
+        self.kind_names, self.row_kinds = (), None
+        if stratify_kinds:
+            from .kinds import shard_kinds
+            # The manifest's kind per shard when it lists one for every shard (v5 since
+            # patch shard-kinds); otherwise parquet footers, which take minutes over NFS.
+            names = [name for name, _ in shards]
+            kinds = ([listed[n]["kind"] for n in names] if names and all("kind" in listed.get(n, {}) for n in names)
+                     else shard_kinds(self.paths))
+            if kinds and len(set(kinds)) > 1:
+                self.kind_names = tuple(sorted(set(kinds)))
+                code = {k: i for i, k in enumerate(self.kind_names)}
+                self.row_kinds = np.repeat(np.array([code[k] for k in kinds], dtype=np.int8), counts)
 
     def order(self, pass_index: int) -> np.ndarray:
         if self._order[0] != pass_index:
             rng = np.random.default_rng([self.seed, int(pass_index)])
-            self._order = (pass_index, rng.permutation(self.total))
+            order = rng.permutation(self.total)
+            if self.row_kinds is not None:
+                from .kinds import even_spacing_order
+                order = order[even_spacing_order(self.row_kinds[order])]
+            self._order = (pass_index, order)
         return self._order[1]
 
     def uniform(self, pass_index: int) -> np.ndarray:
@@ -124,8 +171,7 @@ class ShardPermutation:
             rows: dict[int, dict] = {}
             for s in np.unique(shard):
                 mask = shard == s
-                table = pq.read_table(self.paths[s]).take(local[mask])
-                for gid, row in zip(ids[mask].tolist(), table.to_pylist()):
+                for gid, row in zip(ids[mask].tolist(), read_rows(self.paths[s], local[mask])):
                     rows[gid] = row
             for offset, gid in enumerate(ids.tolist()):
                 yield block_start + offset, rows[gid]

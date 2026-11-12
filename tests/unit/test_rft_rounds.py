@@ -21,14 +21,22 @@ def scores(*values):
     return {str(n): {"val": value, "fixed": 0.0} for n, value in enumerate(values)}
 
 
-def test_stalled_rounds_counts_back_to_the_last_rise(run_rft):
+def test_stalled_rounds_counts_back_to_the_last_best(run_rft):
     results = scores(0.10, 0.20, 0.20, 0.15, 0.14)
     assert [run_rft.stalled_rounds(results, n) for n in range(1, 5)] == [0, 1, 2, 3]
 
 
-def test_a_rise_resets_the_count_even_below_the_best(run_rft):
-    results = scores(0.30, 0.20, 0.25, 0.24)
-    assert [run_rft.stalled_rounds(results, n) for n in range(1, 4)] == [1, 0, 1]
+def test_a_rise_below_the_best_does_not_reset_the_count(run_rft):
+    results = scores(0.30, 0.20, 0.25, 0.24, 0.31)
+    assert [run_rft.stalled_rounds(results, n) for n in range(1, 5)] == [1, 2, 3, 0]
+
+
+def test_the_v4_a100_history_stops_after_round_14(run_rft):
+    vals = (0.147, 0.200, 0.220, 0.243, 0.250, 0.227, 0.243, 0.283, 0.293, 0.297,
+            0.313, 0.367, 0.330, 0.337, 0.323)
+    stalled = [run_rft.stalled_rounds(scores(*vals), n) for n in range(1, 15)]
+    assert stalled[-3:] == [1, 2, 3]
+    assert max(stalled[:-1]) < 3
 
 
 def test_equal_scores_with_different_float_bits_count_as_stalled(run_rft):
@@ -69,9 +77,16 @@ def test_rounds_stop_after_three_stalled_rounds_and_return_the_best(run_rft, mon
     assert started_from == ["a0", "a1", "a2", "a3", "a4"]
 
 
-def test_a_rise_keeps_the_rounds_going(run_rft, monkeypatch, tmp_path):
-    r, best, _ = drive(run_rft, monkeypatch, tmp_path, [0.1, 0.5, 0.4, 0.3, 0.35, 0.3, 0.2, 0.1])
-    assert sorted(map(int, r.state["results"])) == list(range(8))
+def test_a_new_best_keeps_the_rounds_going(run_rft, monkeypatch, tmp_path):
+    r, best, _ = drive(run_rft, monkeypatch, tmp_path, [0.1, 0.5, 0.4, 0.55, 0.3, 0.35, 0.2, 0.1])
+    assert sorted(map(int, r.state["results"])) == list(range(7))
+    assert "ending at round 6" in r.state["rounds_stopped"]
+    assert best == "a3"
+
+
+def test_a_rise_below_the_best_does_not_keep_the_rounds_going(run_rft, monkeypatch, tmp_path):
+    r, best, _ = drive(run_rft, monkeypatch, tmp_path, [0.1, 0.5, 0.4, 0.45, 0.3, 0.9])
+    assert sorted(map(int, r.state["results"])) == list(range(5))
     assert best == "a1"
 
 

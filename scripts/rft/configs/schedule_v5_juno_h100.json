@@ -1,0 +1,25 @@
+{
+ "_comment": "v5 schedule: SFT warm-up -> RFT -> GDPO -> RFT -> GDPO on the juno h100 node (4x H100 80GB), run by scripts/rft/juno_schedule.sbatch (2-day jobs chained with afterany; every stage resumes). Warm-up: 100 steps of 1,024 conversations from the base model, both circuit kinds in every step.",
+ "run_dir": "runs/v5_schedule",
+ "gpus": [
+  0,
+  1,
+  2,
+  3
+ ],
+ "warmup": {
+  "conf": "scripts/train/configs/sft_granite_4.2_8b_v5_warmup_juno_h100.conf",
+  "output_dir": "runs/v5_schedule/warmup_sft",
+  "max_steps": 100
+ },
+ "phases": [
+  {
+   "name": "phase_1",
+   "plan": "scripts/rft/configs/rft_v5_phase1_juno_h100.json"
+  },
+  {
+   "name": "phase_2",
+   "plan": "scripts/rft/configs/rft_v5_phase2_juno_h100.json"
+  }
+ ]
+}

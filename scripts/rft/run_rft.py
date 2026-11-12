@@ -21,8 +21,8 @@ TetraMAX verifies, fine tunes, and evaluates:
 5. ``eval``: greedy detection on the GDPO fixed evaluation (72 faults) and
    on a stratified validation set, scored the same way for every round.
 
-Rounds stop at ``rounds``, when the validation score has not risen over the
-round before for ``patience`` consecutive rounds, or when the next round would
+Rounds stop at ``rounds``, when the validation score has not risen above the
+best earlier score for ``patience`` consecutive rounds, or when the next round would
 end after ``deadline_hours`` (measured from the first launch). Each round
 continues from the previous one, whatever its score. GDPO then starts from the
 best checkpoint (round 0 is the starting SFT checkpoint) and runs to the end
@@ -210,12 +210,23 @@ def gpu_list(plan):
 # ------------------------------------------------------------------ stages
 
 
+def selection_args(plan, kind_shares=None):
+    """Prompt budget and circuit-kind split shared by every selection (v5 sets both)."""
+    extra = []
+    if plan["sample"].get("max_prompt_length"):
+        extra += ["--max_prompt_length", plan["sample"]["max_prompt_length"]]
+    if kind_shares:
+        extra += ["--kind_shares", kind_shares]
+    return extra
+
+
 def select_validation(r):
     plan = r.plan
     target = r.path("eval", "val_problems.parquet")
     target.parent.mkdir(exist_ok=True)
     run([PYTHON, "scripts/star/rationalize.py", "--adapter", plan["start_adapter"], "--dataset", plan["dataset"],
          "--split", "validation", "--per_level", plan["eval"]["val_per_level"], "--seed", plan["seed"],
+         *selection_args(plan, plan["eval"].get("val_kind_shares")),
          "--select_only", "--write_problems", target, "--out", r.path("eval", "val_select")],
         r.path("logs", "select_validation.log"))
     return str(target)
@@ -258,9 +269,15 @@ def evaluate_model(r, tag, adapter):
                      manifest=plan["eval"]["fixed_manifest"]))
     val = r.stage(f"{tag}/eval_val", evaluate, r, adapter, r.path(tag, "eval_val"),
                   problems=str(r.path("eval", "val_problems.parquet")))
-    return {"adapter": str(adapter), "fixed": fixed["all"]["detection"] if fixed else None,
-            "val": val["level_mean_detection"],
-            "val_by_level": {k: v["detection"] for k, v in val["by_level"].items()}}
+    result = {"adapter": str(adapter), "fixed": fixed["all"]["detection"] if fixed else None,
+              "val": val["level_mean_detection"],
+              "val_by_level": {k: v["detection"] for k, v in val["by_level"].items()}}
+    if "kind_level_mean_detection" in val:
+        # v5: each kind weighs the same in the score that ranks rounds.
+        result["val"] = val["kind_level_mean_detection"]
+        result["val_level_mean"] = val["level_mean_detection"]
+        result["val_by_kind"] = {k: v["level_mean_detection"] for k, v in val["by_kind"].items()}
+    return result
 
 
 def run_benchmark(r, adapter, out):
@@ -272,7 +289,11 @@ def run_benchmark(r, adapter, out):
                               "--max_tool_rounds", bench.get("max_tool_rounds", 5),
                               "--max_generated_tokens", bench.get("max_generated_tokens", 16384),
                               "--batch_problems", bench.get("batch_problems", 16)])
-    return {"robust": metrics["all"]["detection"], "level_mean": metrics["level_mean_detection"]}
+    result = {"robust": metrics["all"]["detection"], "level_mean": metrics["level_mean_detection"]}
+    if "kind_level_mean_detection" in metrics:
+        result["kind_level_mean"] = metrics["kind_level_mean_detection"]
+        result["by_kind"] = {k: v["level_mean_detection"] for k, v in metrics["by_kind"].items()}
+    return result
 
 
 def write_report(r, tag, directory):
@@ -305,6 +326,11 @@ def attempted_problems(r, n):
     available to later rounds, since the hard levels hold few problems.
     """
     target = r.path(f"round_{n}", "attempted.parquet")
+    if not target.exists() and not r.path(f"round_{n}").is_dir():
+        # A round directory removed to free disk takes its sampled problems
+        # with it, so those problems become eligible again.
+        log(f"round_{n} is gone; its sampled problems are not excluded")
+        return None
     if not target.exists():
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -325,9 +351,12 @@ def select_round(r, n):
     plan = r.plan
     target = r.path(f"round_{n}", "problems.parquet")
     target.parent.mkdir(exist_ok=True)
-    earlier = [attempted_problems(r, i) for i in range(1, n)]
+    earlier = [p for p in (attempted_problems(r, i) for i in range(1, n)) if p]
+    # Problems an earlier phase of the schedule sampled (run_schedule.py fills this in).
+    earlier += [p for p in plan.get("exclude_problems", []) if Path(p).exists()]
     run([PYTHON, "scripts/star/rationalize.py", "--adapter", plan["start_adapter"], "--dataset", plan["dataset"],
          "--per_level", plan["per_level"], "--seed", plan["seed"] + n, "--select_only",
+         *selection_args(plan, plan.get("kind_shares")),
          "--write_problems", target, "--exclude_problems", ",".join(earlier),
          "--hint_modes", plan["sample"]["hint_modes"], "--out", r.path(f"round_{n}", "gen")],
         r.path("logs", f"round_{n}_select.log"))
@@ -350,7 +379,7 @@ def generate(r, n, adapter):
          "--hint_modes", sample["hint_modes"], "--escalate", "--num_samples", sample["num_samples"],
          "--seed", plan["seed"] + n, "--temperature", sample["temperature"],
          "--max_tool_rounds", sample["max_tool_rounds"], "--max_model_len", sample["max_model_len"],
-         "--max_generated_tokens", sample["max_generated_tokens"],
+         "--max_generated_tokens", sample["max_generated_tokens"], *selection_args(plan),
          "--batch_problems", sample["batch_problems"], "--out", out, *deadline,
          "--shard", "{shard}", "--num_shards", "{num_shards}"],
         r.path("logs", f"round_{n}_generate.log"), env={"PYTHONPATH": str(REPO)})
@@ -366,7 +395,9 @@ def build(r, n):
     report = read_json(out / "report.json")
     if report["sft_examples"] < plan["build"].get("min_examples", 1):
         raise RuntimeError(f"only {report['sft_examples']} SFT examples")
-    return {"sft_examples": report["sft_examples"], "by_level_and_mode": report["sft_examples_by_level_and_mode"]}
+    return {"sft_examples": report["sft_examples"], "by_level_and_mode": report["sft_examples_by_level_and_mode"],
+            "by_kind": report.get("sft_examples_by_kind"),
+            "dropped_over_max_model_len_by_kind": report.get("dropped_over_max_model_len_by_kind")}
 
 
 def sft_steps(plan, examples):
@@ -391,7 +422,15 @@ def train(r, n, start_adapter, examples):
         return str(out / f"checkpoint-{steps}")
     has_checkpoint = subprocess.run([PYTHON, "atpgllm/training/checkpoints.py", str(out)], cwd=REPO,
                                     capture_output=True).returncode == 0 if out.exists() else False
-    env = {"OUTPUT_DIR": str(out), "MAX_STEPS": str(steps),
+    skip = {}
+    summary = Path(start_adapter) / "training_state_summary.json"
+    if not has_checkpoint and sft.get("skip_from") and not summary.exists():
+        # A GDPO policy has no SFT stream offset; continue the earlier phase's stream
+        # instead of starting it over (the config reads SKIP_BUFFER_SIZE from the environment).
+        offset = read_json(Path(sft["skip_from"]) / "training_state_summary.json", {}).get("cumulative_skip_buffer_size")
+        if offset:
+            skip = {"SKIP_BUFFER_SIZE": str(int(offset))}
+    env = {"OUTPUT_DIR": str(out), "MAX_STEPS": str(steps), **skip,
            "SFT_EXTRA_MESSAGES": str(r.path(f"round_{n}", "gen", "sft.jsonl")),
            "SFT_EXTRA_FRACTION": str(sft["extra_fraction"]), "SFT_LEARNING_RATE": str(sft["learning_rate"]),
            "GRADIENT_ACCUMULATION_STEPS": str(sft.get("gradient_accumulation_steps", 256)),
@@ -424,7 +463,9 @@ def gdpo(r, adapter):
                 break
             target = min(g["max_steps"], ((latest or 0) // every + 1) * every)
         env = {"OUTPUT_DIR": str(out), "RESUME_FROM": "latest" if latest is not None else str(adapter),
-               "RESUME_TRAINING_STATE": "True" if latest is not None else "False"}
+               "RESUME_TRAINING_STATE": "True" if latest is not None else "False",
+               # Per-phase settings, e.g. GRPO_BUFFER_SEED so phase 2 reads other prompts.
+               **{k: str(v) for k, v in g.get("env", {}).items()}}
         if target:
             env["STOP_AFTER_STEP"] = str(target)
         wait_for_free_gpus(plan)
@@ -441,6 +482,38 @@ def gdpo(r, adapter):
         r.optional(f"{tag}/export", merge_export, r, policy, f"{tag}_export")
         benchmark_model(r, tag, policy, r.path(tag, "eval_bench"), tag)
     return str(out)
+
+
+def bench_score(result):
+    """The benchmark score that ranks GDPO checkpoints: the kind x level mean on v5, else the level mean."""
+    return result.get("kind_level_mean", result["level_mean"])
+
+
+def best_gdpo(r):
+    """The best benchmarked GDPO checkpoint that still exists, earliest on ties; None without any.
+
+    Written to ``state["gdpo_best"]`` and ``gdpo_best.json``; the schedule
+    (``run_schedule.py``) starts the next RFT phase from its policy.
+    """
+    g = r.plan["gdpo"]
+    out = Path(g["output_dir"])
+    out = out if out.is_absolute() else REPO / out
+    scored = []
+    for name, done in r.state["done"].items():
+        if name.startswith("gdpo_") and name.endswith("/bench") and done.get("result"):
+            step = int(name.split("/")[0].split("_")[1])
+            policy = out / f"checkpoint-{step}" / "policy"
+            if policy.is_dir():
+                scored.append((-bench_score(done["result"]), step, str(policy), done["result"]))
+    if not scored:
+        return None
+    _, step, policy, result = min(scored)
+    best = {"step": step, "policy": policy, "score": bench_score(result), "bench": result}
+    r.state["gdpo_best"] = best
+    r.save()
+    write_json(r.path("gdpo_best.json"), best)
+    log(f"best GDPO checkpoint: step {step} (score {best['score']:.3f}) {policy}")
+    return best
 
 
 def latest_gdpo_step(out):
@@ -468,11 +541,20 @@ def wait_while_held(r):
 
 
 def stalled_rounds(results, n):
-    """Consecutive rounds up to ``n`` whose validation score did not rise over the round before."""
-    stalled = 0
+    """Consecutive rounds up to ``n`` whose validation score did not rise above the best before them.
+
+    A plateau rule: a round that improves on the round before it but stays at
+    or below the best earlier score still counts as stalled.
+    """
     # Rounded: equal detection counts can differ in the last float bits across levels.
-    while n - stalled > 0 and round(results[str(n - stalled)]["val"], 9) <= round(results[str(n - stalled - 1)]["val"], 9):
-        stalled += 1
+    best = round(results["0"]["val"], 9)
+    stalled = 0
+    for k in range(1, n + 1):
+        val = round(results[str(k)]["val"], 9)
+        if val > best:
+            best, stalled = val, 0
+        else:
+            stalled += 1
     return stalled
 
 
@@ -552,6 +634,7 @@ def main():
             return
         wait_while_held(r)
         r.stage("gdpo", gdpo, r, best)
+        best_gdpo(r)
         r.state["finished"] = now()
         r.save()
         log("GDPO finished; the plan is complete")

@@ -129,7 +129,9 @@ class Simulator:
         if text not in self.cache:
             if len(self.cache) > 256:
                 self.cache.clear()
-            self.cache[text] = self.fs.OptimizedNetlist(text, self.gates, self.rf.DECL_RE, self.rf.NAME_RE)
+            # prepare_netlist: a v5 scan netlist becomes a ScanModel (inputs PIs + flop QN
+            # nets, outputs POs + flop D nets); a combinational one is an OptimizedNetlist.
+            self.cache[text] = self.fs.prepare_netlist(text, self.gates, self.rf.DECL_RE, self.rf.NAME_RE)
         return self.cache[text]
 
     def outcome(self, text, fault, vector):

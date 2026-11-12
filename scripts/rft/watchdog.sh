@@ -67,8 +67,9 @@ stamp="$(date +%Y%m%d_%H%M)"
 driver_log="$RUN_DIR/logs/driver_$stamp.log"
 say "starting the driver (log $driver_log)"
 cmd="bash -ic '$REPO/scripts/rft/start_driver.sh $PLAN $driver_log $VENV' </dev/null; exec bash"
+# 9>&-: a tmux server started here would keep the lock for its whole life.
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-    tmux new-window -t "$SESSION" "$cmd"
+    tmux new-window -t "$SESSION" "$cmd" 9>&-
 else
-    tmux new-session -d -s "$SESSION" "$cmd"
+    tmux new-session -d -s "$SESSION" "$cmd" 9>&-
 fi

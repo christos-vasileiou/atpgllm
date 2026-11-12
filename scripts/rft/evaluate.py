@@ -63,6 +63,11 @@ def _line_id(line):
         return None
 
 
+def kind_of(record):
+    """The circuit kind of an evaluation record (v4 manifests have none: combinational)."""
+    return record.get("circuit_kind") or "combinational"
+
+
 def detected(slot):
     return bool((slot.get("reward_components") or {}).get("detection", 0) >= 1.0)
 
@@ -89,6 +94,20 @@ def summarize(out):
     levels = [m["detection"] for m in metrics["by_level"].values()]
     # Mean over levels, so a stratified set is not dominated by any one level.
     metrics["level_mean_detection"] = sum(levels) / len(levels)
+    kinds = sorted({slot.get("kind") or "combinational" for slot in slots})
+    if len(kinds) > 1:
+        # v5: the same summary per circuit kind, and a mean over kind x level.
+        metrics["by_kind"] = {}
+        for kind in kinds:
+            group = [s for s in slots if (s.get("kind") or "combinational") == kind]
+            per_level = defaultdict(list)
+            for slot in group:
+                per_level[slot["level"]].append(slot)
+            levels_k = {level: rates(g) for level, g in sorted(per_level.items())}
+            metrics["by_kind"][kind] = {"all": rates(group), "by_level": levels_k,
+                                        "level_mean_detection": sum(m["detection"] for m in levels_k.values()) / len(levels_k)}
+        metrics["kind_level_mean_detection"] = (
+            sum(m["level_mean_detection"] for m in metrics["by_kind"].values()) / len(metrics["by_kind"]))
     run = json.loads((Path(out) / "run.json").read_text()) if (Path(out) / "run.json").exists() else {}
     metrics["adapter"] = run.get("adapter")
     (Path(out) / "metrics.json").write_text(json.dumps(metrics, indent=1))
@@ -155,9 +174,9 @@ def main():
             batch = items[start:start + args.batch_problems]
             t = time.time()
             results = strategy.sample_batch([p for _, _, p, _ in batch], [r for _, _, _, r in batch])
-            for (example_id, level, _, _), result in zip(batch, results):
+            for (example_id, level, _, record), result in zip(batch, results):
                 for slot in result.slots:
-                    sink.write(json.dumps({"example_id": example_id, "level": level,
+                    sink.write(json.dumps({"example_id": example_id, "level": level, "kind": kind_of(record),
                                            "completion_slot": slot.get("completion_slot", 0),
                                            "status": slot.get("status"), "stop_reason": slot.get("stop_reason"),
                                            "reward_components": slot.get("reward_components"),

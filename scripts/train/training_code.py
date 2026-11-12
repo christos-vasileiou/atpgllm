@@ -269,6 +269,16 @@ def _get_device_map(use_ddp: bool) -> str | dict:
     if torch.cuda.device_count() <= 1:
         return {"": "cuda:0"}
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    # Make "cuda" mean this rank's GPU. PEFT's load_adapter (Trainer
+    # load_best_model_at_end) loads to the default device; without this every
+    # rank loaded onto cuda:0 and ranks 1-3 ran out of memory after the last
+    # step (reasoning_pilot/sft, W&B rft-training/go69rrkq, 2026-11-04).
+    torch.cuda.set_device(local_rank)
+    # set_device alone is not enough: PEFT loads adapters to infer_device() == "cuda",
+    # which safetensors reads as cuda:0 on every rank (checked on eng-tamale2). Name
+    # this rank's GPU instead.
+    import peft.peft_model as peft_model
+    peft_model.infer_device = lambda: f"cuda:{local_rank}"
     return {"": f"cuda:{local_rank}"}
 
 
@@ -609,7 +619,8 @@ def train_with_sft(
 
 def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoint, buffer_size,
                          max_prompt_length, netlist_diversity_strategy, held_out_examples,
-                         prompts_per_step, max_steps, is_main_process, difficulty_weights=None):
+                         prompts_per_step, max_steps, is_main_process, difficulty_weights=None,
+                         buffer_seed=42):
     """GRPO prompts read from the whole train split, ``buffer_size`` at a time.
 
     See :mod:`atpgllm.training.stream_buffer`. Rows pass the same filters as
@@ -669,20 +680,32 @@ def _rolling_grpo_buffer(dataset_path, tokenizer, *, output_dir, resume_checkpoi
     if difficulty_weights:
         # Only when set, so ledgers of unweighted runs still resume.
         settings["difficulty_weights"] = dict(difficulty_weights)
+    if buffer_seed != 42:
+        # A later GDPO phase reads the split in its own order (not the first phase's prompts again).
+        settings["buffer_seed"] = buffer_seed
+    from atpgllm.training.kinds import dataset_kinds, interleave_by_kind
+    mixed_kinds = len(dataset_kinds(dataset_path)) > 1
+    if mixed_kinds:
+        # v5: every optimizer step's consecutive prompts hold both circuit kinds.
+        settings["kind_interleave"] = "even_spacing"
+
+    def reorder(rows, k):
+        rows = interleave_for_field_diversity(rows, "netlist", strategy=netlist_diversity_strategy, seed=buffer_seed + k)
+        return interleave_by_kind(rows) if mixed_kinds else rows
     # Twice the prompts max_steps can consume: the sampler never wraps around.
     length = max(1, math.ceil(2 * max(max_steps, 1) * max(prompts_per_step, 1) / buffer_size)) * buffer_size
     resume_ledger = Path(resume_checkpoint) / LEDGER_NAME if resume_checkpoint else None
     buffer = RollingPromptBuffer(
-        ShardPermutation(directory, "train", seed=42), prepare,
+        ShardPermutation(directory, "train", seed=buffer_seed), prepare,
         chunk_size=buffer_size, length=length, ledger_path=Path(output_dir) / LEDGER_NAME,
         settings=settings, writer=is_main_process, resume_ledger=resume_ledger,
         keep_probability=difficulty_keep_probability(difficulty_weights) if difficulty_weights else None,
-        reorder=lambda rows, k: interleave_for_field_diversity(
-            rows, "netlist", strategy=netlist_diversity_strategy, seed=42 + k),
+        reorder=reorder,
     )
     print(f"[GRPO buffer] Rolling buffer: {buffer_size} prompts per chunk over "
           f"{buffer.source.total} train rows, {len(held_out)} held-out circuit ids, "
           f"virtual length {length} (~{prompts_per_step} prompts per optimizer step)"
+          + (f", circuit kinds evenly spaced {dataset_kinds(dataset_path)}" if mixed_kinds else "")
           + (f", difficulty weights {difficulty_weights}." if difficulty_weights else "."))
     return buffer, ledger_checkpoint_callback(buffer)
 
@@ -734,6 +757,7 @@ def train_with_grpo(
     buffer_rolling: bool = False,
     keep_best_checkpoints: int = 0,
     difficulty_weights: str | None = None,
+    grpo_buffer_seed: int = 42,
     **kwargs,
 ) -> None:
     """
@@ -969,6 +993,11 @@ def train_with_grpo(
 
     # Load and format dataset
     print(f"Loading dataset from: {dataset_path}")
+    from atpgllm.training.kinds import dataset_kinds
+    if len(dataset_kinds(dataset_path)) > 1 and not buffer_rolling:
+        # The streaming path reads shards in file order (every combinational
+        # shard before any sequential one); only the rolling buffer mixes kinds.
+        raise ValueError("A dataset with several circuit kinds (v5) needs --buffer_rolling for GRPO")
     if buffer_rolling:
         # Built after the evaluation holdout is known (see below).
         if skip_buffer_size:
@@ -1094,6 +1123,7 @@ def train_with_grpo(
                               * gradient_accumulation_steps // max(num_generations, 2)),
             max_steps=max_steps, is_main_process=distributed_state.is_main_process,
             difficulty_weights=difficulty_weights or None,
+            buffer_seed=int(grpo_buffer_seed),
         )
 
     # =========================================================================
@@ -1302,7 +1332,7 @@ _WANDB_CONFIG_KEYS_GRPO_ONLY = frozenset({
     "grpo_learning_rate", "grpo_warmup_steps",
     "fixed_eval_size", "fixed_eval_split", "fixed_eval_manifest", "fixed_eval_seed",
     "fixed_eval_steps", "fixed_eval_generations", "fixed_eval_batch_size", "fixed_eval_selection", "stop_after_step",
-    "buffer_rolling", "keep_best_checkpoints", "difficulty_weights",
+    "buffer_rolling", "keep_best_checkpoints", "difficulty_weights", "grpo_buffer_seed",
 })
 
 
@@ -1485,6 +1515,11 @@ def main() -> None:
                         help="SFT: keep at most this many checkpoints (the best one is always kept). "
                              "Env: SAVE_TOTAL_LIMIT (default: keep all)")
     parser.add_argument(
+        "--grpo_buffer_seed", type=int, default=int(_env("GRPO_BUFFER_SEED", "42")),
+        help="GRPO rolling buffer: seed of the split order (and of each chunk's netlist interleave). "
+             "A later GDPO phase sets its own so it does not replay the first phase's prompts. "
+             "Env: GRPO_BUFFER_SEED (default 42)")
+    parser.add_argument(
         "--difficulty_weights", default=_env("DIFFICULTY_WEIGHTS", None),
         help="GRPO rolling buffer: relative sampling weight per difficulty level, e.g. "
              "easy=1,medium=2,hard=3,very_hard=4,random_never_detects=5. Unset samples "
@@ -1648,6 +1683,19 @@ def main() -> None:
 
     if args.skip_buffer_size < 0:
         parser.error("skip_buffer_size must be >= 0")
+
+    if args.dataset and Path(args.dataset).is_dir():
+        from atpgllm.training.kinds import prompt_window_notice
+        window, notice = prompt_window_notice(args.dataset, args.max_prompt_length)
+        if notice:
+            print(notice, flush=True)
+        args.max_prompt_length = window
+        budget = args.max_prompt_length + (args.max_completion_length if args.method.upper() != "SFT" else 0)
+        if args.max_model_len and args.max_model_len < budget:
+            print(f"[v5] WARNING: max_model_len {args.max_model_len} is below the prompt window "
+                  f"{args.max_prompt_length}" + (f" plus the completion budget {args.max_completion_length}"
+                                                 if args.method.upper() != "SFT" else "")
+                  + "; the longest prompts will be dropped as too long.", flush=True)
 
     # ------------------------------------------------------------------
     # Auto-derive --skip_buffer_size from a resumed checkpoint.
