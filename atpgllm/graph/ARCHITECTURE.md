@@ -364,6 +364,43 @@ or `fault_net_unknown`. `record_to_pyg` returns `None` for
 rejected records and counts reasons; other errors propagate. Fault-independent
 graphs are cached per netlist hash.
 
+### Full-scan sequential netlists (dataset v5)
+
+`parse_netlist` reads both kinds of circuit. A netlist with flops and a scan
+chain (`test_si` and `test_so` ports) goes through `parse_scan_to_graph`, which
+builds the graph of one capture cycle on the cut view that the dataset and the
+simulator already use (`data_preprocessing/scan_view.py`, branch seq-v5 or
+later, reached through `DATA_PREPROCESSING_ROOT`):
+
+- every flop is removed. Its QN net becomes a `<PI>` node (a state input, the
+  value loaded through the chain) and its D net a `<PO>` node (a state output,
+  the value captured and shifted out). The clock, `test_si`, `test_se` and
+  `test_so` leave the graph, since the scan procedure drives them.
+- `<PI>` nodes come first and in the order of the row's `input_vector`:
+  primary inputs, then QN nets in scan chain order. The chain order comes from
+  the row's `scan_chain` column, because a flop stitched through a mux has no
+  scan-in pin to trace. Outputs are primary outputs, then D nets. Flops that
+  capture the same net share one node, and a D net that is also a primary
+  output keeps one node.
+- the graph stays a DAG. Which state output feeds which state input is a side
+  table: `state_pair_index [2, F]` (row 0 the D side, row 1 the QN side) with
+  `state_pair_inverted [F]`, plus `state_in_mask` and `state_out_mask`. Message
+  passing never reads the table. `next_state` uses it to turn the outputs of
+  one cycle into the state inputs of the next, so a multi-cycle test is a
+  chain of single-cycle graphs.
+
+State bits are encoded as the ports they act as. A vocabulary built with
+`state_cells=True` (`train_retest --state-cells`) gives them their own bins,
+`<PPI>` and `<PPO>`, which differ from `<PI>` and `<PO>` only in
+`is_sequential`. No table grows and no index moves, so weights trained without
+state cells load unchanged, and `seed_state_rows` starts the new bins as
+copies of the port bins. Stage C takes the vocabulary of the re-test
+checkpoint it loads.
+
+A netlist with flops and no scan chain is still rejected as `sequential_cell`.
+Scan netlists add the reasons `scan_cut_failed`, `chain_table_mismatch` and
+`scan_view_missing`.
+
 The parser produces:
 - `gate_attrs [N, A]` — versioned attribute indices via `GateAttributeVocab`
 - `structural_feats [N, 5]` — depth/degree/port position via `compute_structural_features`

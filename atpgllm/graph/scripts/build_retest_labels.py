@@ -1,14 +1,24 @@
-"""Build the BRIDGES re-test label table from the v4 parquet shards.
+"""Build the BRIDGES re-test label table from the v4 or v5 parquet shards.
 
 Writes, per split, ``problems_<split>.jsonl`` (one line per (netlist, fault)
 with soft targets and port-only fact text) and ``circuits_<split>.jsonl``
 (netlist text once, keyed by the sha256 of the text). Reads only the columns it needs.
+
+v5 shards add ``scan_chain`` and ``circuit_kind``. For a full-scan circuit the
+inputs of a problem are its primary inputs and then each flop's QN net, and
+the outputs its primary outputs and then each flop's D net, so the same
+targets cover state bits. The chain table is stored with the circuit: the
+graph needs it to put state bits in the order of the row.
 
 Usage::
 
     python -m atpgllm.graph.scripts.build_retest_labels \
         --data ../data/freeset/v4_hf_verify/repo/data \
         --out ../data/freeset/retest_labels_v4 --splits validation train
+
+For v5, ``--data`` is the dataset root (one directory per split) and
+``DATA_PREPROCESSING_ROOT`` must point at a checkout with ``scan_view``
+when the table is read back (train_retest, retest_graph_only, retest_hints).
 """
 
 from __future__ import annotations
@@ -30,6 +40,7 @@ COLUMNS = [
     "circuit_id", "netlist_id", "module_name", "fault", "difficulty", "netlist",
     "input_vector", "expected_output", "fault_propagation_gates", "fault_propagation_nets",
 ]
+V5_COLUMNS = ["scan_chain", "circuit_kind"]
 
 
 def _netlist(value):
@@ -39,15 +50,21 @@ def _netlist(value):
 
 
 def build_split(data_dir: str, split: str, out_dir: str) -> Dict[str, int]:
-    shards = sorted(glob.glob(os.path.join(data_dir, f"{split}-*.parquet")))
+    # v4 keeps ``<split>-*.parquet`` in one directory, v5 a directory per
+    # split with ``comb-*.parquet`` and ``seq-*.parquet``.
+    shards = sorted(glob.glob(os.path.join(data_dir, f"{split}-*.parquet"))
+                    + glob.glob(os.path.join(data_dir, split, "*.parquet")))
     if not shards:
         raise FileNotFoundError(f"no {split} shards under {data_dir}")
     problems: "OrderedDict[tuple, List[dict]]" = OrderedDict()
     circuits: Dict[str, dict] = {}
     rows_seen = 0
     for shard in shards:
-        table = pq.read_table(shard, columns=COLUMNS)
-        for row in table.to_pylist():
+        file = pq.ParquetFile(shard)
+        columns = COLUMNS + [c for c in V5_COLUMNS if c in file.schema_arrow.names]
+        # Row group by row group: a v5 sequential shard is several GB.
+        for row in (r for i in range(file.num_row_groups)
+                    for r in file.read_row_group(i, columns=columns).to_pylist()):
             rows_seen += 1
             text = _netlist(row.get("netlist"))
             # netlist_id is not unique per netlist text in v4, so key on the text.
@@ -59,8 +76,11 @@ def build_split(data_dir: str, split: str, out_dir: str) -> Dict[str, int]:
                     "netlist_id": row.get("netlist_id"),
                     "module_name": row.get("module_name"),
                     "netlist": text,
+                    "scan_chain": row.get("scan_chain") or "",
+                    "circuit_kind": row.get("circuit_kind") or "combinational",
                 }
-            row.pop("netlist", None)
+            for column in ("netlist", "scan_chain"):
+                row.pop(column, None)
             problems.setdefault((nid, str(row["fault"]).strip()), []).append(row)
     os.makedirs(out_dir, exist_ok=True)
     written = 0
@@ -91,7 +111,8 @@ def build_split(data_dir: str, split: str, out_dir: str) -> Dict[str, int]:
     with open(os.path.join(out_dir, f"circuits_{split}.jsonl"), "w", encoding="utf-8") as f:
         for c in circuits.values():
             f.write(json.dumps(c) + "\n")
-    return {"rows": rows_seen, "problems": written, "circuits": len(circuits)}
+    return {"rows": rows_seen, "problems": written, "circuits": len(circuits),
+            "scan_circuits": sum(c["circuit_kind"] == "sequential" for c in circuits.values())}
 
 
 def main() -> None:

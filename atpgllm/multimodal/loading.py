@@ -91,7 +91,11 @@ def _load_retest_stack(payload: dict[str, Any], vocab: GateAttributeVocab):
     from atpgllm.graph.retest_qformer import RoleQueryFormer
 
     saved = GateAttributeVocab.from_dict(payload["vocab"])
-    if saved.fingerprint != vocab.fingerprint:
+    if saved.fingerprint == vocab.with_state_cells().fingerprint:
+        # Trained with state cells: graphs must be encoded with them too. The
+        # caller takes this vocabulary from the returned ``vocab`` entry.
+        vocab = saved
+    elif saved.fingerprint != vocab.fingerprint:
         raise ValueError("re-test checkpoint was trained with another gate vocabulary")
     a = payload["args"]
     graph_encoder = NetlistGraphEncoder(vocab=vocab, node_dim=a["node_dim"], gin_hidden_dim=a["node_dim"],
@@ -111,4 +115,4 @@ def _load_retest_stack(payload: dict[str, Any], vocab: GateAttributeVocab):
         "qformer_layers": a["q_layers"],
         "train_step": payload.get("step"),
     }
-    return graph_encoder, q_former, {"architecture": architecture, "stage": "bridges_retest"}
+    return graph_encoder, q_former, {"architecture": architecture, "stage": "bridges_retest", "vocab": vocab}

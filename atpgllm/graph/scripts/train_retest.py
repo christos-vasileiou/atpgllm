@@ -50,16 +50,21 @@ from atpgllm.graph.retest_qformer import (
 from atpgllm.training._paths import DEFAULT_SIM_CONFIG
 
 
-def load_split(labels_dir: str, split: str, limit: int, seed: int):
+def load_split(labels_dir, split: str, limit: int, seed: int):
+    """Problems and circuits of one split. ``labels_dir`` is one label
+    directory or several (v4 and v5 tables together); the problems are
+    shuffled as one set."""
+    dirs = [labels_dir] if isinstance(labels_dir, (str, os.PathLike)) else list(labels_dir)
     circuits = {}
-    with open(os.path.join(labels_dir, f"circuits_{split}.jsonl"), encoding="utf-8") as f:
-        for line in f:
-            c = json.loads(line)
-            circuits[c["netlist_key"]] = c
     problems = []
-    with open(os.path.join(labels_dir, f"problems_{split}.jsonl"), encoding="utf-8") as f:
-        for line in f:
-            problems.append(json.loads(line))
+    for directory in dirs:
+        with open(os.path.join(directory, f"circuits_{split}.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                c = json.loads(line)
+                circuits[c["netlist_key"]] = c
+        with open(os.path.join(directory, f"problems_{split}.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                problems.append(json.loads(line))
     random.Random(seed).shuffle(problems)
     if limit:
         problems = problems[:limit]
@@ -90,7 +95,8 @@ class ProblemGraphs:
         circuit = self.circuits[p["netlist_key"]]
         record = {"netlist": circuit["netlist"], "fault": p["fault"], "input_vector": p["example_input_vector"]}
         try:
-            parsed, base = _circuit_graph(circuit["netlist"], self.gate_funcs, self.vocab)
+            parsed, base = _circuit_graph(circuit["netlist"], self.gate_funcs, self.vocab,
+                                          circuit.get("scan_chain") or "")
             data = base.clone()
             attach_atpg_context(data, parsed, self.gate_funcs, record)
         except GraphRejected:
@@ -190,6 +196,9 @@ def evaluate(model, graphs: List, args, device) -> Dict[str, float]:
     model.eval()
     scores = {"care": [], "path": [], "obs": []}
     labels = {"care": [], "path": [], "obs": []}
+    # Per node: is it a state bit, and is its circuit a scan circuit.
+    state = {"care": [], "path": [], "obs": []}
+    scan = {"care": [], "path": [], "obs": []}
     value_hits = value_n = 0
     sp_err = []
     qs = []
@@ -208,6 +217,9 @@ def evaluate(model, graphs: List, args, device) -> Dict[str, float]:
             valid = dense(batch, mask) & node_mask
             scores[role].append(f.pointer_logits(role, queries, nodes)[valid].cpu())
             labels[role].append((dense(batch, target)[valid] >= 0.5).cpu())
+            bits = dense(batch, "state_in_mask") | dense(batch, "state_out_mask")
+            state[role].append(bits[valid].cpu())
+            scan[role].append(bits.any(dim=1, keepdim=True).expand_as(valid)[valid].cpu())
         care = (dense(batch, "care_target") >= 0.5) & dense(batch, "pi_node_mask") & node_mask
         if care.any():
             pred = f.value_logits(queries, nodes)[care] > 0
@@ -215,6 +227,17 @@ def evaluate(model, graphs: List, args, device) -> Dict[str, float]:
             value_n += int(care.sum())
     model.train()
     out = {f"ap_{r}": average_precision(torch.cat(scores[r]), torch.cat(labels[r])) for r in scores}
+    # Scan circuits apart (NaN when the eval set has none), and inside them
+    # state bits against primary ports.
+    for r in scores:
+        s, y, is_state, is_scan = (torch.cat(v[r]) for v in (scores, labels, state, scan))
+        if not is_scan.any():
+            continue
+        out[f"ap_{r}_comb"] = average_precision(s[~is_scan], y[~is_scan])
+        out[f"ap_{r}_scan"] = average_precision(s[is_scan], y[is_scan])
+        if r != "path":
+            out[f"ap_{r}_state"] = average_precision(s[is_state], y[is_state])
+            out[f"ap_{r}_port"] = average_precision(s[is_scan & ~is_state], y[is_scan & ~is_state])
     out["value_acc"] = value_hits / max(1, value_n)
     out["sp_mae"] = float(torch.cat(sp_err).mean()) if sp_err else float("nan")
     out.update(collapse_metrics(torch.cat(qs)))
@@ -223,7 +246,11 @@ def evaluate(model, graphs: List, args, device) -> Dict[str, float]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--labels", required=True)
+    ap.add_argument("--labels", required=True, nargs="+",
+                    help="One or more label directories (build_retest_labels), for example v4 and v5.")
+    ap.add_argument("--state-cells", action="store_true",
+                    help="Give the state bits of scan circuits their own attribute bin. With --init from a "
+                         "checkpoint trained without them, the new bin starts as a copy of the port bin.")
     ap.add_argument("--train-split", default="train")
     ap.add_argument("--eval-split", default="validation")
     ap.add_argument("--max-train", type=int, default=0)
@@ -256,7 +283,7 @@ def main() -> None:
     random.seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
     gate_funcs = json.loads(open(DEFAULT_SIM_CONFIG, encoding="utf-8").read())["gate_funcs"]
-    vocab = GateAttributeVocab(gate_funcs)
+    vocab = GateAttributeVocab(gate_funcs, state_cells=args.state_cells)
     device = torch.device(args.device)
 
     train_p, train_c = load_split(args.labels, args.train_split, args.max_train, args.seed)
@@ -275,12 +302,6 @@ def main() -> None:
         text_dim = text_encoder.hidden_size
     model = RetestGraphModel(vocab, node_dim=args.node_dim, gin_layers=args.gin_layers, q_hidden=args.q_hidden,
                              slots=args.slots, q_layers=args.q_layers, text_dim=text_dim).to(device)
-    if args.init:
-        init = torch.load(args.init, map_location="cpu", weights_only=False)["model"]
-        own = model.state_dict()
-        loaded = {k: v for k, v in init.items() if k in own and own[k].shape == v.shape}
-        model.load_state_dict(loaded, strict=False)
-        print(f"init: {len(loaded)} of {len(own)} tensors from {args.init}", flush=True)
     params = [{"params": model.parameters(), "lr": args.lr}]
     if text_encoder is not None:
         model.gtm = GraphTextMatchingHead(256).to(device)
@@ -288,11 +309,23 @@ def main() -> None:
                                                max_len=args.text_max_len).to(device)
         params = [{"params": model.parameters(), "lr": args.lr},
                   {"params": text_encoder.parameters(), "lr": args.text_lr}]
+    # After the text heads exist, so a checkpoint trained with text brings them too.
+    if args.init:
+        payload = torch.load(args.init, map_location="cpu", weights_only=False)
+        init = payload["model"]
+        own = model.state_dict()
+        loaded = {k: v for k, v in init.items() if k in own and own[k].shape == v.shape}
+        model.load_state_dict(loaded, strict=False)
+        print(f"init: {len(loaded)} of {len(own)} tensors from {args.init}", flush=True)
+        if args.state_cells and not GateAttributeVocab.from_dict(payload["vocab"]).has_state_cells:
+            seeded = model.encoder.attr_encoder.seed_state_rows()
+            print(f"init: state bin seeded from the port bin: {seeded}", flush=True)
     opt = torch.optim.AdamW(params, weight_decay=0.01)
 
     log = open(os.path.join(args.out, "metrics.jsonl"), "a", encoding="utf-8")
     log.write(json.dumps({"event": "start", "args": vars(args), "train_problems": len(train_p),
-                          "eval_graphs": len(eval_graphs), "eval_rejected": eval_builder.rejected}) + "\n")
+                          "eval_graphs": len(eval_graphs), "eval_rejected": eval_builder.rejected,
+                          "eval_scan_graphs": sum(bool(g.state_in_mask.any()) for g in eval_graphs)}) + "\n")
     order = list(range(len(train_p)))
     cursor = len(order)
     start = time.time()

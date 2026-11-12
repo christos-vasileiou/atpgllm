@@ -114,16 +114,54 @@ def drop_reasoning(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def port_declarations(netlist: str) -> str:
-    """The module header and input/output declarations of a netlist."""
+def port_declarations(netlist: str, drop: Sequence[str] = ()) -> str:
+    """The module header and input/output declarations of a netlist, without
+    the ports named in ``drop`` (see :func:`scan_procedure_ports`)."""
     statements = (s.strip() for s in netlist.split(";"))
-    return "".join(f"{s};\n" for s in statements if re.match(r"(module|input|output)\b", s))
+    kept = [s for s in statements if re.match(r"(module|input|output)\b", s)]
+    if not drop:
+        return "".join(f"{s};\n" for s in kept)
+    gone = set(drop)
+    out = []
+    for s in kept:
+        header = re.match(r"(module\s+\S+\s*\()(.*)\)\s*$", s, re.S)
+        decl = re.match(r"((?:input|output)\s*(?:\[[^\]]+\]\s*)?)(.*)$", s, re.S)
+        head, names = (header or decl).groups()
+        names = [n.strip() for n in names.split(",") if n.strip() and n.strip() not in gone]
+        if header:
+            out.append(f"{head} {', '.join(names)} );\n")
+        elif names:
+            out.append(f"{head.rstrip()} {', '.join(names)};\n")
+    return "".join(out)
+
+
+def scan_procedure_ports(netlist: str) -> List[str]:
+    """The ports of a full-scan netlist that a test never sets or reads: the
+    clock and the scan ports (the scan procedure drives them). Empty for a
+    combinational netlist. The ports view leaves them out, so every declared
+    port is one the answer may name."""
+    from atpgllm.graph.netlist_parser import _scan_view
+
+    try:
+        scan_view = _scan_view()
+    except ValueError:
+        return []
+    if not scan_view.is_scan_netlist(netlist):
+        return []
+    try:
+        _, clocks = scan_view.scan_cells_from_netlist(netlist)
+    except ValueError:      # a scan netlist the graph rejects as well
+        return []
+    return list(scan_view.SCAN_PORTS) + [re.sub(r"\[\d+\]$", "", clock) for clock in clocks]
 
 
 # Lines the ports view can add after the graph slot. Bus ports are declared
 # as ``input [3:0] a;``, so the declarations never spell a bit such as
 # ``a[3]``, the name the model must write.
-#   PORT_BITS  every input bit by name. Anchored fusion adds each bit's graph
+#   PORT_BITS  every input bit by name, in the order of the answer's input
+#              vector: primary inputs, then for a scan circuit each flop's QN
+#              net in chain order (most are not ports, so the declarations
+#              do not name them). Anchored fusion adds each bit's graph
 #              vector to the tokens of its name here.
 #   HINT       the graph model's decoded suggestion as plain text (the hint
 #              arm): the inputs its care head marks, with the value head's
@@ -229,7 +267,8 @@ def _compact_netlist_payload(record: Dict[str, Any], view: str = "graph",
     doc_id = netlist_key(record)
     stand_in = GRAPH_CONTEXT
     if view == "ports":
-        stand_in = port_declarations(netlist) + GRAPH_CONTEXT + "\n" + extra + "endmodule\n"
+        stand_in = (port_declarations(netlist, scan_procedure_ports(netlist))
+                    + GRAPH_CONTEXT + "\n" + extra + "endmodule\n")
     return (
         str({"doc_id": doc_id, "netlist": netlist}),
         str({"doc_id": doc_id, "netlist": stand_in}),

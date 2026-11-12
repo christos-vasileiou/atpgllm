@@ -44,6 +44,9 @@ from .netlist_parser import (  # noqa: F401
     netlist_to_pyg,
     parse_verilog_to_pyg,
     parse_verilog_to_graph,
+    parse_scan_to_graph,
+    parse_netlist,
+    next_state,
     parsed_to_pyg,
     compute_structural_features,
 )
@@ -116,6 +119,9 @@ __all__ = [
     "netlist_to_pyg",
     "parse_verilog_to_pyg",
     "parse_verilog_to_graph",
+    "parse_scan_to_graph",
+    "parse_netlist",
+    "next_state",
     "parsed_to_pyg",
     "compute_structural_features",
     # Dataset utilities

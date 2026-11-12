@@ -122,6 +122,20 @@ class AttributeDecompositionEncoder(nn.Module):
         parts.append(fault_feats)
         return self.mlp(torch.cat(parts, dim=-1))
 
+    @torch.no_grad()
+    def seed_state_rows(self) -> bool:
+        """Start the ``is_sequential`` row of state bits from the row every
+        node used so far. Weights trained before state cells never touched
+        that row (it still holds its random start), so after this copy a
+        vocabulary with state cells gives the same output as the one without,
+        and training moves the two apart only where it helps. Returns False
+        when ``is_sequential`` is not an enabled attribute."""
+        if "is_sequential" not in self.attribute_names:
+            return False
+        weight = self.embeddings[self.attribute_names.index("is_sequential")].weight
+        weight[2].copy_(weight[1])     # BINARY_CLASSES: UNKNOWN, False, True
+        return True
+
     @classmethod
     def from_vocab(
         cls,

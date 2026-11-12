@@ -19,7 +19,7 @@ import torch
 from torch import Tensor, nn
 from torch_geometric.data import Batch
 
-from atpgllm.graph.netlist_parser import parse_verilog_to_graph, parsed_to_pyg
+from atpgllm.graph.netlist_parser import parse_netlist, parsed_to_pyg
 from atpgllm.graph.size.fault_head import FaultHead, view_tokens
 from atpgllm.graph.size.fovea import View, build_view
 from atpgllm.graph.size.netgraph import NetGraph, build_netgraph, clean_netlist
@@ -32,7 +32,7 @@ from atpgllm.multimodal.anchored import (
     render_view_text,
     token_net_map,
 )
-from atpgllm.multimodal.data import port_declarations
+from atpgllm.multimodal.data import port_declarations, scan_procedure_ports
 
 
 @dataclass
@@ -48,13 +48,16 @@ class CircuitCache:
     trunk_vectors: Optional[Tensor] = None
 
 
-def build_circuit_cache(netlist: str, gate_funcs, vocab) -> CircuitCache:
+def build_circuit_cache(netlist: str, gate_funcs, vocab, chain_table: str = "") -> CircuitCache:
+    """``chain_table`` (a v5 row's ``scan_chain``) orders the state bits of a
+    scan netlist. Both views of a scan netlist are its cut view: the net
+    graph through the simulator's model, the node graph through the parser."""
     from atpgllm.training.tools import simulation_model
 
     text = clean_netlist(netlist)
     compiled = simulation_model(text)
     graph = build_netgraph(compiled)
-    parsed = parse_verilog_to_graph(text, gate_funcs)
+    parsed = parse_netlist(text, gate_funcs, chain_table)
     pyg = parsed_to_pyg(parsed, vocab=vocab)
     TopoSweepTrunk.prepare(pyg)
     node_of_net: Dict[str, int] = {}
@@ -89,7 +92,7 @@ def build_fault_prompt(cache: CircuitCache, fault: str, tokenizer, *, module: st
     view = build_view(cache.graph, net, cap=cap, k=k, side_cap=side_cap)
     tokens = view_tokens(view, cache.graph)
     view_text = render_view_text(cache.compiled, view, fault=fault, module=module,
-                                 ports=port_declarations(cache.netlist))
+                                 ports=port_declarations(cache.netlist, scan_procedure_ports(cache.netlist)))
     user = user_template.format(module=module, fault=fault, netlist=str({"netlist": view_text}))
     prompt = tokenizer.apply_chat_template([{"role": "user", "content": user}], tokenize=False,
                                            add_generation_prompt=True)

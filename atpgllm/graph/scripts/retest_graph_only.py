@@ -33,8 +33,12 @@ from atpgllm.graph.scripts.train_retest import ProblemGraphs, RetestGraphModel, 
 from atpgllm.training._paths import DEFAULT_SIM_CONFIG
 
 
-def location(problem: dict) -> str:
+def location(problem: dict, state_inputs=()) -> str:
+    """``state_inputs`` are the QN nets of a scan circuit: a fault there is on
+    a state bit, which the test loads through the chain."""
     net = problem["fault"].split(None, 1)[1]
+    if net in state_inputs:
+        return "state_in"
     if net in problem["inputs"]:
         return "pi_stem"
     if net in problem["outputs"]:
@@ -57,7 +61,8 @@ def detects(sim_model, vector: dict, problem: dict) -> bool:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--labels", required=True)
+    ap.add_argument("--labels", required=True, nargs="+",
+                    help="One or more label directories (v4, v5).")
     ap.add_argument("--split", default="validation")
     ap.add_argument("--max-problems", type=int, default=2000)
     ap.add_argument("--threshold", type=float, default=0.5)
@@ -112,10 +117,12 @@ def main() -> None:
         key = p["netlist_key"]
         if key not in sims:
             sims[key] = simulation_model(circuits[key]["netlist"])
-        loc = location(p)
+        state_inputs = {names[i] for i in g.state_in_mask.nonzero().flatten().tolist()}
+        loc = location(p, state_inputs)
+        kind = "sequential" if state_inputs else "combinational"
         for policy, vec in vectors.items():
             hit = detects(sims[key], vec, p)
-            for group in ("all", f"loc:{loc}", f"difficulty:{p.get('difficulty')}"):
+            for group in ("all", f"kind:{kind}", f"loc:{loc}", f"difficulty:{p.get('difficulty')}"):
                 tally[policy][group][0] += int(hit)
                 tally[policy][group][1] += 1
     rates = {policy: {group: {"detect": h / n, "n": n} for group, (h, n) in groups.items()}

@@ -19,11 +19,18 @@ Graph nodes are:
 Directed edges run from the node driving a net to each pin reading it and
 carry the (driver output pin, sink input pin) roles. Netlists the schema
 cannot represent faithfully raise :class:`GraphRejected` with a reason.
+
+Full-scan sequential netlists (dataset v5) go through
+:func:`parse_scan_to_graph`: every flop is cut into a state input node, named
+by its QN net, and a state output node, named by its D net. The graph stays a
+DAG. Which state output feeds which state input is kept beside the graph
+(``state_outputs`` / ``state_inputs``), never as an edge.
+:func:`parse_netlist` picks the right parse for a netlist.
 """
 
 from collections import deque
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import math
 import regex as re
@@ -108,6 +115,14 @@ class ParsedNetlistGraph:
         Simulator-ordered primary input / output / wire bits.
     edges:
         ``(driver, sink, driver_pin, sink_pin, net)`` per reading pin.
+    flops / state_inputs / state_outputs / state_inverted:
+        Scan netlists only, one entry per flop, in scan chain order when the
+        chain table is given (netlist order otherwise). ``state_inputs[k]`` is
+        the ``<PI>`` node of flop ``k``'s QN net and ``state_outputs[k]`` the
+        ``<PO>`` node of its D net. ``state_inverted[k]`` is true when the
+        value captured at D appears inverted at QN after the clock (every v5
+        flop, since only QN is wired). This table is the only link from a
+        state output back to a state input: the edge set never closes a loop.
     """
 
     gates: List[ParsedGate]
@@ -117,6 +132,14 @@ class ParsedNetlistGraph:
     outputs: List[str]
     wires: List[str]
     edges: List[Tuple[int, int, str, str, str]]
+    flops: List[str] = field(default_factory=list)
+    state_inputs: List[int] = field(default_factory=list)
+    state_outputs: List[int] = field(default_factory=list)
+    state_inverted: List[bool] = field(default_factory=list)
+
+    @property
+    def is_scan(self) -> bool:
+        return bool(self.flops)
 
 
 # Same instance pattern as ``OptimizedNetlist._parse_and_compile``; used to
@@ -278,6 +301,229 @@ def parse_verilog_to_graph(
     )
 
 
+# ---------------------------------------------------------------------
+# Full-scan sequential netlists
+# ---------------------------------------------------------------------
+
+_CHAIN_ROW_RE = re.compile(r"^\s*(\d+)\s+(\S+)\s+D=(\S+)\s+QN=(\S+)\s*$", re.M)
+
+
+def chain_order(chain_table: str) -> List[str]:
+    """Flop instances from test_si to test_so, as a v5 row's ``scan_chain``
+    column lists them (``  0 d_reg  D=n11  QN=d``)."""
+    rows = _CHAIN_ROW_RE.findall(chain_table or "")
+    return [inst for _, inst, _, _ in sorted(rows, key=lambda row: int(row[0]))]
+
+
+_MODULE_PORTS_RE = re.compile(r"\bmodule\s+\S+\s*\(([^)]*)\)\s*;")
+
+
+def has_scan_ports(verilog_text: str) -> bool:
+    """True when the module has a scan chain to load and unload its flops
+    through (``test_si`` and ``test_so`` ports). Only then is one capture
+    cycle a combinational test of the cut view."""
+    header = _MODULE_PORTS_RE.search(verilog_text)
+    ports = {p.strip() for p in header.group(1).split(",")} if header else set()
+    return {"test_si", "test_so"} <= ports
+
+
+def _scan_view():
+    """``scan_view`` of the paired data_preprocessing checkout (branch seq-v5
+    or later), which owns the cut-view rules the dataset and the simulator use."""
+    from atpgllm.training._paths import ensure_data_preprocessing_on_path
+
+    ensure_data_preprocessing_on_path()
+    try:
+        import scan_view
+    except ImportError as exc:
+        raise GraphRejected(
+            "scan_view_missing",
+            "the data_preprocessing checkout has no scan_view; point "
+            "DATA_PREPROCESSING_ROOT at branch seq-v5 or later",
+        ) from exc
+    return scan_view
+
+
+def parse_scan_to_graph(
+    verilog_text: str,
+    gate_func: Dict,
+    chain_table: str = "",
+) -> ParsedNetlistGraph:
+    """Parse a full-scan netlist into the graph of one capture cycle.
+
+    The dataset's cut view removes every flop, drives its QN net from a new
+    input and observes its D net at a new output; scan ports and the clock
+    leave the port list. That view is parsed as a combinational netlist and
+    its synthetic buffers are folded away, so the graph speaks the names a
+    scan test uses:
+
+    - a ``<PI>`` node per primary input, then one per flop named by its QN net;
+    - a ``<PO>`` node per primary output, then one per distinct D net. A D
+      net that is also a primary output keeps one node, among the D nets, as
+      in the row's ``expected_output``.
+
+    ``<PI>`` nodes come first, in the order of the row's ``input_vector``.
+    State bits follow the scan chain (test_si first) when ``chain_table`` is
+    the row's ``scan_chain``; the netlist alone does not give that order for
+    a flop stitched through a mux. Without the table they keep netlist order,
+    which is the simulator's.
+
+    Raises :class:`GraphRejected` ``scan_cut_failed`` for a circuit the cut
+    view refuses (a clock that feeds logic, a non-scan sequential cell) and
+    ``chain_table_mismatch`` when the table names other flops.
+    """
+    scan_view = _scan_view()
+    try:
+        cells, clocks = scan_view.scan_cells_from_netlist(verilog_text)
+        cut = scan_view.cut_view(verilog_text, cells, clocks)
+    except ValueError as exc:
+        raise GraphRejected("scan_cut_failed", str(exc)) from exc
+    order = {inst: i for i, inst in enumerate(chain_order(chain_table))}
+    if order:
+        if set(order) != {cell["instance"] for cell in cells}:
+            raise GraphRejected("chain_table_mismatch")
+        cells = sorted(cells, key=lambda cell: order[cell["instance"]])
+    g = parse_verilog_to_graph(cut.netlist, gate_func)
+
+    qn_nets = list(dict.fromkeys(cell["QN"] for cell in cells))
+    d_nets = list(dict.fromkeys(cell["D"] for cell in cells))
+    qn_set, d_set = set(qn_nets), set(d_nets)
+
+    # Old nodes of the cut graph, by what they become.
+    pseudo_in: Dict[int, str] = {}    # <PI> v5_ppi_k        -> QN net
+    pseudo_out: Dict[int, str] = {}   # <PO> v5_ppo_k        -> D net
+    buffer_in: Dict[int, str] = {}    # buffer v5_ppi_k -> QN -> QN net
+    buffer_out: Dict[int, str] = {}   # buffer D -> v5_ppo_k  -> D net
+    merged_out: set = set()           # primary <PO> of a net that is also a D net
+    for i, gate in enumerate(g.gates):
+        if gate.cell == "<PI>" and gate.inst in cut.ppi:
+            pseudo_in[i] = cut.ppi[gate.inst]
+        elif gate.cell == "<PO>" and gate.inst in cut.ppo:
+            pseudo_out[i] = cut.ppo[gate.inst]
+        elif gate.cell == "<PO>" and gate.inst in d_set:
+            merged_out.add(i)
+        elif not gate.cell.startswith("<"):
+            reads = [net for pin, net in gate.connections.items() if net in cut.ppi]
+            drives = [net for pin, net in gate.connections.items() if net in cut.ppo]
+            if reads:
+                buffer_in[i] = cut.ppi[reads[0]]
+            elif drives:
+                buffer_out[i] = cut.ppo[drives[0]]
+    if len(pseudo_in) != len(cells) or len(buffer_in) != len(cells) \
+            or len(pseudo_out) != len(cells) or len(buffer_out) != len(cells):
+        raise GraphRejected("scan_cut_failed", "cut cells do not match the flops")
+
+    nodes: List[ParsedGate] = []
+    new_index: Dict[int, int] = {}
+    for i, gate in enumerate(g.gates):
+        if gate.cell == "<PI>" and i not in pseudo_in:
+            new_index[i] = len(nodes)
+            nodes.append(gate)
+    state_in: Dict[str, int] = {}
+    for net in qn_nets:
+        state_in[net] = len(nodes)
+        nodes.append(ParsedGate("<PI>", net, {PSEUDO_OUT_PIN: net}))
+    dropped = set(pseudo_in) | set(pseudo_out) | set(buffer_in) | set(buffer_out) | merged_out
+    for i, gate in enumerate(g.gates):
+        if i in dropped or gate.cell in ("<PI>", "<PO>"):
+            continue
+        new_index[i] = len(nodes)
+        nodes.append(gate)
+    for i, gate in enumerate(g.gates):
+        if gate.cell == "<PO>" and i not in dropped:
+            new_index[i] = len(nodes)
+            nodes.append(gate)
+    state_out: Dict[str, int] = {}
+    for net in d_nets:
+        state_out[net] = len(nodes)
+        nodes.append(ParsedGate("<PO>", net, {PSEUDO_IN_PIN: net}))
+
+    edges: List[Tuple[int, int, str, str, str]] = []
+    observed: set = set()
+    for src, dst, src_pin, dst_pin, net in g.edges:
+        if dst in buffer_in or src in buffer_out or dst in merged_out:
+            continue                      # pseudo port to its buffer, or a merged output
+        if src in buffer_in:
+            new_src, src_pin = state_in[buffer_in[src]], PSEUDO_OUT_PIN
+        else:
+            new_src = new_index[src]
+        if dst in buffer_out:
+            if net in observed:           # flops sharing a D net share its node
+                continue
+            observed.add(net)
+            new_dst, dst_pin = state_out[buffer_out[dst]], PSEUDO_IN_PIN
+        else:
+            new_dst = new_index[dst]
+        edges.append((new_src, new_dst, src_pin, dst_pin, net))
+
+    net_drivers: Dict[str, List[int]] = {}
+    for net, (node,) in g.net_drivers.items():
+        if cut.synthetic(net):
+            continue
+        net_drivers[net] = [state_in[buffer_in[node]] if node in buffer_in else new_index[node]]
+    net_sinks: Dict[str, List[int]] = {}
+    for _, dst, _, _, net in edges:
+        net_sinks.setdefault(net, []).append(dst)
+
+    return ParsedNetlistGraph(
+        gates=nodes,
+        net_drivers=net_drivers,
+        net_sinks=net_sinks,
+        inputs=[n for n in g.inputs if not cut.synthetic(n) and n not in qn_set] + qn_nets,
+        outputs=[n for n in g.outputs if not cut.synthetic(n) and n not in d_set] + d_nets,
+        wires=[w for w in g.wires if not cut.synthetic(w)],
+        edges=edges,
+        flops=[cell["instance"] for cell in cells],
+        state_inputs=[state_in[cell["QN"]] for cell in cells],
+        state_outputs=[state_out[cell["D"]] for cell in cells],
+        state_inverted=[
+            any("IQN" in expr for expr in gate_func.get(cell["cell"], {}).values())
+            for cell in cells
+        ],
+    )
+
+
+def parse_netlist(
+    verilog_text: str,
+    gate_func: Dict,
+    chain_table: str = "",
+) -> ParsedNetlistGraph:
+    """Graph of a combinational netlist, or of one capture cycle of a
+    full-scan netlist (:func:`parse_scan_to_graph`). ``chain_table`` is a v5
+    row's ``scan_chain`` and is ignored for combinational netlists.
+
+    A netlist with flops and no scan chain stays rejected as
+    ``sequential_cell``: its state cannot be set or read by a test, so the
+    cut would describe another circuit."""
+    try:
+        return parse_verilog_to_graph(verilog_text, gate_func)
+    except GraphRejected as exc:
+        if exc.reason != "sequential_cell" or not has_scan_ports(verilog_text):
+            raise
+    return parse_scan_to_graph(verilog_text, gate_func, chain_table)
+
+
+def next_state(parsed: ParsedNetlistGraph, captured: Mapping[str, Any]) -> Dict[str, Any]:
+    """State inputs of the next cycle from the outputs of this one.
+
+    ``captured`` maps output names to 0, 1 or ``"x"`` (a row's
+    ``expected_output``, or a simulated response). Returns ``{QN net: value}``
+    for every flop, using the pairing kept beside the graph. This is the only
+    place a state output reaches a state input, so a multi-cycle test is a
+    chain of single-cycle graphs, never a cyclic one.
+    """
+    out: Dict[str, Any] = {}
+    for d_node, qn_node, inverted in zip(parsed.state_outputs, parsed.state_inputs, parsed.state_inverted):
+        value = captured.get(parsed.gates[d_node].inst, "x")
+        text = str(value).strip().lower()
+        if text in ("0", "1"):
+            value = int(text) ^ int(inverted)
+        else:
+            value = "x"
+        out[parsed.gates[qn_node].inst] = value
+    return out
+
+
 def compute_structural_features(
     edge_index: torch.Tensor,
     num_nodes: int,
@@ -404,6 +650,12 @@ def parsed_to_pyg(
     - ``edge_index`` : ``[2, E]`` — one driver → sink edge per reading pin
     - ``structural_feats`` : ``[N, NUM_STRUCTURAL_FEATURES]`` float32 — depth / degree / port features
     - ``gate_node_mask`` / ``po_node_mask`` / ``pi_node_mask`` : ``[N]`` bool — node kinds
+    - ``state_in_mask`` / ``state_out_mask`` : ``[N]`` bool — the ``<PI>`` /
+      ``<PO>`` nodes that are state bits of a scan circuit (all false otherwise)
+    - ``state_pair_index`` : ``[2, F]`` — per flop, its state output node
+      (row 0, D side) and its state input node (row 1, QN side). A side table,
+      not edges: batching offsets it like ``edge_index``, message passing
+      never reads it. ``state_pair_inverted`` : ``[F]`` bool.
     - ``node_names`` : instance names, or net names for ``<PI>``/``<PO>`` nodes
 
     These are consumed by :class:`AttributeDecompositionEncoder` and
@@ -455,11 +707,15 @@ def parsed_to_pyg(
     cell_type = torch.tensor(cell_ids, dtype=torch.int64)
     inst_id = torch.tensor(inst_ids, dtype=torch.int64)
 
+    state_in = set(parsed.state_inputs)
+    state_out = set(parsed.state_outputs)
+    state_nodes = state_in | state_out
+
     # ----- Attribute decomposition & structural features -----
     if vocab is not None:
         if num_nodes:
             gate_attrs = torch.tensor(
-                [vocab.encode(ct) for ct in cell_types],
+                [vocab.encode_node(ct, i in state_nodes) for i, ct in enumerate(cell_types)],
                 dtype=torch.int64,
             )
         else:
@@ -491,6 +747,16 @@ def parsed_to_pyg(
         pi_node_mask=torch.tensor(
             [ct == "<PI>" for ct in cell_types], dtype=torch.bool
         ),
+        state_in_mask=torch.tensor(
+            [i in state_in for i in range(num_nodes)], dtype=torch.bool
+        ),
+        state_out_mask=torch.tensor(
+            [i in state_out for i in range(num_nodes)], dtype=torch.bool
+        ),
+        state_pair_index=torch.tensor(
+            [parsed.state_outputs, parsed.state_inputs], dtype=torch.int64
+        ).reshape(2, -1),
+        state_pair_inverted=torch.tensor(parsed.state_inverted, dtype=torch.bool),
         node_names=inst_names,
     )
 
@@ -499,14 +765,15 @@ def parse_verilog_to_pyg(
     verilog_text: str,
     gate_func: Dict,
     vocab: Optional[GateAttributeVocab] = None,
+    chain_table: str = "",
 ) -> Data:
     """Convenience wrapper: directly return a PyG ``Data`` graph from
-    Verilog text and gate function dict.
+    Verilog text and gate function dict (:func:`parse_netlist`).
 
     When *vocab* is given, attribute decomposition and structural
     features are computed.
     """
-    parsed = parse_verilog_to_graph(verilog_text, gate_func)
+    parsed = parse_netlist(verilog_text, gate_func, chain_table)
     return parsed_to_pyg(parsed, vocab=vocab)
 
 

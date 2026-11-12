@@ -652,6 +652,8 @@ def _load_common(args: argparse.Namespace):
         args.alignment_ckpt,
         vocab,
     )
+    # A re-test checkpoint trained with state cells brings its own vocabulary.
+    vocab = alignment.get("vocab", vocab)
     tokenizer = AutoTokenizer.from_pretrained(local_pretrained(args.llm))
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token

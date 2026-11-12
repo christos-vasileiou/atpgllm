@@ -58,6 +58,18 @@ PSEUDO_CELLS: Dict[str, str] = {
     "<CONST1>": "CONST1",
     "<ASSIGN>": "ASSIGN",
 }
+# State bits of a full-scan circuit (see ``netlist_parser.parse_scan_to_graph``).
+# A flop is cut into a state input (its QN net, loaded through the chain) and a
+# state output (its D net, captured and shifted out). In the graph these are
+# ``<PI>`` and ``<PO>`` nodes, because a scan test sets and observes them like
+# ports. A vocabulary built with ``state_cells=True`` also gives them their own
+# attribute bin: the family and function of the port they act as, with
+# ``is_sequential`` true. No table grows and no index moves, so weights trained
+# without state cells load unchanged.
+STATE_CELLS: Dict[str, str] = {
+    "<PI>": "<PPI>",
+    "<PO>": "<PPO>",
+}
 # Pin names used on pseudo-cells.
 PSEUDO_IN_PIN = "<IN>"
 PSEUDO_OUT_PIN = "<OUT>"
@@ -360,12 +372,12 @@ def _function_signature(func_dict: Dict[str, str]) -> str:
     )
 
 
-def _pseudo_attrs(cell: str, family: str) -> GateAttributes:
+def _pseudo_attrs(cell: str, family: str, *, state: bool = False) -> GateAttributes:
     return GateAttributes(
         logic_family=family,
         input_count={"PO": 1, "ASSIGN": 1}.get(family, 0),
         output_complemented=False,
-        is_sequential=False,
+        is_sequential=state,
         drive_strength=1.0,
         num_outputs=0 if family == "PO" else 1,
         tristate=False,
@@ -387,12 +399,17 @@ class GateAttributeVocab:
     gate_funcs : dict
         ``{cell_name: {output_pin: boolean_expression, ...}, ...}``
         as read from ``sim_config.json["gate_funcs"]``.
+    state_cells : bool
+        Register ``<PPI>`` and ``<PPO>`` (:data:`STATE_CELLS`),
+        so the state bits of a scan circuit are encoded apart from primary
+        ports. Off by default: the fingerprint of existing checkpoints stays.
     """
 
     def __init__(
         self,
         gate_funcs: Dict[str, Dict[str, str]],
         attribute_names: Optional[Sequence[str]] = None,
+        state_cells: bool = False,
     ) -> None:
         self.attribute_names = tuple(attribute_names or ATTRIBUTE_NAMES)
         unknown = set(self.attribute_names) - set(_ATTRIBUTE_REGISTRY)
@@ -405,6 +422,8 @@ class GateAttributeVocab:
             self._attrs[cell_name] = self._extract(cell_name, gate_funcs[cell_name])
         for cell_name, family in PSEUDO_CELLS.items():
             self._attrs[cell_name] = _pseudo_attrs(cell_name, family)
+        if state_cells:
+            self._add_state_cells()
 
         self.function_labels: List[str] = ["UNKNOWN"] + sorted(
             {attrs.function for attrs in self._attrs.values()}
@@ -463,6 +482,36 @@ class GateAttributeVocab:
         if cell_name in self._indices:
             return self._indices[cell_name]
         return self._default_indices()
+
+    def _add_state_cells(self) -> None:
+        for port, state in STATE_CELLS.items():
+            # Same function label as the port: ``function_labels`` must not grow.
+            self._attrs[state] = _pseudo_attrs(port, PSEUDO_CELLS[port], state=True)
+
+    @property
+    def has_state_cells(self) -> bool:
+        return all(state in self._attrs for state in STATE_CELLS.values())
+
+    def with_state_cells(self) -> "GateAttributeVocab":
+        """This vocabulary plus the state cells (itself when it has them)."""
+        if self.has_state_cells:
+            return self
+        other = self.__class__.__new__(self.__class__)
+        other.attribute_names = self.attribute_names
+        other.function_labels = list(self.function_labels)
+        other.pin_labels = list(self.pin_labels)
+        other._attrs = dict(self._attrs)
+        other._add_state_cells()
+        other._init_indices()
+        return other
+
+    def encode_node(self, cell_name: str, state: bool = False) -> Tuple[int, ...]:
+        """Indices of a graph node. A state bit (``state=True``) takes its
+        state cell when this vocabulary has one, and its port cell otherwise,
+        so a checkpoint trained before state cells reads it as a port."""
+        if state and self.has_state_cells:
+            cell_name = STATE_CELLS.get(cell_name, cell_name)
+        return self.encode(cell_name)
 
     def encode_pin(self, pin: str) -> int:
         """Pin-role index; 0 (UNKNOWN) for pins absent from the library."""

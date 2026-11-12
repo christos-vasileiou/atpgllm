@@ -46,7 +46,7 @@ from .gate_features import GateAttributeVocab
 from .netlist_parser import (
     GraphRejected,
     ParsedNetlistGraph,
-    parse_verilog_to_graph,
+    parse_netlist,
     parse_verilog_to_pyg,
     parsed_to_pyg,
 )
@@ -277,19 +277,24 @@ def _netlist_text(record: Dict[str, Any]) -> str:
 # Fault-independent graph per circuit; datasets repeat each circuit across
 # many fault records, and the simulator-backed parse dominates load time.
 _GRAPH_CACHE: "collections.OrderedDict[tuple, Any]" = collections.OrderedDict()
-_GRAPH_CACHE_SIZE = 4096
+# v4 plus v5 train is 4,782 circuits: keep all of them, a miss re-runs the simulator parse.
+_GRAPH_CACHE_SIZE = 8192
 
 
 def _circuit_graph(
     netlist: str,
     gate_funcs: Dict[str, Dict[str, str]],
     vocab: GateAttributeVocab,
+    chain_table: str = "",
 ) -> Tuple[ParsedNetlistGraph, Data]:
-    key = (id(gate_funcs), id(vocab), hashlib.sha256(netlist.encode("utf-8")).hexdigest())
+    """``chain_table`` is a v5 row's ``scan_chain``: it orders the state bits
+    of a scan netlist and is part of the cache key."""
+    text = netlist if not chain_table else netlist + "\0" + chain_table
+    key = (id(gate_funcs), id(vocab), hashlib.sha256(text.encode("utf-8")).hexdigest())
     cached = _GRAPH_CACHE.get(key)
     if cached is None:
         try:
-            parsed = parse_verilog_to_graph(netlist, gate_funcs)
+            parsed = parse_netlist(netlist, gate_funcs, chain_table)
             cached = (parsed, parsed_to_pyg(parsed, vocab=vocab))
         except GraphRejected as exc:
             cached = exc
@@ -321,7 +326,9 @@ def record_to_pyg(
     if not netlist:
         return None
     try:
-        parsed, base = _circuit_graph(netlist, gate_funcs, vocab)
+        parsed, base = _circuit_graph(
+            netlist, gate_funcs, vocab, str(record.get("scan_chain") or "")
+        )
         data = base.clone()
         attach_atpg_context(data, parsed, gate_funcs, record)
     except GraphRejected as exc:
