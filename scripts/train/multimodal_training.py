@@ -711,7 +711,8 @@ def _searched(records, args, salt):
         for record in records:
             yield record, _tool_attempt(record, args, salt)
         return
-    with ThreadPoolExecutor(args.example_workers) as pool:
+    pool = ThreadPoolExecutor(args.example_workers)
+    try:
         window: collections.deque = collections.deque()
         for record in records:
             window.append((record, pool.submit(_tool_attempt, record, args, salt)))
@@ -721,6 +722,56 @@ def _searched(records, args, salt):
         while window:
             head, future = window.popleft()
             yield head, future.result()
+    finally:
+        # Closed early (--stop-after): searches not yet started are dropped.
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _in_background(source, ahead: int, join_timeout: float = 300.0):
+    """The items of ``source``, produced by one background thread that runs at
+    most ``ahead`` items in front of the consumer.
+
+    Closing the generator stops the thread, closes ``source`` inside it and
+    waits for it. A thread still inside native code when the interpreter exits
+    aborts the process: the two --stop-after runs of 11-11 (juno 506526 and
+    506528) saved step 40 and then died with SIGABRT, which Slurm reported as
+    a failed job."""
+    buffer: queue.Queue = queue.Queue(maxsize=ahead)
+    done = object()
+    stop = threading.Event()
+
+    def put(item) -> bool:
+        while not stop.is_set():
+            try:
+                buffer.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def produce() -> None:
+        try:
+            for item in source:
+                if not put(item):
+                    break
+        except BaseException as exc:  # raised again in the consuming thread
+            put(exc)
+        finally:
+            close = getattr(source, "close", None)
+            if close is not None:
+                close()
+            put(done)
+
+    worker = threading.Thread(target=produce, daemon=True)
+    worker.start()
+    try:
+        while (item := buffer.get()) is not done:
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        stop.set()
+        worker.join(join_timeout)
 
 
 def _tool_example(record, args, gate_funcs, vocab, tokenizer, rejections, salt,
@@ -975,44 +1026,39 @@ def train_sft(args: argparse.Namespace) -> None:
     kinds: collections.Counter = collections.Counter()
     counters = threading.Lock()
 
+    def built_examples():
+        """Runs in the background thread, where tokenizing and graph building stay."""
+        searched = _searched(records, args, str(args.seed))
+        try:
+            for record, attempt in searched:
+                rejected: collections.Counter = collections.Counter()
+                example = _tool_example(record, args, gate_funcs, vocab, tokenizer,
+                                        rejected, salt=str(args.seed),
+                                        attempt=attempt, searched=True)
+                with counters:
+                    rejections.update(rejected)
+                if example is not None:
+                    yield example
+        finally:
+            searched.close()
+
     def tool_examples():
         """Examples built in a background thread, so the TetraMAX runs of
         retry examples overlap with the GPU's work on earlier ones."""
-        buffer: queue.Queue = queue.Queue(maxsize=2 * examples_per_step)
-        done = object()
-
-        def produce() -> None:
-            try:
-                # Tokenizing and graph building stay in this one thread.
-                for record, attempt in _searched(records, args, str(args.seed)):
-                    rejected: collections.Counter = collections.Counter()
-                    example = _tool_example(record, args, gate_funcs, vocab, tokenizer,
-                                            rejected, salt=str(args.seed),
-                                            attempt=attempt, searched=True)
-                    with counters:
-                        rejections.update(rejected)
-                    if example is not None:
-                        buffer.put(example)
-            except BaseException as exc:  # raised again in the training thread
-                buffer.put(exc)
-            buffer.put(done)
-
-        threading.Thread(target=produce, daemon=True).start()
-        while (item := buffer.get()) is not done:
-            if isinstance(item, BaseException):
-                raise item
-            kinds["retry" if item.retry else "single"] += 1
-            yield item
+        with contextlib.closing(_in_background(built_examples(), 2 * examples_per_step)) as examples:
+            for item in examples:
+                kinds["retry" if item.retry else "single"] += 1
+                yield item
 
     def tool_steps():
         """Each step's micro-batches, each with its share of the step's examples."""
-        examples = tool_examples()
-        while len(chunk := list(islice(examples, examples_per_step))) == examples_per_step:
-            yield [
-                (collate_tool_sft(group, tokenizer.pad_token_id), len(group) / examples_per_step)
-                for group in _pack(chunk, args.batch_size, args.micro_batch_tokens,
-                                   model.num_queries)
-            ]
+        with contextlib.closing(tool_examples()) as examples:
+            while len(chunk := list(islice(examples, examples_per_step))) == examples_per_step:
+                yield [
+                    (collate_tool_sft(group, tokenizer.pad_token_id), len(group) / examples_per_step)
+                    for group in _pack(chunk, args.batch_size, args.micro_batch_tokens,
+                                       model.num_queries)
+                ]
 
     def legacy_steps():
         batches = legacy_batches()
@@ -1051,7 +1097,10 @@ def train_sft(args: argparse.Namespace) -> None:
     optimizer.zero_grad(set_to_none=True)
     window_loss, window_steps, window_micro = 0.0, 0, 0
     started = time.time()
-    for micro_batches in (tool_steps() if args.tool_format else legacy_steps()):
+    # Closed on both ways out of the loop, so the example thread has ended
+    # before the process exits.
+    steps = tool_steps() if args.tool_format else legacy_steps()
+    for micro_batches in steps:
         for index, (batch, weight) in enumerate(micro_batches):
             batch = {
                 key: value.to(device) if hasattr(value, "to") else value
@@ -1116,7 +1165,9 @@ def train_sft(args: argparse.Namespace) -> None:
             if main_process:
                 print(f"stopped after step {step} of {args.max_steps} (--stop-after); "
                       "resume from its checkpoint to continue", flush=True)
+            steps.close()
             return
+    steps.close()
     keep_best(evaluate(probe=True))
     save("final")
 

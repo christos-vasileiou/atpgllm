@@ -36,3 +36,69 @@ def test_searched_matches_serial_order_and_values(monkeypatch):
     assert [r["i"] for r, _ in parallel] == list(range(60))
     assert parallel == serial
     assert any(a is mt._NO_RETRY for _, a in serial) and any(a is None for _, a in serial)
+
+
+def test_in_background_keeps_order_and_raises_the_source_error():
+    mt = _module()
+    assert list(mt._in_background(iter(range(50)), ahead=4)) == list(range(50))
+
+    def broken():
+        yield 1
+        raise KeyError("bad row")
+
+    items = mt._in_background(broken(), ahead=4)
+    assert next(items) == 1
+    try:
+        next(items)
+    except KeyError as exc:
+        assert exc.args == ("bad row",)
+    else:
+        raise AssertionError("the source error was swallowed")
+
+
+def test_closing_in_background_ends_its_thread_and_closes_the_source():
+    """A --stop-after run returns mid-stream: the example thread must be gone
+    before the interpreter exits (juno 506526 and 506528 aborted on exit)."""
+    import threading
+
+    mt = _module()
+    closed = []
+
+    def source():
+        try:
+            i = 0
+            while True:  # endless, like the repeating training rows
+                yield i
+                i += 1
+        finally:
+            closed.append(threading.current_thread().name)
+
+    before = set(threading.enumerate())
+    items = mt._in_background(source(), ahead=3)
+    assert [next(items) for _ in range(5)] == [0, 1, 2, 3, 4]
+    worker = (set(threading.enumerate()) - before).pop()
+    items.close()
+    assert not worker.is_alive()
+    # Closed inside the worker, not from the consuming thread.
+    assert closed == [worker.name]
+
+
+def test_closing_searched_early_leaves_no_search_threads(monkeypatch):
+    import threading
+
+    mt = _module()
+    started = []
+
+    def slow_attempt(record, args, salt):
+        started.append(record["i"])
+        time.sleep(0.02)
+        return record["i"]
+
+    monkeypatch.setattr(mt, "_tool_attempt", slow_attempt)
+    before = set(threading.enumerate())
+    args = SimpleNamespace(example_workers=2)
+    searched = mt._searched(({"i": i} for i in range(1000)), args, "42")
+    assert next(searched)[1] == 0
+    searched.close()
+    assert not [t for t in set(threading.enumerate()) - before if t.is_alive()]
+    assert len(started) < 20  # queued searches were dropped, not run out
