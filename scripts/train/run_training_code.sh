@@ -538,6 +538,11 @@ build_cmd_args() {
             if [ -n "${FIXED_EVAL_MANIFEST:-}" ]; then
                 CMD_ARGS+=(--fixed_eval_manifest "$FIXED_EVAL_MANIFEST")
             fi
+            # The manifest protocol records the selection, so a sourced but
+            # unexported FIXED_EVAL_SELECTION must reach Python as a flag.
+            if [ -n "${FIXED_EVAL_SELECTION:-}" ]; then
+                CMD_ARGS+=(--fixed_eval_selection "$FIXED_EVAL_SELECTION")
+            fi
             if [ -n "${KEEP_BEST_CHECKPOINTS:-}" ]; then
                 CMD_ARGS+=(--keep_best_checkpoints "$KEEP_BEST_CHECKPOINTS")
             fi
