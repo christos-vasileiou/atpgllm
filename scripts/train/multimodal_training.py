@@ -80,6 +80,7 @@ from atpgllm.multimodal.data import (
     _template_ids,
     build_tool_sft_example,
     collate_tool_sft,
+    HINT_STYLES,
     load_hints,
     graph_position,
 )
@@ -202,6 +203,14 @@ def _parse_args() -> argparse.Namespace:
         help="Text-hint arm: JSONL files of the graph model's decoded care "
              "inputs (atpgllm.graph.scripts.retest_hints), written into the "
              "prompt after the port declarations. Use with --graph-off.",
+    )
+    parser.add_argument(
+        "--hint-style",
+        choices=HINT_STYLES,
+        default="plain",
+        help="plain: the suggested inputs and values. rich: also which of them "
+             "the graph model is unsure of, further candidates, and where it "
+             "expects the fault to be observed.",
     )
     parser.add_argument(
         "--target",
@@ -685,12 +694,29 @@ def _prompt_extras(args: argparse.Namespace) -> dict[str, Any]:
     """What the fusion and the hint arm add to the ports prompt
     (``build_tool_sft_example`` and the tool probe take these)."""
     hints = getattr(args, "hints", None)
-    if hints and str(hints) not in _HINTS:
-        _HINTS[str(hints)] = load_hints(hints)
+    key = f"{hints}|{getattr(args, 'hint_style', 'plain')}"
+    if hints and key not in _HINTS:
+        _HINTS[key] = load_hints(hints, getattr(args, "hint_style", "plain"))
     return {
         "port_bits": getattr(args, "fusion", "prefix") != "prefix",
-        "hints": _HINTS[str(hints)] if hints else None,
+        "hints": _HINTS[key] if hints else None,
     }
+
+
+def _too_wide(record, args) -> bool:
+    """True when the record cannot fit ``--max-seq-len`` whatever its text.
+    The tool call names every input and every output and the answer names
+    every input, at no fewer than six tokens per input and four per output.
+    The length cap rejects such a record later, and it must not reach the
+    simulator first: TetraMAX refuses a pattern file whose signal list is
+    one line of more than 50,000 characters, which the two widest v5
+    netlists (2,883 and 4,181 inputs) produce."""
+    try:
+        inputs = len(json.loads(record["input_vector"]))
+        outputs = len(json.loads(record["expected_output"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return 6 * inputs + 4 * outputs > args.max_seq_len
 
 
 def _tool_attempt(record, args, salt, retry_fraction=None):
@@ -700,7 +726,7 @@ def _tool_attempt(record, args, salt, retry_fraction=None):
     rng = random.Random(record_seed(record, salt))
     if retry_fraction is None:
         retry_fraction = args.retry_fraction
-    if rng.random() < retry_fraction:
+    if rng.random() < retry_fraction and not _too_wide(record, args):
         return failed_attempt(record, rng, max_flips=args.max_flips)
     return _NO_RETRY
 
@@ -828,7 +854,7 @@ def _held_out(args, gate_funcs, vocab, tokenizer):
                 if example is not None:
                     examples.append(example)
                     continue
-            if len(probes) < args.probe_examples:
+            if len(probes) < args.probe_examples and not _too_wide(record, args):
                 attempt = failed_attempt(record, random.Random(record_seed(record, "probe")),
                                          max_flips=args.max_flips)
                 if attempt is not None and build_tool_sft_example(

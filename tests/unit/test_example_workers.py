@@ -102,3 +102,29 @@ def test_closing_searched_early_leaves_no_search_threads(monkeypatch):
     searched.close()
     assert not [t for t in set(threading.enumerate()) - before if t.is_alive()]
     assert len(started) < 20  # queued searches were dropped, not run out
+
+
+def test_a_record_too_wide_to_fit_never_reaches_the_simulator(monkeypatch):
+    """TetraMAX refuses the pattern file of a circuit with thousands of
+    inputs. Such a record cannot fit the length cap either, so the search for
+    a failed attempt skips it instead of failing the run."""
+    import json
+
+    mt = _module()
+
+    def simulator(*_args, **_kwargs):
+        raise AssertionError("the simulator was called")
+
+    monkeypatch.setattr(mt, "failed_attempt", simulator)
+    args = SimpleNamespace(retry_fraction=1.0, max_flips=3, max_seq_len=14336)
+    wide = {"circuit_id": "wide", "fault": "sa1 a[0]",
+            "input_vector": json.dumps({f"a[{i}]": 0 for i in range(2883)}),
+            "expected_output": json.dumps({f"y[{i}]": 0 for i in range(338)})}
+    assert mt._too_wide(wide, args)
+    assert mt._tool_attempt(wide, args, "42") is mt._NO_RETRY
+
+    narrow = {"circuit_id": "narrow", "fault": "sa1 a",
+              "input_vector": json.dumps({"a": 0, "b": 1}), "expected_output": json.dumps({"y": 0})}
+    assert not mt._too_wide(narrow, args)
+    monkeypatch.setattr(mt, "failed_attempt", lambda *a, **k: "searched")
+    assert mt._tool_attempt(narrow, args, "42") == "searched"

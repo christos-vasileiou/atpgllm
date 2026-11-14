@@ -16,6 +16,8 @@
 #   ARM=anchored sbatch scripts/train/juno_retest_stage_c.sbatch   # input-bit anchors (11-10)
 #   ARM=hint sbatch scripts/train/juno_retest_stage_c.sbatch       # text hint control (11-10);
 #                                         # needs runs/bridges_retest/hints for train and validation
+#   ARM=hint_plain sbatch scripts/train/juno_retest_stage_c.sbatch # hint arm on v5 (11-12);
+#   ARM=hint_rich sbatch scripts/train/juno_retest_stage_c.sbatch  # needs runs/bridges_retest_seq/hints
 #   ARM=graph SMOKE=1 sbatch --gres=gpu:1 -t 01:00:00 scripts/train/juno_retest_stage_c.sbatch
 #
 # STOP_AFTER=40 stops an arm after step 40 with the 300-step schedule kept,
@@ -28,13 +30,16 @@
 # that already saved its last step exits at once.
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-ARM=${ARM:?set ARM=graph, ports, anchored or hint}
+ARM=${ARM:?set ARM=graph, ports, anchored, hint, hint_plain or hint_rich}
 case "$ARM" in
     graph) export ARM_CONF=multimodal_sft_retest.conf; OUT=runs/multimodal_sft_retest ;;
     ports) export ARM_CONF=multimodal_sft_retest_ports_only.conf; OUT=runs/multimodal_sft_retest_ports_only ;;
     anchored) export ARM_CONF=multimodal_sft_retest_anchored.conf; OUT=runs/multimodal_sft_retest_anchored ;;
     hint) export ARM_CONF=multimodal_sft_retest_hint.conf; OUT=runs/multimodal_sft_retest_hint ;;
-    *) echo "ARM must be graph, ports, anchored or hint"; exit 1 ;;
+    # v5, both kinds of circuit, hints from the graph model trained on both (11-12).
+    hint_plain) export ARM_CONF=multimodal_sft_hint_v5_plain.conf; OUT=runs/multimodal_sft_hint_v5_plain ;;
+    hint_rich) export ARM_CONF=multimodal_sft_hint_v5_rich.conf; OUT=runs/multimodal_sft_hint_v5_rich ;;
+    *) echo "ARM must be graph, ports, anchored, hint, hint_plain or hint_rich"; exit 1 ;;
 esac
 set +u
 [ -f /etc/profile.d/lmod.sh ] && source /etc/profile.d/lmod.sh
@@ -42,6 +47,13 @@ module load tetramax/vO-2018.06-SP1
 set -u
 source "${PYTHON_VENV:-/work/cxv200006/myenv}/bin/activate"
 export PYTHONPATH="$PWD" HF_HUB_OFFLINE=1 WANDB_MODE=offline
+# Its own PyG cache folder (the trainer adds one per rank below it): arms that
+# start together on different nodes must not share ~/.cache/pyg.
+export PYG_HOME="${TMPDIR:-/tmp}/pyg_${SLURM_JOB_ID:-$$}"
+# A tree without a sibling data_preprocessing (the v5 arms) names its checkout.
+if [ ! -d ../data_preprocessing ]; then
+    export DATA_PREPROCESSING_ROOT="${DATA_PREPROCESSING_ROOT:-/work/cxv200006/transformers_atpg/data_preprocessing_seq-v5}"
+fi
 # A seat pool per job: pool.json binds a pool to one host, and the two arms
 # run on different nodes.
 export TMAX_LOCK_DIR="$(cd .. && pwd)/.runtime/tetramax_${SLURM_JOB_ID:-local}"

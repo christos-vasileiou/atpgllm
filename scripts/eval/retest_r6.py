@@ -122,11 +122,13 @@ def load_model(checkpoint: Path, adapter: Path):
     from atpgllm.graph.gate_features import GateAttributeVocab
     from atpgllm.multimodal import GraphConditionedCausalLM
 
-    vocab = GateAttributeVocab(json.loads(cs.SIM_CONFIG.read_text())["gate_funcs"])
-    payload = load_stage_checkpoint(checkpoint, expected_stages=["multimodal_sft"], vocab=vocab)
+    payload = load_stage_checkpoint(checkpoint, expected_stages=["multimodal_sft"])
     session = payload["session"]
     args = cs._llm_args(alignment_ckpt=session["alignment_ckpt"])
+    # The vocabulary is the alignment checkpoint's (with state cells when it
+    # was trained with them), and must be the one this checkpoint saved.
     gate_funcs, vocab, graph_encoder, q_former, _, tokenizer = mt._load_common(args)
+    vocab.assert_compatible(GateAttributeVocab.from_dict(payload["vocab"]))
     llm = PeftModel.from_pretrained(mt._base_llm(args), adapter)
     architecture = payload["architecture"]["multimodal"]
     model = GraphConditionedCausalLM(graph_encoder, q_former, llm,
@@ -154,8 +156,9 @@ def hint_tables(args, session) -> tuple:
     from atpgllm.multimodal.data import load_hints
 
     trained = session.get("hints")
+    style = session.get("hint_style", "plain")
     if trained:
-        return load_hints(args.hints or trained), None
+        return load_hints(args.hints or trained, style), None
     return None, (load_hints(args.hints) if args.hints else None)
 
 

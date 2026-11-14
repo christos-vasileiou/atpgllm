@@ -136,6 +136,7 @@ case "${STAGE:?STAGE is required}" in
         [ -n "${FUSION:-}" ] && CMD+=(--fusion "$FUSION")
         [ -n "${ANCHOR_GATE_LR:-}" ] && CMD+=(--anchor-gate-lr "$ANCHOR_GATE_LR")
         [ -n "${HINTS:-}" ] && CMD+=(--hints "$HINTS")
+        [ -n "${HINT_STYLE:-}" ] && CMD+=(--hint-style "$HINT_STYLE")
         [ "${FREEZE_GRAPH_BN:-False}" = True ] && CMD+=(--freeze-graph-bn)
         [ -n "${MAX_TOOL_CALLS:-}" ] && CMD+=(--max-tool-calls "$MAX_TOOL_CALLS")
         [ -n "${ADVANTAGE:-}" ] && CMD+=(--advantage "$ADVANTAGE")

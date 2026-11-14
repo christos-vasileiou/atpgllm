@@ -16,10 +16,22 @@ trained on the train split's labels, so its train hints are better than its
 validation hints, and a model trained on them may trust a hint more than it
 should on new circuits. Compare the two summaries before reading a result.
 
+Each row also carries ``rich``: the model's probabilities for every input it
+gives at least :data:`RICH_FLOOR` care probability and every output it gives
+at least that observation probability. The rich hint style
+(:func:`atpgllm.multimodal.data.rich_hint_text`) writes these as confidence
+marks and an "observe at" line. Measured on v5 validation (2026-11-12, model
+trained on both kinds of circuit): a value the model is sure of (margin at
+least 0.4 from 0.5) is right 97.6% of the time, one with margin under 0.1
+only 57.2%, and 19% of its values are in that last band.
+
     PYTHONPATH=$PWD python -m atpgllm.graph.scripts.retest_hints \\
         --checkpoint runs/bridges_retest/r3/best.pt \\
         --labels ../data/freeset/retest_labels_v4 --split validation \\
         --out runs/bridges_retest/hints
+
+``--shards N --shard k`` splits a split over N processes. Problems are read
+as a stream, so a process holds only its own rows of a multi-GB label table.
 """
 
 from __future__ import annotations
@@ -33,8 +45,40 @@ import torch
 from torch_geometric.data import Batch
 
 from atpgllm.graph.gate_features import GateAttributeVocab
-from atpgllm.graph.scripts.train_retest import ProblemGraphs, RetestGraphModel, load_split
+from atpgllm.graph.scripts.train_retest import ProblemGraphs, RetestGraphModel
 from atpgllm.training._paths import DEFAULT_SIM_CONFIG
+
+# Inputs and outputs below this probability are left out of ``rich``.
+RICH_FLOOR = 0.2
+
+
+def stream_split(labels, split: str, shard: int = 0, shards: int = 1, limit: int = 0):
+    """``(circuits, problems)`` of one split over one or more label
+    directories. ``problems`` is a generator over this shard's rows, in file
+    order: a v5 train table is several GB, and a shard needs a part of it."""
+    dirs = [labels] if isinstance(labels, (str, os.PathLike)) else list(labels)
+    circuits = {}
+    for directory in dirs:
+        with open(os.path.join(directory, f"circuits_{split}.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                c = json.loads(line)
+                circuits[c["netlist_key"]] = c
+
+    def problems():
+        index = taken = 0
+        for directory in dirs:
+            with open(os.path.join(directory, f"problems_{split}.jsonl"), encoding="utf-8") as f:
+                for line in f:
+                    mine = index % shards == shard
+                    index += 1
+                    if not mine:
+                        continue
+                    yield json.loads(line)
+                    taken += 1
+                    if limit and taken >= limit:
+                        return
+
+    return circuits, problems()
 
 
 def load_graph_model(checkpoint: str, device: torch.device):
@@ -50,18 +94,36 @@ def load_graph_model(checkpoint: str, device: torch.device):
 
 
 @torch.no_grad()
-def decode_hint(model, graph, device: torch.device, threshold: float = 0.5) -> dict:
-    """``{input: 0 or 1}`` for the inputs the care head marks."""
+def decode(model, graph, device: torch.device, threshold: float = 0.5,
+           floor: float = RICH_FLOOR) -> tuple:
+    """``(hint, rich)`` for one problem graph.
+
+    ``hint`` is ``{input: 0 or 1}`` for the inputs the care head marks at
+    ``threshold``. ``rich`` keeps the probabilities behind it:
+    ``{"inputs": {name: [care, one]}, "outputs": {name: observed}}`` for
+    every input and output at or above ``floor``, in vector order."""
     _, queries = model(Batch.from_data_list([graph]).to(device))
     former = model.q_former
     nodes = former.last["nodes"]
-    care = torch.sigmoid(former.pointer_logits("care", queries, nodes))[0]
-    value = torch.sigmoid(former.value_logits(queries, nodes))[0]
-    return {
-        name: int(value[i] >= 0.5)
-        for i, name in enumerate(graph.node_names)
-        if bool(graph.pi_node_mask[i]) and care[i] >= threshold
-    }
+    care = torch.sigmoid(former.pointer_logits("care", queries, nodes))[0].tolist()
+    value = torch.sigmoid(former.value_logits(queries, nodes))[0].tolist()
+    observed = torch.sigmoid(former.pointer_logits("obs", queries, nodes))[0].tolist()
+    hint, inputs, outputs = {}, {}, {}
+    is_input, is_output = graph.pi_node_mask.tolist(), graph.po_node_mask.tolist()
+    for i, name in enumerate(graph.node_names):
+        if is_input[i]:
+            if care[i] >= threshold:
+                hint[name] = int(value[i] >= 0.5)
+            if care[i] >= floor:
+                inputs[name] = [round(care[i], 2), round(value[i], 2)]
+        elif is_output[i] and observed[i] >= floor:
+            outputs[name] = round(observed[i], 2)
+    return hint, {"inputs": inputs, "outputs": outputs}
+
+
+def decode_hint(model, graph, device: torch.device, threshold: float = 0.5) -> dict:
+    """``{input: 0 or 1}`` for the inputs the care head marks."""
+    return decode(model, graph, device, threshold)[0]
 
 
 def agreement(hint: dict, problem: dict, threshold: float = 0.5) -> dict:
@@ -81,7 +143,8 @@ def agreement(hint: dict, problem: dict, threshold: float = 0.5) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--labels", required=True)
+    ap.add_argument("--labels", required=True, nargs="+",
+                    help="One or more label directories (build_retest_labels).")
     ap.add_argument("--split", default="validation")
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--threshold", type=float, default=0.5)
@@ -95,8 +158,7 @@ def main() -> None:
     device = torch.device(args.device)
     model, vocab = load_graph_model(args.checkpoint, device)
     gate_funcs = json.loads(open(DEFAULT_SIM_CONFIG, encoding="utf-8").read())["gate_funcs"]
-    problems, circuits = load_split(args.labels, args.split, args.limit, 0)
-    problems = problems[args.shard::args.shards]
+    circuits, problems = stream_split(args.labels, args.split, args.shard, args.shards, args.limit)
     builder = ProblemGraphs(circuits, gate_funcs, vocab)
     args.out.mkdir(parents=True, exist_ok=True)
     path = args.out / f"{args.split}_{args.shard:03d}.jsonl"
@@ -112,14 +174,15 @@ def main() -> None:
             graph = builder.build(p)
             if graph is None:
                 continue
-            hint = decode_hint(model, graph, device, args.threshold)
-            fh.write(json.dumps({"netlist_key": p["netlist_key"], "fault": p["fault"], "hint": hint}) + "\n")
+            hint, rich = decode(model, graph, device, args.threshold)
+            fh.write(json.dumps({"netlist_key": p["netlist_key"], "fault": p["fault"], "hint": hint,
+                                 "rich": rich}) + "\n")
             for key, value in agreement(hint, p, args.threshold).items():
                 totals[key] += int(value)
             totals["problems"] += 1
             totals["empty"] += not hint
             if index % 5000 == 0:
-                print(f"{args.split} shard {args.shard}: {index}/{len(problems)}", flush=True)
+                print(f"{args.split} shard {args.shard}: {index}", flush=True)
     totals["rejected"] = builder.rejected
     totals["resumed_past"] = len(done)
     summary = args.out / f"summary_{args.split}_{args.shard:03d}.json"

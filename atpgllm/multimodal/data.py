@@ -166,9 +166,27 @@ def scan_procedure_ports(netlist: str) -> List[str]:
 #   HINT       the graph model's decoded suggestion as plain text (the hint
 #              arm): the inputs its care head marks, with the value head's
 #              values, for example ``a[3]=1 sel=1``.
+# The ``rich`` hint style adds how sure the graph model is and where it expects
+# the fault to show (:func:`rich_hint_text`):
+#   // suggested inputs: a[3]=1 sel=0?
+#   // possibly needed: b=1 c=0?
+#   // observe at: y n10
 PORT_BITS = "// input bits:"
 PORT_BITS_END = " ;"
 HINT = "// suggested inputs:"
+HINT_MAYBE = "// possibly needed:"
+HINT_OBSERVE = "// observe at:"
+HINT_STYLES = ("plain", "rich")
+# Rich hint thresholds, from the calibration of 2026-11-12 on v5 validation.
+# Care probability at or above RICH_SURE: 64% to 95% of those inputs are set
+# in most of the dataset's patterns; between RICH_MAYBE and RICH_SURE, 9% to
+# 35%. A value within RICH_VALUE_MARGIN of 0.5 is right 57% to 74% of the
+# time and gets a question mark; a surer one is right 85% to 98%.
+RICH_SURE = 0.8
+RICH_MAYBE = 0.35
+RICH_VALUE_MARGIN = 0.3
+RICH_MAYBE_CAP = 12
+RICH_OBSERVE_CAP = 6
 
 
 def netlist_key(record: Dict[str, Any]) -> str:
@@ -185,9 +203,40 @@ def hint_text(vector: Dict[str, Any]) -> str:
     return " ".join(chosen) or "none"
 
 
-def load_hints(path) -> Dict[tuple, str]:
+def rich_hint_text(rich: Dict[str, Any]) -> str:
+    """The rich hint of one problem, as the text after :data:`HINT`.
+
+    ``rich`` is a row's ``rich`` field from ``retest_hints``. Inputs the
+    graph model is sure need a value go on the first line; a ``?`` after a
+    value says the value itself is close to a coin flip. Inputs it is less
+    sure about follow on :data:`HINT_MAYBE`, most likely first. The outputs
+    where it expects the fault effect go on :data:`HINT_OBSERVE`; when it is
+    sure of none, the most likely one is listed with a ``?``."""
+    def assignment(name: str, one: float) -> str:
+        return f"{name}={int(one >= 0.5)}" + ("?" if abs(one - 0.5) < RICH_VALUE_MARGIN else "")
+
+    inputs = rich.get("inputs") or {}
+    sure = [assignment(name, one) for name, (care, one) in inputs.items() if care >= RICH_SURE]
+    maybe = sorted(((care, name, one) for name, (care, one) in inputs.items()
+                    if RICH_MAYBE <= care < RICH_SURE), key=lambda item: -item[0])[:RICH_MAYBE_CAP]
+    outputs = rich.get("outputs") or {}
+    seen = [name for name, p in outputs.items() if p >= RICH_SURE][:RICH_OBSERVE_CAP]
+    if not seen and outputs:
+        seen = [max(outputs, key=outputs.get) + "?"]
+    lines = [" ".join(sure) or "none"]
+    if maybe:
+        lines.append(f"{HINT_MAYBE} " + " ".join(assignment(name, one) for _, name, one in maybe))
+    if seen:
+        lines.append(f"{HINT_OBSERVE} " + " ".join(seen))
+    return "\n".join(lines)
+
+
+def load_hints(path, style: str = "plain") -> Dict[tuple, str]:
     """``(netlist key, fault) -> hint text`` from the JSONL files that
-    ``atpgllm.graph.scripts.retest_hints`` writes (one file or a directory)."""
+    ``atpgllm.graph.scripts.retest_hints`` writes (one file or a directory).
+    ``style="rich"`` needs rows written with their ``rich`` field."""
+    if style not in HINT_STYLES:
+        raise ValueError(f"hint style must be one of {HINT_STYLES}")
     path = Path(path)
     files = sorted(path.glob("*.jsonl")) if path.is_dir() else [path]
     if not files:
@@ -197,7 +246,13 @@ def load_hints(path) -> Dict[tuple, str]:
         with file.open() as fh:
             for line in fh:
                 row = json.loads(line)
-                hints[(row["netlist_key"], row["fault"])] = hint_text(row["hint"])
+                if style == "rich":
+                    if "rich" not in row:
+                        raise ValueError(f"{file} has no rich hints; build it again with retest_hints")
+                    text = rich_hint_text(row["rich"])
+                else:
+                    text = hint_text(row["hint"])
+                hints[(row["netlist_key"], row["fault"])] = text
     return hints
 
 

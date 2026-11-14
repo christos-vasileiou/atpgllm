@@ -102,14 +102,26 @@ def load_rows(
     loaded: Dict[Tuple[int, int], Dict[str, Any]] = {}
     netlists: Dict[str, str] = {}
     for file_index, rows in wanted.items():
-        table = pq.read_table(files[file_index], columns=list(columns)).take(rows)
-        for row, record in zip(rows, table.to_pylist()):
-            if "netlist" in record:
-                # One copy per distinct netlist text. Not per circuit_id: a
-                # circuit groups structurally equal netlists whose port names
-                # differ, and each row's vector names its own netlist's ports.
-                record["netlist"] = netlists.setdefault(record["netlist"], record["netlist"])
-            loaded[(file_index, row)] = record
+        # One row group at a time, one row at a time. ``take`` on a whole file
+        # joins the text of every row into one array, and the netlists of a v5
+        # file exceed the 2 GB a ``string`` array can address.
+        file = pq.ParquetFile(files[file_index])
+        pending = sorted(set(rows))
+        first = 0
+        for group in range(file.num_row_groups):
+            last = first + file.metadata.row_group(group).num_rows
+            inside = [row for row in pending if first <= row < last]
+            if inside:
+                table = file.read_row_group(group, columns=list(columns))
+                for row in inside:
+                    record = table.slice(row - first, 1).to_pylist()[0]
+                    if "netlist" in record:
+                        # One copy per distinct netlist text. Not per circuit_id: a
+                        # circuit groups structurally equal netlists whose port names
+                        # differ, and each row's vector names its own netlist's ports.
+                        record["netlist"] = netlists.setdefault(record["netlist"], record["netlist"])
+                    loaded[(file_index, row)] = record
+            first = last
     return [loaded[pick] for pick in picks]
 
 

@@ -235,3 +235,26 @@ def test_rows_keep_their_own_netlist_within_a_circuit(tmp_path):
     rows = load_rows([str(path)], [(0, 0), (0, 1), (0, 2)], columns=("circuit_id", "netlist"))
     assert [r["netlist"] for r in rows] == ["module m(a, y);", "module m(b, y);", "module m(a, y);"]
     assert rows[0]["netlist"] is rows[2]["netlist"]   # identical text is still shared
+
+
+def test_rows_are_read_across_row_groups_in_pick_order(tmp_path):
+    """v5 files hold more netlist text than one ``string`` array can address,
+    so rows are read one row group at a time. Picks keep their order, may
+    repeat, and may fall in any group."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from atpgllm.graph.circuit_sampling import load_rows
+
+    path = tmp_path / "data-00000.parquet"
+    table = pa.table({
+        "circuit_id": [f"c{i // 2}" for i in range(10)],
+        "netlist": [f"module m{i}(); endmodule" for i in range(10)],
+    })
+    pq.write_table(table, path, row_group_size=3)
+    assert pq.ParquetFile(path).num_row_groups == 4
+
+    picks = [(0, 9), (0, 0), (0, 4), (0, 3), (0, 9), (0, 2)]
+    rows = load_rows([str(path)], picks, columns=("circuit_id", "netlist"))
+    assert [r["netlist"] for r in rows] == [f"module m{i}(); endmodule" for _, i in picks]
+    assert [r["circuit_id"] for r in rows] == [f"c{i // 2}" for _, i in picks]
