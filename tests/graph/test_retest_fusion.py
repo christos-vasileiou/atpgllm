@@ -182,8 +182,40 @@ def test_anchors_need_the_retest_qformer_and_rollouts_refuse_them():
     with pytest.raises(ValueError):
         GraphConditionedCausalLM(encoder, plain, _LLM(), fusion="anchored")
     model = GraphConditionedCausalLM(encoder, former, _LLM(), fusion="anchored")
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError):
         model.generate_turns(torch.zeros(1, model.num_queries, 12), [[1, 2]], pad_token_id=0)
+
+
+def test_rollout_turns_carry_the_anchors_of_the_prompt():
+    """A turn of a rollout sees the same prompt embeddings as training: the
+    anchored tokens moved, also in a context that is left-padded."""
+    model, batch, ids, at, anchors = _anchored_inputs("both")
+    with torch.no_grad():
+        model.port_anchor.alpha.fill_(1.0)
+    seen = {}
+
+    def generate(inputs_embeds, attention_mask, **kwargs):
+        seen["embeds"], seen["mask"] = inputs_embeds, attention_mask
+        return torch.tensor([[7], [7]])
+
+    model.llm.generate = generate
+    prefix, nodes = model.graph_context(batch)
+    prompt = ids[0].tolist()
+    turns = model.generate_turns(prefix, [prompt, prompt + [5, 6, 7]], pad_token_id=0, graph_at=at[0],
+                                 node_vectors=nodes, anchors=anchors, eos_token_id=[7])
+    assert turns == [[7], [7]]
+    expected, _ = model._prefix_and_token_embeddings(batch, ids, torch.ones_like(ids),
+                                                     graph_at=at, anchors=anchors)
+    width = expected.shape[1]
+    assert torch.allclose(seen["embeds"][0, 3:], expected[0])           # three pads on the left
+    assert torch.allclose(seen["embeds"][1, :width], expected[0])
+    assert seen["mask"][0].tolist() == [0] * 3 + [1] * width
+    # No node vectors is the no-graph condition: the prompt's tokens stay plain.
+    model.generate_turns(torch.zeros_like(prefix), [prompt], pad_token_id=0, graph_at=at[0],
+                         node_vectors=None, anchors=anchors, eos_token_id=[7])
+    slot = slice(at[0], at[0] + model.num_queries)
+    text = torch.cat([seen["embeds"][0, : at[0]], seen["embeds"][0, slot.stop:]])
+    assert torch.equal(text, model.llm.emb(ids)[0])
 
 
 def test_the_anchor_gate_has_its_own_learning_rate():
@@ -208,3 +240,32 @@ def test_the_anchor_gate_has_its_own_learning_rate():
     held = [p for g in optimizer.param_groups for p in g["params"]]
     assert any(p is model.port_anchor.proj.weight for p in held)
     assert len(held) == len({id(p) for p in held})
+
+
+def test_a_run_can_start_from_the_aligned_graph_side(tmp_path):
+    """The alignment test saves the modules it trained; Stage C loads them
+    and refuses a file made for another fusion."""
+    import importlib.util
+    import sys
+
+    root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(root / "scripts" / "train"))
+    spec = importlib.util.spec_from_file_location(
+        "multimodal_training", root / "scripts" / "train" / "multimodal_training.py")
+    trainer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(trainer)
+    source, *_ = _anchored_inputs("both")
+    with torch.no_grad():
+        source.port_anchor.alpha.fill_(0.7)
+        next(source.graph_to_llm.parameters()).add_(1.0)
+    path = tmp_path / "graph_side.pt"
+    torch.save({name: module.state_dict() for name, module in trainer._graph_modules(source).items()
+                if name != "graph_encoder"}, path)
+    model, *_ = _anchored_inputs("both")
+    assert trainer._load_graph_side(model, path) == ["graph_to_llm", "port_anchor", "q_former"]
+    assert float(model.port_anchor.alpha) == pytest.approx(0.7)
+    assert torch.equal(next(model.graph_to_llm.parameters()), next(source.graph_to_llm.parameters()))
+    encoder, former = _stack()
+    prefix_only = GraphConditionedCausalLM(encoder, former, _LLM(), prefix_at="placeholder")
+    with pytest.raises(ValueError):
+        trainer._load_graph_side(prefix_only, path)

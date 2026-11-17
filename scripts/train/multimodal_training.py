@@ -198,6 +198,16 @@ def _parse_args() -> argparse.Namespace:
              "step 300 (measured 11-10).",
     )
     parser.add_argument(
+        "--graph-side",
+        type=Path,
+        help="Graph-side weights of the alignment test (graph_side.pt of "
+             "scripts/train/latent_alignment.py): the projector and, when that "
+             "run trained them, the anchors and the graph stack. They are "
+             "trained against a frozen Granite, so the LLM can read the graph "
+             "from the first step. Loaded when a run starts; a resumed run "
+             "keeps its own.",
+    )
+    parser.add_argument(
         "--hints",
         type=Path,
         help="Text-hint arm: JSONL files of the graph model's decoded care "
@@ -507,6 +517,18 @@ def _load_module_state(
 ) -> None:
     for name, module in _graph_modules(model).items():
         module.load_state_dict(states[name], strict=True)
+
+
+def _load_graph_side(model: GraphConditionedCausalLM, path: Path) -> list[str]:
+    """Load the modules an alignment run saved; returns their names."""
+    states = torch.load(path, map_location="cpu")
+    modules = _graph_modules(model)
+    unknown = sorted(set(states) - set(modules))
+    if unknown:
+        raise ValueError(f"{path} holds {unknown}, which --fusion {model.fusion} does not build.")
+    for name, state in states.items():
+        modules[name].load_state_dict(state, strict=True)
+    return sorted(states)
 
 
 def _architecture(
@@ -943,6 +965,10 @@ def train_sft(args: argparse.Namespace) -> None:
         module.to(device)
     if resume_payload:
         _load_module_state(model, resume_payload["states"])
+    elif args.graph_side:
+        loaded = _load_graph_side(model, args.graph_side)
+        if main_process:
+            print(f"graph side from {args.graph_side}: {', '.join(loaded)}", flush=True)
     architecture = _architecture(model, alignment, args)
     if resume_payload and resume_payload["architecture"] != architecture:
         raise ValueError("SFT resume architecture differs from the checkpoint.")

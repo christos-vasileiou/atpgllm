@@ -135,6 +135,7 @@ case "${STAGE:?STAGE is required}" in
         [ -n "${STOP_AFTER:-}" ] && CMD+=(--stop-after "$STOP_AFTER")
         [ -n "${FUSION:-}" ] && CMD+=(--fusion "$FUSION")
         [ -n "${ANCHOR_GATE_LR:-}" ] && CMD+=(--anchor-gate-lr "$ANCHOR_GATE_LR")
+        [ -n "${GRAPH_SIDE:-}" ] && CMD+=(--graph-side "$GRAPH_SIDE")
         [ -n "${HINTS:-}" ] && CMD+=(--hints "$HINTS")
         [ -n "${HINT_STYLE:-}" ] && CMD+=(--hint-style "$HINT_STYLE")
         [ "${FREEZE_GRAPH_BN:-False}" = True ] && CMD+=(--freeze-graph-bn)

@@ -121,3 +121,37 @@ def test_alignment_runs_and_scores_real_wrong_and_no_graph(la, tmp_path, fusion,
     saved = torch.load(out / "graph_side.pt", weights_only=False)
     assert ("q_former" in saved) == (train == "graph")
     assert ("port_anchor" in saved) == (fusion != "prefix")
+
+
+def test_labels_target_is_the_vote_of_the_dataset_patterns(la, tmp_path):
+    labels = tmp_path / "labels"
+    labels.mkdir()
+    (labels / "circuits_train.jsonl").write_text(
+        json.dumps({"netlist_key": "0b", "netlist": COMB, "scan_chain": ""}) + "\n")
+    row = {"netlist_key": "0b", "netlist_id": "n", "circuit_id": "c", "fault": "sa0 n1",
+           "inputs": ["a[0]", "a[1]", "b", "c"],
+           "care_freq": {"a[0]": 1.0, "a[1]": 0.6, "b": 0.2, "c": 0.5},
+           "one_freq": {"a[0]": 1.0, "a[1]": 0.4, "b": 0.5, "c": 0.0}, "example_input_vector": "{}"}
+    (labels / "problems_train.jsonl").write_text(json.dumps(row) + "\n")
+    _, problems = la.load_problems([labels], "train", {("0b", "sa0 n1"): {}})
+    assert problems[0]["vote"] == {"a[0]": 1, "a[1]": 0, "c": 0}
+    data = la.Examples.__new__(la.Examples)
+    data.target_kind = "labels"
+    assert data.target(problems[0]) == "a[0]=1 a[1]=0 c=0"
+
+
+def test_reinitialize_gives_untrained_weights(la):
+    class Stack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.queries = torch.nn.Parameter(torch.ones(3, 4))
+            self.inner = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.LayerNorm(4))
+
+    torch.manual_seed(0)
+    module = Stack()
+    with torch.no_grad():
+        module.inner[1].weight.fill_(3.0)
+    before = module.inner[0].weight.clone()
+    la.reinitialize(module)
+    assert not torch.equal(module.inner[0].weight, before)
+    assert torch.all(module.inner[1].weight == 1.0) and float(module.queries.abs().max()) < 0.5

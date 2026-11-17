@@ -78,8 +78,13 @@ def load_problems(labels: List[Path], split: str, wanted: Dict[tuple, dict]):
                 continue
             p = json.loads(line)
             if (p["netlist_key"], p["fault"]) in wanted:
+                # The vote of the dataset's patterns: an input is set when most
+                # patterns set it, to the value most of them give it.
+                care, one = p.get("care_freq") or {}, p.get("one_freq") or {}
+                vote = {name: int(one.get(name, 0) >= 0.5) for name in p.get("inputs") or []
+                        if care.get(name, 0) >= 0.5}
                 problems.append({"netlist_key": p["netlist_key"], "fault": p["fault"],
-                                 "example_input_vector": p["example_input_vector"]})
+                                 "example_input_vector": p["example_input_vector"], "vote": vote})
     return circuits, problems
 
 
@@ -98,11 +103,13 @@ def f1(predicted: set, target: set) -> float:
 class Examples:
     """Tokenized (prompt, hint) pairs with their graphs."""
 
-    def __init__(self, tokenizer, gate_funcs, vocab, circuits, hints, *, anchors: bool, max_len: int) -> None:
+    def __init__(self, tokenizer, gate_funcs, vocab, circuits, hints, *, anchors: bool, max_len: int,
+                 target: str = "hint") -> None:
         from atpgllm.multimodal.data import template_opens_thinking
 
         self.tokenizer, self.gate_funcs, self.vocab = tokenizer, gate_funcs, vocab
         self.circuits, self.hints, self.anchors, self.max_len = circuits, hints, anchors, max_len
+        self.target_kind = target
         self.rejected = collections.Counter()
         # Granite 4.2's generation prompt opens a thinking block: close it.
         self.lead = "</think>\n" if template_opens_thinking(tokenizer) else ""
@@ -116,6 +123,8 @@ class Examples:
     def target(self, problem: dict) -> str:
         from atpgllm.multimodal.data import hint_text
 
+        if self.target_kind == "labels":
+            return hint_text(problem["vote"])
         return hint_text(self.hints[(problem["netlist_key"], problem["fault"])]["hint"])
 
     def build(self, problem: dict, graph_fault: Optional[str] = None):
@@ -146,6 +155,21 @@ class Examples:
             anchors=port_anchors(self.tokenizer, ids, graph_at, graph) if self.anchors else ())
 
 
+def reinitialize(module) -> None:
+    """Fresh weights for a module, as if it had never been trained: every
+    layer's own reset, and a small normal draw for a parameter no layer owns
+    (learned queries)."""
+    import torch
+
+    for layer in module.modules():
+        if hasattr(layer, "reset_parameters"):
+            layer.reset_parameters()
+        else:
+            for parameter in layer._parameters.values():
+                if parameter is not None:
+                    torch.nn.init.normal_(parameter, std=0.02)
+
+
 def build_model(args):
     import compare_stage_c_text_sft as cs
     import multimodal_training as mt
@@ -156,8 +180,13 @@ def build_model(args):
     llm = mt._base_llm(llm_args)
     for parameter in llm.parameters():
         parameter.requires_grad = False
+    scratch = getattr(args, "init", "trained") == "random"
+    if scratch:
+        for module in (graph_encoder, q_former):
+            reinitialize(module)
+    # An untrained stack has no running statistics worth keeping.
     model = GraphConditionedCausalLM(graph_encoder, q_former, llm, prefix_at="placeholder",
-                                     freeze_graph_batchnorm=True, fusion=args.fusion)
+                                     freeze_graph_batchnorm=not scratch, fusion=args.fusion)
     model.set_graph_policy("full" if args.train == "graph" else "frozen")
     device = mt._graph_device(model)
     for module in mt._graph_modules(model).values():
@@ -283,6 +312,12 @@ def main(argv=None, model_factory=build_model) -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--fusion", choices=("prefix", "anchored", "both"), default="anchored")
     parser.add_argument("--train", choices=("projector", "graph"), default="projector")
+    parser.add_argument("--target", choices=("hint", "labels"), default="hint",
+                        help="What Granite must write: the graph model's own hint, or the vote of "
+                             "the dataset's patterns (the label the graph model itself is trained on).")
+    parser.add_argument("--init", choices=("trained", "random"), default="trained",
+                        help="random: the graph encoder and the Q-Former start untrained, so the "
+                             "graph stack learns only through the frozen Granite (use --train graph).")
     parser.add_argument("--train-shards", type=int, nargs="+", default=[0],
                         help="Hint shard files of the train split to learn from.")
     parser.add_argument("--eval-shards", type=int, nargs="+", default=[0])
@@ -298,6 +333,8 @@ def main(argv=None, model_factory=build_model) -> None:
     parser.add_argument("--max-len", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
+    if args.init == "random" and args.train != "graph":
+        parser.error("--init random needs --train graph")
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -308,7 +345,8 @@ def main(argv=None, model_factory=build_model) -> None:
         hints = hint_rows(args.hints, split, shards)
         circuits, problems = load_problems(args.labels, split, hints)
         sets[split] = (Examples(tokenizer, gate_funcs, vocab, circuits, hints,
-                                anchors=args.fusion != "prefix", max_len=args.max_len), problems)
+                                anchors=args.fusion != "prefix", max_len=args.max_len,
+                                target=args.target), problems)
     train_data, train_problems = sets["train"]
     eval_data, eval_problems = sets["validation"]
     rng.shuffle(eval_problems)

@@ -18,6 +18,9 @@
 #                                         # needs runs/bridges_retest/hints for train and validation
 #   ARM=hint_plain sbatch scripts/train/juno_retest_stage_c.sbatch # hint arm on v5 (11-12);
 #   ARM=hint_rich sbatch scripts/train/juno_retest_stage_c.sbatch  # needs runs/bridges_retest_seq/hints
+#   ARM=latent sbatch scripts/train/juno_retest_stage_c.sbatch     # latent arms on v5 (11-14): both
+#   ARM=latent_rich sbatch scripts/train/juno_retest_stage_c.sbatch  # channels, from the aligned graph
+#                                         # side of runs/latent_alignment/both_graph
 #   ARM=graph SMOKE=1 sbatch --gres=gpu:1 -t 01:00:00 scripts/train/juno_retest_stage_c.sbatch
 #
 # STOP_AFTER=40 stops an arm after step 40 with the 300-step schedule kept,
@@ -30,7 +33,7 @@
 # that already saved its last step exits at once.
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-ARM=${ARM:?set ARM=graph, ports, anchored, hint, hint_plain or hint_rich}
+ARM=${ARM:?set ARM=graph, ports, anchored, hint, hint_plain, hint_rich, latent or latent_rich}
 case "$ARM" in
     graph) export ARM_CONF=multimodal_sft_retest.conf; OUT=runs/multimodal_sft_retest ;;
     ports) export ARM_CONF=multimodal_sft_retest_ports_only.conf; OUT=runs/multimodal_sft_retest_ports_only ;;
@@ -39,7 +42,10 @@ case "$ARM" in
     # v5, both kinds of circuit, hints from the graph model trained on both (11-12).
     hint_plain) export ARM_CONF=multimodal_sft_hint_v5_plain.conf; OUT=runs/multimodal_sft_hint_v5_plain ;;
     hint_rich) export ARM_CONF=multimodal_sft_hint_v5_rich.conf; OUT=runs/multimodal_sft_hint_v5_rich ;;
-    *) echo "ARM must be graph, ports, anchored, hint, hint_plain or hint_rich"; exit 1 ;;
+    # v5, graph slot and input-bit anchors, graph side from the alignment test (11-14).
+    latent) export ARM_CONF=multimodal_sft_latent_v5.conf; OUT=runs/multimodal_sft_latent_v5 ;;
+    latent_rich) export ARM_CONF=multimodal_sft_latent_rich_v5.conf; OUT=runs/multimodal_sft_latent_rich_v5 ;;
+    *) echo "ARM must be graph, ports, anchored, hint, hint_plain, hint_rich, latent or latent_rich"; exit 1 ;;
 esac
 set +u
 [ -f /etc/profile.d/lmod.sh ] && source /etc/profile.d/lmod.sh

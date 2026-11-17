@@ -367,15 +367,23 @@ class GraphConditionedCausalLM(nn.Module):
         *,
         pad_token_id: int,
         graph_at: int = 0,
+        node_vectors: Optional[Tensor] = None,
+        anchors=None,
         **kwargs,
     ) -> list[list[int]]:
         """One batched generation over several token contexts that share one
         graph prefix (``[1, Q, D]``) and one prompt, so the graph goes in at
         the same ``graph_at`` of every context (with ``prefix_at="start"``,
         first). Each row is left-padded, so its positions run contiguously;
-        returns the new tokens of each row, unpadded."""
-        if getattr(self, "fusion", "prefix") != "prefix":
-            raise NotImplementedError("Rollouts do not carry anchors yet.")
+        returns the new tokens of each row, unpadded.
+
+        With anchors, ``anchors`` is the prompt's :func:`collate_anchors` pair
+        (one row) and ``node_vectors`` :meth:`graph_context`'s second value.
+        The anchored tokens are in the prompt, which every context starts
+        with. ``node_vectors=None`` is the no-graph condition."""
+        fused = getattr(self, "fusion", "prefix") != "prefix"
+        if fused and anchors is None:
+            raise ValueError("Anchored fusion needs the prompt's anchors.")
         if getattr(self, "prefix_at", "start") == "start":
             graph_at = 0
         embed = self.llm.get_input_embeddings()
@@ -388,6 +396,11 @@ class GraphConditionedCausalLM(nn.Module):
                 [pad_token_id] * pad + list(ids), device=embed.weight.device
             )
             embeddings = embed(tokens)
+            if fused and node_vectors is not None:
+                index, weight = anchors
+                index = index.clone()
+                index[:, 0], index[:, 1] = 0, index[:, 1] + pad
+                embeddings = self._anchor(embeddings.unsqueeze(0), node_vectors, (index, weight))[0]
             at = pad + graph_at
             rows.append(torch.cat([embeddings[:at], prefix[0], embeddings[at:]], dim=0))
             masks.append(torch.tensor(

@@ -14,12 +14,18 @@
 #   FUSION=prefix TRAIN=projector sbatch scripts/train/juno_latent_alignment.sbatch
 #   FUSION=anchored TRAIN=projector sbatch scripts/train/juno_latent_alignment.sbatch
 #   FUSION=both TRAIN=graph sbatch scripts/train/juno_latent_alignment.sbatch
+# Order test (11-14): the dataset's pattern vote as the target, from the trained
+# graph stack and from an untrained one (OUT must differ):
+#   FUSION=both TRAIN=graph TARGET=labels INIT=trained OUT=runs/latent_alignment/labels_trained sbatch ...
+#   FUSION=both TRAIN=graph TARGET=labels INIT=random OUT=runs/latent_alignment/labels_random sbatch ...
 #
 # Needs the hint files of runs/bridges_retest_seq/hints (juno_retest_seq_hints.sbatch).
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 FUSION=${FUSION:?set FUSION=prefix, anchored or both}
 TRAIN=${TRAIN:?set TRAIN=projector or graph}
+TARGET=${TARGET:-hint}
+INIT=${INIT:-trained}
 OUT=${OUT:-runs/latent_alignment/${FUSION}_${TRAIN}}
 source "${PYTHON_VENV:-/work/cxv200006/myenv}/bin/activate"
 # Its own PyG cache folder: jobs that start together must not share one.
@@ -34,7 +40,8 @@ echo "[align] fusion=$FUSION train=$TRAIN host=$(hostname) GPUs=${CUDA_VISIBLE_D
 head -1 PROVENANCE.txt
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 COMMON="--alignment ${ALIGNMENT:-runs/bridges_retest_seq/r3s/best.pt} --labels ${LABELS:-../data/freeset/retest_labels_v5}
-        --hints ${HINTS:-runs/bridges_retest_seq/hints} --fusion $FUSION --train $TRAIN"
+        --hints ${HINTS:-runs/bridges_retest_seq/hints} --fusion $FUSION --train $TRAIN
+        --target $TARGET --init $INIT"
 # Twenty steps first: a broken setup fails in minutes.
 python scripts/train/latent_alignment.py $COMMON --steps 20 --eval-every 20 --max-eval 24 --decode 4 \
     --out "$OUT/smoke_${SLURM_JOB_ID:-local}"
