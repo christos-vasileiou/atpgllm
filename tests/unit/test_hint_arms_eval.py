@@ -76,6 +76,50 @@ def test_report_scores_first_call_retries_and_final_answer(ev, tmp_path):
     assert "| rich | 3 |" in ev.markdown(report)
 
 
+def test_second_pass_overlays_the_rows_that_ran_into_a_limit(ev, tmp_path):
+    def roll(row, flags, final, **more):
+        return {"row": row, "circuit_id": 1, "kind": "combinational", "location": "internal",
+                "difficulty": "easy", "final_vector": {"a": 1} if final is not None else None,
+                "truncated": False, "calls": [{"detected": f} for f in flags],
+                "final_detected": bool(final), **more}
+
+    base, out = tmp_path / "base", tmp_path / "long"
+    base.mkdir(), out.mkdir()
+    first = [roll(0, [True], True), roll(1, [False], None, truncated=True),
+             roll(2, [False, False, False], None, call_limit_hit=True)]
+    (base / "rollout_plain.jsonl").write_text("".join(json.dumps(r) + "\n" for r in first))
+    assert ev.limit_rows(base, "plain") == {1, 2}
+    again = [roll(1, [False, True], True), roll(2, [False, False, False, False, True], True)]
+    (out / "rollout_plain.s0.jsonl").write_text("".join(json.dumps(r) + "\n" for r in again))
+    table = ev.build_report(out, calls=5, base=[base])["tables"]["all"]["plain"]
+    assert table["n"] == 3 and table["first"] == pytest.approx(1 / 3)
+    assert table["within_2"] == pytest.approx(2 / 3) and table["within_3"] == pytest.approx(2 / 3)
+    assert table["within_5"] == 1.0 and table["final"] == 1.0 and table["truncated"] == 0.0
+    assert ev.build_report(base, calls=3)["tables"]["all"]["plain"]["truncated"] == pytest.approx(1 / 3)
+    (out / "rollout_other.jsonl").write_text(json.dumps(roll(1, [True], True)) + "\n")
+    assert ev.build_report(out, calls=5, base=[base])["rows"] == 1
+    assert list(ev.build_report(out, calls=5, base=[base], only=["plain"])["tables"]["all"]) == ["plain"]
+
+
+def test_final_answer_ends_where_the_fault_list_begins(ev):
+    import torch
+
+    class Tok:
+        words = {1: "INPUT_VECTOR: a: 1 ", 2: "DETECTED_FAULTS", 3: ": sa0 n1", 9: "<end>"}
+
+        def decode(self, ids, **kwargs):
+            return "".join(self.words.get(int(i), "?") for i in ids)
+
+        def batch_decode(self, rows, **kwargs):
+            return [self.decode(row) for row in rows]
+
+    rule = ev.ends_answer(Tok(), 9)
+    done = rule(torch.tensor([[1, 2], [1, 1], [1, 9]]), None)
+    assert done.tolist() == [True, False, True]
+    assert ev.close_answer(Tok(), [1, 2], 9) == [1, 2, 9]
+    assert ev.close_answer(Tok(), [1, 9], 9) == [1, 9] and ev.close_answer(Tok(), [1, 1], 9) == [1, 1]
+
+
 def test_rollout_row_reads_the_tool_and_simulates_the_answer(ev, monkeypatch):
     monkeypatch.setenv("FAULT_SIM_BACKEND", "fast")
     from atpgllm.training._paths import ensure_data_preprocessing_on_path

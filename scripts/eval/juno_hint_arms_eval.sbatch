@@ -17,6 +17,14 @@
 #       scripts/eval/juno_hint_arms_eval.sbatch
 #   STEP=report sbatch -p dev --gres=none -t 00:20:00 scripts/eval/juno_hint_arms_eval.sbatch
 #
+# Second pass with wider limits (11-14), in its own folder over the first one:
+# the rows that ran into the token budget or the call limit, again with
+# TOKENS=16384 CALLS=8 STOP_AT_FAULTS=1, and the report over both folders.
+#   STEP=rollout NAME=plain RUN=... OUT=runs/hint_arms_eval_long REDO_FROM=runs/hint_arms_eval \
+#       TOKENS=16384 CALLS=8 STOP_AT_FAULTS=1 SHARD=0 SHARDS=3 sbatch scripts/eval/juno_hint_arms_eval.sbatch
+#   STEP=report OUT=runs/hint_arms_eval_long BASE=runs/hint_arms_eval CALLS=8 sbatch -p dev ...
+# A latent arm takes GRAPH=real, zero or shuffled (the graph it is given).
+#
 # rollout and decoder simulate with TetraMAX (x stays unknown, as in training).
 # Every pass skips finished rows, so a job cut off by its time limit can be
 # submitted again.
@@ -63,14 +71,18 @@ case "$STEP" in
         tetramax
         python scripts/eval/hint_arms_eval.py rollout --name "${NAME:?set NAME}" --out "$OUT" \
             --checkpoint "$RUN/multimodal_sft_${CKPT}.pt" --adapter "$RUN/adapter_${CKPT}" \
-            --max-tool-calls "$CALLS" --shard "${SHARD:-0}" --shards "${SHARDS:-1}" ${LIMIT:+--limit $LIMIT} ;;
+            --max-tool-calls "$CALLS" --max-completion-tokens "${TOKENS:-4096}" \
+            --graph-condition "${GRAPH:-real}" ${STOP_AT_FAULTS:+--stop-at-faults} \
+            ${REDO_FROM:+--redo-from $REDO_FROM} ${REDO_NAME:+--redo-name $REDO_NAME} \
+            --shard "${SHARD:-0}" --shards "${SHARDS:-1}" ${LIMIT:+--limit $LIMIT} ;;
     decoder)
-        tetramax
+        # SIM=fast scores with the fast simulator (a check of its agreement with TetraMAX).
+        if [ "${SIM:-tetramax}" = fast ]; then export FAULT_SIM_BACKEND=fast; else tetramax; fi
         python scripts/eval/hint_arms_eval.py decoder --out "$OUT" --hints "$HINTS" --labels "$LABELS" \
-            --attempts "$CALLS" --shard "${SHARD:-0}" --shards "${SHARDS:-1}" ;;
+            --attempts "${ATTEMPTS:-$CALLS}" --shard "${SHARD:-0}" --shards "${SHARDS:-1}" ;;
     report)
         export FAULT_SIM_BACKEND=fast
-        python scripts/eval/hint_arms_eval.py report --out "$OUT" --max-tool-calls "$CALLS" ;;
+        python scripts/eval/hint_arms_eval.py report --out "$OUT" --max-tool-calls "$CALLS" ${BASE:+--base $BASE} ${METHODS:+--methods $METHODS} ;;
     *) echo "STEP must be rows, rollout, decoder or report"; exit 1 ;;
 esac
 echo "[hint-eval] done $(date -Is)"

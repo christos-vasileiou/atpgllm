@@ -163,9 +163,46 @@ def rollout_row(trajectory, record) -> Dict[str, Any]:
             "turns": [turn[-1200:] for turn in trajectory.turns]}
 
 
+FAULT_LIST = "DETECTED_FAULTS"
+GRAPH_CONDITIONS = {"real": "real", "zero": "zero", "shuffled": "shuffled_0"}
+
+
+def limit_rows(directory: Path, name: str) -> set:
+    """Rows whose rollout in ``directory`` ran into a limit of the evaluation
+    (the token budget or the call limit) and so say little about the model."""
+    return {i for i, r in read_method(directory, f"rollout_{name}").items()
+            if r.get("truncated") or r.get("call_limit_hit")}
+
+
+def ends_answer(tokenizer, stop_token: int):
+    """A stopping rule that ends the final answer where the list of detected
+    faults begins. The vectors are complete by then, and on a large circuit
+    the list alone can run to thousands of tokens."""
+    from transformers import StoppingCriteria
+
+    class EndsAnswer(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs):
+            import torch
+
+            tails = tokenizer.batch_decode(input_ids[:, -16:], skip_special_tokens=False)
+            done = [FAULT_LIST in tail or int(row[-1]) == stop_token
+                    for tail, row in zip(tails, input_ids)]
+            return torch.tensor(done, device=input_ids.device)
+
+    return EndsAnswer()
+
+
+def close_answer(tokenizer, turn: List[int], stop_token: int) -> List[int]:
+    """A turn cut at the fault list gets its stop token, so the rollout reads
+    it as a finished answer."""
+    if turn and turn[-1] != stop_token and FAULT_LIST in tokenizer.decode(turn[-16:], skip_special_tokens=False):
+        return list(turn) + [stop_token]
+    return turn
+
+
 def run_rollout(args) -> None:
     import torch
-    from torch_geometric.data import Batch
+    from transformers import StoppingCriteriaList
 
     import multimodal_training as mt
     from atpgllm.multimodal.tool_rollout import rollout_group
@@ -179,6 +216,14 @@ def run_rollout(args) -> None:
             if isinstance(t, int) and t >= 0]
     device = model.llm.get_input_embeddings().weight.device
     todo = [i for i in range(len(records)) if i % args.shards == args.shard and i not in done]
+    if args.redo_from:
+        redo = limit_rows(args.redo_from, args.redo_name or args.name)
+        todo = [i for i in todo if i in redo]
+    condition = GRAPH_CONDITIONS[args.graph_condition]
+    if condition != "real" and model.graph_off:
+        raise ValueError("This arm was trained without a graph: only --graph-condition real applies.")
+    cut = {"stopping_criteria": StoppingCriteriaList([ends_answer(tokenizer, stop[0])])} if args.stop_at_faults else {}
+    cache: Dict[int, Any] = {}
     if args.limit:
         todo = todo[:args.limit]
     started = time.time()
@@ -194,13 +239,19 @@ def run_rollout(args) -> None:
                 continue
             prompt_ids = list(shown["input_ids"][:shown["turns"][0][0]])
             with torch.no_grad():
-                prefix = model.graph_soft_prompt(Batch.from_data_list([shown["graph"]]).to(device))
+                context = r6._context(model, records, index, condition, shown, cache,
+                                      tokenizer, gate_funcs, vocab, session)
+            if context is None:
+                fh.write(json.dumps({**base, "rejected": True}) + "\n")
+                continue
+            prefix, nodes = context
 
             def generate_turn(contexts, max_new_tokens):
-                return model.generate_turns(
+                turns = model.generate_turns(
                     prefix, contexts, pad_token_id=tokenizer.pad_token_id,
-                    graph_at=shown["graph_at"], max_new_tokens=max_new_tokens,
-                    do_sample=False, eos_token_id=stop)
+                    graph_at=shown["graph_at"], node_vectors=nodes, anchors=shown["anchors"],
+                    max_new_tokens=max_new_tokens, do_sample=False, eos_token_id=stop, **cut)
+                return [close_answer(tokenizer, turn, stop[0]) for turn in turns] if cut else turns
 
             trajectory = rollout_group(
                 generate_turn, tokenizer, prompt_ids,
@@ -325,12 +376,26 @@ def bootstrap(pairs: List[tuple], resamples: int = 2000, seed: int = 0) -> List[
     return [means[int(0.025 * resamples)], means[int(0.975 * resamples) - 1]]
 
 
-def build_report(out: Path, calls: int) -> Dict[str, Any]:
+def build_report(out: Path, calls: int, base: Optional[List[Path]] = None,
+                 only: Optional[List[str]] = None) -> Dict[str, Any]:
+    """``base`` holds earlier evaluations of the same rows: a method's rows
+    come from there unless a later folder (``out`` last) has a newer result
+    of the row. ``only`` keeps the named arms and leaves the graph decoder out."""
+    places = list(base or []) + [out]
+
+    def read(prefix: str) -> Dict[int, dict]:
+        rows: Dict[int, dict] = {}
+        for directory in places:
+            rows.update(read_method(directory, prefix))
+        return rows
+
     methods: Dict[str, Dict[int, dict]] = {}
-    names = {re.sub(r"\.s\d+$", "", path.stem)[len("rollout_"):] for path in out.glob("rollout_*.jsonl")}
+    names = {re.sub(r"\.s\d+$", "", path.stem)[len("rollout_"):]
+             for directory in places for path in directory.glob("rollout_*.jsonl")}
     for name in sorted(names):
-        methods[name] = read_method(out, f"rollout_{name}")
-    rows = read_method(out, "decoder")
+        if not only or name in only:
+            methods[name] = read(f"rollout_{name}")
+    rows = {} if only else read("decoder")
     if rows:
         methods["graph_decoder"] = rows
         methods["answer_key"] = {i: {**r, "attempts": [r["answer_key"]]} for i, r in rows.items()}
@@ -388,11 +453,11 @@ def markdown(report: Dict[str, Any]) -> str:
     for group, methods in report["tables"].items():
         if not any(line["n"] for line in methods.values()):
             continue
-        lines += [f"## {group}", "", "| method | n | " + " | ".join(measures) + " | calls | answered |",
-                  "|---|---|" + "---|" * (len(measures) + 2)]
+        lines += [f"## {group}", "", "| method | n | " + " | ".join(measures) + " | calls | answered | cut off |",
+                  "|---|---|" + "---|" * (len(measures) + 3)]
         for name, line in methods.items():
             lines.append(f"| {name} | {line['n']} | " + " | ".join(_pct(line.get(m)) for m in measures)
-                         + f" | {line.get('mean_calls', float('nan')):.2f} | {_pct(line.get('answered'))} |")
+                         + f" | {line.get('mean_calls', float('nan')):.2f} | {_pct(line.get('answered'))} | {_pct(line.get('truncated'))} |")
         lines.append("")
     lines += ["## Paired differences (all rows)", "",
               "| comparison | difference | 95% interval over circuits | rows |", "|---|---|---|---|"]
@@ -403,7 +468,7 @@ def markdown(report: Dict[str, Any]) -> str:
 
 
 def run_report(args) -> None:
-    report = build_report(args.out, args.max_tool_calls)
+    report = build_report(args.out, args.max_tool_calls, args.base, args.methods)
     (args.out / "report.json").write_text(json.dumps(report, indent=1))
     (args.out / "report.md").write_text(markdown(report))
     print(markdown(report))
@@ -425,6 +490,20 @@ def main() -> None:
     parser.add_argument("--max-tool-calls", type=int, default=3)
     parser.add_argument("--max-completion-tokens", type=int, default=4096)
     parser.add_argument("--attempts", type=int, default=3)
+    parser.add_argument("--graph-condition", choices=sorted(GRAPH_CONDITIONS), default="real",
+                        help="rollout: the graph the model is given. zero: none. shuffled: the graph "
+                             "of another row, with the input-bit anchors dealt to other inputs.")
+    parser.add_argument("--stop-at-faults", action="store_true",
+                        help="rollout: end the final answer where its list of detected faults begins.")
+    parser.add_argument("--redo-from", type=Path,
+                        help="rollout: only the rows whose rollout in this directory was cut off by "
+                             "the token budget or the call limit.")
+    parser.add_argument("--redo-name", help="rollout: the arm's label in --redo-from (default --name).")
+    parser.add_argument("--base", type=Path, nargs="*",
+                        help="report: earlier evaluations of the same rows that --out overlays.")
+    parser.add_argument("--methods", nargs="*",
+                        help="report: only these arms, without the graph decoder (a comparison "
+                             "of arms scored on a part of the rows).")
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
