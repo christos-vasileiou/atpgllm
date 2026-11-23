@@ -525,6 +525,41 @@ def latest_gdpo_step(out):
     return int(Path(found.stdout.strip().splitlines()[-1]).name.split("-")[1])
 
 
+def last_trained(r):
+    """``(round, adapter)`` of the last round whose SFT finished; ``(None, start adapter)`` before any.
+
+    Read from the finished ``round_<n>/sft`` stages, not from ``results``: a
+    round whose job ended between its SFT and its evaluation still trained.
+    """
+    done = r.state["done"]
+    trained = [int(name.split("/")[0].split("_")[1]) for name, value in done.items()
+               if name.startswith("round_") and name.endswith("/sft") and value.get("result")]
+    if not trained:
+        return None, r.plan["start_adapter"]
+    n = max(trained)
+    return n, done[f"round_{n}/sft"]["result"]
+
+
+def gdpo_from_last(r):
+    """GDPO from the last trained round, for chains that give RFT a fixed number of jobs.
+
+    The first launch ends the rounds and records where GDPO starts
+    (``state["gdpo_start"]``); a later launch resumes the GDPO already started.
+    """
+    start = r.state.get("gdpo_start")
+    if not start:
+        n, adapter = last_trained(r)
+        r.state.setdefault("rounds_stopped", f"{now()} GDPO started after round {n} (--gdpo_from_last)")
+        r.state["gdpo_start"] = start = {"round": n, "adapter": adapter, "at": now()}
+        r.save()
+        if n is None:
+            log(f"no RFT round finished its SFT; GDPO starts from the start adapter {adapter}")
+        else:
+            log(f"GDPO starts from the last trained round {n}: {adapter}")
+    r.stage("gdpo", gdpo, r, start["adapter"])
+    best_gdpo(r)
+
+
 def wait_while_held(r):
     """Rounds are over, and GDPO starts only when the plan's ``gdpo.hold`` is cleared."""
     announced = False
@@ -618,7 +653,13 @@ def main():
     parser.add_argument("--plan", default=str(REPO / "scripts/rft/configs/rft_v4_a100.json"))
     parser.add_argument("--run_dir", default=None, help="Overrides the plan's run_dir")
     parser.add_argument("--no_gdpo", action="store_true", help="Stop after choosing the best round")
+    parser.add_argument("--rounds_only", action="store_true",
+                        help="Run (or resume) the RFT rounds and exit without GDPO; the plan stays unfinished")
+    parser.add_argument("--gdpo_from_last", action="store_true",
+                        help="End the rounds and run GDPO from the last trained round, or resume the GDPO already started")
     args = parser.parse_args()
+    if args.rounds_only and args.gdpo_from_last:
+        parser.error("--rounds_only and --gdpo_from_last exclude each other")
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGHUP, on_signal)
     signal.signal(signal.SIGINT, on_signal)
@@ -627,7 +668,16 @@ def main():
     (r.path("driver.pid")).write_text(f"{os.getpid()}\n")
     log(f"driver pid {os.getpid()} in {r.dir}")
     try:
+        if args.gdpo_from_last:
+            gdpo_from_last(r)
+            r.state["finished"] = now()
+            r.save()
+            log("GDPO finished; the plan is complete")
+            return
         best = rounds(r)
+        if args.rounds_only:
+            log("rounds finished (--rounds_only); GDPO is left for a --gdpo_from_last launch")
+            return
         if args.no_gdpo or not r.plan.get("gdpo"):
             r.state["finished"] = now()
             r.save()

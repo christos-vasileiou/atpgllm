@@ -14,10 +14,14 @@
 # ends at the 2-day limit; Slurm sends TERM 15 min before, the driver stops its
 # stage and exits, and the next job of the chain resumes every stage where it
 # stopped. Submit a chain from the repo root (see scripts/rft/submit_juno_schedule.sh):
-#   sbatch scripts/rft/juno_schedule.sbatch [schedule json]
+#   sbatch scripts/rft/juno_schedule.sbatch [schedule json] [stage]
+# With a stage (warmup, rft or gdpo) the job runs only that stage of the first
+# phase (run_schedule.py --only), so a chain can give each stage a fixed number
+# of jobs; see scripts/rft/submit_juno_stages.sh.
 #   sbatch --dependency=afterany:<previous> scripts/rft/juno_schedule.sbatch [schedule json]
 set -uo pipefail
 SCHEDULE="${1:-scripts/rft/configs/schedule_v5_juno_h100.json}"
+STAGE="${2:-}"
 REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
 cd "$REPO" || exit 1
 
@@ -46,9 +50,23 @@ fi
 echo "job $SLURM_JOB_ID on $(hostname) at $(date -Iseconds); repo $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || cat "$REPO/PROVENANCE.txt" 2>/dev/null | head -1)"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
+# 2026-11-18: smoke 514981 hung in its first NCCL all reduce for the whole
+# 2 hour collective timeout (the two H200 NVL cards of a node share no NVLink),
+# as stage C did on 11-08. GPU peer to peer stays off (the GDPO runs on these
+# nodes use the same setting), and a short check stops the job within minutes
+# when the transport is still broken. The exported setting reaches every stage
+# the driver starts.
+export NCCL_P2P_DISABLE=1
+ngpu=$(nvidia-smi -L | wc -l)
+if [ "$ngpu" -gt 1 ] && ! timeout 240 torchrun --standalone --nproc-per-node "$ngpu" scripts/train/nccl_check.py; then
+    echo "NCCL check failed with NCCL_P2P_DISABLE=1; not starting the schedule"
+    exit 1
+fi
+
 # In the background so the TERM trap runs while python works; python stops its
 # stage on TERM (run_rft.on_signal) and exits 143.
-python scripts/rft/run_schedule.py --schedule "$SCHEDULE" &
+echo "stage: ${STAGE:-whole schedule}"
+python scripts/rft/run_schedule.py --schedule "$SCHEDULE" ${STAGE:+--only "$STAGE"} &
 child=$!
 trap 'kill -TERM $child 2>/dev/null' TERM
 wait $child

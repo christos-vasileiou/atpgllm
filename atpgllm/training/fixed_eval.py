@@ -254,7 +254,11 @@ def load_or_create_manifest(path, protocol: dict, candidates_factory, *, resume_
     if saved is not None or path.exists():
         manifest = saved if saved is not None else json.loads(path.read_text())
         if manifest.get("version") != 1 or manifest.get("protocol") != protocol:
-            raise ValueError(f"Fixed-evaluation protocol changed: use a new manifest path ({path})")
+            frozen = manifest.get("protocol") or {}
+            changed = {key: {"manifest": frozen.get(key), "run": protocol.get(key)}
+                       for key in sorted(set(frozen) | set(protocol)) if frozen.get(key) != protocol.get(key)}
+            raise ValueError(f"Fixed-evaluation protocol changed: use a new manifest path ({path}). "
+                             f"version={manifest.get('version')!r}, changed fields: {changed}")
         if digest(manifest["examples"]) != manifest["examples_sha256"]:
             raise ValueError(f"Fixed-evaluation manifest checksum mismatch: {path}")
         if saved is not None and path.exists() and json.loads(path.read_text()) != saved:
