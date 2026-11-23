@@ -23,6 +23,13 @@ from atpgllm.training.template_rendering import render_reasoning_template
 from atpgllm.training.tools import FAULT_SIMULATION_TOOL
 
 FAULT_PATTERN = re.compile(r"(sa)(\d)\s+(.+)", re.IGNORECASE)
+
+
+def grounded_text_enabled() -> bool:
+    """``SFT_GROUNDED_TEXT``: tool conversations read the snapshot instead of fixed lines."""
+    import os
+
+    return os.environ.get("SFT_GROUNDED_TEXT", "").strip().lower() in ("1", "true", "yes", "on")
 INDEXED_BRACKET_PATTERN = re.compile(r"^(.+)\[(\d+)\]$")
 INDEXED_SUFFIX_PATTERN = re.compile(r"^(.+/[A-Za-z_]+)(\d+)$")
 
@@ -295,7 +302,8 @@ class ConversationExample:
         return messages
 
     @staticmethod
-    def from_record(record: Dict[str, Any], use_tools: bool = False) -> "ConversationExample":
+    def from_record(record: Dict[str, Any], use_tools: bool = False,
+                    grounded: bool | None = None) -> "ConversationExample":
         """
         Create a ConversationExample from a dataset record.  This method
         combines the system, user, reasoning and answer fields into a
@@ -311,6 +319,13 @@ class ConversationExample:
         use_tools : bool
             If *True*, format the assistant turn with explicit tool-call
             JSON and a separate ``tool`` message containing the snapshot.
+        grounded : bool, optional
+            Tool conversations only. Drop the fixed sentence after the call's
+            thinking block, and start the final turn with a thinking block that
+            names the primary outputs where the snapshot's Good and Bad Machine
+            differ, instead of the fixed "has been sensitized" lead. Default:
+            the ``SFT_GROUNDED_TEXT`` setting (off when unset), so existing
+            runs render as before.
 
         Returns
         -------
@@ -343,6 +358,9 @@ class ConversationExample:
         expected_output_dict = prep["expected_output_dict"]
         fault = prep["fault"]
 
+        if grounded is None:
+            grounded = grounded_text_enabled()
+        grounded = bool(grounded and use_tools)
         reasoning_content = record.get("reasoning_content", "")
         answer_content = record.get("answer_content", "")
         snapshot = record.get("snapshot", "")
@@ -390,6 +408,8 @@ class ConversationExample:
                     "I have to verify if the fault is detected by the input and "
                     "output vectors. I need to call the fault simulation tool.\n"
                 )
+                if grounded:
+                    tool_call_content = "<think>" + reasoning_content + "</think>\n\n"
                 messages.append({
                     "role": "assistant",
                     "content": tool_call_content,
@@ -411,7 +431,26 @@ class ConversationExample:
                         + "</think>\n\n"
                     ),
                 })
-        if answer_content:
+        reading = None
+        if answer_content and grounded and snapshot:
+            from atpgllm.training.tool_feedback import detected_sentence, read_snapshot
+
+            try:
+                reading = read_snapshot(snapshot, fault, list(expected_output_dict))
+            except (ValueError, KeyError, TypeError):
+                reading = None
+        if reading is not None and reading.detected:
+            # A snapshot that does not read as a detection (three-valued, an
+            # output x in either machine) keeps the old lead instead of
+            # failing the stream.
+            messages.append({
+                "role": "assistant",
+                "content": (
+                    "<think>\n" + detected_sentence(reading) + "\n</think>\n\n"
+                    "To sum up, the vectors are:\n" + answer_content
+                ),
+            })
+        elif answer_content:
             messages.append({
                 "role": "assistant",
                 "content": (

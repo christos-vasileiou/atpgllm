@@ -410,6 +410,7 @@ def train_with_sft(
             cached_circuit_validation, check_sft_dataset, load_circuit_train,
             prepare_circuit_validation, sft_evaluation_config,
         )
+        from atpgllm.training.conversation import grounded_text_enabled
         data_manifest, dataset_fingerprint = check_sft_dataset(dataset_path, resume_from)
 
     lora_config = _resolve_lora_config(
@@ -487,6 +488,7 @@ def train_with_sft(
             "dataset_sha256": dataset_fingerprint, "sft_format": sft_format,
             "max_prompt_length": max_prompt_length, "max_model_len": max_model_len,
             "per_circuit": sft_eval_per_circuit,
+            "grounded_text": grounded_text_enabled(),
             "chat_template_sha256": hashlib.sha256(
                 str(tokenizer.chat_template).encode()).hexdigest(),
         }
@@ -523,6 +525,7 @@ def train_with_sft(
         max_model_len=max_model_len if sft_format == "messages" else None,
     )
 
+    pretokenized = False
     if sft_extra_messages:
         # Pre-built conversations (e.g. STaR rationalizations) mixed into the stream.
         if sft_format != "messages":
@@ -532,6 +535,24 @@ def train_with_sft(
         train_dataset = mix_in_examples(train_dataset, extra, sft_extra_fraction, seed=42)
         print(f"[SFT] Mixing {len(extra)} examples from {sft_extra_messages} as "
               f"{sft_extra_fraction:.0%} of the training stream.")
+        masked = sum(1 for example in extra if example.get("assistant_train") is not None
+                     and not all(example["assistant_train"]))
+        if masked:
+            # Retry examples: their failed first call is context, not a target.
+            # Tokenize here so the per-turn masks reach the collator, which applies
+            # assistant_masks whenever they are present. The validation set gets the
+            # same tokenization (every assistant turn), so its loss is unchanged.
+            from atpgllm.training.dataset_utils import (
+                pretokenize_with_turn_masks, tokenize_with_turn_masks,
+            )
+            train_dataset = pretokenize_with_turn_masks(train_dataset, tokenizer)
+            if eval_dataset is not None:
+                from datasets import Dataset
+                eval_dataset = Dataset.from_list(
+                    [tokenize_with_turn_masks(example, tokenizer) for example in eval_dataset])
+            pretokenized = True
+            print(f"[SFT] {masked} extra examples mask some assistant turns; the stream is "
+                  "tokenized with per-turn loss masks.")
 
     if resume_training_state and skip_buffer_size:
         print(
@@ -572,7 +593,12 @@ def train_with_sft(
     if save_total_limit:
         # The best checkpoint (load_best_model_at_end) is always kept as well.
         sft_kwargs["save_total_limit"] = save_total_limit
-    if assistant_only_loss:
+    if assistant_only_loss and pretokenized:
+        # Already tokenized with assistant_masks (per-turn masks): TRL only
+        # accepts its flag on conversational data, and its collator applies the
+        # masks without it.
+        sft_kwargs["assistant_only_loss"] = False
+    elif assistant_only_loss:
         # SFTTrainer detects the conversational layout from the "messages"
         # column and applies the chat template internally with
         # return_assistant_tokens_mask=True.
