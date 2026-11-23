@@ -539,6 +539,12 @@ build_cmd_args() {
             if [ -n "${FIXED_EVAL_MANIFEST:-}" ]; then
                 CMD_ARGS+=(--fixed_eval_manifest "$FIXED_EVAL_MANIFEST")
             fi
+            # The manifest protocol records the selection, so a sourced but
+            # unexported FIXED_EVAL_SELECTION must reach Python as a flag
+            # (ported from hard-faults 8cb2cf0, 2026-11-18).
+            if [ -n "${FIXED_EVAL_SELECTION:-}" ]; then
+                CMD_ARGS+=(--fixed_eval_selection "$FIXED_EVAL_SELECTION")
+            fi
             if [ -n "${KEEP_BEST_CHECKPOINTS:-}" ]; then
                 CMD_ARGS+=(--keep_best_checkpoints "$KEEP_BEST_CHECKPOINTS")
             fi
@@ -1065,11 +1071,17 @@ else
     fi
 
     if [ "$USE_DDP" == "True" ]; then
-        echo "Command: accelerate launch --multi_gpu --num_processes $NUM_GPUS --mixed_precision bf16 $_TRAIN_PY ${CMD_ARGS[*]}"
+        # accelerate refuses --multi_gpu below 2 processes, which is the GRPO
+        # layout of one training GPU beside one vLLM GPU (2026-11-18).
+        _MULTI_GPU=()
+        if [ "${NUM_GPUS:-1}" -gt 1 ]; then
+            _MULTI_GPU=(--multi_gpu)
+        fi
+        echo "Command: accelerate launch ${_MULTI_GPU[*]} --num_processes $NUM_GPUS --mixed_precision bf16 $_TRAIN_PY ${CMD_ARGS[*]}"
         echo ""
         if [ "$DRY_RUN" != "True" ]; then
             setsid accelerate launch \
-                --multi_gpu \
+                "${_MULTI_GPU[@]}" \
                 --num_processes $NUM_GPUS \
                 --mixed_precision bf16 \
                 "$_TRAIN_PY" "${CMD_ARGS[@]}" &
