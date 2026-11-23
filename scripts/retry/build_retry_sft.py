@@ -167,7 +167,7 @@ def _synthetic_slot(job):
     os.environ.setdefault("FAULT_SIM_BACKEND", "fast")
     from atpgllm.training.conversation import ConversationExample
     from atpgllm.training.retry_repair import fast_simulator, fast_structure
-    from atpgllm.training.retry_trajectories import outputs_of
+    from atpgllm.training.retry_trajectories import outputs_of, strip_assignment_lines
     try:
         messages = ConversationExample.from_record(dict(record), use_tools=True, grounded=True).messages
         outputs = list(json.loads(record["expected_output"]))
@@ -180,6 +180,8 @@ def _synthetic_slot(job):
         return {"status": "no_failure"}
     vector, snapshot = failure
     call = dict(messages[2])
+    # The dataset reasoning spells out the detecting vector; keep only the plan.
+    call["content"] = strip_assignment_lines(call.get("content") or "")
     function = dict(call["tool_calls"][0]["function"])
     function["arguments"] = dict(function["arguments"], input_vector=vector,
                                  output_vector=outputs_of(snapshot, outputs))

@@ -168,3 +168,15 @@ def test_turn_masks_leave_the_failed_call_out_of_the_loss(granite_tokenizer):
     bad = dict(example, assistant_train=[True, False])
     with pytest.raises(ValueError):
         tokenize_with_turn_masks(bad, tokenizer)
+
+
+def test_strip_assignment_lines_keeps_the_plan_and_drops_the_vector():
+    from atpgllm.training.retry_trajectories import strip_assignment_lines
+    content = ("<think>1. **Excitation**: set inputs via a, b so n1 is 1.\n"
+               "6. **Output Prediction**: Expected output: y: 1.\n"
+               "7. **Simulation**: Execute the input vector a: 1, b: 1, c: 0 and snapshot.</think>\n\n"
+               "I'll call the tool.")
+    stripped = strip_assignment_lines(content)
+    assert "set inputs via a, b so n1 is 1." in stripped
+    assert "a: 1, b: 1" not in stripped and "Expected output" not in stripped
+    assert stripped.endswith("</think>\n\nI'll call the tool.")

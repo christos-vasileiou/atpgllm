@@ -48,6 +48,25 @@ STOCK_LEAD_RE = re.compile(
 )
 
 
+# A "net: value" or "net=value" assignment inside reasoning text.
+_ASSIGNMENT = re.compile(r"[\w\\\[\]/.$:-]+?\s*[:=]\s*[01xX]\b")
+
+
+def strip_assignment_lines(content: str) -> str:
+    """The thinking block without the lines that list input or output values.
+
+    A synthetic retry example starts from a dataset row whose reasoning spells
+    out the detecting vector, while its first call uses a perturbed one. Kept as
+    context, those lines would let the next call copy the answer instead of
+    reading the simulator's table, so only the structural plan (net and gate
+    names) stays. Text after the thinking block is unchanged.
+    """
+    head, sep, tail = content.partition("</think>")
+    kept = [line for line in head.split("\n")
+            if len(_ASSIGNMENT.findall(line)) < 2 and "Expected output" not in line]
+    return "\n".join(kept) + sep + tail
+
+
 def _care(value: Any) -> bool:
     return str(value).strip() in ("0", "1")
 
