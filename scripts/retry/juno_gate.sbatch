@@ -66,6 +66,8 @@ done
 for arm in "${arms[@]}"; do
     python scripts/retry/gate_report.py "$GATE/$arm" --manifest "$MANIFEST" --max_k "$MAX_TOOL_ROUNDS" \
         --out "$GATE/report_${arm}.json" > /dev/null
+    # Do the edits read the answer? Model edits against random edits of the same size (CPU).
+    python scripts/retry/edit_quality.py "$GATE/$arm" --workers 30 --out "$GATE/edit_quality_${arm}.json" > /dev/null
 done
 # GATE_REQUIRE=<arm>: the job fails unless that arm passes the bar against the
 # baseline, so a job queued with --dependency=afterok on this one (the GDPO run

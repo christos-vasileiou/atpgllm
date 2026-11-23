@@ -47,22 +47,57 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 
-def _slot_parts(slot):
-    """(user text, first call message, call arguments, tool content) of a one-call slot."""
+def _slot_calls(slot):
+    """(user text, [(assistant call message, arguments, tool content), ...]) of a slot.
+
+    The trajectory must be calls and their answers in turn, one tool call per
+    assistant message with dict vectors, optionally ending in a final answer.
+    None for anything else (a protocol repair or controller message in between).
+    """
     user = next(m for m in slot["prompt_messages"] if m["role"] == "user")["content"]
-    calls = [m for m in slot["messages"] if m["role"] == "assistant" and m.get("tool_calls")]
-    tools = [m for m in slot["messages"] if m["role"] == "tool"]
-    if len(calls) != 1 or len(tools) != 1 or len(calls[0]["tool_calls"]) != 1:
-        return None
-    arguments = calls[0]["tool_calls"][0]["function"]["arguments"]
-    if not isinstance(arguments, dict) or not isinstance(arguments.get("input_vector"), dict) \
-            or not isinstance(arguments.get("output_vector"), dict):
-        return None
-    return user, calls[0], arguments, tools[0]["content"]
+    calls, messages = [], list(slot["messages"])
+    i = 0
+    # Slots store the prompt (system, user) ahead of the generated turns.
+    while i < len(messages) and messages[i]["role"] in ("system", "user") and not calls:
+        if any(m["role"] in ("assistant", "tool") for m in messages[:i]):
+            break
+        i += 1
+    while i < len(messages):
+        message = messages[i]
+        if message["role"] == "assistant" and message.get("tool_calls"):
+            if len(message["tool_calls"]) != 1 or i + 1 >= len(messages) or messages[i + 1]["role"] != "tool":
+                return None
+            arguments = message["tool_calls"][0]["function"]["arguments"]
+            if not isinstance(arguments, dict) or not isinstance(arguments.get("input_vector"), dict) \
+                    or not isinstance(arguments.get("output_vector"), dict):
+                return None
+            calls.append((message, arguments, messages[i + 1]["content"]))
+            i += 2
+        elif message["role"] == "assistant" and i == len(messages) - 1:
+            i += 1
+        else:
+            return None
+    return (user, calls) if calls else None
 
 
-def select(patterns, per_level, max_per_problem, seed):
-    """Unhinted one-call failures, at most ``max_per_problem`` per problem and ``per_level`` per level."""
+def _slot_parts(slot):
+    """(user text, last call message, its arguments, its tool content) of a slot."""
+    parsed = _slot_calls(slot)
+    if parsed is None:
+        return None
+    user, calls = parsed
+    return (user, *calls[-1])
+
+
+def select(patterns, per_level, max_per_problem, seed, max_calls=8):
+    """Unhinted failed trajectories, at most ``max_per_problem`` per problem and ``per_level`` per level.
+
+    A trajectory qualifies when every call it made missed and its answer does
+    not detect, with room for at least one more call under ``max_calls``. A
+    one-call failure is the common case; after retry SFT the policy's own
+    multi-call failures are the starts that teach it to recover from its own
+    wrong retries.
+    """
     from atpgllm.training.tool_feedback import read_snapshot
     by_level = defaultdict(lambda: defaultdict(list))
     seen = Counter()
@@ -72,23 +107,28 @@ def select(patterns, per_level, max_per_problem, seed):
             for line in open(path):
                 slot = json.loads(line)
                 seen["slots"] += 1
-                if slot.get("hint_mode") != "none" or slot.get("status") != "FINAL":
+                if slot.get("hint_mode") != "none" or slot.get("status") not in ("FINAL", "EXHAUSTED"):
                     continue
                 if (slot.get("reward_components") or {}).get("detection", 0) >= 1:
                     continue
-                parts = _slot_parts(slot)
-                if parts is None:
-                    seen["not_one_call"] += 1
+                parsed = _slot_calls(slot)
+                if parsed is None:
+                    seen["not_a_call_trajectory"] += 1
                     continue
-                _, _, arguments, tool = parts
+                _, calls = parsed
+                if len(calls) >= max_calls:
+                    seen["no_call_left"] += 1
+                    continue
                 try:
-                    reading = read_snapshot(tool, slot["fault"], list(arguments["output_vector"]))
+                    readings = [read_snapshot(tool, slot["fault"], list(arguments["output_vector"]))
+                                for _, arguments, tool in calls]
                 except Exception:
                     seen["tool_unreadable"] += 1
                     continue
-                if reading.detected:
+                if any(reading.detected for reading in readings):
                     seen["call_detected_answer_wrong"] += 1
                     continue
+                seen[f"calls/{len(calls)}"] += 1
                 slot["_round"] = round_name
                 by_level[slot["difficulty"]][tuple(slot["problem"])].append(slot)
     rng = random.Random(seed)
@@ -263,11 +303,14 @@ def select_dataset(directory, split, per_group, seed, workers):
 
 
 def _search_one(job):
-    slot, max_steps, max_flips = job
+    slot, max_steps, max_flips, max_calls = job
     os.environ.setdefault("FAULT_SIM_BACKEND", "fast")
     from atpgllm.training.retry_repair import RepairSearch, fast_simulator, fast_structure
     from atpgllm.training.tools import ToolHelper
-    user, _, arguments, tool = _slot_parts(slot)
+    user, calls = _slot_calls(slot)
+    _, arguments, tool = calls[-1]
+    max_steps = min(max_steps, max_calls - len(calls))
+    tried = [dict(a["input_vector"]) for _, a, _ in calls[:-1]]
     key = {"problem": slot["problem"], "difficulty": slot["difficulty"], "round": slot["_round"],
            "seed": slot.get("seed"), "completion_slot": slot.get("completion_slot")}
     try:
@@ -278,7 +321,8 @@ def _search_one(job):
                               list(arguments["input_vector"]), outputs,
                               seed=int(hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:8], 16),
                               max_flips=max_flips)
-        steps = search.path(dict(arguments["input_vector"]), start_snapshot=tool, max_steps=max_steps)
+        steps = search.path(dict(arguments["input_vector"]), start_snapshot=tool, max_steps=max_steps,
+                            avoid=tried)
     except Exception as exc:
         return {**key, "status": f"error: {type(exc).__name__}: {exc}"[:300]}
     if steps is None:
@@ -287,7 +331,7 @@ def _search_one(job):
             "steps": [{"vector": s.observation.vector, "changes": [list(c) for c in s.changes]} for s in steps]}
 
 
-def search_phase(chosen, out, workers, max_steps, max_flips):
+def search_phase(chosen, out, workers, max_steps, max_flips, max_calls=8):
     path = out / "paths.jsonl"
     done = set()
     if path.exists():
@@ -297,7 +341,7 @@ def search_phase(chosen, out, workers, max_steps, max_flips):
                 done.add((tuple(row["problem"]), row["round"], row["seed"], row["completion_slot"]))
             except json.JSONDecodeError:
                 pass
-    jobs = [(slot, max_steps, max_flips) for slot in chosen
+    jobs = [(slot, max_steps, max_flips, max_calls) for slot in chosen
             if (tuple(slot["problem"]), slot["_round"], slot.get("seed"), slot.get("completion_slot")) not in done]
     print(f"[search] {len(jobs)} slots to search ({len(done)} done)", flush=True)
     t = time.time()
@@ -316,25 +360,31 @@ def _tool(vector, output_vector, fault, doc_id, netlist):
 
 
 def _confirm_one(item):
-    """Simulate every call of a path with GDPO's tool handler and re-read each snapshot."""
+    """Simulate every call (the policy's and the path's) with GDPO's tool handler and re-read each."""
     slot, row = item
     from atpgllm.training.retry_repair import RepairSearch, fast_simulator, fast_structure
     from atpgllm.training.retry_trajectories import outputs_of
     from atpgllm.training.tools import ToolHelper
-    user, call, arguments, stored = _slot_parts(slot)
+    user, calls = _slot_calls(slot)
     document = ToolHelper.get_document(user)
     netlist, doc_id = document["netlist"], document["doc_id"]
     fault = slot["fault"]
-    outputs = list(arguments["output_vector"])
+    outputs = list(calls[-1][1]["output_vector"])
     structure = fast_structure(netlist)
     search = RepairSearch(structure, fast_simulator(structure, fault, outputs), fault,
-                          list(arguments["input_vector"]), outputs)
-    first = _tool(arguments["input_vector"], arguments["output_vector"], fault, doc_id, netlist)
-    if first.startswith("Tool "):
-        return {"status": "first_call_tool_error", "detail": first[:200]}
-    previous = search.explain(arguments["input_vector"], first)
-    if previous.reading.detected:
-        return {"status": "first_call_detects_on_tool"}
+                          list(calls[-1][1]["input_vector"]), outputs)
+    context, all_match = [], True
+    for message, arguments, stored in calls:
+        snapshot = _tool(arguments["input_vector"], arguments["output_vector"], fault, doc_id, netlist)
+        if snapshot.startswith("Tool "):
+            return {"status": "first_call_tool_error", "detail": snapshot[:200]}
+        if search.explain(arguments["input_vector"], snapshot).reading.detected:
+            return {"status": "first_call_detects_on_tool"}
+        all_match &= snapshot == stored
+        context.append((message, snapshot))
+    last_vector = calls[-1][1]["input_vector"]
+    previous = search.explain(last_vector, context[-1][1])
+    start_activated = previous.reading.activated
     steps = []
     for step in row["steps"]:
         fast = search.observe(step["vector"])
@@ -351,9 +401,8 @@ def _confirm_one(item):
         previous = observed
     if not previous.reading.detected:
         return {"status": "last_call_does_not_detect"}
-    return {"status": "confirmed", "first_snapshot": first, "first_matches_stored": first == stored,
-            "steps": steps, "doc_id": doc_id, "outputs": outputs, "first_call": call,
-            "start_activated": search.explain(arguments["input_vector"], first).reading.activated}
+    return {"status": "confirmed", "context": context, "first_matches_stored": all_match,
+            "steps": steps, "doc_id": doc_id, "outputs": outputs, "start_activated": start_activated}
 
 
 def _key(problem, round_name, seed, completion_slot):
@@ -362,7 +411,7 @@ def _key(problem, round_name, seed, completion_slot):
 
 def confirm_and_assemble(chosen, rows, out, tool_workers, tokenizer, max_model_len, confirm, cap=None):
     """Confirm each path with the tool, assemble its example; one line per path in confirm.jsonl."""
-    from atpgllm.training.retry_trajectories import retry_example, sft_first_call
+    from atpgllm.training.retry_trajectories import retry_example_from_context, sft_first_call
     from atpgllm.training.tools import TOOLS
     if confirm and os.environ.get("FAULT_SIM_BACKEND") != "tetramax":
         raise SystemExit("confirm needs FAULT_SIM_BACKEND=tetramax (run under scripts/rft/with_tetramax.sh)")
@@ -391,15 +440,16 @@ def confirm_and_assemble(chosen, rows, out, tool_workers, tokenizer, max_model_l
             return entry
         entry["first_matches_stored"] = result["first_matches_stored"]
         prompt = [m for m in slot["prompt_messages"] if m["role"] in ("system", "user")]
-        example = retry_example(prompt, sft_first_call(result["first_call"]), result["first_snapshot"],
-                                result["steps"], slot["fault"], result["doc_id"], result["outputs"], TOOLS)
+        context = [(sft_first_call(message), snapshot) for message, snapshot in result["context"]]
+        example = retry_example_from_context(prompt, context, result["steps"], slot["fault"],
+                                             result["doc_id"], result["outputs"], TOOLS)
         length = len(tokenizer.apply_chat_template(example["messages"], tools=TOOLS, tokenize=True))
         if length > max_model_len:
             entry["status"] = "too_long"
             return entry
         example["retry"] = {"problem": slot["problem"], "difficulty": level, "round": slot["_round"],
                             "kind": slot.get("kind", "combinational"),
-                            "steps": len(result["steps"]),
+                            "steps": len(result["steps"]), "context_calls": len(context),
                             "flips": [len(s["changes"]) for s in result["steps"]],
                             "start": "activated" if result["start_activated"] else "not_activated",
                             "tokens": length}
@@ -480,7 +530,9 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--per_level", type=int, default=2000)
     parser.add_argument("--max_per_problem", type=int, default=2)
-    parser.add_argument("--max_steps", type=int, default=4)
+    parser.add_argument("--max_steps", type=int, default=4, help="Repair calls after the failed ones")
+    parser.add_argument("--max_calls", type=int, default=8,
+                        help="Calls per example, the failed ones included (the GRPO cap)")
     parser.add_argument("--max_flips", type=int, default=3)
     parser.add_argument("--workers", type=int, default=30)
     parser.add_argument("--tool_workers", type=int, default=16)
@@ -500,9 +552,10 @@ def main():
     if args.dataset:
         chosen, selection = select_dataset(args.dataset, args.split, args.per_group, args.seed, args.workers)
     else:
-        chosen, selection = select(args.slots, args.per_level, args.max_per_problem, args.seed)
+        chosen, selection = select(args.slots, args.per_level, args.max_per_problem, args.seed,
+                                   max_calls=args.max_calls)
     print(f"[select] {len(chosen)} failed calls: {selection}", flush=True)
-    rows = search_phase(chosen, out, args.workers, args.max_steps, args.max_flips)
+    rows = search_phase(chosen, out, args.workers, args.max_steps, args.max_flips, args.max_calls)
     search_stats = Counter(r["status"] if not r["status"].startswith("error") else "error" for r in rows)
     examples, confirm_stats, by_level = confirm_and_assemble(
         chosen, rows, out, args.tool_workers, tokenizer, args.max_model_len, not args.no_confirm,
@@ -511,6 +564,7 @@ def main():
               "by_level": by_level, "retry_examples": len(examples),
               "steps": dict(Counter(e["retry"]["steps"] for e in examples)),
               "start": dict(Counter(e["retry"]["start"] for e in examples)),
+              "context_calls": dict(Counter(e["retry"].get("context_calls", 1) for e in examples)),
               "flips": dict(Counter(f for e in examples for f in e["retry"]["flips"])),
               "args": vars(args)}
     if args.kept:

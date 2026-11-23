@@ -153,7 +153,7 @@ def final_message(reading: SimulationReading, vector: Dict[str, Any], snapshot: 
 def retry_example(prompt_messages: List[Dict[str, Any]], first_call: Dict[str, Any],
                   first_snapshot: str, steps: Sequence[Dict[str, Any]], fault: str,
                   doc_id: str, output_nets: Sequence[str], tools: Any) -> Dict[str, Any]:
-    """The SFT example for one repair path.
+    """The SFT example for one repair path after a single failed call.
 
     ``first_call`` is the failed assistant call in the SFT layout and
     ``first_snapshot`` the tool's answer for it. Each step holds ``vector``,
@@ -161,8 +161,25 @@ def retry_example(prompt_messages: List[Dict[str, Any]], first_call: Dict[str, A
     and ``reading``/``blockers`` of the snapshot *before* the step
     (``prev_reading``, ``prev_blockers``). The last step must detect.
     """
-    messages = deepcopy(prompt_messages) + [deepcopy(first_call), tool_message(first_snapshot)]
-    train = [False]
+    return retry_example_from_context(prompt_messages, [(first_call, first_snapshot)], steps,
+                                      fault, doc_id, output_nets, tools)
+
+
+def retry_example_from_context(prompt_messages: List[Dict[str, Any]],
+                               context: Sequence[Tuple[Dict[str, Any], str]],
+                               steps: Sequence[Dict[str, Any]], fault: str, doc_id: str,
+                               output_nets: Sequence[str], tools: Any) -> Dict[str, Any]:
+    """The SFT example for a repair path after one or more failed calls.
+
+    ``context`` holds the failed calls in order, each with the tool's answer
+    for it. They are kept as context and left out of the loss: the model learns
+    to read the last answer and recover, not to make those calls. Every step
+    after them is a target, as in :func:`retry_example`.
+    """
+    messages = deepcopy(prompt_messages)
+    for call, snapshot in context:
+        messages += [deepcopy(call), tool_message(snapshot)]
+    train = [False] * len(context)
     for step in steps:
         think = retry_think(step["prev_reading"], step["prev_blockers"], step["changes"], step["snapshot"])
         messages.append(call_message(think, step["vector"], outputs_of(step["snapshot"], output_nets),
