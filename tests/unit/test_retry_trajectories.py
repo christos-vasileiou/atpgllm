@@ -180,3 +180,77 @@ def test_strip_assignment_lines_keeps_the_plan_and_drops_the_vector():
     assert "set inputs via a, b so n1 is 1." in stripped
     assert "a: 1, b: 1" not in stripped and "Expected output" not in stripped
     assert stripped.endswith("</think>\n\nI'll call the tool.")
+
+
+def _builder():
+    import importlib
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "retry"))
+    return importlib.import_module("build_retry_sft")
+
+
+def _slot(vectors, final=True):
+    structure = fast_structure(NETLIST)
+    simulate = fast_simulator(structure, FAULT, ["y"])
+    user = "Target sa0 n1 in tiny.\n\n" + repr({"doc_id": "d", "netlist": NETLIST})
+    messages = []
+    for vector in vectors:
+        messages.append({"role": "assistant", "content": "<think>\ntry\n</think>\n\n", "tool_calls": [
+            {"type": "function", "function": {"name": "fault_simulation_tool", "arguments": {
+                "input_vector": dict(vector), "output_vector": {"y": 1}, "fault": FAULT, "doc_id": "d"}}}]})
+        messages.append({"role": "tool", "name": "fault_simulation_tool", "content": simulate(vector)})
+    if final:
+        messages.append({"role": "assistant", "content": "The fault sa0 n1 has been sensitized."})
+    return {"prompt_messages": [{"role": "system", "content": "ATPG"}, {"role": "user", "content": user}],
+            "messages": messages, "problem": ["tiny", FAULT], "difficulty": "easy", "_round": "r",
+            "seed": 1, "completion_slot": 0, "fault": FAULT, "hint_mode": "none", "status": "FINAL",
+            "reward_components": {"detection": 0.0}}
+
+
+def test_slot_calls_reads_multi_call_trajectories():
+    b = _builder()
+    slot = _slot([{"a": 0, "b": 1, "c": 1}, {"a": 0, "b": 0, "c": 1}])
+    user, calls = b._slot_calls(slot)
+    assert len(calls) == 2 and calls[-1][1]["input_vector"] == {"a": 0, "b": 0, "c": 1}
+    # RFT slots keep the prompt in front of the generated turns.
+    with_prompt = dict(slot, messages=slot["prompt_messages"] + slot["messages"])
+    assert len(b._slot_calls(with_prompt)[1]) == 2
+    assert b._slot_parts(slot)[2]["input_vector"] == {"a": 0, "b": 0, "c": 1}
+    # A controller message between calls is not a plain call trajectory.
+    slot["messages"].insert(2, {"role": "user", "content": "The previous action was invalid"})
+    assert b._slot_calls(slot) is None
+
+
+def test_search_continues_from_the_last_failed_call_within_the_call_budget():
+    b = _builder()
+    slot = _slot([{"a": 0, "b": 1, "c": 1}, {"a": 0, "b": 0, "c": 1}])
+    row = b._search_one((slot, 4, 3, 8))
+    assert row["status"] == "path"
+    assert row["steps"][-1]["vector"] == {"a": 1, "b": 1, "c": 0}
+    # The first failed vector is never proposed again.
+    assert all(step["vector"] != {"a": 0, "b": 1, "c": 1} for step in row["steps"])
+    # No call left: two failed calls under a cap of two.
+    assert b._search_one((slot, 4, 3, 2))["status"] == "no_path"
+
+
+def test_example_from_context_masks_every_failed_call():
+    from atpgllm.training.retry_trajectories import retry_example_from_context
+    structure = fast_structure(NETLIST)
+    simulate = fast_simulator(structure, FAULT, ["y"])
+    search = RepairSearch(structure, simulate, FAULT, ["a", "b", "c"], ["y"])
+    tried = [{"a": 0, "b": 1, "c": 1}, {"a": 0, "b": 0, "c": 1}]
+    context = [(call_message("x", v, {"y": 1}, FAULT, "d"), simulate(v)) for v in tried]
+    previous = search.explain(tried[-1], context[-1][1])
+    steps = []
+    for step in search.path(tried[-1], start_snapshot=context[-1][1], avoid=tried[:-1]):
+        steps.append({"vector": step.observation.vector, "changes": list(step.changes),
+                      "snapshot": step.observation.snapshot, "prev_reading": previous.reading,
+                      "prev_blockers": list(previous.blockers)})
+        previous = step.observation
+    example = retry_example_from_context(PROMPT, context, steps, FAULT, "d", ["y"], TOOLS)
+    assert example["assistant_train"][:2] == [False, False]
+    assert all(example["assistant_train"][2:])
+    calls = [m for m in example["messages"] if m.get("tool_calls")]
+    assert len(calls) == 2 + len(steps)
+    assert "does not detect" in [m["content"] for m in example["messages"] if m["role"] == "assistant"][2]

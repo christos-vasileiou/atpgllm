@@ -332,14 +332,19 @@ class RepairSearch:
         return None
 
     def path(self, start: Dict[str, Any], *, max_steps: int = 4,
-             start_snapshot: Optional[str] = None) -> Optional[List[RepairStep]]:
-        """Steps from ``start`` to a detecting call, or None within ``max_steps``."""
+             start_snapshot: Optional[str] = None,
+             avoid: Sequence[Dict[str, Any]] = ()) -> Optional[List[RepairStep]]:
+        """Steps from ``start`` to a detecting call, or None within ``max_steps``.
+
+        ``avoid`` holds vectors already tried (earlier failed calls); a step
+        that lands on one of them ends the search, as a repeat of ``start`` does.
+        """
         current = (self.explain(start, start_snapshot) if start_snapshot is not None
                    else self.observe(start))
-        if current.reading.detected:
+        if current.reading.detected or max_steps < 1:
             return None
         steps: List[RepairStep] = []
-        seen = {tuple(sorted((n, str(v)) for n, v in start.items()))}
+        seen = {tuple(sorted((n, str(v)) for n, v in vector.items())) for vector in (start, *avoid)}
         for _ in range(max_steps):
             step = self.next_step(current)
             if step is None:
