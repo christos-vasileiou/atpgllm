@@ -19,7 +19,7 @@
   "num_samples": 8,
   "hint_modes": "none,path,partial",
   "temperature": 1.0,
-  "max_tool_rounds": 4,
+  "max_tool_rounds": 8,
   "max_prompt_length": 14336,
   "max_model_len": 32768,
   "max_generated_tokens": 16384,
@@ -28,7 +28,14 @@
  },
  "build": {
   "max_per_problem": 2,
-  "min_examples": 50
+  "min_examples": 50,
+  "retry": {
+   "per_level": 600,
+   "max_per_problem": 2,
+   "max_steps": 4,
+   "workers": 30,
+   "tool_workers": 16
+  }
  },
  "sft": {
   "conf": "scripts/train/configs/sft_granite_4.2_8b_v5_rft_juno_h200.conf",
@@ -45,7 +52,7 @@
  "eval": {
   "val_per_level": "easy=60,medium=60,hard=60,very_hard=60,random_never_detects=60",
   "val_kind_shares": "combinational=0.5,sequential=0.5",
-  "max_tool_rounds": 16,
+  "max_tool_rounds": 8,
   "references": {},
   "bench": {
    "manifest": "runs/v5_schedule/eval/v5_bench_manifest.json",
@@ -53,7 +60,7 @@
    "num_samples": 16,
    "temperature": 0.7,
    "top_p": 0.95,
-   "max_tool_rounds": 5,
+   "max_tool_rounds": 8,
    "max_generated_tokens": 16384,
    "reward_profile": "staged"
   }

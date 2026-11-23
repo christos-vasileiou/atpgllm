@@ -395,9 +395,46 @@ def build(r, n):
     report = read_json(out / "report.json")
     if report["sft_examples"] < plan["build"].get("min_examples", 1):
         raise RuntimeError(f"only {report['sft_examples']} SFT examples")
-    return {"sft_examples": report["sft_examples"], "by_level_and_mode": report["sft_examples_by_level_and_mode"],
-            "by_kind": report.get("sft_examples_by_kind"),
-            "dropped_over_max_model_len_by_kind": report.get("dropped_over_max_model_len_by_kind")}
+    summary = {"sft_examples": report["sft_examples"], "by_level_and_mode": report["sft_examples_by_level_and_mode"],
+               "by_kind": report.get("sft_examples_by_kind"),
+               "dropped_over_max_model_len_by_kind": report.get("dropped_over_max_model_len_by_kind")}
+    if plan["build"].get("retry"):
+        summary["retry"] = build_retry(r, n, plan["build"]["retry"])
+        summary["sft_examples"] = summary["retry"]["examples"]
+    return summary
+
+
+def build_retry(r, n, retry):
+    """Retry examples from this round's own failed calls, mixed into sft.jsonl.
+
+    scripts/retry/build_retry_sft.py takes the round's unhinted one-call
+    failures, finds fewest-flip repairs, simulates every call again through
+    GDPO's tool handler and writes conversations that read each answer and call
+    again until one detects (the failed call masked from the loss). The kept
+    single-call rows are rewritten without the two stock lines. sft.jsonl then
+    holds both; build_sft's own file stays as sft_single.jsonl.
+    """
+    out = r.path(f"round_{n}", "gen")
+    single = out / "sft_single.jsonl"
+    if not single.exists():
+        shutil.copyfile(out / "sft.jsonl", single)
+    target = out / "retry"
+    run(["bash", "scripts/rft/with_tetramax.sh", PYTHON, "scripts/retry/build_retry_sft.py",
+         "--slots", str(out / "slots*.jsonl"), "--kept", str(single), "--out", str(target),
+         "--per_level", retry.get("per_level", 600), "--max_per_problem", retry.get("max_per_problem", 2),
+         "--max_steps", retry.get("max_steps", 4), "--max_model_len", r.plan["sft"]["max_model_len"],
+         "--workers", retry.get("workers", 30), "--tool_workers", retry.get("tool_workers", 16)],
+        r.path("logs", f"round_{n}_retry.log"), env={"PYTHONPATH": str(REPO)})
+    report = read_json(target / "report.json")
+    examples = 0
+    with open(out / "sft.jsonl", "w") as sink:
+        for name in ("kept_grounded.jsonl", "retry.jsonl"):
+            for line in open(target / name):
+                sink.write(line)
+                examples += 1
+    return {"examples": examples, "retry_examples": report["retry_examples"],
+            "kept_grounded": (report.get("kept") or {}).get("examples"), "steps": report.get("steps"),
+            "search": report.get("search"), "confirm": report.get("confirm")}
 
 
 def sft_steps(plan, examples):
