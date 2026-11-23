@@ -457,7 +457,9 @@ def load_messages_jsonl(path) -> list[dict]:
     """Pre-built SFT examples, one ``{"messages", "tools"}`` object per line.
 
     Other keys (provenance such as ``star``) are dropped so every example has
-    the layout ``_format_sft_messages_record`` produces.
+    the layout ``_format_sft_messages_record`` produces. ``assistant_train``
+    (one flag per assistant message, retry examples) is kept: a False turn is
+    context, not a target (:func:`tokenize_with_turn_masks`).
     """
     import json
     examples = []
@@ -465,10 +467,70 @@ def load_messages_jsonl(path) -> list[dict]:
         for line in handle:
             if line.strip():
                 example = json.loads(line)
-                examples.append({key: example[key] for key in ("messages", "tools") if key in example})
+                examples.append({key: example[key] for key in ("messages", "tools", "assistant_train")
+                                 if key in example})
     if not examples:
         raise ValueError(f"No SFT examples in {path}")
     return examples
+
+
+def assistant_spans(mask: list[int]) -> list[tuple[int, int]]:
+    """``[start, end)`` of each run of ones in an assistant token mask."""
+    spans, start = [], None
+    for index, value in enumerate(mask):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            spans.append((start, index))
+            start = None
+    if start is not None:
+        spans.append((start, len(mask)))
+    return spans
+
+
+def tokenize_with_turn_masks(example: dict, tokenizer) -> dict:
+    """``input_ids`` and ``assistant_masks`` as SFTTrainer builds them, per-turn masks applied.
+
+    The chat template's generation markers give one run of ones per assistant
+    message. A message whose ``assistant_train`` flag is False keeps its tokens
+    in the input but leaves the loss. Examples without flags train every
+    assistant message, exactly as TRL's own tokenization does.
+    """
+    messages = example["messages"]
+    processed = tokenizer.apply_chat_template(
+        messages, return_dict=True, tokenize=True, return_assistant_tokens_mask=True,
+        tools=example.get("tools"),
+    )
+    ids = list(processed["input_ids"])
+    mask = list(processed["assistant_masks"])
+    flags = example.get("assistant_train")
+    if flags is not None:
+        spans = assistant_spans(mask)
+        count = sum(message.get("role") == "assistant" for message in messages)
+        if len(flags) != count or len(spans) != count:
+            raise ValueError(
+                f"assistant_train has {len(flags)} flags, the conversation {count} assistant "
+                f"messages and the template {len(spans)} assistant spans"
+            )
+        for (start, end), keep in zip(spans, flags):
+            if not keep:
+                mask[start:end] = [0] * (end - start)
+    if 1 not in mask:
+        raise ValueError("An SFT example has no trained assistant token")
+    return {"input_ids": ids, "assistant_masks": mask}
+
+
+def pretokenize_with_turn_masks(dataset, tokenizer) -> IterableDataset:
+    """The stream tokenized here, so per-turn masks reach SFTTrainer.
+
+    SFTTrainer skips its own tokenization for examples that already hold
+    ``input_ids`` and applies ``assistant_masks`` in its collator.
+    """
+    def generate():
+        for example in dataset:
+            yield tokenize_with_turn_masks(example, tokenizer)
+
+    return IterableDataset.from_generator(generate)
 
 
 def mix_in_examples(dataset, examples: list[dict], fraction: float, seed: int = 0) -> IterableDataset:

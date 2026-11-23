@@ -1299,10 +1299,13 @@ class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
                 # Totals over ranks (each rank runs the tool loop on its own slice).
                 agg_tool_reused_count = self.accelerator.gather(
                     torch.tensor(getattr(self, "_tool_reused_count", 0), device=device)).sum()
+                agg_tool_capped_count = self.accelerator.gather(
+                    torch.tensor(getattr(self, "_tool_capped_count", 0), device=device)).sum()
                 if agg_tool_call_count > 0:
                     self._metrics[mode]["tools/call_count"].append(agg_tool_call_count.item())
                     self._metrics[mode]["tools/failure_count"].append(agg_tool_failure_count.item())
                     self._metrics[mode]["tools/reused_count"].append(agg_tool_reused_count.item())
+                    self._metrics[mode]["tools/capped_count"].append(agg_tool_capped_count.item())
                     self._metrics[mode]["tools/failure_rate"].append(failure_frequency)
 
             generation_elapsed = time.perf_counter() - generation_start_time
@@ -1402,7 +1405,11 @@ class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
         else:
             max_model_len = getattr(self.model.config, 'max_position_embeddings', 4096)
 
-        from atpgllm.training.tools import ToolScheduler, abort_on_simulator_failure
+        from atpgllm.training.tools import (
+            ToolScheduler, abort_on_simulator_failure, max_tool_calls, may_call_again,
+        )
+        call_cap = max_tool_calls()
+        capped_calls = 0
         with ToolScheduler(self.tool_functions) as scheduler:
             while True:
                 # ==================================================================
@@ -1611,9 +1618,15 @@ class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
                 new_idxs_with_tool = []
                 new_tool_calls_filtered = []
                 for i, idx in enumerate(idxs_with_tool):
-                    if new_tool_calls[i] is not None:
-                        new_idxs_with_tool.append(idx)
-                        new_tool_calls_filtered.append(new_tool_calls[i])
+                    if new_tool_calls[i] is None:
+                        continue
+                    if not may_call_again(completions[idx], call_cap):
+                        # GRPO_MAX_TOOL_CALLS reached: the completion ends with
+                        # this call unexecuted (no final answer, so no detection).
+                        capped_calls += 1
+                        continue
+                    new_idxs_with_tool.append(idx)
+                    new_tool_calls_filtered.append(new_tool_calls[i])
 
                 idxs_with_tool = new_idxs_with_tool
                 tool_calls = new_tool_calls_filtered
@@ -1622,6 +1635,7 @@ class DualAdapterGRPOTrainer(BestOfNTrainingMixin, GenerationBatchLossMixin, GRP
         # Repeated calls answered from an earlier observation, not simulated.
         # The counts are this rank's; _generate logs them summed over ranks.
         self._tool_reused_count = scheduler.reused
+        self._tool_capped_count = capped_calls
 
         # Ensure tool_mask, logprobs, and completion_ids all have identical lengths per sequence.
         # Mismatches cause shape errors when these are padded into tensors downstream.

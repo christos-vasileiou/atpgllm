@@ -92,6 +92,34 @@ async def fault_simulation_tool_handler(input_vector, output_vector, fault, doc_
         raise
 
 
+def max_tool_calls():
+    """``GRPO_MAX_TOOL_CALLS``: executed tool calls allowed per GRPO completion.
+
+    Unset or 0 means no cap (the loop then stops only at the context limit).
+    A completion that asks for one more call after the cap ends there, with the
+    call unexecuted, as the evaluator's ``tool_round_limit`` does.
+    """
+    value = os.environ.get("GRPO_MAX_TOOL_CALLS", "").strip()
+    if not value:
+        return None
+    cap = int(value)
+    if cap < 0:
+        raise ValueError("GRPO_MAX_TOOL_CALLS must be zero (no cap) or positive")
+    return cap or None
+
+
+def executed_tool_calls(completion) -> int:
+    """Tool answers already appended to a completion (a message list)."""
+    if not isinstance(completion, list):
+        return 0
+    return sum(1 for message in completion if isinstance(message, dict) and message.get("role") == "tool")
+
+
+def may_call_again(completion, cap) -> bool:
+    """Whether a completion may have one more tool call executed under ``cap``."""
+    return cap is None or executed_tool_calls(completion) < cap
+
+
 def tool_deadline_s():
     return acquire_timeout_s() + per_run_timeout_s() + 20
 
