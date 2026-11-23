@@ -395,9 +395,46 @@ def build(r, n):
     report = read_json(out / "report.json")
     if report["sft_examples"] < plan["build"].get("min_examples", 1):
         raise RuntimeError(f"only {report['sft_examples']} SFT examples")
-    return {"sft_examples": report["sft_examples"], "by_level_and_mode": report["sft_examples_by_level_and_mode"],
-            "by_kind": report.get("sft_examples_by_kind"),
-            "dropped_over_max_model_len_by_kind": report.get("dropped_over_max_model_len_by_kind")}
+    summary = {"sft_examples": report["sft_examples"], "by_level_and_mode": report["sft_examples_by_level_and_mode"],
+               "by_kind": report.get("sft_examples_by_kind"),
+               "dropped_over_max_model_len_by_kind": report.get("dropped_over_max_model_len_by_kind")}
+    if plan["build"].get("retry"):
+        summary["retry"] = build_retry(r, n, plan["build"]["retry"])
+        summary["sft_examples"] = summary["retry"]["examples"]
+    return summary
+
+
+def build_retry(r, n, retry):
+    """Retry examples from this round's own failed calls, mixed into sft.jsonl.
+
+    scripts/retry/build_retry_sft.py takes the round's unhinted one-call
+    failures, finds fewest-flip repairs, simulates every call again through
+    GDPO's tool handler and writes conversations that read each answer and call
+    again until one detects (the failed call masked from the loss). The kept
+    single-call rows are rewritten without the two stock lines. sft.jsonl then
+    holds both; build_sft's own file stays as sft_single.jsonl.
+    """
+    out = r.path(f"round_{n}", "gen")
+    single = out / "sft_single.jsonl"
+    if not single.exists():
+        shutil.copyfile(out / "sft.jsonl", single)
+    target = out / "retry"
+    run(["bash", "scripts/rft/with_tetramax.sh", PYTHON, "scripts/retry/build_retry_sft.py",
+         "--slots", str(out / "slots*.jsonl"), "--kept", str(single), "--out", str(target),
+         "--per_level", retry.get("per_level", 600), "--max_per_problem", retry.get("max_per_problem", 2),
+         "--max_steps", retry.get("max_steps", 4), "--max_model_len", r.plan["sft"]["max_model_len"],
+         "--workers", retry.get("workers", 30), "--tool_workers", retry.get("tool_workers", 16)],
+        r.path("logs", f"round_{n}_retry.log"), env={"PYTHONPATH": str(REPO)})
+    report = read_json(target / "report.json")
+    examples = 0
+    with open(out / "sft.jsonl", "w") as sink:
+        for name in ("kept_grounded.jsonl", "retry.jsonl"):
+            for line in open(target / name):
+                sink.write(line)
+                examples += 1
+    return {"examples": examples, "retry_examples": report["retry_examples"],
+            "kept_grounded": (report.get("kept") or {}).get("examples"), "steps": report.get("steps"),
+            "search": report.get("search"), "confirm": report.get("confirm")}
 
 
 def sft_steps(plan, examples):
@@ -525,6 +562,41 @@ def latest_gdpo_step(out):
     return int(Path(found.stdout.strip().splitlines()[-1]).name.split("-")[1])
 
 
+def last_trained(r):
+    """``(round, adapter)`` of the last round whose SFT finished; ``(None, start adapter)`` before any.
+
+    Read from the finished ``round_<n>/sft`` stages, not from ``results``: a
+    round whose job ended between its SFT and its evaluation still trained.
+    """
+    done = r.state["done"]
+    trained = [int(name.split("/")[0].split("_")[1]) for name, value in done.items()
+               if name.startswith("round_") and name.endswith("/sft") and value.get("result")]
+    if not trained:
+        return None, r.plan["start_adapter"]
+    n = max(trained)
+    return n, done[f"round_{n}/sft"]["result"]
+
+
+def gdpo_from_last(r):
+    """GDPO from the last trained round, for chains that give RFT a fixed number of jobs.
+
+    The first launch ends the rounds and records where GDPO starts
+    (``state["gdpo_start"]``); a later launch resumes the GDPO already started.
+    """
+    start = r.state.get("gdpo_start")
+    if not start:
+        n, adapter = last_trained(r)
+        r.state.setdefault("rounds_stopped", f"{now()} GDPO started after round {n} (--gdpo_from_last)")
+        r.state["gdpo_start"] = start = {"round": n, "adapter": adapter, "at": now()}
+        r.save()
+        if n is None:
+            log(f"no RFT round finished its SFT; GDPO starts from the start adapter {adapter}")
+        else:
+            log(f"GDPO starts from the last trained round {n}: {adapter}")
+    r.stage("gdpo", gdpo, r, start["adapter"])
+    best_gdpo(r)
+
+
 def wait_while_held(r):
     """Rounds are over, and GDPO starts only when the plan's ``gdpo.hold`` is cleared."""
     announced = False
@@ -618,7 +690,13 @@ def main():
     parser.add_argument("--plan", default=str(REPO / "scripts/rft/configs/rft_v4_a100.json"))
     parser.add_argument("--run_dir", default=None, help="Overrides the plan's run_dir")
     parser.add_argument("--no_gdpo", action="store_true", help="Stop after choosing the best round")
+    parser.add_argument("--rounds_only", action="store_true",
+                        help="Run (or resume) the RFT rounds and exit without GDPO; the plan stays unfinished")
+    parser.add_argument("--gdpo_from_last", action="store_true",
+                        help="End the rounds and run GDPO from the last trained round, or resume the GDPO already started")
     args = parser.parse_args()
+    if args.rounds_only and args.gdpo_from_last:
+        parser.error("--rounds_only and --gdpo_from_last exclude each other")
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGHUP, on_signal)
     signal.signal(signal.SIGINT, on_signal)
@@ -627,7 +705,16 @@ def main():
     (r.path("driver.pid")).write_text(f"{os.getpid()}\n")
     log(f"driver pid {os.getpid()} in {r.dir}")
     try:
+        if args.gdpo_from_last:
+            gdpo_from_last(r)
+            r.state["finished"] = now()
+            r.save()
+            log("GDPO finished; the plan is complete")
+            return
         best = rounds(r)
+        if args.rounds_only:
+            log("rounds finished (--rounds_only); GDPO is left for a --gdpo_from_last launch")
+            return
         if args.no_gdpo or not r.plan.get("gdpo"):
             r.state["finished"] = now()
             r.save()

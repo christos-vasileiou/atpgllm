@@ -178,8 +178,12 @@ def test_schedule_starts_each_phase_from_the_one_before(tmp_path):
     assert run_schedule.phase_start(state, 1) == "/x/checkpoint-8/policy"
 
 
-def test_v5_configs_agree():
-    schedule = json.loads((REPO / "scripts/rft/configs/schedule_v5_juno_h100.json").read_text())
+SCHEDULES = ["scripts/rft/configs/schedule_v5_juno_h100.json", "scripts/rft/configs/schedule_v5_juno_h200.json"]
+
+
+@pytest.mark.parametrize("path", SCHEDULES)
+def test_v5_configs_agree(path):
+    schedule = json.loads((REPO / path).read_text())
     for phase in schedule["phases"]:
         plan = json.loads((REPO / phase["plan"]).read_text())
         assert plan["sample"]["max_prompt_length"] == V5_PROMPT_WINDOW
@@ -195,8 +199,41 @@ def test_v5_configs_agree():
     assert "SFT_CIRCUIT_VALIDATION=True" in warm and "MAX_PROMPT_LENGTH=14336" in warm
 
 
-def test_gdpo_phases_read_different_prompts():
-    schedule = json.loads((REPO / "scripts/rft/configs/schedule_v5_juno_h100.json").read_text())
+def _conf_int(text, key):
+    import re
+
+    return int(re.search(rf"^{key}=(?:\$\{{{key}:-)?(\d+)", text, re.M).group(1))
+
+
+def test_the_h200_schedule_keeps_the_step_sizes_of_the_h100_schedule():
+    """Two GPUs in place of four: a step must hold the same conversations
+    (SFT) and the same completions (GDPO: accumulation times trainer ranks,
+    where the vLLM server takes TP x DP of the node's GPUs)."""
+    sizes = []
+    for path in SCHEDULES:
+        schedule = json.loads((REPO / path).read_text())
+        warm = (REPO / schedule["warmup"]["conf"]).read_text()
+        assert _conf_int(warm, "GPUS_PER_NODE") == len(schedule["gpus"])
+        row = [_conf_int(warm, "GPUS_PER_NODE") * _conf_int(warm, "GRADIENT_ACCUMULATION_STEPS")]
+        for phase in schedule["phases"]:
+            plan = json.loads((REPO / phase["plan"]).read_text())
+            assert plan["gpus"] == schedule["gpus"] and plan["sft"]["gpus"] == len(plan["gpus"])
+            sft = (REPO / plan["sft"]["conf"]).read_text()
+            assert _conf_int(sft, "GPUS_PER_NODE") == plan["sft"]["gpus"]
+            assert _conf_int(sft, "GRADIENT_ACCUMULATION_STEPS") == plan["sft"]["gradient_accumulation_steps"]
+            row.append(plan["sft"]["gpus"] * plan["sft"]["gradient_accumulation_steps"])
+            gdpo = (REPO / plan["gdpo"]["conf"]).read_text()
+            trainers = _conf_int(gdpo, "GPUS_PER_NODE") - _conf_int(gdpo, "TENSOR_PARALLEL_SIZE") * _conf_int(gdpo, "DATA_PARALLEL_SIZE")
+            assert trainers >= 1 and _conf_int(gdpo, "GPUS_PER_NODE") == len(plan["gpus"])
+            assert _conf_int(gdpo, "STEPS_PER_GENERATION") == _conf_int(gdpo, "GRADIENT_ACCUMULATION_STEPS")
+            row.append(trainers * _conf_int(gdpo, "GRADIENT_ACCUMULATION_STEPS"))
+        sizes.append(row)
+    assert sizes[0] == sizes[1] == [1024, 1024, 1152, 1024, 1152]
+
+
+@pytest.mark.parametrize("path", SCHEDULES)
+def test_gdpo_phases_read_different_prompts(path):
+    schedule = json.loads((REPO / path).read_text())
     seeds = [json.loads((REPO / p["plan"]).read_text())["gdpo"].get("env", {}).get("GRPO_BUFFER_SEED", 42)
              for p in schedule["phases"]]
     assert len(set(seeds)) == len(seeds)
@@ -256,3 +293,60 @@ def test_read_rows_picks_rows_across_row_groups(tmp_path):
     pq.write_table(pa.table({"i": list(range(25)), "s": [f"x{i}" * 3 for i in range(25)]}), path, row_group_size=4)
     rows = read_rows(path, [24, 0, 5, 5, 13])
     assert [r["i"] for r in rows] == [24, 0, 5, 5, 13] and rows[2]["s"] == "x5x5x5"
+
+
+def test_gdpo_from_last_starts_from_the_last_trained_round(tmp_path, monkeypatch):
+    run_rft = load("run_rft", "scripts/rft/run_rft.py")
+    plan = {"run_dir": str(tmp_path / "run"), "start_adapter": "/warm/checkpoint-100", "gdpo": {"output_dir": "x"}}
+    (tmp_path / "plan.json").write_text(json.dumps(plan))
+    r = run_rft.Run(tmp_path / "plan.json")
+    assert run_rft.last_trained(r) == (None, "/warm/checkpoint-100")
+    # Round 2 trained but its job ended before the evaluation; round 3 only sampled.
+    r.state["done"].update({"round_1/sft": {"result": "/r1/checkpoint-10"}, "round_1/evaluate": {"result": {}},
+                            "round_2/sft": {"result": "/r2/checkpoint-10"}, "round_3/generate": {"result": "g"}})
+    assert run_rft.last_trained(r) == (2, "/r2/checkpoint-10")
+    seen = []
+    monkeypatch.setattr(run_rft, "gdpo", lambda r, adapter: seen.append(adapter) or "out")
+    monkeypatch.setattr(run_rft, "best_gdpo", lambda r: None)
+    run_rft.gdpo_from_last(r)
+    assert seen == ["/r2/checkpoint-10"] and r.state["gdpo_start"]["round"] == 2 and r.state["rounds_stopped"]
+    # A later launch resumes the same GDPO even when more rounds appear in the state.
+    r.state["done"].pop("gdpo")
+    r.state["done"]["round_3/sft"] = {"result": "/r3/checkpoint-10"}
+    run_rft.gdpo_from_last(r)
+    assert seen == ["/r2/checkpoint-10", "/r2/checkpoint-10"]
+
+
+@pytest.mark.parametrize("stage, flag", [("rft", "--rounds_only"), ("gdpo", "--gdpo_from_last")])
+def test_schedule_only_runs_one_stage_of_the_first_phase(tmp_path, monkeypatch, stage, flag):
+    load("run_rft", "scripts/rft/run_rft.py")
+    run_schedule = load("run_schedule", "scripts/rft/run_schedule.py")
+    plan = tmp_path / "phase.json"
+    plan.write_text(json.dumps({"run_dir": "unused", "sft": {}}))
+    schedule = {"run_dir": str(tmp_path / "run"), "warmup": {"conf": "w.conf", "output_dir": "w", "max_steps": 100},
+                "phases": [{"name": "phase_1", "plan": str(plan)}, {"name": "phase_2", "plan": str(plan)}]}
+    run_dir = tmp_path / "run"
+    (run_dir / "logs").mkdir(parents=True)
+    seen = []
+    monkeypatch.setattr(run_schedule, "run", lambda cmd, log, env=None: seen.append([str(c) for c in cmd]))
+    monkeypatch.setattr(run_schedule, "warmup", lambda schedule, run_dir: "/warm/checkpoint-100")
+    state = {} if stage == "rft" else {"warmup": "/warm/checkpoint-100"}
+    run_schedule.run_only(schedule, run_dir, state, stage)
+    if stage == "rft":   # the warm-up is finished first when an earlier job ran out of time
+        assert state["warmup"] == "/warm/checkpoint-100"
+    assert len(seen) == 1 and seen[0][-1] == flag and seen[0][-2].endswith("phase_1")
+    written = json.loads((run_dir / "phase_1" / "plan.source.json").read_text())
+    assert written["start_adapter"] == "/warm/checkpoint-100" and "phase_2" not in state.get("phases", {})
+
+
+def test_schedule_only_warmup_stops_after_the_warmup(tmp_path, monkeypatch):
+    load("run_rft", "scripts/rft/run_rft.py")
+    run_schedule = load("run_schedule", "scripts/rft/run_schedule.py")
+    seen = []
+    monkeypatch.setattr(run_schedule, "run", lambda *a, **k: seen.append(a))
+    monkeypatch.setattr(run_schedule, "warmup", lambda schedule, run_dir: "/warm/checkpoint-100")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    state = {}
+    run_schedule.run_only({"phases": []}, run_dir, state, "warmup")
+    assert state == {"warmup": "/warm/checkpoint-100"} and not seen

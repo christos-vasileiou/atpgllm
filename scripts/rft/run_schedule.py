@@ -83,14 +83,14 @@ def handover(previous):
             "skip_from": results[str(max(trained))]["adapter"] if trained else None}
 
 
-def run_phase(schedule, run_dir, state, index):
+def prepare_phase(schedule, run_dir, state, index):
+    """Write the phase's plan (once) and record it in the schedule state.
+    Returns ``(name, phase directory, plan path, record)``."""
     phase = schedule["phases"][index]
     name = phase.get("name", f"phase_{index + 1}")
     phase_dir = run_dir / name
     phase_dir.mkdir(parents=True, exist_ok=True)
     recorded = state.setdefault("phases", {}).get(str(index))
-    if recorded and recorded.get("finished"):
-        return recorded
     start = recorded["start_adapter"] if recorded else phase_start(state, index)
     source = phase_dir / "plan.source.json"
     if not source.exists():
@@ -102,21 +102,66 @@ def run_phase(schedule, run_dir, state, index):
         write_json(source, plan)
     state["phases"][str(index)] = recorded = {"name": name, "run_dir": str(phase_dir), "start_adapter": start}
     write_json(run_dir / "state.json", state)
-    log(f"{name}: RFT rounds then GDPO from {start}")
+    return name, phase_dir, source, recorded
+
+
+def record_finished(run_dir, state, recorded, phase_dir):
+    phase_state = read_json(phase_dir / "state.json", {})
+    recorded.update({"finished": phase_state["finished"], "best_round": phase_state.get("best"),
+                     "gdpo_best": phase_state.get("gdpo_best"), "gdpo_start": phase_state.get("gdpo_start")})
+    write_json(run_dir / "state.json", state)
+
+
+def run_phase(schedule, run_dir, state, index):
+    recorded = state.setdefault("phases", {}).get(str(index))
+    if recorded and recorded.get("finished"):
+        return recorded
+    name, phase_dir, source, recorded = prepare_phase(schedule, run_dir, state, index)
+    log(f"{name}: RFT rounds then GDPO from {recorded['start_adapter']}")
     run([PYTHON, "scripts/rft/run_rft.py", "--plan", source, "--run_dir", phase_dir],
         run_dir / "logs" / f"{name}_driver.log")
-    phase_state = read_json(phase_dir / "state.json", {})
-    if not phase_state.get("finished"):
+    if not read_json(phase_dir / "state.json", {}).get("finished"):
         raise RuntimeError(f"{name} stopped before finishing (see {phase_dir}/state.json)")
-    recorded.update({"finished": phase_state["finished"], "best_round": phase_state.get("best"),
-                     "gdpo_best": phase_state.get("gdpo_best")})
-    write_json(run_dir / "state.json", state)
+    record_finished(run_dir, state, recorded, phase_dir)
     return recorded
+
+
+def run_only(schedule, run_dir, state, stage):
+    """One stage of the first phase, for a chain that gives each stage a fixed
+    number of jobs (each job runs this script with ``--only`` and resumes):
+
+    * ``warmup``: the warm-up SFT.
+    * ``rft``: the RFT rounds of the first phase, finishing the warm-up first if
+      an earlier job ran out of time. The rounds resume where they stopped.
+    * ``gdpo``: GDPO of the first phase from its last trained round (not the
+      best one), or the GDPO already started, resumed from its latest checkpoint.
+    """
+    if stage in ("warmup", "rft") and "warmup" not in state:
+        state["warmup"] = warmup(schedule, run_dir)
+        write_json(run_dir / "state.json", state)
+    if stage == "warmup":
+        log(f"warm-up done: {state['warmup']}")
+        return
+    if "warmup" not in state:
+        raise RuntimeError("GDPO needs the warm-up and the RFT rounds first (state.json has no warm-up)")
+    recorded = state.setdefault("phases", {}).get("0")
+    if recorded and recorded.get("finished"):
+        log(f"{recorded['name']} already finished at {recorded['finished']}")
+        return
+    name, phase_dir, source, recorded = prepare_phase(schedule, run_dir, state, 0)
+    flag = "--rounds_only" if stage == "rft" else "--gdpo_from_last"
+    log(f"{name}: {stage} only ({flag}), phase start {recorded['start_adapter']}")
+    run([PYTHON, "scripts/rft/run_rft.py", "--plan", source, "--run_dir", phase_dir, flag],
+        run_dir / "logs" / f"{name}_driver.log")
+    if stage == "gdpo" and read_json(phase_dir / "state.json", {}).get("finished"):
+        record_finished(run_dir, state, recorded, phase_dir)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--schedule", required=True)
+    parser.add_argument("--only", choices=("warmup", "rft", "gdpo"),
+                        help="Run one stage of the first phase and exit (see run_only)")
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, run_rft.on_signal)
     signal.signal(signal.SIGHUP, run_rft.on_signal)
@@ -131,6 +176,9 @@ def main():
     state = read_json(run_dir / "state.json", {})
     state.setdefault("started", time.time())
     (run_dir / "schedule.pid").write_text(f"{os.getpid()}\n")
+    if args.only:
+        run_only(schedule, run_dir, state, args.only)
+        return
     if "warmup" not in state:
         state["warmup"] = warmup(schedule, run_dir)
         write_json(run_dir / "state.json", state)

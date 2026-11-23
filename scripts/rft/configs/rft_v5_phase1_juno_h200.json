@@ -1,0 +1,78 @@
+{
+ "_comment": "Phase 1 of the v5 schedule (scripts/rft/run_schedule.py, schedule_v5_juno_h200.json) on one juno h200 node (2x H200 141GB): RFT rounds with STaR rationalization until val has not risen above the best round for 3 rounds, then GDPO from the best round. start_adapter and run_dir are filled in by the schedule (phase 1: the warm-up SFT; phase 2: the best benchmarked GDPO checkpoint of phase 1). v5 settings: problems are selected per circuit kind and level (kind_shares), prompts up to 14,336 tokens, validation and benchmark split evenly between kinds, rounds ranked by the mean over kind x level. Two GPUs in place of four: an SFT step keeps its 1,024 conversations (2 ranks x 512), and sampling gets twice the hours so a round holds as many problems as planned for the h100 node.",
+ "run_dir": "runs/v5_schedule/phase_1",
+ "start_adapter": null,
+ "dataset": "../data/freeset/dataset.freeset.asap7sc7p5t_28.rvt.tt.v5",
+ "gpus": [
+  0,
+  1
+ ],
+ "seed": 2026,
+ "rounds": 100,
+ "patience": 3,
+ "deadline_hours": 720,
+ "round_hours_estimate": 44,
+ "max_failures": 3,
+ "per_level": "easy=1000,medium=1500,hard=2000,very_hard=2000,random_never_detects=2000",
+ "kind_shares": "combinational=0.5,sequential=0.5",
+ "sample": {
+  "num_samples": 8,
+  "hint_modes": "none,path,partial",
+  "temperature": 1.0,
+  "max_tool_rounds": 8,
+  "max_prompt_length": 14336,
+  "max_model_len": 32768,
+  "max_generated_tokens": 16384,
+  "batch_problems": 64,
+  "max_hours": 20
+ },
+ "build": {
+  "max_per_problem": 2,
+  "min_examples": 50,
+  "retry": {
+   "per_level": 600,
+   "max_per_problem": 2,
+   "max_steps": 4,
+   "workers": 30,
+   "tool_workers": 16
+  }
+ },
+ "sft": {
+  "conf": "scripts/train/configs/sft_granite_4.2_8b_v5_rft_juno_h200.conf",
+  "gpus": 2,
+  "gradient_accumulation_steps": 512,
+  "epochs": 2,
+  "extra_fraction": 0.5,
+  "learning_rate": 2e-05,
+  "min_steps": 10,
+  "max_steps": 10,
+  "max_model_len": 24576,
+  "circuit_validation": true
+ },
+ "eval": {
+  "val_per_level": "easy=60,medium=60,hard=60,very_hard=60,random_never_detects=60",
+  "val_kind_shares": "combinational=0.5,sequential=0.5",
+  "max_tool_rounds": 8,
+  "references": {},
+  "bench": {
+   "manifest": "runs/v5_schedule/eval/v5_bench_manifest.json",
+   "from_round": 1,
+   "num_samples": 16,
+   "temperature": 0.7,
+   "top_p": 0.95,
+   "max_tool_rounds": 8,
+   "max_generated_tokens": 16384,
+   "reward_profile": "staged"
+  }
+ },
+ "gdpo": {
+  "conf": "scripts/train/configs/grpo_granite_4.2_8b_v5_juno_h200_tetramax_after_rft.conf",
+  "output_dir": "runs/v5_schedule/phase_1_gdpo",
+  "hold": false,
+  "eval_every": 2,
+  "max_steps": 40,
+  "env": {
+   "GRPO_BUFFER_SEED": 42
+  }
+ }
+}

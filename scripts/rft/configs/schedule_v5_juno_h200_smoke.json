@@ -1,0 +1,18 @@
+{
+ "_comment": "Smoke of the h200 move: two warm-up SFT steps on one h200 node through the real launcher, no RFT phase. Shows that the two-GPU layout starts, fits the 24,576 token context and how long a step of 1,024 conversations takes.",
+ "run_dir": "runs/v5_h200_smoke",
+ "gpus": [
+  0,
+  1
+ ],
+ "warmup": {
+  "conf": "scripts/train/configs/sft_granite_4.2_8b_v5_warmup_juno_h200.conf",
+  "output_dir": "runs/v5_h200_smoke/warmup_sft",
+  "max_steps": 2,
+  "env": {
+   "WANDB_RUN_GROUP": "v5_h200_smoke",
+   "WANDB_NAME": "v5_h200_smoke/warmup_sft"
+  }
+ },
+ "phases": []
+}
