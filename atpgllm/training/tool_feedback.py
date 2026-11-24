@@ -85,6 +85,46 @@ def _bit(value: Any) -> Optional[str]:
     return text if text in ("0", "1") else None
 
 
+def _flag(name: str) -> bool:
+    import os
+
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def read_outputs_enabled() -> bool:
+    """``SFT_READ_OUTPUTS``: a reading lists every primary output's Good/Bad values first.
+
+    The retry SFT of 2026-11-23 left the detect-or-miss choice to one token
+    after the tool answer, and the model never learned to make it from the
+    answer (teacher-forced AUC 0.63, juno 530313). Copying each output's two
+    values first turns the verdict into a local comparison of what was just
+    written.
+    """
+    return _flag("SFT_READ_OUTPUTS")
+
+
+def output_pairs(snapshot: str | Mapping[str, Any], output_nets: Sequence[str]) -> str:
+    """``Primary outputs, Good/Bad: y[0] 0/0, y[1] 1/0.`` in the given output order (x unknown)."""
+    good, bad = _machines(snapshot)
+
+    def shown(value: Any) -> str:
+        bit = _bit(value)
+        return bit if bit is not None else "x"
+
+    pairs = [f"{net} {shown(good.get(net))}/{shown(bad.get(net))}" for net in output_nets]
+    return "Primary outputs, Good/Bad: " + ", ".join(pairs) + "."
+
+
+def with_outputs(sentence: str, snapshot: str | Mapping[str, Any] | None,
+                 output_nets: Sequence[str], enabled: Optional[bool] = None) -> str:
+    """``sentence`` after the output pairs when ``SFT_READ_OUTPUTS`` is on, else unchanged."""
+    if enabled is None:
+        enabled = read_outputs_enabled()
+    if not enabled or snapshot is None or not output_nets:
+        return sentence
+    return output_pairs(snapshot, output_nets) + " " + sentence
+
+
 def parse_fault(fault: str) -> Tuple[int, str]:
     match = FAULT_PATTERN.match(fault.strip())
     if not match:

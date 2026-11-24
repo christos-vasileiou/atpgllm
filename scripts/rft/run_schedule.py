@@ -18,6 +18,13 @@ The schedule writes each phase's plan to ``<run_dir>/<phase>/plan.source.json``
 with ``start_adapter`` and ``run_dir`` filled in, and runs ``run_rft.py`` on it,
 so every phase has its own state, markers and logs and resumes on its own.
 A rerun skips finished steps; ``state.json`` records what each one produced.
+
+Optional keys: ``env`` is exported before anything runs, so the driver, the
+data builds it starts and every training stage see the same settings (the
+v5r run's SFT_READ_OUTPUTS and SFT_PLAN_THINK). ``wandb_project`` starts the
+RFT mirror (``wandb_log.py``) for each phase while it runs, so round
+evaluations, benchmarks and GDPO evaluations land in that project next to the
+training runs, whose configs name the same project.
 """
 from __future__ import annotations
 
@@ -112,11 +119,31 @@ def record_finished(run_dir, state, recorded, phase_dir):
     write_json(run_dir / "state.json", state)
 
 
+def start_mirror(schedule, phase_dir):
+    """The W&B mirror of one phase, in the background (``wandb_project``); None without one.
+
+    It syncs every 15 minutes and stops by itself when the phase finishes; a
+    job that ends kills it with the rest of the job, and the next job starts it again.
+    """
+    project = schedule.get("wandb_project")
+    if not project:
+        return None
+    import subprocess
+    phase_dir = Path(phase_dir)
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    (phase_dir / "logs").mkdir(exist_ok=True)
+    log_file = open(phase_dir / "logs" / "wandb_log.log", "a")
+    return subprocess.Popen([PYTHON, "scripts/rft/wandb_log.py", "--run_dir", str(phase_dir),
+                             "--project", project, "--every", "900"],
+                            cwd=REPO, stdout=log_file, stderr=subprocess.STDOUT)
+
+
 def run_phase(schedule, run_dir, state, index):
     recorded = state.setdefault("phases", {}).get(str(index))
     if recorded and recorded.get("finished"):
         return recorded
     name, phase_dir, source, recorded = prepare_phase(schedule, run_dir, state, index)
+    start_mirror(schedule, phase_dir)
     log(f"{name}: RFT rounds then GDPO from {recorded['start_adapter']}")
     run([PYTHON, "scripts/rft/run_rft.py", "--plan", source, "--run_dir", phase_dir],
         run_dir / "logs" / f"{name}_driver.log")
@@ -149,6 +176,7 @@ def run_only(schedule, run_dir, state, stage):
         log(f"{recorded['name']} already finished at {recorded['finished']}")
         return
     name, phase_dir, source, recorded = prepare_phase(schedule, run_dir, state, 0)
+    start_mirror(schedule, phase_dir)
     flag = "--rounds_only" if stage == "rft" else "--gdpo_from_last"
     log(f"{name}: {stage} only ({flag}), phase start {recorded['start_adapter']}")
     run([PYTHON, "scripts/rft/run_rft.py", "--plan", source, "--run_dir", phase_dir, flag],
@@ -173,6 +201,7 @@ def main():
     if not (run_dir / "schedule.json").exists():
         write_json(run_dir / "schedule.json", schedule)
     schedule = read_json(run_dir / "schedule.json")  # the run's copy, editable while it goes on
+    os.environ.update({key: str(value) for key, value in (schedule.get("env") or {}).items()})
     state = read_json(run_dir / "state.json", {})
     state.setdefault("started", time.time())
     (run_dir / "schedule.pid").write_text(f"{os.getpid()}\n")

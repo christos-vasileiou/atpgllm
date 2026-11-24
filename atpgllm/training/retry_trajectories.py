@@ -31,6 +31,7 @@ from atpgllm.training.tool_feedback import (
     read_snapshot,
     repair_sentence,
     undetected_sentence,
+    with_outputs,
 )
 
 TOOL_NAME = "fault_simulation_tool"
@@ -129,9 +130,14 @@ def unblocked_sides(blockers: Sequence[Tuple[str, str, str, Optional[str]]],
     return changed
 
 
-def retry_think(reading: SimulationReading, blockers, changes, next_snapshot: str) -> str:
-    """Reasoning for the call after an undetected answer."""
-    parts = [undetected_sentence(reading)]
+def retry_think(reading: SimulationReading, blockers, changes, next_snapshot: str,
+                snapshot: Optional[str] = None, output_nets: Sequence[str] = ()) -> str:
+    """Reasoning for the call after an undetected answer.
+
+    ``snapshot`` is the undetected answer itself: with ``SFT_READ_OUTPUTS`` the
+    reading lists its output pairs before the verdict.
+    """
+    parts = [with_outputs(undetected_sentence(reading), snapshot, output_nets)]
     if reading.activated and blockers:
         parts.append(blocked_detail(blockers))
     unblocked = (unblocked_sides(blockers, next_snapshot, [net for net, _ in changes])
@@ -145,8 +151,8 @@ def final_message(reading: SimulationReading, vector: Dict[str, Any], snapshot: 
     good = json.loads(snapshot)["Good Machine"]
     return {
         "role": "assistant",
-        "content": ("<think>\n" + detected_sentence(reading) + "\n</think>\n\n"
-                    + answer_text(vector, good, output_nets, fault)),
+        "content": ("<think>\n" + with_outputs(detected_sentence(reading), snapshot, output_nets)
+                    + "\n</think>\n\n" + answer_text(vector, good, output_nets, fault)),
     }
 
 
@@ -180,8 +186,11 @@ def retry_example_from_context(prompt_messages: List[Dict[str, Any]],
     for call, snapshot in context:
         messages += [deepcopy(call), tool_message(snapshot)]
     train = [False] * len(context)
+    previous = context[-1][1] if context else None
     for step in steps:
-        think = retry_think(step["prev_reading"], step["prev_blockers"], step["changes"], step["snapshot"])
+        think = retry_think(step["prev_reading"], step["prev_blockers"], step["changes"], step["snapshot"],
+                            snapshot=previous, output_nets=output_nets)
+        previous = step["snapshot"]
         messages.append(call_message(think, step["vector"], outputs_of(step["snapshot"], output_nets),
                                      fault, doc_id))
         messages.append(tool_message(step["snapshot"]))
@@ -226,7 +235,7 @@ def ground_example(example: Dict[str, Any], fault: str,
     reading = read_snapshot(tools[-1]["content"], fault, output_nets)
     if not reading.detected:
         return None
-    lead = detected_sentence(reading)
+    lead = with_outputs(detected_sentence(reading), tools[-1]["content"], output_nets)
     for message in messages:
         if message["role"] != "assistant":
             continue

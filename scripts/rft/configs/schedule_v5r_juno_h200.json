@@ -1,0 +1,26 @@
+{
+ "_comment": "v5r schedule (user goal 2026-11-24): warm-up SFT with retry rows from step 1 -> RFT rounds -> GDPO, one juno h200 node (2x H200), chained 2-day jobs (scripts/rft/submit_juno_stages.sh). Warm-up: 100 steps of 1,024 conversations from base Granite, half of each step retry rows. Round 0 of phase 1 evaluates the warm-up: detection within 8 calls and reading of the tool answers (gate_report scalars). Everything reports to W&B project atpg-v5-retry.",
+ "run_dir": "runs/v5r_schedule",
+ "gpus": [
+  0,
+  1
+ ],
+ "env": {
+  "SFT_GROUNDED_TEXT": "1",
+  "SFT_READ_OUTPUTS": "1",
+  "SFT_PLAN_THINK": "1",
+  "WANDB_RUN_GROUP": "v5r_schedule"
+ },
+ "wandb_project": "atpg-v5-retry",
+ "warmup": {
+  "conf": "scripts/train/configs/sft_granite_4.2_8b_v5r_warmup_juno_h200.conf",
+  "output_dir": "runs/v5r_schedule/warmup_sft",
+  "max_steps": 100
+ },
+ "phases": [
+  {
+   "name": "phase_1",
+   "plan": "scripts/rft/configs/rft_v5r_phase1_juno_h200.json"
+  }
+ ]
+}

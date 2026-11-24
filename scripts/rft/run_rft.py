@@ -277,6 +277,14 @@ def evaluate_model(r, tag, adapter):
         result["val"] = val["kind_level_mean_detection"]
         result["val_level_mean"] = val["level_mean_detection"]
         result["val_by_kind"] = {k: v["level_mean_detection"] for k, v in val["by_kind"].items()}
+    if plan["eval"].get("reading"):
+        # Does the model read the tool answer and call again after a miss? Same slots, CPU only.
+        try:
+            sys.path.insert(0, str(REPO / "scripts" / "retry"))
+            from gate_report import scalars
+            result["reading"] = scalars(r.path(tag, "eval_val"), int(plan["eval"]["max_tool_rounds"]))
+        except Exception as exc:  # a report failure never stops the rounds
+            log(f"{tag}: reading metrics failed: {exc!r}")
     return result
 
 
@@ -577,6 +585,40 @@ def last_trained(r):
     return n, done[f"round_{n}/sft"]["result"]
 
 
+def gdpo_gate(r, n, adapter):
+    """GDPO starts only from a round that reads the tool answer and calls again (``gdpo.gate``).
+
+    v4 GDPO 521449 (2026-11-23) sharpened a model that never made a second
+    call and stayed flat. ``gate`` maps reading metrics of the start round's
+    evaluation (``result["reading"]``, gate_report scalars) to the lowest value
+    each must reach, e.g. ``{"retry_after_miss": 0.5, "reading_miss_recall": 0.5}``.
+    The round is evaluated first when its job ended before its evaluation. A
+    missing metric fails. On a failure the driver records ``gdpo_blocked`` and
+    exits 3, so a chained GDPO job ends at once instead of training.
+    """
+    gate = (r.plan.get("gdpo") or {}).get("gate")
+    if not gate:
+        return
+    results = r.state.setdefault("results", {})
+    key = "0" if n is None else str(n)
+    if key not in results:
+        results[key] = r.stage(f"round_{key}/evaluate", evaluate_model, r, f"round_{key}", adapter)
+        r.save()
+    reading = results[key].get("reading") or {}
+    checks = {name: {"value": reading.get(name), "min": low,
+                     "ok": reading.get(name) is not None and reading.get(name) >= low}
+              for name, low in gate.items()}
+    if all(c["ok"] for c in checks.values()):
+        log(f"GDPO gate passed on round {key}: {checks}")
+        r.state.pop("gdpo_blocked", None)
+        r.save()
+        return
+    r.state["gdpo_blocked"] = {"round": key, "adapter": str(adapter), "checks": checks, "at": now()}
+    r.save()
+    log(f"GDPO gate FAILED on round {key}: {checks}; GDPO does not start")
+    raise SystemExit(3)
+
+
 def gdpo_from_last(r):
     """GDPO from the last trained round, for chains that give RFT a fixed number of jobs.
 
@@ -586,6 +628,7 @@ def gdpo_from_last(r):
     start = r.state.get("gdpo_start")
     if not start:
         n, adapter = last_trained(r)
+        gdpo_gate(r, n, adapter)
         r.state.setdefault("rounds_stopped", f"{now()} GDPO started after round {n} (--gdpo_from_last)")
         r.state["gdpo_start"] = start = {"round": n, "adapter": adapter, "at": now()}
         r.save()
@@ -720,6 +763,8 @@ def main():
             r.save()
             return
         wait_while_held(r)
+        if "gdpo" not in r.state["done"]:
+            gdpo_gate(r, (r.state.get("best") or {}).get("round"), best)
         r.stage("gdpo", gdpo, r, best)
         best_gdpo(r)
         r.state["finished"] = now()

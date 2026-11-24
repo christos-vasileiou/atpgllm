@@ -43,6 +43,22 @@ sys.path.insert(0, str(REPO))
 
 CLAIM_RE = re.compile(r"has been sensitized|differ at \d+ primary output|The pattern detects|is detected",
                       re.IGNORECASE)
+# A reading turn that says the call missed (checked before CLAIM_RE).
+MISS_RE = re.compile(r"agree on every primary output|No primary output has a 0|does not detect|do not differ|"
+                     r"are identical|has no effect|is not detected", re.IGNORECASE)
+
+
+def reading_claims(messages):
+    """What the turn after each tool answer says: 'detected', 'miss' or None, in call order."""
+    claims = []
+    for i, message in enumerate(messages):
+        if message.get("role") != "tool":
+            continue
+        following = next((m for m in messages[i + 1:] if m.get("role") == "assistant"), None)
+        text = (following or {}).get("content") or ""
+        head = text.split("To sum up", 1)[0]
+        claims.append("miss" if MISS_RE.search(head) else "detected" if CLAIM_RE.search(head) else None)
+    return claims
 
 
 def _vector(observation):
@@ -87,7 +103,9 @@ def slot_facts(slot, fault):
     final = slot.get("final_answer") or ""
     answer = (slot.get("reward_components") or {}).get("detection", 0) >= 1
     first_hit = next((i for i, d in enumerate(detected) if d), None)
+    claims = reading_claims(slot.get("messages") or [])
     return {
+        "readings": [(claim, "detected" if truth else "miss") for claim, truth in zip(claims, detected)],
         "calls": len(observations), "detected": detected, "answer": answer,
         "first_call": bool(detected[:1] and detected[0]),
         "duplicates": sum(v in vectors[:i] for i, v in enumerate(vectors) if i > 0),
@@ -103,7 +121,14 @@ def faults_of(manifest):
     return {e["_fixed_eval_id"]: e["fault"] for e in data["examples"]}
 
 
-def load(run, faults):
+def fault_of(example_id, faults=None):
+    """The fault of a slot: from the manifest, else the last field of an RFT problem id."""
+    if faults and example_id in faults:
+        return faults[example_id]
+    return str(example_id).rsplit("|", 1)[-1] if "|" in str(example_id) else None
+
+
+def load(run, faults=None):
     slots = {}
     for path in sorted(glob.glob(str(Path(run) / "slots*.jsonl"))):
         for line in open(path):
@@ -111,10 +136,11 @@ def load(run, faults):
                 slot = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            fault = faults.get(slot["example_id"])
+            fault = fault_of(slot["example_id"], faults)
             if fault is None:
                 continue
-            slots[slot["example_id"]] = (slot["level"], slot_facts(slot, fault))
+            key = (slot["example_id"], slot.get("completion_slot", 0))
+            slots[key if key[1] else slot["example_id"]] = (slot["level"], slot_facts(slot, fault))
     return slots
 
 
@@ -128,8 +154,17 @@ def summary(facts, max_k):
     hits = [f for f in facts if f["first_hit"] is not None]
     wrong = [f for f in facts if not f["answer"]]
     later = sum(f["later_calls"] for f in facts)
+    readings = [pair for f in facts for pair in f.get("readings", [])]
+    misses_read = [claim for claim, truth in readings if truth == "miss"]
+    detects_read = [claim for claim, truth in readings if truth == "detected"]
     return {
         "n": n,
+        # Reading the tool answer: every turn after a tool answer, its verdict against the snapshot.
+        "readings": len(readings),
+        "reading_accuracy": sum(c == t for c, t in readings) / len(readings) if readings else None,
+        "reading_miss_recall": sum(c == "miss" for c in misses_read) / len(misses_read) if misses_read else None,
+        "reading_detect_recall": (sum(c == "detected" for c in detects_read) / len(detects_read)
+                                  if detects_read else None),
         "first_call": sum(f["first_call"] for f in facts) / n,
         "within_k": {k: sum(any(f["detected"][:k]) for f in facts) / n for k in range(1, max_k + 1)},
         "answer": sum(f["answer"] for f in facts) / n,
@@ -193,13 +228,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run")
     parser.add_argument("--baseline")
-    parser.add_argument("--manifest", required=True, help="fixed_eval_manifest.json used by both runs")
+    parser.add_argument("--manifest", help="fixed_eval_manifest.json used by both runs (RFT evaluation slots "
+                        "carry the fault in their id and need none)")
     parser.add_argument("--max_k", type=int, default=8)
     parser.add_argument("--out")
     parser.add_argument("--require", action="store_true",
                         help="Exit 1 unless the run passes the bar against --baseline")
     args = parser.parse_args()
-    faults = faults_of(args.manifest)
+    faults = faults_of(args.manifest) if args.manifest else None
     run = load(args.run, faults)
     result = {"run": str(args.run), "report": report(run, args.max_k)}
     if args.baseline:
@@ -219,6 +255,32 @@ def main():
         if "gate" not in result:
             parser.error("--require needs --baseline")
         sys.exit(0 if result["gate"]["passed"] else 1)
+
+
+def scalars(run, max_k=8):
+    """Flat reading, retry and detection metrics of one evaluation directory, for W&B and state.json."""
+    full = report(load(run), max_k)
+    keys = ("reading_accuracy", "reading_miss_recall", "reading_detect_recall", "retry_after_miss",
+            "next_call_after_miss", "duplicate_calls", "false_claim", "first_call", "answer", "mean_calls",
+            "no_final_answer", "hit_call_limit")
+    out = {key: full["all"].get(key) for key in keys}
+    out[f"within_{max_k}"] = full["all"].get("within_k", {}).get(max_k)
+    by_kind = defaultdict(list)
+    for path in sorted(glob.glob(str(Path(run) / "slots*.jsonl"))):
+        for line in open(path):
+            try:
+                slot = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            fault = fault_of(slot["example_id"])
+            if fault:
+                by_kind[slot.get("kind") or "combinational"].append(slot_facts(slot, fault))
+    for kind, facts in by_kind.items():
+        part = summary(facts, max_k)
+        for key in ("reading_accuracy", "reading_miss_recall", "retry_after_miss"):
+            out[f"{kind}_{key}"] = part.get(key)
+        out[f"{kind}_within_{max_k}"] = part.get("within_k", {}).get(max_k)
+    return out
 
 
 if __name__ == "__main__":

@@ -203,3 +203,43 @@ def test_gdpo_chunks_stop_at_even_steps_and_benchmark_each(run_rft, monkeypatch,
     assert launches == [("best", "False", "2"), ("latest", "True", "4")]
     assert benches == ["gdpo_2", "gdpo_4"]
     assert json.loads((tmp_path / "gdpo" / "fixed_eval_manifest.json").read_text()) == {}
+
+
+def gated_run(run_rft, tmp_path, reading, gate={"retry_after_miss": 0.5, "reading_miss_recall": 0.5}):
+    plan = {"run_dir": str(tmp_path / "run"), "start_adapter": "a0", "eval": {}, "gdpo": {"gate": gate}}
+    (tmp_path / "plan.json").write_text(json.dumps(plan))
+    r = run_rft.Run(tmp_path / "plan.json")
+    r.state.setdefault("results", {})["2"] = {"adapter": "a2", "val": 0.3, "reading": reading}
+    return r
+
+
+def test_gdpo_gate_passes_a_round_that_reads_and_retries(run_rft, tmp_path):
+    r = gated_run(run_rft, tmp_path, {"retry_after_miss": 0.7, "reading_miss_recall": 0.6})
+    run_rft.gdpo_gate(r, 2, "a2")
+    assert "gdpo_blocked" not in r.state
+
+
+@pytest.mark.parametrize("reading", [{"retry_after_miss": 0.0, "reading_miss_recall": 0.9},
+                                     {"retry_after_miss": 0.9},  # a missing metric fails
+                                     {}])
+def test_gdpo_gate_blocks_a_round_that_does_not(run_rft, tmp_path, reading):
+    # v4 GDPO 521449 trained a model that never called twice.
+    r = gated_run(run_rft, tmp_path, reading)
+    with pytest.raises(SystemExit) as stop:
+        run_rft.gdpo_gate(r, 2, "a2")
+    assert stop.value.code == 3
+    assert r.state["gdpo_blocked"]["round"] == "2"
+
+
+def test_gdpo_gate_evaluates_a_round_whose_job_ended_before_its_evaluation(run_rft, tmp_path, monkeypatch):
+    r = gated_run(run_rft, tmp_path, {})
+    calls = []
+    monkeypatch.setattr(run_rft, "evaluate_model", lambda r, tag, adapter: calls.append(tag) or
+                        {"adapter": adapter, "val": 0.2, "reading": {"retry_after_miss": 0.6, "reading_miss_recall": 0.8}})
+    run_rft.gdpo_gate(r, 3, "a3")
+    assert calls == ["round_3"] and r.state["results"]["3"]["reading"]["retry_after_miss"] == 0.6
+
+
+def test_no_gate_means_no_check(run_rft, tmp_path):
+    r = gated_run(run_rft, tmp_path, {}, gate=None)
+    run_rft.gdpo_gate(r, 2, "a2")

@@ -224,6 +224,12 @@ def round_metrics(run_dir, n, result, durations, sft_steps):
         metrics["round/fixed_detection"] = result["fixed"]
     for level, value in (result.get("val_by_level") or {}).items():
         metrics[f"round/val_{level}"] = value
+    for kind, value in (result.get("val_by_kind") or {}).items():
+        metrics[f"round/val_{kind}"] = value
+    # Reading the tool answer and retrying (run_rft eval.reading, gate_report scalars).
+    for key, value in (result.get("reading") or {}).items():
+        if value is not None:
+            metrics[f"round/read_{key}"] = value
     if n == 0:
         return metrics
     if str(n) in durations:

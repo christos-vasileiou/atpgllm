@@ -30,6 +30,19 @@ def grounded_text_enabled() -> bool:
     import os
 
     return os.environ.get("SFT_GROUNDED_TEXT", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def plan_think_enabled() -> bool:
+    """``SFT_PLAN_THINK``: a call's thinking keeps the plan, not lines that spell out the vector.
+
+    Synthetic retry examples strip those lines from their failed first call
+    (they would give the repair away). Stripping them from every call too
+    keeps the two kinds of call alike, so whether the call missed can only be
+    read from the tool answer, not from the shape of the call's thinking.
+    """
+    import os
+
+    return os.environ.get("SFT_PLAN_THINK", "").strip().lower() in ("1", "true", "yes", "on")
 INDEXED_BRACKET_PATTERN = re.compile(r"^(.+)\[(\d+)\]$")
 INDEXED_SUFFIX_PATTERN = re.compile(r"^(.+/[A-Za-z_]+)(\d+)$")
 
@@ -410,6 +423,10 @@ class ConversationExample:
                 )
                 if grounded:
                     tool_call_content = "<think>" + reasoning_content + "</think>\n\n"
+                    if plan_think_enabled():
+                        from atpgllm.training.retry_trajectories import strip_assignment_lines
+
+                        tool_call_content = strip_assignment_lines(tool_call_content)
                 messages.append({
                     "role": "assistant",
                     "content": tool_call_content,
@@ -433,7 +450,7 @@ class ConversationExample:
                 })
         reading = None
         if answer_content and grounded and snapshot:
-            from atpgllm.training.tool_feedback import detected_sentence, read_snapshot
+            from atpgllm.training.tool_feedback import detected_sentence, read_snapshot, with_outputs
 
             try:
                 reading = read_snapshot(snapshot, fault, list(expected_output_dict))
@@ -446,7 +463,9 @@ class ConversationExample:
             messages.append({
                 "role": "assistant",
                 "content": (
-                    "<think>\n" + detected_sentence(reading) + "\n</think>\n\n"
+                    "<think>\n"
+                    + with_outputs(detected_sentence(reading), snapshot, list(expected_output_dict))
+                    + "\n</think>\n\n"
                     "To sum up, the vectors are:\n" + answer_content
                 ),
             })
