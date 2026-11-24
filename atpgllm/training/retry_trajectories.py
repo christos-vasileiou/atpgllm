@@ -51,21 +51,41 @@ STOCK_LEAD_RE = re.compile(
 
 # A "net: value" or "net=value" assignment inside reasoning text.
 _ASSIGNMENT = re.compile(r"[\w\\\[\]/.$:-]+?\s*[:=]\s*[01xX]\b")
+# The value the plan needs on the fault site or a net of its path ("satisfy n2 = 0")
+# is the same for every detecting vector, so that one assignment stays.
+_OBJECTIVE = re.compile(r"\bsatisfy\s+\S+\s*=\s*[01xX]\b")
+# Wide vectors are written compactly (conversation.compact_binary_assignment_dict):
+# "in1[0..31] ones={2..3, 26}" and "a[0..7] bits_lsb0=01111111".
+_COMPACT_VECTOR = re.compile(r"\b(?:ones|zeros)\s*=\s*\{|\bbits_lsb0\s*=")
+_THINK_OPEN = "<think>"
+
+
+def _carries_values(line: str) -> bool:
+    if _COMPACT_VECTOR.search(line) or "expected output" in line.lower():
+        return True
+    return _ASSIGNMENT.search(_OBJECTIVE.sub("", line)) is not None
 
 
 def strip_assignment_lines(content: str) -> str:
-    """The thinking block without the lines that list input or output values.
+    """The thinking block without the lines that state input or output values.
 
     A synthetic retry example starts from a dataset row whose reasoning spells
     out the detecting vector, while its first call uses a perturbed one. Kept as
     context, those lines would let the next call copy the answer instead of
-    reading the simulator's table, so only the structural plan (net and gate
-    names) stays. Text after the thinking block is unchanged.
+    reading the simulator's table, and a plan whose vector disagrees with its
+    call would mark the call as a failure before the table is read. So only the
+    structural plan (net and gate names, and the value the fault site needs)
+    stays, in every row that uses this filter. A line goes when it holds a
+    plain assignment, a compact vector or an expected output. The thinking
+    opener stays when the first line goes, and text after the thinking block is
+    unchanged.
     """
     head, sep, tail = content.partition("</think>")
-    kept = [line for line in head.split("\n")
-            if len(_ASSIGNMENT.findall(line)) < 2 and "Expected output" not in line]
-    return "\n".join(kept) + sep + tail
+    opener = ""
+    if head.startswith(_THINK_OPEN):
+        opener, head = _THINK_OPEN, head[len(_THINK_OPEN):]
+    kept = [line for line in head.split("\n") if not _carries_values(line)]
+    return opener + "\n".join(kept) + sep + tail
 
 
 def _care(value: Any) -> bool:

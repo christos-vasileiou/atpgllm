@@ -182,6 +182,54 @@ def test_strip_assignment_lines_keeps_the_plan_and_drops_the_vector():
     assert stripped.endswith("</think>\n\nI'll call the tool.")
 
 
+def test_strip_assignment_lines_drops_compact_vectors_and_single_outputs():
+    """v5 plans as conversation renders them: wide buses compact, one-output circuits."""
+    from atpgllm.training.retry_trajectories import strip_assignment_lines
+    content = (
+        "<think>1. **Initialization**: Execute the input vector a: 1, b: 0, c: 1 first.\n"
+        "2. **Backtrace to PIs**: Trace backward from n2 through U4, U3 to satisfy n2 = 0. "
+        "Controlling nets: i1, i2, s.\n"
+        "3. **Logic Justification**: To excite the stuck-at-1 fault, we need n19 at 0.\n"
+        "4. **Output Verification**: The fault is sensitized if out1 differs from out1: 0.\n"
+        "5. **Fault Simulation**: Compare the good machine (expected output: o: 0) with the faulty one.\n"
+        "6. **Final Vector Synthesis**: The input vector in1[0..31] ones={2..3, 26}.\n"
+        "7. **Data Snapshot**: Snapshot with a[0..7] bits_lsb0=01111111, d[0]: x. "
+        "Detected faults: sa1 n19, sa1 out1.</think>\n\n")
+    stripped = strip_assignment_lines(content)
+    # The first line goes with its values; the thinking opener stays.
+    assert stripped.startswith("<think>2. **Backtrace to PIs**")
+    assert "satisfy n2 = 0" in stripped and "we need n19 at 0" in stripped
+    for gone in ("a: 1", "out1: 0", "o: 0", "ones={", "bits_lsb0", "Detected faults"):
+        assert gone not in stripped
+    assert stripped.endswith("we need n19 at 0.</think>\n\n")
+    # Applying it again changes nothing, so a built set can be brought up to date.
+    assert strip_assignment_lines(stripped) == stripped
+
+
+def test_restrip_restores_the_opener_the_old_filter_dropped():
+    import importlib
+    import sys
+    from collections import Counter
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "retry"))
+    restrip_plans = importlib.import_module("restrip_plans")
+    old_output = "2. **Path Selection**: from n10 to y.\n6. **Vector**: in1[0..31] ones={1}.</think>\n\n"
+    row = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+                        {"role": "assistant", "content": old_output, "tool_calls": []},
+                        {"role": "tool", "content": "{}"},
+                        {"role": "assistant", "content": "<think>\nreading\n</think>\n\nanswer"}],
+           "assistant_train": [False, True]}
+    stats = Counter()
+    out = restrip_plans.restrip_row(row, stats)
+    assert out["messages"][2]["content"] == "<think>2. **Path Selection**: from n10 to y.</think>\n\n"
+    assert out["messages"][4]["content"] == "<think>\nreading\n</think>\n\nanswer"
+    assert stats["opener_restored"] == 1 and stats["changed"] == 1
+    trained = dict(row, assistant_train=[True, True])
+    import pytest
+    with pytest.raises(SystemExit):
+        restrip_plans.restrip_row(trained, Counter())
+
+
 def _builder():
     import importlib
     import sys
