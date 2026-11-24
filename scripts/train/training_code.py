@@ -402,7 +402,7 @@ def train_with_sft(
         # create it otherwise with the ten-minute default, while rank zero
         # alone re-reads the skipped stream prefix.
         from atpgllm.training.distributed_runtime import initialize_grpo_distributed
-        initialize_grpo_distributed(int(kwargs.get("ddp_timeout") or 3600))
+        initialize_grpo_distributed(int(kwargs.get("ddp_timeout") or 3600), use_ddp=True)
 
     data_manifest = dataset_fingerprint = None
     if sft_circuit_validation:
@@ -929,7 +929,7 @@ def train_with_grpo(
     # PartialState is shared: its first initialization fixes the actual NCCL
     # timeout. Do this before any model/dataset helper or fixed-eval setup.
     from atpgllm.training.distributed_runtime import initialize_grpo_distributed, pin_vllm_group_port
-    distributed_state = initialize_grpo_distributed(ddp_timeout)
+    distributed_state = initialize_grpo_distributed(ddp_timeout, use_ddp=use_ddp)
     if os.environ.get("VLLM_GROUP_PORT"):
         pin_vllm_group_port(int(os.environ["VLLM_GROUP_PORT"]))
 

@@ -144,3 +144,53 @@ def test_sft_sets_distributed_timeout_before_validation_cache():
                     if isinstance(node, ast.FunctionDef) and node.name == "train_with_sft")
     body = ast.get_source_segment(source, function)
     assert body.index("initialize_grpo_distributed(") < body.index("cached_circuit_validation(")
+
+
+def test_lone_ddp_process_gets_torchrun_rank_variables():
+    # juno 525530: one training process with a DeepSpeed config had no process
+    # group, so GRPOTrainer's first barrier failed.
+    from atpgllm.training.distributed_runtime import give_lone_process_rank
+    environ = {}
+    assert give_lone_process_rank(environ) is True
+    assert {k: environ[k] for k in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")} == {
+        "LOCAL_RANK": "0", "RANK": "0", "WORLD_SIZE": "1", "LOCAL_WORLD_SIZE": "1"}
+    assert environ["MASTER_ADDR"] == "127.0.0.1" and 0 < int(environ["MASTER_PORT"]) < 65536
+    kept = {"MASTER_ADDR": "10.0.0.5", "MASTER_PORT": "29511"}
+    assert give_lone_process_rank(kept) is True
+    assert (kept["MASTER_ADDR"], kept["MASTER_PORT"]) == ("10.0.0.5", "29511")
+
+
+@pytest.mark.parametrize("launched", [{"LOCAL_RANK": "1"}, {"RANK": "0"}, {"WORLD_SIZE": "4"}])
+def test_launcher_rank_variables_are_left_alone(launched):
+    from atpgllm.training.distributed_runtime import give_lone_process_rank
+    environ = dict(launched)
+    assert give_lone_process_rank(environ) is False
+    assert environ == launched
+
+
+@pytest.mark.parametrize("use_ddp", [False, True])
+def test_rank_variables_only_for_ddp(monkeypatch, use_ddp):
+    import accelerate
+    from atpgllm.training.distributed_runtime import RANK_VARIABLES, initialize_grpo_distributed
+    for name in RANK_VARIABLES + ("LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
+        # setenv first so teardown removes what the call adds (delenv alone
+        # does not record a variable that was absent).
+        monkeypatch.setenv(name, "unset")
+        monkeypatch.delenv(name)
+    seen = {}
+    def create_state(**kwargs):
+        import os
+        seen.update({name: os.environ.get(name) for name in RANK_VARIABLES})
+        return SimpleNamespace(num_processes=1, print=lambda message: None)
+    monkeypatch.setattr(accelerate, 'PartialState', create_state)
+    initialize_grpo_distributed(600, use_ddp=use_ddp)
+    expected = {"LOCAL_RANK": "0", "RANK": "0", "WORLD_SIZE": "1"} if use_ddp else dict.fromkeys(RANK_VARIABLES)
+    assert seen == expected
+
+
+def test_training_entry_points_pass_use_ddp():
+    source = (Path(__file__).resolve().parents[2] / "scripts/train/training_code.py").read_text()
+    calls = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)
+             and getattr(node.func, "id", None) == "initialize_grpo_distributed"]
+    assert len(calls) == 2
+    assert all(any(k.arg == "use_ddp" for k in call.keywords) for call in calls)
