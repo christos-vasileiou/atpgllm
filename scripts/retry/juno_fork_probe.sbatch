@@ -24,7 +24,9 @@ unset BUFFER_SIZE DATASET DATASET_HF_REPO_NAME GRADIENT_ACCUMULATION_STEPS MAX_S
 source /work/cxv200006/myenv/bin/activate
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export DATA_PREPROCESSING_ROOT="$(cd "$REPO/../data_preprocessing" && pwd)"
-export HF_HOME=/work/cxv200006/.cache/huggingface HF_HUB_OFFLINE=1
+# No HF_HUB_OFFLINE: the compute nodes have internet, and offline mode breaks the Granite
+# tokenizer load by Hub id in the merged bf16 export (transformers checks is_base_mistral).
+export HF_HOME=/work/cxv200006/.cache/huggingface
 export VLLM_DISABLE_COMPILE_CACHE=1 NCCL_P2P_DISABLE=1
 mkdir -p jobs
 OUT="${PROBE_OUT:-runs/retry_sft_v4/fork_probe}"
